@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs; every push to main gets a full result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  patch-series:
+    name: Patch series applies on BASE
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Lint patches/series
+        run: |
+          set -euo pipefail
+          cd patches
+          fail=0
+          listed=()
+          while IFS= read -r p || [[ -n $p ]]; do
+            p=${p%$'\r'}
+            [[ -z ${p//[[:space:]]/} || $p == \#* ]] && continue
+            if [[ $p == */* ]]; then
+              echo "::error file=patches/series::entry must be a bare file name in patches/: $p"; fail=1; continue
+            fi
+            if [[ ! -f $p ]]; then
+              echo "::error file=patches/series::listed patch does not exist: $p"; fail=1; continue
+            fi
+            listed+=("$p")
+          done < series
+          shopt -s nullglob
+          for f in *.patch; do
+            found=0
+            for p in "${listed[@]}"; do [[ $p == "$f" ]] && found=1 && break; done
+            if [[ $found == 0 ]]; then
+              echo "::error file=patches/$f::patch is not listed in patches/series"; fail=1
+            fi
+            # Patches must be text-only: no binary hunks, renames or mode changes.
+            if hits=$(grep -nE '^(GIT binary patch|Binary files .* differ|rename from |old mode )' "$f"); then
+              while IFS= read -r h; do
+                echo "::error file=patches/$f,line=${h%%:*}::non-text change (patches must be text-only): ${h#*:}"
+              done <<<"$hits"
+              fail=1
+            fi
+          done
+          [[ $fail == 0 ]] || exit 1
+          echo "patches/series OK (${#listed[@]} patches)"
+
+      - name: Fetch upstream vLLM at BASE tag
+        run: |
+          set -euo pipefail
+          base=$(cat patches/BASE)
+          src=$RUNNER_TEMP/vllm
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/vllm-project/vllm.git
+          # BASE is an annotated tag; fetching the tag ref keeps the tag object,
+          # and --depth 1 pulls only the commit it points at.
+          git -C "$src" fetch -q --depth 1 --no-tags origin "refs/tags/$base:refs/tags/$base"
+          echo "$base -> $(git -C "$src" rev-parse "refs/tags/$base^{commit}")"
+          echo "VLLM_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Apply series with git am
+        run: scripts/regen-patches.sh --check "$VLLM_SRC"
+
+  python-unit:
+    name: Python unit tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Detect plugin and tests
+        id: detect
+        run: |
+          set -euo pipefail
+          run=false
+          if { [[ -d sm70/vllm_sm70 ]] || [[ -f sm70/pyproject.toml ]]; } \
+             && [[ -d tests ]] && [[ -n $(find tests -name 'test_*.py' -print -quit) ]]; then
+            run=true
+          else
+            echo "no vllm_sm70 tests yet"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: steps.detect.outputs.run == 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        if: steps.detect.outputs.run == 'true'
+        env:
+          # TODO(Kai): agree on the env var that makes sm70/'s build backend skip
+          # compiling the CUDA extension; VLLM_SM70_SKIP_EXT is the proposed name.
+          VLLM_SM70_SKIP_EXT: "1"
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          if [[ -f sm70/pyproject.toml ]]; then
+            python -m pip install -e sm70
+          else
+            echo "sm70/pyproject.toml absent; importing vllm_sm70 from sm70/ via PYTHONPATH"
+            echo "PYTHONPATH=$PWD/sm70${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+          fi
+
+      - name: pytest (not gpu)
+        if: steps.detect.outputs.run == 'true'
+        # Exit 5 means every collected test was GPU-only (deselected), which is fine on CPU.
+        run: |
+          set -uo pipefail
+          pytest -q tests -m "not gpu"; rc=$?
+          [[ $rc == 0 || $rc == 5 ]] || exit $rc
+
+  # Owned by Felix (flake, PR #2); he may extend this job. It must never build
+  # vllm/tree/venv (hours of CUDA compile): eval only, plus the cheap `source`
+  # output (fetch + patch), which proves the series applies under Nix's `patch`.
+  nix-eval:
+    name: Nix eval + source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Detect flake
+        id: detect
+        run: |
+          if test -s flake.nix; then
+            echo "has_flake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "flake.nix is missing or empty; skipping nix-eval"
+            echo "has_flake=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        if: steps.detect.outputs.has_flake == 'true'
+        with:
+          # Job-scoped token (read-only here), only to avoid GitHub API rate
+          # limits when Nix fetches github: inputs. Not a stored secret.
+          github_access_token: ${{ github.token }}
+
+      - name: nix flake metadata
+        if: steps.detect.outputs.has_flake == 'true'
+        run: nix flake metadata
+
+      - name: Evaluate derivations (no build)
+        if: steps.detect.outputs.has_flake == 'true'
+        # Pure eval: the flake sets config.allowUnfree for CUDA itself.
+        run: |
+          set -euo pipefail
+          nix eval --raw .#packages.x86_64-linux.vllm.drvPath; echo
+          nix eval --raw .#packages.x86_64-linux.source.drvPath; echo
+
+      - name: Build source (fetch + patch)
+        if: steps.detect.outputs.has_flake == 'true'
+        run: nix build .#source --print-build-logs
