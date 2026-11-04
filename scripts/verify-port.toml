@@ -1,0 +1,108 @@
+# Normalization rules for scripts/verify-port.py.
+#
+# Each [[rule]] is a regex applied to the FORK source (fork -> port spelling)
+# before parsing, unless side = "both" (applied to both trees) or "port".
+# lang is "cpp", "py" or "all". Every rename the port is allowed to make must
+# be listed here, so the list doubles as the reviewable set of expected
+# differences. Rules run in file order. Python `re` syntax; use '''raw''' strings.
+#
+# A body that only differs by these rules is reported IDENTICAL. Anything else
+# is CHANGED and must be judged by a reviewer.
+
+# Fork functions/classes whose absence in the port is expected. Regex on the
+# qualified name (after rules). Matches are reported DROPPED(expected).
+[expected_dropped]
+patterns = [
+  '''(?i)with_policy''',          # with_policy wrappers removed
+  '''(?i)gguf''',                 # GGUF paths dropped
+  '''(?i)(^|[_:.])glm''',         # GLM paths dropped
+  '''(?i)mxfp4''',                # MXFP4 paths dropped
+  '''(?i)tp4''',                  # TP4 paths dropped
+  '''(?i)1cat|onecat''',          # 1Cat env/policy indirection
+  '''(?i)native_policy''',
+]
+
+# Port names that are expected to be new (no fork counterpart).
+[expected_new]
+patterns = [
+  '''(?i)sm70config''',
+  '''^register''',                # plugin entry points
+]
+
+# --- with_policy wrappers removed (must run before the namespace rules) ---
+
+[[rule]]
+name = "policy: with_policy(&fn) -> &fn"
+lang = "cpp"
+pattern = '''(?:\bvllm::)?(?:sm70::)?with_policy\(\s*(&[\w:]+)\s*\)'''
+repl = "\\1"
+
+[[rule]]
+name = "policy: call_native(op, native_policy, *args) -> op(*args)"
+lang = "py"
+pattern = '''\bcall_native\(\s*((?:[^(),]|\([^()]*\))+?)\s*,\s*native_policy\s*,\s*'''
+repl = "\\1("
+
+# --- namespace / extension name -------------------------------------------
+
+[[rule]]
+name = "ext: register_fake/custom_op '_C::' -> '_sm70_C::'"
+lang = "py"
+pattern = '''(["'])_C::'''
+repl = "\\1_sm70_C::"
+
+[[rule]]
+name = "ext: torch.ops._C -> torch.ops._sm70_C"
+lang = "py"
+pattern = '''torch\.ops\._C\b'''
+repl = "torch.ops._sm70_C"
+
+[[rule]]
+name = "ext: import vllm._C -> vllm_sm70._sm70_C"
+lang = "py"
+pattern = '''\bvllm\._C\b'''
+repl = "vllm_sm70._sm70_C"
+
+[[rule]]
+name = "ext: TORCH_LIBRARY(_C) -> _sm70_C"
+lang = "cpp"
+pattern = '''\bTORCH_LIBRARY(_EXPAND|_IMPL_EXPAND)?\(\s*(TORCH_EXTENSION_NAME|_C)\b'''
+repl = "TORCH_LIBRARY\\1(_sm70_C"
+
+[[rule]]
+name = "ns: namespace vllm -> namespace vllm_sm70"
+lang = "cpp"
+pattern = '''\bnamespace\s+vllm\b'''
+repl = "namespace vllm_sm70"
+
+[[rule]]
+name = "ns: vllm:: -> vllm_sm70::"
+lang = "cpp"
+pattern = '''(?<![\w:])vllm::'''
+repl = "vllm_sm70::"
+
+# --- native_policy argument removed ----------------------------------------
+
+[[rule]]
+name = "policy: drop C++ param std::optional<std::string> native_policy"
+lang = "cpp"
+pattern = ''',\s*(const\s+)?(std::)?optional<\s*(std::)?string\s*>\s*(const\s*)?&?\s*native_policy(\s*=\s*[^,)]*)?'''
+repl = ""
+
+[[rule]]
+name = "policy: drop schema arg 'str? native_policy'"
+lang = "all"
+pattern = ''',\s*str\?\s*native_policy(\s*=\s*None)?'''
+repl = ""
+
+[[rule]]
+name = "policy: drop Python param native_policy"
+lang = "py"
+pattern = ''',\s*native_policy\s*(:\s*(?:\w+\[[^\]]*\]|[^,)=\[]+))?(\s*=\s*(?:\(\)|None|[^,()]+))?(?=\s*[,)])'''
+repl = ""
+
+[[rule]]
+name = "policy: drop call-site native_policy argument"
+lang = "all"
+pattern = ''',\s*(native_policy\s*=\s*)?native_policy\b'''
+repl = ""
