@@ -11,7 +11,7 @@ Expected (nixpkgs 7dcdd87, unchanged flake):
 Confirm it after the build.
 
 ## 1. Closure to c4130 (before the window, no service impact, no sudo)
-c4130 has harmonia (`http://10.25.0.2:5000`) as a substituter and trusts
+c4130 has the harmonia binary cache on r440 as a substituter and trusts
 `r440-cache-1`, so realising the outPath as charlie pulls it:
 ```sh
 # on r440
