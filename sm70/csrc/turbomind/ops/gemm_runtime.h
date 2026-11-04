@@ -17,18 +17,8 @@ enum class TuneKeyKind : int {
   kGenericMoe = 3,
   kAwqMoe = 4,
   kFp8Moe = 5,
-  kMxfp4Dense = 6,
   kNvfp4Dense = 7,
-  kMxfp4Moe = 8,
   kNvfp4Moe = 9,
-  kGgufAffineU4 = 10,
-  kGgufAffineU8 = 11,
-  kGgufAffineU2 = 12,
-  kGgufBitPlane3 = 13,
-  kGgufBitPlane5 = 14,
-  kGgufBitPlane6 = 15,
-  kGgufLut4IQ = 16,
-  kGgufLut4E2M1 = 17,
 };
 
 struct Sm70F16WeightCacheEntry {
@@ -39,16 +29,6 @@ struct Sm70F16WeightCacheEntry {
 const turbomind::gemm::Workspace& workspace_for(int device,
                                                 cudaStream_t stream);
 bool awq_tune_small_shapes_enabled();
-
-bool mxfp4_moe_compact_grouped_decode_enabled();
-
-bool mxfp4_moe_broadcast_input_decode_enabled();
-
-bool mxfp4_moe_grouped_m8_enabled();
-
-bool mxfp4_moe_grouped_verifier_enabled();
-
-bool mxfp4_moe_grouped_m8_expert_rows_enabled();
 
 bool nvfp4_moe_grouped_prefill_enabled();
 
@@ -74,9 +54,6 @@ turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream);
 
-turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
-    int device, int m, int n, int k, int group_size, cudaStream_t stream);
-
 turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream);
 
@@ -94,10 +71,6 @@ turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
     cudaStream_t stream);
 
 turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
-    int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream);
-
-turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream);
 
