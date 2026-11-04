@@ -2,7 +2,10 @@
 # build in ./vllm.nix applies them:
 #   lmcache = prev.lmcache.overrideAttrs (old: {
 #     patches = (old.patches or [ ]) ++ import ./patches/lmcache;
+#     patchFlags = [ "-p1" "--fuzz=0" "--no-backup-if-mismatch" ];
 #   });
+# (paths relative to nix/: this is nix/patches/lmcache, not the top-level
+# patches/ series, which is vLLM-only)
 # `checks.<system>.lmcache-patches-apply` checks they apply to the pinned sdist.
 [
   # Start the MP worker's heartbeat at KV-cache registration, so a worker that

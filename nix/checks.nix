@@ -67,7 +67,7 @@ in
     cd lmcache-0.5.6
     for p in ${lib.concatMapStringsSep " " (p: "${p}") (import ./patches/lmcache)}; do
       echo "applying $p"
-      patch -p1 --batch --forward < "$p"
+      patch -p1 --fuzz=0 --no-backup-if-mismatch --batch --forward < "$p"
     done
     ${pkgs.python3}/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' \
       lmcache/integration/vllm/vllm_multi_process_adapter.py
