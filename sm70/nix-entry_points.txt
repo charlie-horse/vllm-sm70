@@ -1,0 +1,5 @@
+[vllm.general_plugins]
+sm70 = vllm_sm70:register
+
+[vllm.platform_plugins]
+sm70 = vllm_sm70.platform:activate

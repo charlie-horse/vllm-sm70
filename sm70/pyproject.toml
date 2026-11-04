@@ -1,0 +1,20 @@
+[build-system]
+# Nix supplies these; nothing is fetched at build time.
+requires = ["setuptools>=77", "torch==2.14.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-sm70"
+version = "0.1.0"
+description = "Volta (SM70) kernels and plugins for vLLM v0.33.0"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# Entry points come from nix-entry_points.txt (single source of truth),
+# read by setup.py.
+dynamic = ["entry-points"]
+
+[tool.setuptools.packages.find]
+include = ["vllm_sm70*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

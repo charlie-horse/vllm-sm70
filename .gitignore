@@ -23,3 +23,6 @@ patches/*.patch~
 .vscode/
 .idea/
 *.swp
+
+# sm70 extension built in place
+sm70/vllm_sm70/*.so
