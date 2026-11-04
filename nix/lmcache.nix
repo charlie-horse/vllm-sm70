@@ -38,7 +38,8 @@ let
       num_workers = 8;
       max_capacity_gb = cfg.l2SizeGb;
     })
-  ];
+  ]
+  ++ cfg.extraArgs;
 
   # LMCache's dashboard is a read-only proxy in front of the MP server's admin
   # API: `--nodes` is both the node list it renders and the allowlist its
@@ -140,6 +141,19 @@ in
       type = lib.types.ints.positive;
       default = 180;
       description = "L2 cap in GB (local disk, enforced by vllm-lmcache-l2-prune).";
+    };
+
+    extraArgs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "--worker-registration-grace-seconds"
+        "604800"
+      ];
+      description = ''
+        Extra `lmcache server` arguments, appended after the module's own
+        (a later flag overrides an earlier one).
+      '';
     };
 
     ui = {

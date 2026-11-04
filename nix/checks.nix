@@ -30,6 +30,11 @@ let
             firewallInterfaces = [ "eno1" ];
           };
           services.lmcache-sm70.ui.firewallInterfaces = [ "eno1" ];
+          # Exercises extraArgs (appended to the server's ExecStart).
+          services.lmcache-sm70.extraArgs = [
+            "--worker-registration-grace-seconds"
+            "7200"
+          ];
         }
       ];
     };
@@ -48,8 +53,27 @@ let
       );
     in
     pkgs.writeText "vllm-sm70-units-${activeModel}" (builtins.unsafeDiscardStringContext text);
+
+  # The LMCache sdist the build uses (docs/pins.md) with our patches applied.
+  # Building this check fetches the sdist (~MBs); no compiling.
+  lmcacheSdist = pkgs.fetchurl {
+    url = "https://files.pythonhosted.org/packages/84/25/3ccd46844c94e08897aa8d72716a538c07e4583410d84dbc6cd12cb60dc1/lmcache-0.5.6.tar.gz";
+    sha256 = "d6951e60ce8818a76aa42d0866a4ba85f1c95cd919355fff30ff24dcc3243f1e";
+  };
 in
 {
+  lmcache-patches-apply = pkgs.runCommand "lmcache-patches-apply" { } ''
+    tar xzf ${lmcacheSdist}
+    cd lmcache-0.5.6
+    for p in ${lib.concatMapStringsSep " " (p: "${p}") (import ./patches/lmcache)}; do
+      echo "applying $p"
+      patch -p1 --batch --forward < "$p"
+    done
+    ${pkgs.python3}/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' \
+      lmcache/integration/vllm/vllm_multi_process_adapter.py
+    touch $out
+  '';
+
   flint-checkpoint-outpath =
     assert lib.assertMsg (ckpt.flintCheckpoint.outPath == ckpt.expectedOutPath) ''
       flintCheckpoint is ${ckpt.flintCheckpoint.outPath}, expected ${ckpt.expectedOutPath}.

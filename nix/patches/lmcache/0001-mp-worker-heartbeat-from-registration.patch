@@ -1,0 +1,17 @@
+diff --git a/lmcache/integration/vllm/vllm_multi_process_adapter.py b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+index 64d3e00..aa2eed5 100644
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -1629,6 +1629,12 @@ class LMCacheMPWorkerAdapter:
+             layout_hints if layout_hints is not None else vllm_layout_hints()
+         )
+         self._send_register_kv_caches_request(kv_caches)
++        # Ping from registration on, not from the first store/retrieve: a
++        # worker that serves only sub-chunk prompts (or none) for longer than
++        # --worker-registration-grace-seconds would otherwise be reaped while
++        # alive, and a later PING (always True) never re-registers it, so every
++        # STORE is rejected until vLLM restarts.
++        self._ensure_heartbeat_started()
+ 
+     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
+         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)

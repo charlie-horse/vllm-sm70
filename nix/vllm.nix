@@ -10,6 +10,9 @@
 #   lmcacheUi  wrapper with only bin/python, able to import
 #              lmcache.lmcache_frontend.app (kept off the system PATH).
 #
+# LMCache 0.5.6 is built from the sdist with `import ./patches/lmcache` applied
+# (a list of patch files, in order; see that file).
+#
 # Both wrappers set CUDA_HOME/CUDA_PATH (CUDA 12.6), NVCC_PREPEND_FLAGS,
 # TRITON_LIBCUDA_PATH=/run/opengl-driver/lib, CC/CXX (gcc 13 backendStdenv)
 # and LD_LIBRARY_PATH (/run/opengl-driver/lib, the nvidia-*/torch lib dirs,
