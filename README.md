@@ -2,7 +2,7 @@
 
 A Nix flake that builds upstream [vLLM](https://github.com/vllm-project/vllm) for NVIDIA Volta GPUs (SM70, e.g. Tesla V100). It does this by applying a small, ordered patch series on top of a pinned release tag.
 
-Status: work in progress. Nothing here builds yet.
+Status: Phase 1 spike (branch `phase1-spike`): unpatched v0.33.0 for sm_70, TRITON_ATTN only. Not yet built.
 
 ## Pins
 
@@ -22,10 +22,10 @@ Full pins, hashes and evidence are in [docs/pins.md](docs/pins.md). Volta has no
 | path | contents |
 |---|---|
 | `flake.nix` | flake entry point |
-| `nix/` | derivations and NixOS modules |
+| `nix/` | `source.nix` (tag + patches), `deps.nix` (CMake FetchContent sources), `package.nix` (uv2nix wheel env, sm_70 build, wrapper), `pyenv/` (`pyproject.toml` + `uv.lock`, re-lock with `uv lock --python 3.13`) |
 | `patches/` | the patch series applied on top of the vLLM tag |
 | `tests/` | sm70 checks |
-| `docs/` | `pins.md` (locked pins and evidence) |
+| `docs/` | `pins.md` (locked pins and evidence), `phase1-gpu-runbook.md` (c4130 test) |
 
 ## License
 
