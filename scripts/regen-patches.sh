@@ -8,7 +8,8 @@
 # Regen mode writes patches/NNNN-<subject>.patch plus patches/series, and
 # fails if any commit is missing a required header field.
 # --check mode applies patches/series onto a fresh worktree of base-tag with
-# `git am` and fails on the first patch that does not apply.
+# `git am` (no 3-way merge, so stale context fails) and stops at the first
+# patch that does not apply cleanly.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,7 +35,7 @@ if [[ $mode == check ]]; then
   while read -r p; do
     [[ -z $p || $p == \#* ]] && continue
     git -C "$wt" -c user.name=check -c user.email=check@localhost \
-      am -q --3way "$patch_dir/$p" || die "patch does not apply: $p"
+      am -q "$patch_dir/$p" || die "patch does not apply: $p"
     echo "ok  $p"
   done < "$patch_dir/series"
   echo "series applies cleanly on $base"
