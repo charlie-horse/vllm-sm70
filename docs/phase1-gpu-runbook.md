@@ -7,7 +7,7 @@ checks with their expected output.
 
 `$OUT` = outPath of `.#vllm` (r440, `~/vllm-sm70-work/felix/result-vllm`).
 Expected (nixpkgs 7dcdd87, unchanged flake):
-`/nix/store/1ggjx5f52pdhsa6bdmmc70ckn298gxya-vllm-sm70-0.33.0`.
+`/nix/store/zlbyyjzl4kifkdv1hl7rf08cqk78yvdr-vllm-sm70-0.33.0`.
 Confirm it after the build.
 
 ## 1. Closure to c4130 (before the window, no service impact, no sudo)
