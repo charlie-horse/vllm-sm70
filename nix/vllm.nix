@@ -9,6 +9,8 @@
 #              (LMCache 0.5.6 from the same env: `lmcache server`).
 #   lmcacheUi  wrapper with only bin/python, able to import
 #              lmcache.lmcache_frontend.app (kept off the system PATH).
+#   tree       the sm_70-built vLLM tree (exposed as packages.tree; CI
+#              evaluates its drvPath).
 #
 # Both wrappers set CUDA_HOME/CUDA_PATH (CUDA 12.6), NVCC_PREPEND_FLAGS,
 # TRITON_LIBCUDA_PATH=/run/opengl-driver/lib, CC/CXX (gcc 13 backendStdenv)
@@ -36,4 +38,5 @@ in
 {
   vllm = stub "vllm-sm70-stub" [ "vllm" "hf" "lmcache" ];
   lmcacheUi = stub "lmcache-ui-sm70-stub" [ "python" ];
+  tree = stub "vllm-sm70-tree-stub" [ ];
 }
