@@ -13,7 +13,8 @@
 // stay verbatim. They include this through the sm70_policy.h shim.
 //
 // Environment names are the fork's, so existing tuning notes still apply.
-// Only knobs read by the K02 file set are listed; K03+ add their own.
+// Only knobs read by the K02 file set are listed, plus batch_gemm_layouts
+// (shared with K03 Python). K03+ add their own.
 #pragma once
 
 // Same std headers the fork's sm70_policy.h chain provided, so vendored
@@ -82,7 +83,36 @@ namespace vllm::sm70 {
   X(nvfp4_dense_tune_max_m, "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M")              \
   X(awq_moe_tune_max_tokens, "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS")            \
   X(nvfp4_moe_tune_max_tokens, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS")        \
-  X(f16_dense_max_m, "VLLM_SM70_F16_DENSE_MAX_M")
+  X(f16_dense_max_m, "VLLM_SM70_F16_DENSE_MAX_M")                            \
+  X(batch_gemm_layouts, "VLLM_SM70_BATCH_GEMM_LAYOUTS")
+
+// c4130 production defaults.
+//
+// The fork overrode some call-site defaults on every SM70 run. The dict is
+// _SM70_BATCH_GEMM_DEFAULTS, fork cf9492a vllm/platforms/runtime_defaults.py:36-44.
+// It is applied for any participating capability-7.0 device, and only for
+// unset variables, by _apply_sm70_batch_gemm_defaults (:103-112). The call
+// chain is apply_runtime_policy_defaults (:254, loop at :263) from
+// VllmConfig.__post_init__ (fork vllm/config/vllm.py:1426). We make those
+// values our defaults. An explicitly set variable still wins.
+//   VLLM_SM70_FP8_DENSE_TUNE_MAX_M=64    fork call-site default 16.
+//     Consumer: gemm_runtime.cpp fp8_dense_tune_max_m()
+//     -> select_fp8_dense_dispatch_policy (K02).
+//   VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=64  fork call-site default 16.
+//     Consumer: gemm_runtime.cpp nvfp4_dense_tune_max_m()
+//     -> select_nvfp4_dense_dispatch_policy (K02).
+//   VLLM_SM70_BATCH_GEMM_LAYOUTS=1       fork envs.py default 0.
+//     No C++ consumer. The Python prepare path reads it (fork
+//     sm70_turbomind.py:151-159 use_batched_gemm_layouts(), called from
+//     kernels/linear/qpn/nvfp4.py:37,287,316 and
+//     compressed_tensors_w8a16_fp8.py:450), so the K03 Python port needs it.
+//     The constant is recorded here so both sides share one value.
+//   VLLM_SM70_AWQ_WARMUP_MAX_M=64        same dict. Python AWQ warmup only
+//     (K04). Recorded, not read here.
+inline constexpr int kFp8DenseTuneMaxMDefault = 64;
+inline constexpr int kNvfp4DenseTuneMaxMDefault = 64;
+inline constexpr bool kBatchGemmLayoutsDefault = true;
+inline constexpr int kAwqWarmupMaxMDefault = 64;
 
 enum class PolicyField {
 #define X(field, env) field,
@@ -206,6 +236,13 @@ inline const std::vector<GemmTargetPolicy>& policy_gemm_targets() {
     return parse_gemm_targets(raw ? raw : "");
   }();
   return targets;
+}
+
+// VLLM_SM70_BATCH_GEMM_LAYOUTS with the c4130 default (on). For the K03
+// bindings to expose to Python. No K02 code branches on it.
+inline bool batch_gemm_layouts_enabled() {
+  return policy_atoi(PolicyField::batch_gemm_layouts,
+                     kBatchGemmLayoutsDefault ? 1 : 0) != 0;
 }
 
 // Process-wide named counters (the fork kept them per engine runtime). Used

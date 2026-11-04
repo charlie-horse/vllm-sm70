@@ -337,13 +337,15 @@ int generic_dense_tune_max_m() {
 
 int fp8_dense_tune_max_m() {
   return std::max(vllm::sm70::policy_atoi(
-                      vllm::sm70::PolicyField::fp8_dense_tune_max_m, 16),
+                      vllm::sm70::PolicyField::fp8_dense_tune_max_m,
+                      vllm::sm70::kFp8DenseTuneMaxMDefault),
                   0);
 }
 
 int nvfp4_dense_tune_max_m() {
   return std::max(vllm::sm70::policy_atoi(
-                      vllm::sm70::PolicyField::nvfp4_dense_tune_max_m, 16),
+                      vllm::sm70::PolicyField::nvfp4_dense_tune_max_m,
+                      vllm::sm70::kNvfp4DenseTuneMaxMDefault),
                   0);
 }
 
