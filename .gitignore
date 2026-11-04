@@ -1,0 +1,25 @@
+# Nix
+result
+result-*
+.direnv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Build output
+build/
+dist/
+*.whl
+
+# Patch workflow leftovers
+*.orig
+*.rej
+patches/*.patch~
+
+# Editors
+.vscode/
+.idea/
+*.swp
