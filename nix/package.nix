@@ -157,6 +157,8 @@ let
           -name '*.so*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd:)
         mkdir -p $out/bin
         # `vllm` is the venv python running vllm's CLI from the tree.
+        # TRITON_PTXAS_PATH is only a default (12.6 ptxas): set it to Triton's
+        # bundled ptxas (12.9) to compare.
         for exe in python vllm; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
@@ -164,7 +166,7 @@ let
             --prefix PYTHONPATH : ${tree} \
             --set CUDA_HOME ${cuda.cudatoolkit} \
             --set CUDA_PATH ${cuda.cudatoolkit} \
-            --set TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
+            --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
             --set TRITON_LIBCUDA_PATH /run/opengl-driver/lib \
             --set CC ${cuda.backendStdenv.cc}/bin/cc \
             --set CXX ${cuda.backendStdenv.cc}/bin/c++ \

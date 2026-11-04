@@ -6,9 +6,10 @@ specific to the vllm-sm70 build: the closure, the test commands, and the
 checks with their expected output.
 
 `$OUT` = outPath of `.#vllm` (r440, `~/vllm-sm70-work/felix/result-vllm`).
-Expected (nixpkgs 7dcdd87, unchanged flake):
-`/nix/store/zlbyyjzl4kifkdv1hl7rf08cqk78yvdr-vllm-sm70-0.33.0`.
-Confirm it after the build.
+Built 2026-11-04 on r440 (tree build 60 min, exit 0):
+`/nix/store/w22ph5z450cawvabknms35j5sp3hccfb-vllm-sm70-0.33.0` (closure 10.4 GiB;
+tree `/nix/store/1xc5dp2nrh425sfphk52d2s7mv91is9l-vllm-sm70-0.33.0`).
+Already realised on c4130 and GC-rooted at `~charlie/vsm70/result-vllm`.
 
 ## 1. Closure to c4130 (before the window, no service impact, no sudo)
 c4130 has the harmonia binary cache on r440 as a substituter and trusts
@@ -35,9 +36,13 @@ chmod -R a+rX /var/tmp/vsm70-test/models
 
 ## 3. Static checks (before the window; one small CUDA context, no load)
 ```sh
-cd /var/tmp && $OUT/bin/python -c "import torch, vllm, vllm._C; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list(), vllm.__version__, torch.cuda.get_device_capability(0))"
+cd /var/tmp && CUDA_VISIBLE_DEVICES= $OUT/bin/python -c "import torch, vllm, vllm._C_stable_libtorch, vllm._moe_C_stable_libtorch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list(), vllm.__version__)"
 ```
-Expected: `2.14.0+cu126 12.6 [..., 'sm_70', ...] 0.33.0 (7, 0)`.
+Seen 2026-11-04 on c4130 (no GPU touched):
+`2.14.0+cu126 12.6 ['sm_50', 'sm_60', 'sm_70', 'sm_75', 'sm_80', 'sm_86', 'sm_90'] 0.33.0`.
+v0.33.0 has no `vllm._C`: its kernels are `vllm._C_stable_libtorch` (imported by
+`platforms/cuda.py:23`) and `vllm._moe_C_stable_libtorch`. In the window, also print
+`torch.cuda.get_device_capability(0)` and expect `(7, 0)`.
 (No `-I` here: the wrapper puts the vLLM tree on PYTHONPATH, and `-I` would drop it.)
 
 ## 4. Test commands (inside the window, Flint stopped)
@@ -59,6 +64,10 @@ CUDA_VISIBLE_DEVICES=0  $OUT/bin/vllm serve /var/tmp/vsm70-test/models/Qwen3-0.6
 ```
 TP2: the same with `CUDA_VISIBLE_DEVICES=0,1 --tensor-parallel-size 2`.
 LMCache stays running (~328 MiB/GPU); 0.80 leaves room for it.
+`TRITON_PTXAS_PATH` defaults to the CUDA 12.6 ptxas, which caps PTX ISA at 8.5. If
+TRITON_ATTN fails to compile (ptxas / PTX ISA errors), retry once with Triton's
+bundled ptxas (12.9) and record which one works:
+`TRITON_PTXAS_PATH=/nix/store/vj0g2w16a7l9q7cnfp4982p3fdfvrm3n-vllm-sm70-env/lib/python3.13/site-packages/triton/backends/nvidia/bin/ptxas`.
 Use `RuntimeMaxSec=900` on the transient unit; first start includes Triton JIT
 and torch.compile (expect 2–4 min to /health).
 
