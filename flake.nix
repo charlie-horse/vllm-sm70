@@ -35,6 +35,7 @@
       packages.${system} = {
         default = p.vllm;
         vllm = p.vllm;
+        inherit (p) tree;
         flint-checkpoint = p.flintCheckpoint;
         inherit source;
       };

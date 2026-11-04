@@ -9,6 +9,8 @@
 #              (LMCache 0.5.6 from the same env: `lmcache server`).
 #   lmcacheUi  wrapper with only bin/python, able to import
 #              lmcache.lmcache_frontend.app (kept off the system PATH).
+#   tree       the sm_70-built vLLM tree (exposed as packages.tree; CI
+#              evaluates its drvPath).
 #
 # LMCache 0.5.6 is built from the sdist with `import ./patches/lmcache` applied
 # (a list of patch files, in order; see that file).
@@ -39,4 +41,5 @@ in
 {
   vllm = stub "vllm-sm70-stub" [ "vllm" "hf" "lmcache" ];
   lmcacheUi = stub "lmcache-ui-sm70-stub" [ "python" ];
+  tree = stub "vllm-sm70-tree-stub" [ ];
 }
