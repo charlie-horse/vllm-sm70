@@ -104,8 +104,9 @@ let
         '') deps
       )}
 
-      # nvcc needs a few GB per job; follow the builder's cores, capped at 16.
-      export MAX_JOBS=$(( NIX_BUILD_CORES > 16 ? 16 : NIX_BUILD_CORES ))
+      # nvcc needs a few GB per job: one job per builder core, never more
+      # than 8 (two 16-job CUDA trees hung r440 on 2026-11-04).
+      export MAX_JOBS=$(( NIX_BUILD_CORES > 8 ? 8 : NIX_BUILD_CORES ))
       ${buildVenv}/bin/python setup.py build_ext --inplace
       runHook postBuild
     '';
