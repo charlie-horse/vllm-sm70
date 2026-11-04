@@ -610,11 +610,12 @@ def compare(fork: Tree, port: Tree, cfg: Config, ctx: int) -> list[dict]:
         last = re.split(r"::|\.", _bare(e.key).split("#")[0])[-1]
         return re.sub(r"(?<![\w])" + re.escape(last) + r"(?![\w])", "<NAME>", e.body)
     by_body: dict[str, list[str]] = {}
+    movable = ("func", "kernel", "method", "class", "macro")   # consts/imports are too generic
     for k, e in drop.items():
-        if len(e.body) > 40:
+        if len(e.body) > 40 and e.kind in movable:
             by_body.setdefault(anon(e), []).append(k)
     for pk, pe in list(new.items()):
-        ks = by_body.get(anon(pe))
+        ks = by_body.get(anon(pe)) if pe.kind in movable else None
         if ks:
             fk = ks.pop(0)
             fe = drop.pop(fk)
