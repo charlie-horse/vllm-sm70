@@ -53,10 +53,10 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 | M2 | 1 | `Sm70Fp8Config` / `Sm70ModelOptNvFp4Config` registered over `"fp8"` / `"modelopt_fp4"` | Mara | K01 | `VLLM_SM70_QUANT=0` (upstream classes, which refuse on sm70) | CPU, mocked cc: gate is 70 at cc 7.0 with `_sm70_C`, 75 without; identical to upstream at cc 8.0; registry identity asserted in `register()`; real Flint (nested ModelOpt W4A16_NVFP4) and Qwen fp8 block-128 configs pass the upstream capability check (`config/vllm.py:926-936`) |
 | M7 | 1 | DFlash2 draft: BF16-range emulation in fp16, as a `DFlash2DraftModel` subclass registered by the plugin (U6 is the fallback) | Mara | M1 | `VLLM_SM70_DFLASH2_EMULATION=0` | GPU: draft forward in fp16 has no inf/NaN (plain cuBLAS fp16). Acceptance-rate e2e runs after M6 |
 | K03 | 2 | TurboMind fp16/FP8/NVFP4 dense + MoE ops (~5.8K), `vllm_sm70/ops.py` | Kai | K02, U1 | `VLLM_SM70_TURBOMIND=0` (fp16 path only) | GPU: TM fp16/FP8-block/NVFP4 GEMM vs `torch.matmul` on dequantized weights, max-abs-rel < 1e-2 at M ∈ {1,2,8,64,512}, N/K from the Flint and Qwen shapes; MoE vs a reference loop; the fork tests in the carry map pass |
-| M3 | 3 | NVFP4 dense linear → TurboMind GEMM, via the plugin's `LINEAR_METHOD_BUILDERS` entry; the M≤2 GEMV is wired only if K11's op is present | Mara | M2, K03 | `VLLM_SM70_NVFP4_GEMV=0` (GEMM only) | GPU: layer output vs dequantized fp16 reference |
-| M4 | 4 | NVFP4 MoE → TurboMind MoE via `FusedMoEMethodCls`; the decode fast path is wired only if K12's op is present | Mara | M3, K03 | `VLLM_SM70_MOE_DECODE_FASTPATH=0` | GPU: MoE block vs reference |
+| M3 | 3 | NVFP4 dense linear → TurboMind GEMM, via the plugin's `LINEAR_METHOD_BUILDERS` entry; the M≤2 GEMV is wired only if K11's op is present | Mara | M2, K03 | `VLLM_SM70_MODELOPT_NVFP4_GEMV=0` (GEMM only) | GPU: layer output vs dequantized fp16 reference |
+| M4 | 4 | NVFP4 MoE → TurboMind MoE via `FusedMoEMethodCls`; the decode fast path is wired only if K12's op is present | Mara | M3, K03 | `VLLM_SM70_FLINT_MOE_QPN_DECODE=0` | GPU: MoE block vs reference |
 | M5 | 5 | `FlintSm70ForCausalLM` (FP16 rescale), registered with `register_model` and selected with `--hf-overrides architectures`; fused qk-norm/RoPE/KV is used only if K15 is present | Mara | M3, M4, U1 | `VLLM_SM70_FLINT_QK_ROPE_KV=0` (unfused) | GPU e2e quality suite: math 10/10, code 5/5, needle@32K 3/3, no gibberish at concurrency 20, glm47 tool/reasoning parse, LMCache prefix reuse |
-| M6 | 5 | Qwen FP8 block-128 dense + MoE → TurboMind FP8 weight-only | Mara | M2, M4, K03 | `VLLM_SM70_FP8_TURBOMIND=0` → refuse with a clear error | GPU e2e: Qwen3.6-35B-A3B and Qwen3.8-27B FP8 at TP2 within 32 GB/GPU; quality suite |
+| M6 | 5 | Qwen FP8 block-128 dense + MoE → TurboMind FP8 weight-only | Mara | M2, M4, K03 | `VLLM_SM70_FP8_TURBOMIND=0` → refuse with a clear error; `VLLM_SM70_FP8_MOE_DECODE=0` turns off the FP8 MoE single-token decode route | GPU e2e: Qwen3.6-35B-A3B and Qwen3.8-27B FP8 at TP2 within 32 GB/GPU; quality suite |
 
 **Phase 2 exit:** Flint and Qwen3.6/3.8 serve on c4130 TP2 with `--dtype half` on TRITON_ATTN, and the M5 and M6 quality suites pass. Speed isn't gated yet.
 
@@ -72,7 +72,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 | K10 | 2 | opt: GDN TileLang prefill (needs a Nix tilelang) | Kai | K08 | `VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0` (default 0) | GPU: TileLang vs native state rel-L2 < 4e-4 |
 | K09 | 3 | QPN8 block-FP8 decode GEMV (op only) | Kai | K03 | – (switch is M8's) | GPU: vs TM FP8 max-abs-rel < 1e-2 |
 | K18 | 3 | DFlash2 draft fp16 M≤8 GEMM + compact half top-k (`dflash2_fp16_m8_sm70.cu`, `compact_half_topk_sm70.cu`, `vllm_sm70/ops/dflash2.py`) | Kai | K03 | `VLLM_SM70_DFLASH2_FP16=0` | GPU: vs `torch.matmul` max-abs-rel < 1e-2; draft acceptance unchanged |
-| M8 | 6 | Wire QPN8 FP8 decode into Qwen | Mara | M6, K09 | `VLLM_SM70_FP8_QPN8=0` | GPU: Qwen decode tok/s not worse than M6 alone; outputs unchanged |
+| M8 | 6 | Wire QPN8 FP8 decode into Qwen (TP2 only: the fork's TP4 meaning of the switch is not carried) | Mara | M6, K09 | `VLLM_SM70_FP8_QPN8=0` | GPU: Qwen decode tok/s not worse than M6 alone; outputs unchanged |
 | M9 | 6 | DFlash2 M8 verifier GEMVs. **Not in a PR until its hook point is named** | Mara | M6, M7 | `VLLM_SM70_DFLASH2_VERIFIER=0` | GPU: DFlash2 spec decode ≥ fork (fork reference: 111 tok/s at 4K on the 3.6-35B) |
 
 **Phase 3 exit:** Qwen3.6/3.8 decode and prefill on c4130 are at or above the fork's numbers in `bench_vllm.py`, with Flash-V100, GDN FlashQLA and DFlash2 on.
@@ -85,8 +85,8 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 |---|---|---|---|---|---|---|
 | U3 | 0 | MoE router/gate provider hook | Kai | – | no provider → upstream | CPU: with no provider, upstream behaviour is bit-identical |
 | U4 | 0 | V1 sampler hook (subject to D2) | Kai | – | no hook → upstream | CPU: with no hook, upstream behaviour is bit-identical |
-| K11 | 3 | Flint NVFP4 M≤2 GEMV (op only; M3 feature-detects it) | Kai | K03 | – (switch is M3's `VLLM_SM70_NVFP4_GEMV`) | fork tests listed in the carry map |
-| K12 | 3 | Flint NVFP4 MoE QPN decode (op only; M4 feature-detects it) | Kai | K03 | – (switch is M4's `VLLM_SM70_MOE_DECODE_FASTPATH`) | fork tests listed in the carry map |
+| K11 | 3 | Flint NVFP4 M≤2 GEMV (op only; M3 feature-detects it) | Kai | K03 | – (switch is M3's `VLLM_SM70_MODELOPT_NVFP4_GEMV`) | fork tests listed in the carry map |
+| K12 | 3 | Flint NVFP4 MoE QPN decode (op only; M4 feature-detects it) | Kai | K03 | – (switch is M4's `VLLM_SM70_FLINT_MOE_QPN_DECODE`) | fork tests listed in the carry map |
 | K13 | 1 | Flint fused router (op) | Kai | K01, U3 | – (switch is M10's) | fork tests; greedy-identical with the switch off |
 | K14 | 3 | Flint one-launch sink decode + counter fix (fork 7f12d21b8) | Kai | K06 | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0` | GPU: `test_decode_sinks_descending_capture_regression`; max-num-seqs sweep 2/3/4/8/20 coherent, each prompt twice |
 | K15 | 1 | Flint q/k-norm + RoPE + KV write, Triton (op; M5 calls it) | Kai | K01 | – (switch is M5's `VLLM_SM70_FLINT_QK_ROPE_KV`) | GPU: vs unfused ops |
@@ -117,7 +117,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 ## Settled
 
 - **Plugin route** for M nodes, so the models area adds 0 upstream lines (Charlie).
-- **Kill-switch placement:** a switch lives where the path is chosen. K09, K11, K12, K13, K15 and K16 ship without switches. Proposed by Mara; Kai to confirm.
+- **Kill-switch placement** (Kai and Mara): one switch per feature, read where the path is chosen, normally in M wiring. K14 (attention) and K17 (pass) are the exceptions, because their path is chosen inside Kai's code. K ops carry no runtime switch. Only `0` acts; env never turns a feature on. The seven Flint switch names stay exactly as the fork's operator docs have them: `MODELOPT_NVFP4_GEMV`, `FLINT_MOE_QPN_DECODE`, `FLINT_QK_ROPE_KV`, `FLINT_FUSED_ROUTER`, `FLINT_SAMPLER`, `FLINT_ATTN_FUSED_DECODE`, `FLINT_AR_RMSNORM` (each `VLLM_SM70_`-prefixed).
 - **K15 is the op and M5 calls it,** with `VLLM_SM70_FLINT_QK_ROPE_KV` as the only switch. `VLLM_SM70_FLINT_FUSIONS` is dropped.
 - **M6-M (Marlin-SM70 FP8) is dropped for v1.** Revisit only if M6 is blocked.
 - **D2** is deferred to phase 4, measured before K16. **D3:** U5 ships, last in phase 4.
