@@ -32,8 +32,8 @@ For a feature PR, the PR title is the summary line and the fields go in the temp
 |---|---|---|---|
 | 0001–0099 | `build`: CMake arch list, FetchContent trimming, CUDA-13-only deps | Penny | – |
 | 0100–0199 | `platform`: hooks in upstream files that sm70/ plugs into | Kai (U1 co-owned with Mara) | U1–U5 |
-| 0500–0699 | `models`: upstream registration and gating edits for sm70 models and quant | Mara | the upstream-file parts of M1–M7 |
-| 0700–0799 | `kv`: LMCache / KV-connector glue | Theo | – |
+| 0500–0699 | `models`: empty under the plugin route. Models and quant register through the plugin. Reserved only for U6 (the M7 fallback hook) | Mara | U6 (optional) |
+| 0700–0799 | `kv`: empty. LMCache loads through `kv_connector_module_path` with no vLLM-side patch | Theo | – |
 | 0900–0999 | `misc`: logging, docs | anyone | – |
 
 `git format-patch` numbers the files sequentially. The ranges set the commit order on the branch, not the file numbers. See `docs/roadmap.md` for the full dependency graph.
