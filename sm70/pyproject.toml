@@ -1,6 +1,9 @@
 [build-system]
-# Nix supplies these; nothing is fetched at build time.
-requires = ["setuptools>=77", "torch==2.14.0"]
+# torch is deliberately not listed: an isolated build would download it.
+# The extension build imports the installed torch 2.14.0, so build it with
+# `pip install --no-build-isolation` (Nix does). VLLM_SM70_SKIP_EXT=1
+# builds the pure-Python package, which needs only setuptools.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,3 +21,4 @@ include = ["vllm_sm70*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["gpu: needs an SM70 GPU (deselect with -m 'not gpu')"]
