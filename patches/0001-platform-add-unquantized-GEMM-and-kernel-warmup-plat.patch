@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 20:49:34 +0000
+Subject: [PATCH] platform: add unquantized-GEMM and kernel-warmup platform
+ hooks
+
+What: Adds Platform.get_unquantized_gemm(linear_backend) (default None)
+  and Platform.kernel_warmup(worker) (default no-op), and calls them from
+  dispatch_unquantized_gemm and kernel_warmup.
+Why: Out-of-tree platforms (the vllm-sm70 plugin) need to route fp16
+  linear/lm_head/router-gate GEMMs to Volta kernels and pre-tune them
+  before CUDA graph capture; no existing hook reaches
+  vllm/model_executor/layers/utils.py:682 or kernel_warmup.py.
+Upstream-files: vllm/platforms/interface.py, vllm/model_executor/layers/utils.py, vllm/model_executor/warmup/kernel_warmup.py
+Kill-switch: none (hooks default to upstream behaviour)
+Tests: sm70/tests/plugin/test_u1_hooks.py
+Upstream-status: candidate
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmTunjuSkk6L8stBVhg
+
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 2ecff71efc95..0c420c889eb0 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -682,6 +682,9 @@ def cpu_unquantized_gemm(
+ def dispatch_unquantized_gemm(
+     linear_backend: str = "auto",
+ ) -> Callable[..., torch.Tensor]:
++    platform_gemm = current_platform.get_unquantized_gemm(linear_backend)
++    if platform_gemm is not None:
++        return platform_gemm
+     if current_platform.is_rocm():
+         return rocm_unquantized_gemm
+     elif current_platform.is_cpu():
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index 0f1058a98661..cb68a1cd8f3b 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -224,6 +224,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+         # https://github.com/vllm-project/vllm/pull/47451
+         cutedsl_warmup()
+ 
++    current_platform.kernel_warmup(worker)
++
+     if process_local_only:
+         return
+ 
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index de899f7a1bf2..765a64441505 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1203,6 +1203,15 @@ class Platform:
+         """Return the memory usage in bytes."""
+         raise NotImplementedError
+ 
++    @classmethod
++    def get_unquantized_gemm(cls, linear_backend: str = "auto") -> Any:
++        """Return a platform unquantized-GEMM callable, or None for upstream."""
++        return None
++
++    @classmethod
++    def kernel_warmup(cls, worker: Any) -> None:
++        """Warm up platform kernels before CUDA graph capture."""
++
+     @classmethod
+     def get_punica_wrapper(cls) -> str:
+         """Return the punica wrapper for current platform."""
