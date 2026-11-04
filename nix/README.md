@@ -45,6 +45,31 @@ rejects them at startup until the patch series adds them:
 - `--attention-backend FLASH_ATTN_V100` (qwen3.8-27b) and the DFlash draft's
   `attention_backend = "FLASH_ATTN_V100"`. Without them vLLM picks TRITON_ATTN.
 
+## Kill switches (VLLM_SM70_*)
+
+Agreed by the patch owners (Mara/Kai). Only `=0` does anything: it turns that
+sm_70 feature off. Environment variables can't turn features on, and any other
+`VLLM_SM70_*` variable from the old fork is ignored on this stack. Defaults and
+tuning go through `--additional-config '{"sm70":{...}}'`, and only to change a
+default. Set a switch per model with `models.<name>.env`.
+
+| Variable | Kept from the fork |
+|---|---|
+| `VLLM_SM70_MODELOPT_NVFP4_GEMV` | yes (Flint) |
+| `VLLM_SM70_FLINT_MOE_QPN_DECODE` | yes (Flint) |
+| `VLLM_SM70_FLINT_QK_ROPE_KV` | yes (Flint) |
+| `VLLM_SM70_FLINT_FUSED_ROUTER` | yes (Flint) |
+| `VLLM_SM70_FLINT_SAMPLER` | yes (Flint) |
+| `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | yes (Flint) |
+| `VLLM_SM70_FLINT_AR_RMSNORM` | yes (Flint) |
+| `VLLM_SM70_FP8_MOE_DECODE` | new |
+| `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |
+| `VLLM_SM70_QUANT` | new |
+| `VLLM_SM70_FP8_TURBOMIND` | new |
+| `VLLM_SM70_DFLASH2_EMULATION` | new |
+| `VLLM_SM70_DFLASH2_VERIFIER` | new |
+| `VLLM_SM70_SHARED_MOE_OVERLAP` | new |
+
 ## Host use
 
 ```nix
