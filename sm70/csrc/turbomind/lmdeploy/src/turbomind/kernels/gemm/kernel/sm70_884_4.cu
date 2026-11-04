@@ -1,4 +1,3 @@
-#include "sm70_policy.h"
 // Copyright (c) OpenMMLab. All rights reserved.
 
 #include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
@@ -17,19 +16,6 @@ using S = cache_policy::Stream;
 using D = cache_policy::Default;
 
 namespace {
-
-// Reuse the existing decoder and indexed grouped layout, with the padded
-// activation supply already used by the quantized batch family.
-template <class Config>
-struct PaddedActivationConfig;
-
-template <class A, class TransformA, class U, class B, class TransformB,
-          class V, Order order_C, class Tc, Order raster_order, int group_axis>
-struct PaddedActivationConfig<Sm70_s884<A, TransformA, U, B, TransformB, V,
-                                      order_C, Tc, raster_order, group_axis>> {
-  using type = Sm70_s884<Operand_A_BatchPadded<half>, TransformA, U, B,
-                        TransformB, V, order_C, Tc, raster_order, group_axis>;
-};
 
 // Keep shape-specific small-N tactics out of prefill and unrelated CUDA graph
 // shapes.
@@ -50,296 +36,9 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
   }
 };
 
-// Narrow GGUF expert projections otherwise spend much of an N128/N256
-// tile on padding. Keep these candidates out of wide projection descriptors.
-template <class Gemm>
-class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
- public:
-  bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) &&
-           KernelImpl<Gemm>::is_feasible(desc);
-  }
-};
-
-// Prefill expert projections with N = 160 (gate/up) or 320 (interleaved
-// gate|up): N64 tiles avoid the N128 padding. Prefill-sized batches only, so
-// decode and verify descriptors keep their measured candidates.
-template <class Gemm>
-class GgufPrefillNarrowKernelImpl final : public KernelImpl<Gemm> {
- public:
-  bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return desc.n <= 512 && desc.n % 64 == 0 && desc.m >= 512 &&
-           KernelImpl<Gemm>::is_feasible(desc);
-  }
-};
-
-// Default-cache-B kernel for the exact Qwen3.8 TP4 W2 prefill descriptor.
-// Expert-sorted prefill gives each expert several adjacent M tiles, so keeping
-// B cacheable may reuse its FP4 weights across those tiles. The exact contract
-// and default-on feature gate keep it out of unrelated descriptors and provide
-// an operational rollback.
-template <class Gemm>
-class Qwen38Nvfp4W2CacheBKernelImpl final : public KernelImpl<Gemm> {
- public:
-  bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return (vllm::sm70::policy_atoi(
-                vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) !=
-            0) &&
-           desc.m >= 1280 && desc.num == 512 && desc.n == 2560 &&
-           desc.k == 160 && KernelImpl<Gemm>::is_feasible(desc);
-  }
-};
-
-// The full W13 N=320 shape is faster with N128 tiles, but its final tile does
-// half-empty work. This N64 kernel is exposed only for the exact split-W13
-// tail, while the first 256 columns retain the established N128 kernel.
-template <class Gemm>
-class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
- public:
-  bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return (vllm::sm70::policy_atoi(
-                vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) !=
-            0) &&
-           desc.m >= 1280 && desc.num == 512 && desc.n == 64 &&
-           desc.k == 2560 && KernelImpl<Gemm>::is_feasible(desc);
-  }
-};
-
 }  // namespace
 
 void Registry::sm70_884_4() {
-  {
-    auto add_lattice = [this]<int Type, int Group>() {
-      using C = Config_GgufLattice<Type, Group, kColMajor>;
-      using G = Config_GgufLattice<Type, Group, kColMajor, 0>;
-      if constexpr (Type == 17) {
-        using Grouped64 =
-            typename G::template Type<128, 64, Group, 2, 1, 1, D, D, 2, true, 1,
-                                      Group, 64, 64>;
-        using Grouped128 =
-            typename G::template Type<128, 128, Group, 2, 2, 1, D, D, 2, true,
-                                      1, Group, 64, 128>;
-        Add(std::make_unique<
-            GgufLatticeNarrowKernelImpl<typename Grouped64::Kernel>>());
-        Add(std::make_unique<
-            GgufLatticeNarrowKernelImpl<typename Grouped128::Kernel>>());
-        using Grouped16 = typename G::template Type<16, 128, 32, 1, 4, 1, D, S,
-                                                    2, true, 1, Group>;
-        Add(std::make_unique<
-            GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
-      }
-
-      if constexpr (Type == 18 || Type == 21 || Type == 22) {
-        // Like the type-17 narrow candidate: CTA_K equals the group size
-        // (a K16 tile under a 32-value group produced wrong results).
-        using Prefill128x64 =
-            typename G::template Type<128, 64, Group, 2, 1, 1, D, D, 2, true,
-                                      1, Group, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
-        // Ragged expert batches often have fewer than 128 rows. Halving M
-        // reduces both masked MMA work and the accumulator register demand;
-        // retain the existing quantization-group-sized K iteration.
-        using Prefill64x64 =
-            typename G::template Type<64, 64, Group, 2, 1, 1, D, D, 2, true,
-                                      1, Group, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Prefill64x64::Kernel>>());
-        using P = typename PaddedActivationConfig<G>::type;
-        // K32/K64 unpadded activation rows repeat shared-memory banks across
-        // the four distinct rows read by each eight-lane MMA load group.
-        // Eight half values of row padding spread those accesses apart.
-        // A full-width epilogue is required: N64 subtiles of an N128 CTA
-        // are smaller than the epilogue thread map's horizontal span.
-        // K64 also distinguishes these tactics in serialized tuning caches.
-        using Padded32x64K64 =
-            typename P::template Type<32, 64, 64, 2, 2, 1, D, D, 2, true,
-                                      1, Group, 32, 64>;
-        using Padded64x64K64 =
-            typename P::template Type<64, 64, 64, 2, 2, 1, D, D, 2, true,
-                                      1, Group, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Padded32x64K64::Kernel>>());
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Padded64x64K64::Kernel>>());
-      }
-      Add<typename C::template Type<128, 256, Group, 2, 4, 1, D, D, 2, true, 1,
-                                    Group, 128, 128>>();
-      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    Group>>();
-    };
-    add_lattice.template operator()<16, 32>();
-    add_lattice.template operator()<17, 16>();
-    add_lattice.template operator()<18, 32>();
-    add_lattice.template operator()<19, 32>();
-    add_lattice.template operator()<21, 32>();
-    add_lattice.template operator()<22, 16>();
-    add_lattice.template operator()<29, 16>();
-    auto add_lut = [this]<class C, class G, int GroupSize>() {
-      if constexpr (GroupSize == 32 &&
-                    std::is_same_v<C, Config_GgufLut4_IQ<kColMajor>>) {
-        using Prefill128x64 =
-            typename G::template Type<128, 64, 32, 2, 1, 1, D, D, 2, true, 1,
-                                      GroupSize, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
-        using Prefill64x64 =
-            typename G::template Type<64, 64, 32, 2, 1, 1, D, D, 2, true, 1,
-                                      GroupSize, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Prefill64x64::Kernel>>());
-        using P = typename PaddedActivationConfig<G>::type;
-        using Padded32x64K64 =
-            typename P::template Type<32, 64, 64, 2, 2, 1, D, D, 2, true,
-                                      1, GroupSize, 32, 64>;
-        using Padded64x64K64 =
-            typename P::template Type<64, 64, 64, 2, 2, 1, D, D, 2, true,
-                                      1, GroupSize, 64, 64>;
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Padded32x64K64::Kernel>>());
-        Add(std::make_unique<
-            GgufPrefillNarrowKernelImpl<typename Padded64x64K64::Kernel>>());
-      }
-      Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1,
-                                    GroupSize, 128, 128>>();
-      Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1,
-                                    GroupSize, 64, 128>>();
-      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-    };
-    add_lut.template operator()<Config_GgufLut4_IQ<kColMajor>,
-                                Config_GgufLut4_IQ<kColMajor, 0>, 32>();
-    add_lut.template operator()<Config_GgufLut4_E2M1<kColMajor>,
-                                Config_GgufLut4_E2M1<kColMajor, 0>, 16>();
-    add_lut.template operator()<Config_GgufLut4_E2M1<kColMajor>,
-                                Config_GgufLut4_E2M1<kColMajor, 0>, 32>();
-  }
-  {
-    auto add_planes = [this]<class C, class G, int GroupSize>() {
-      // Metadata holds the high plane for one full group. CTA K must be a
-      // multiple of that group so the register code position restarts at 0.
-      constexpr int PrefillK = GroupSize == 16 ? 16 : 32;
-      Add<typename C::template Type<128, 256, PrefillK, 2, 4, 1, D, D, 2, true,
-                                    1, GroupSize, 128, 128>>();
-      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
-                                    GroupSize>>();
-    };
-    add_planes
-        .template operator()<Config_GgufCenteredBitPlane3<kColMajor>,
-                             Config_GgufCenteredBitPlane3<kColMajor, 0>, 16>();
-    add_planes
-        .template operator()<Config_GgufBitPlane<4, 1, 32, kColMajor>,
-                             Config_GgufBitPlane<4, 1, 32, kColMajor, 0>, 32>();
-    add_planes
-        .template operator()<Config_GgufBitPlane<4, 2, 16, kColMajor>,
-                             Config_GgufBitPlane<4, 2, 16, kColMajor, 0>, 16>();
-  }
-  {
-    // Two-bit affine weights share the FP16 MMA pipeline and coefficient
-    // carrier. Keep separate dense/grouped descriptors for group16/group32.
-    using C = Config_U2_Affine<kColMajor>;
-    using G = Config_U2_Affine<kColMajor, 0>;
-    // Keep the native prefill tile repertoire: the source code width does
-    // not require halving N or doubling the MMA K tile.
-    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 16, 128, 128>>();
-    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>>();
-    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>();
-    Add<G::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>>();
-    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 16>>();
-    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<G::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 16>>();
-    Add<G::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<G::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<G::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<G::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
-    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 32, 128, 128>>();
-    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
-    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 32, 32, 128>>();
-    Add<G::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
-    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<G::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
-    Add<G::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<G::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<G::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<G::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-  }
-  {
-    // Canonical GGUF u4 uses per-group scale plus additive bias, in the
-    // existing affine metadata layout. Dense group-32 tiles complement the
-    // grouped group-32 kernels below; they retain the same mma884 arithmetic.
-    using C = Config_U4_d<kColMajor>;
-    // Match the established dense affine tile repertoire. The metadata group
-    // width is a decoding contract, not a reason to force narrower N tiles.
-    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 32, 128, 128>>();
-    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
-    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 32, 32, 128>>();
-    Add<C::Type<32, 256, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<16, 256, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<8, 256, 64, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-  }
   {
     using B = Config_QuantizedBatch<fp4_e2m1_t, kColMajor>;
     using Rows32 = B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>;
@@ -367,6 +66,7 @@ void Registry::sm70_884_4() {
         DenseBatchSupplyKernelImpl<typename Tail64::Kernel, true, true>>());
   }
 
+#ifdef VLLM_SM70_TM_AWQ  // optional AWQ/int4 (K04); off by default
   if constexpr (1) {
     // clang-format off
         using C = Config_U4_d<kColMajor>;
@@ -430,17 +130,7 @@ void Registry::sm70_884_4() {
         Add<C::Type<  8, 256,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
     // clang-format on
   }
-
-  if constexpr (1) {
-    // clang-format off
-        using C = Config_MXF4<kColMajor, 0>;
-        Add<C::Type<128, 128,  16, 2, 2, 1, D, D, 2, true, 1, 32,  64, 128>>();
-        Add<C::Type< 64, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32,  32, 128>>();
-        Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-        Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
-        Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
-    // clang-format on
-  }
+#endif  // VLLM_SM70_TM_AWQ
 
   if constexpr (1) {
     // clang-format off
@@ -450,10 +140,6 @@ void Registry::sm70_884_4() {
         Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 16>>();
-        using Qwen38CacheB = C::Type<32, 128, 32, 1, 4, 1, D, D, 2, true, 1, 16>;
-        Add(std::make_unique<Qwen38Nvfp4W2CacheBKernelImpl<typename Qwen38CacheB::Kernel>>());
-        using Qwen38W13TailN64 = C::Type<32, 64, 32, 1, 2, 1, D, S, 2, true, 1, 16>;
-        Add(std::make_unique<Qwen38Nvfp4W13TailN64KernelImpl<typename Qwen38W13TailN64::Kernel>>());
         using C32K64L1 = C::Type<8, 32, 64, 1, 1, 1, D, S, 2, true, 1, 16>;
         using C32K64L2 = C::Type<8, 32, 64, 1, 1, 1, D, S, 2, true, 1, 16, -1, -1, 2>;
         using C32K128L1 = C::Type<8, 32, 128, 1, 1, 1, D, S, 2, true, 1, 16>;
