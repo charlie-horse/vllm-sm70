@@ -44,6 +44,24 @@ def _debug_flag(name: str) -> Callable[[], bool]:
     return getter
 
 
+def _build_time(name: str) -> Callable[[], None]:
+    """Getter for a variable read only by setup.py / CMakeLists.txt.
+
+    Registered so that `validate_environ` accepts it when it is still set at
+    runtime (normal in CI and dev shells). It always returns None, whatever
+    the environment says, so it adds a constant to compile_factors() and can
+    never split the compile cache. (Upstream's exclusion list, `ignored_factors`
+    in UP envs.py:2358-2450, is a local set inside compile_factors(), so a
+    plugin cannot add to it.)
+    """
+
+    def getter() -> None:
+        return None
+
+    getter.__name__ = f"build_time_{name}"
+    return getter
+
+
 def _ext_fingerprint() -> str:
     from vllm_sm70._ext import fingerprint
 
@@ -52,8 +70,20 @@ def _ext_fingerprint() -> str:
 
 # Per-area sections, in register() order. Values are zero-argument getters.
 _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
+    # Read by setup.py / CMakeLists.txt only; inert at runtime.
+    "build": {
+        name: _build_time(name)
+        for name in (
+            "VLLM_SM70_SKIP_EXT",  # setup.py: build without _sm70_C
+            "VLLM_SM70_ALLOW_NO_CUDA",  # setup.py: CPU-only binding (tests)
+            "VLLM_SM70_CUTLASS_DIR",  # setup.py -> CMake: CUTLASS headers
+            "VLLM_SM70_REQUIRE_CUDA",  # CMake option
+            "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
+        )
+    },
     "core": {
-        # Extra plugin logging (diagnostic, not a feature).
+        # Debug logging only. Not a kill switch, so the only-"0"-acts rule
+        # does not apply: any value other than "" or "0" turns it on.
         "VLLM_SM70_PLUGIN_DEBUG": _debug_flag("VLLM_SM70_PLUGIN_DEBUG"),
         # Not meant to be set: a derived getter so that compile_factors()
         # changes whenever _sm70_C is rebuilt (abi_version + .so sha256).
