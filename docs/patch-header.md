@@ -32,6 +32,7 @@ Upstream-status: <not-upstreamable | candidate | submitted: <PR url> | backport:
 - Use a runtime kill switch wherever behaviour changes. Name it `VLLM_SM70_<THING>=0`.
 - Touch as few upstream files as possible. Put new code in new files where you can, since rebases are cheaper that way.
 - Never reformat upstream code.
+- Text-only patches: no binary hunks, renames, or mode changes. The Nix build applies the series with plain `patch -p1 --fuzz=0`, and `--check` uses `git am` without `--3way`, so a patch with stale context fails in both places.
 
 ## Example
 
