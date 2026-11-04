@@ -24,12 +24,19 @@
         inherit (nixpkgs) lib;
       };
       vllm = import ./nix/module.nix { inherit inputs; };
+      # Upstream vLLM at patches/BASE with patches/series applied (the same
+      # file as on phase1-spike).
+      source = import ./nix/source.nix {
+        inherit pkgs;
+        inherit (nixpkgs) lib;
+      };
     in
     {
       packages.${system} = {
         default = p.vllm;
         vllm = p.vllm;
         flint-checkpoint = p.flintCheckpoint;
+        inherit source;
       };
 
       # `vllm` (services.vllm-sm70) imports `lmcache` (services.lmcache-sm70);
