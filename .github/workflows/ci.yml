@@ -162,8 +162,11 @@ jobs:
         # Pure eval: the flake sets config.allowUnfree for CUDA itself.
         run: |
           set -euo pipefail
-          nix eval --raw .#packages.x86_64-linux.vllm.drvPath; echo
-          nix eval --raw .#packages.x86_64-linux.source.drvPath; echo
+          # No import-from-derivation: eval must never build anything.
+          for out in vllm tree source; do
+            nix eval --option allow-import-from-derivation false \
+              --raw ".#packages.x86_64-linux.$out.drvPath"; echo
+          done
 
       - name: Build source (fetch + patch)
         if: steps.detect.outputs.has_flake == 'true'
