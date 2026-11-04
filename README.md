@@ -23,9 +23,19 @@ Full pins, hashes and evidence are in [docs/pins.md](docs/pins.md). Volta has no
 |---|---|
 | `flake.nix` | flake entry point |
 | `nix/` | derivations and NixOS modules |
-| `patches/` | the patch series applied on top of the vLLM tag |
+| `patches/` | the patch series: `BASE` (upstream tag), `series` (apply order), `NNNN-*.patch` |
+| `scripts/regen-patches.sh` | regenerates `patches/` from a vLLM working branch, or checks that the series applies |
 | `tests/` | sm70 checks |
-| `docs/` | `pins.md` (locked pins and evidence) |
+| `docs/` | `pins.md` (locked pins and evidence), `patch-header.md` (patch format and series areas) |
+
+## Working on patches
+
+1. Clone upstream vLLM and create the working branch on the base tag: `git switch -c sm70 v0.33.0`.
+2. Commit each change with the header in `docs/patch-header.md`.
+3. Regenerate the series: `scripts/regen-patches.sh ~/src/vllm`.
+4. Check that it applies to a clean tag: `scripts/regen-patches.sh --check ~/src/vllm`.
+
+To move to a new upstream release, rebase `sm70` onto the new tag, then repeat steps 3–4.
 
 ## License
 
