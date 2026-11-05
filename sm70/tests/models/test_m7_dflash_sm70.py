@@ -6,7 +6,7 @@ What: on CPU, checks that the torch-reference BF16-range emulation matches an
   to inf. Also covers the bit-exact RNE helper, the o_proj input scale, the
   module swap (parameter names unchanged), the gate (cc / draft dtype /
   runtime dtype), the VLLM_SM70_DFLASH2_EMULATION kill switch, and the
-  ModelRegistry wiring with is_sm70_ready mocked. The classes are checked
+  ModelRegistry wiring with the GPU / _sm70_C probes mocked. The classes are checked
   against UP 4ba787e.
 Why: the DFlash2 drafts are BF16-trained but run with --dtype half on V100;
   without the emulation their residual and SwiGLU products leave FP16 range.
@@ -287,8 +287,45 @@ def registry():
     ModelRegistry.models[m7.DRAFT_ARCH] = saved
 
 
+def _ready(monkeypatch, sm70_gpus: bool, ext_loaded: bool):
+    from vllm_sm70 import _ext
+
+    monkeypatch.setattr(sm70_platform, "all_visible_gpus_are_sm70", lambda: sm70_gpus)
+    monkeypatch.setattr(_ext, "is_loaded", lambda: ext_loaded)
+
+
+def test_register_raises_on_sm70_without_ext(monkeypatch, registry, caplog):
+    before = registry.models[m7.DRAFT_ARCH]
+    _ready(monkeypatch, True, False)
+    with caplog.at_level("WARNING", logger=m7.logger.name):
+        with pytest.raises(RuntimeError, match="_sm70_C is not loaded"):
+            m7.register()
+    assert "_sm70_C is not loaded" in caplog.text
+    assert registry.models[m7.DRAFT_ARCH] is before
+
+
+@pytest.mark.parametrize("ext_loaded", [False, True])
+def test_register_skips_quietly_off_sm70(monkeypatch, registry, ext_loaded, caplog):
+    before = registry.models[m7.DRAFT_ARCH]
+    _ready(monkeypatch, False, ext_loaded)
+    with caplog.at_level("DEBUG", logger=m7.logger.name):
+        assert m7.register() is False
+    assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+    assert registry.models[m7.DRAFT_ARCH] is before
+
+
+def test_register_skips_on_kill_even_without_ext(monkeypatch, registry, caplog):
+    before = registry.models[m7.DRAFT_ARCH]
+    _ready(monkeypatch, True, False)
+    monkeypatch.setenv(m7.KILL_SWITCH, "0")
+    with caplog.at_level("INFO", logger=m7.logger.name):
+        assert m7.register() is False
+    assert "not registered" in caplog.text
+    assert registry.models[m7.DRAFT_ARCH] is before
+
+
 def test_register_when_ready(monkeypatch, registry):
-    monkeypatch.setattr(sm70_platform, "is_sm70_ready", lambda: True)
+    _ready(monkeypatch, True, True)
     assert m7.register() is True
     entry = registry.models[m7.DRAFT_ARCH]
     assert (entry.module_name, entry.class_name) == (
@@ -301,7 +338,7 @@ def test_register_when_ready(monkeypatch, registry):
 
 def test_not_registered_when_not_ready(monkeypatch, registry):
     before = registry.models[m7.DRAFT_ARCH]
-    monkeypatch.setattr(sm70_platform, "is_sm70_ready", lambda: False)
+    _ready(monkeypatch, False, False)
     assert m7.register() is False
     assert registry.models[m7.DRAFT_ARCH] is before
     assert before.class_name == "DFlash2Qwen3ForCausalLM"  # UP registry.py:666
@@ -309,7 +346,7 @@ def test_not_registered_when_not_ready(monkeypatch, registry):
 
 def test_not_registered_when_killed(monkeypatch, registry):
     before = registry.models[m7.DRAFT_ARCH]
-    monkeypatch.setattr(sm70_platform, "is_sm70_ready", lambda: True)
+    _ready(monkeypatch, True, True)
     monkeypatch.setenv(m7.KILL_SWITCH, "0")
     assert m7.register() is False
     assert registry.models[m7.DRAFT_ARCH] is before
@@ -340,7 +377,7 @@ def test_area_register_idempotent_and_retries_after_failure(monkeypatch):
 
 
 def test_register_raises_if_registry_ignores_override(monkeypatch, registry):
-    monkeypatch.setattr(sm70_platform, "is_sm70_ready", lambda: True)
+    _ready(monkeypatch, True, True)
     monkeypatch.setattr(registry, "register_model", lambda arch, cls: None)
     with pytest.raises(RuntimeError, match="DFlash2DraftModel"):
         m7.register()

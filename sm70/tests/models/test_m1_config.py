@@ -208,7 +208,11 @@ def _dflash2_emulation_off(name):
     bf16_draft = SimpleNamespace(dtype=torch.bfloat16)
     assert not dflash_sm70.emulation_enabled(bf16_draft, torch.float16, capability=70)
     before = ModelRegistry.models[dflash_sm70.DRAFT_ARCH]
-    with mock.patch.object(sm70_platform, "is_sm70_ready", lambda: True):
+    from vllm_sm70 import _ext
+
+    with mock.patch.object(
+        sm70_platform, "all_visible_gpus_are_sm70", lambda: True
+    ), mock.patch.object(_ext, "is_loaded", lambda: True):
         assert dflash_sm70.register() is False
     assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
 

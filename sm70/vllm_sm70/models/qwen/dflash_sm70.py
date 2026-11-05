@@ -646,8 +646,9 @@ LAZY_TARGET = f"{__name__}:DFlash2SM70Qwen3ForCausalLM"
 def register() -> bool:
     """Point "DFlash2DraftModel" at the SM70 subclass. Returns True if registered.
 
-    Registers only when vllm_sm70.platform.is_sm70_ready() and the kill switch
-    is off; raises if the registry did not take the override. The
+    Skips (returns False) when the kill switch is engaged (info log) or no
+    visible GPU is cc 7.0 (debug log). Raises when every visible GPU is cc 7.0
+    but _sm70_C is missing, and when the registry did not take the override. The
     lazy "<module>:<class>" form keeps CUDA and vllm model imports out of
     plugin load (UP models/registry.py:1176-1212). It overwrites UP's entry
     (registry.py:666), logged at debug. Call it before the first
@@ -655,13 +656,28 @@ def register() -> bool:
     Every plugin process runs it, because vllm.general_plugins load in all of
     them.
     """
+    from vllm_sm70 import _ext
     from vllm_sm70 import platform as sm70_platform
 
     if not envs.VLLM_SM70_DFLASH2_EMULATION:
         logger.info("%s=0: DFlash2 SM70 emulation not registered.", KILL_SWITCH)
         return False
-    if not sm70_platform.is_sm70_ready():
+    if not sm70_platform.all_visible_gpus_are_sm70():
+        logger.debug("No cc 7.0 GPUs visible: DFlash2 SM70 emulation not registered.")
         return False
+    if not _ext.is_loaded():
+        # A cc 7.0 host without _sm70_C is broken, not "not SM70". Nothing on
+        # main fails fast on it: _ext.load() only logs at info (_ext.py:16-28),
+        # and Sm70CudaPlatform.check_and_update_config just imports the areas
+        # (_cuda_platform.py:72-77). So raise; vllm_sm70._register_area logs
+        # it at ERROR (__init__.py:60-66) and the area stays unregistered.
+        msg = (
+            "vllm_sm70: every visible GPU is cc 7.0 but _sm70_C is not loaded; "
+            "the BF16-trained DFlash2 draft would run in plain FP16 (overflow). "
+            f"Fix the extension build, or set {KILL_SWITCH}=0 to accept that."
+        )
+        logger.warning(msg)
+        raise RuntimeError(msg)
     from vllm.model_executor.models import ModelRegistry
 
     ModelRegistry.register_model(DRAFT_ARCH, LAZY_TARGET)
