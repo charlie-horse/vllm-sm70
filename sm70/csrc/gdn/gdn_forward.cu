@@ -1,4 +1,9 @@
-#include <torch/extension.h>
+// SPDX-License-Identifier: MIT
+// FlashQLA SM70 gated-delta-net kernels (Qwen team, Alibaba Group; MIT, see
+// LICENSE). Vendored for vllm-sm70 (K08) from fork cf9492a; the changes
+// against the fork are listed in PROVENANCE.md.
+#include <torch/all.h>
+#include <torch/library.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -627,75 +632,69 @@ void validate_same_device(const torch::Tensor& tensor,
               " must be on the same CUDA device as q");
 }
 
-// Only the explicit immutable policy adapter installs this thread-local value.
-// -2 is an independent legacy call; -1 keeps the original dynamic shape rule.
-thread_local int active_column_groups = -2;
-
+// Columns of V handled per thread subgroup. The fork's thread-local policy
+// and FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK override are gone (K08); only
+// the shape heuristic remains.
 int get_column_groups_per_block(int tokens,
                                 int q_heads,
                                 int v_heads) {
-  const char* raw = active_column_groups == -2
-      ? std::getenv("FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK") : nullptr;
-  if (active_column_groups > 0) return active_column_groups;
-  if (raw == nullptr || raw[0] == '\0') {
-    // Real Qwen3.5/Qwen3.6 SM70 shapes are dominated by Hv=8/12/16/24/32
-    // after TP. Keep this as a shape heuristic; the env above remains the
-    // escape hatch for benchmarks and future model-specific tuning. V100 has
-    // no native bf16, so the default is derived from the fp16 production path.
-    if (v_heads == 24 || v_heads == 48) {
-      return 2;
-    }
-    if (v_heads == 32) {
-      if (q_heads == 16) {
-        return tokens <= 1024 ? 4 : 2;
-      }
-      if (q_heads == 8) {
-        return tokens <= 1024 ? 2 : 1;
-      }
-      return 1;
-    }
-    if (v_heads >= 64) {
-      return 1;
-    }
-    if (v_heads == 16) {
-      if (q_heads == 8) {
-        return 2;
-      }
-      return tokens <= 1024 ? 2 : 1;
-    }
-    if (v_heads == 12) {
-      return tokens >= 1024 ? 2 : 1;
-    }
-    if (v_heads == 8) {
-      return tokens <= 1024 ? 1 : 4;
-    }
+  // Real Qwen3.5/Qwen3.6 SM70 shapes are dominated by Hv=8/12/16/24/32
+  // after TP. V100 has no native bf16, so the default is derived from the
+  // fp16 production path.
+  if (v_heads == 24 || v_heads == 48) {
     return 2;
   }
-  const int value = std::atoi(raw);
-  TORCH_CHECK(value == 1 || value == 2 || value == 4 || value == 8,
-              "FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK must be one of 1, 2, 4, 8");
-  return value;
+  if (v_heads == 32) {
+    if (q_heads == 16) {
+      return tokens <= 1024 ? 4 : 2;
+    }
+    if (q_heads == 8) {
+      return tokens <= 1024 ? 2 : 1;
+    }
+    return 1;
+  }
+  if (v_heads >= 64) {
+    return 1;
+  }
+  if (v_heads == 16) {
+    if (q_heads == 8) {
+      return 2;
+    }
+    return tokens <= 1024 ? 2 : 1;
+  }
+  if (v_heads == 12) {
+    return tokens >= 1024 ? 2 : 1;
+  }
+  if (v_heads == 8) {
+    return tokens <= 1024 ? 1 : 4;
+  }
+  return 2;
 }
 
 }  // namespace
 
-int resolve_column_groups_per_block(int tokens, int q_heads, int v_heads) {
-  return get_column_groups_per_block(tokens, q_heads, v_heads);
+int64_t gdn_resolve_column_groups_per_block(int64_t tokens, int64_t q_heads,
+                                            int64_t v_heads) {
+  return get_column_groups_per_block(static_cast<int>(tokens),
+                                     static_cast<int>(q_heads),
+                                     static_cast<int>(v_heads));
 }
 
-std::vector<torch::Tensor> gdn_forward_vlk_varlen(
+// Writes output [1, T, Hv, V] and final_state [N, Hv, V, K] (fp32). The
+// fork allocated both and could validate cu_seqlens on the host (a device
+// sync); here the caller allocates them and cu_seqlens is trusted.
+void gdn_forward_vlk_varlen_out(
+    torch::Tensor output,
+    torch::Tensor final_state,
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
     torch::Tensor gate,
     torch::Tensor beta,
-    c10::optional<torch::Tensor> initial_state,
+    std::optional<torch::Tensor> initial_state,
     torch::Tensor cu_seqlens,
     double scale,
-    bool output_final_state,
-    bool validate_cu_seqlens,
-    bool gate_is_exp,
-    c10::optional<torch::Tensor> output_arg) {
+    bool gate_is_exp) {
   validate_tensor(q, "q", 4);
   validate_tensor(k, "k", 4);
   validate_tensor(v, "v", 4);
@@ -715,10 +714,6 @@ std::vector<torch::Tensor> gdn_forward_vlk_varlen(
   validate_activation_dtype(beta, "beta");
   TORCH_CHECK(cu_seqlens.scalar_type() == torch::kInt32,
               "cu_seqlens must be int32");
-  if (validate_cu_seqlens) {
-    TORCH_CHECK(cu_seqlens[0].item<int32_t>() == 0,
-                "cu_seqlens must start at 0");
-  }
   TORCH_CHECK(q.sizes() == k.sizes(), "q and k must have the same shape");
 
   const int batch = static_cast<int>(q.size(0));
@@ -728,10 +723,6 @@ std::vector<torch::Tensor> gdn_forward_vlk_varlen(
   const int v_heads = static_cast<int>(v.size(2));
   const int v_dim = static_cast<int>(v.size(3));
   const int num_sequences = static_cast<int>(cu_seqlens.size(0) - 1);
-  if (validate_cu_seqlens) {
-    TORCH_CHECK(cu_seqlens[num_sequences].item<int32_t>() == tokens,
-                "cu_seqlens must end at the flattened token count");
-  }
   TORCH_CHECK(batch == 1,
               "gdn_forward_vlk_varlen expects flattened q/k/v with batch=1");
   TORCH_CHECK(num_sequences > 0, "cu_seqlens must contain at least one sequence");
@@ -764,25 +755,22 @@ std::vector<torch::Tensor> gdn_forward_vlk_varlen(
     state_dtype = h0.scalar_type();
   }
 
-  torch::Tensor output;
-  if (output_arg.has_value() && output_arg.value().defined()) {
-    output = output_arg.value();
-    validate_tensor(output, "output", 4);
-    validate_same_device(output, q, "output");
-    TORCH_CHECK(output.scalar_type() == v.scalar_type(),
-                "output must match v dtype");
-    TORCH_CHECK(output.size(0) == batch && output.size(1) == tokens &&
-                    output.size(2) == v_heads && output.size(3) == v_dim,
-                "output must have shape [1, T, Hv, V]");
-  } else {
-    output = torch::empty_like(v);
-  }
-  auto final_state = output_final_state
-                         ? torch::empty({num_sequences, v_heads, v_dim, k_dim},
-                                        q.options().dtype(torch::kFloat32))
-                         : torch::Tensor();
-  float* final_state_ptr =
-      output_final_state ? final_state.data_ptr<float>() : nullptr;
+  validate_tensor(output, "output", 4);
+  validate_same_device(output, q, "output");
+  TORCH_CHECK(output.scalar_type() == v.scalar_type(),
+              "output must match v dtype");
+  TORCH_CHECK(output.size(0) == batch && output.size(1) == tokens &&
+                  output.size(2) == v_heads && output.size(3) == v_dim,
+              "output must have shape [1, T, Hv, V]");
+  validate_tensor(final_state, "final_state", 4);
+  validate_same_device(final_state, q, "final_state");
+  TORCH_CHECK(final_state.scalar_type() == torch::kFloat32,
+              "final_state must be float32");
+  TORCH_CHECK(final_state.size(0) == num_sequences &&
+                  final_state.size(1) == v_heads &&
+                  final_state.size(2) == v_dim && final_state.size(3) == k_dim,
+              "final_state must have shape [N, Hv, V, K]");
+  float* final_state_ptr = final_state.data_ptr<float>();
   const int column_groups_per_block =
       get_column_groups_per_block(tokens, q_heads, v_heads);
   const auto stream = at::cuda::getCurrentCUDAStream(q.device().index()).stream();
@@ -856,7 +844,6 @@ std::vector<torch::Tensor> gdn_forward_vlk_varlen(
   }
 
   check_cuda(cudaGetLastError(), "gdn_forward_vlk_varlen launch");
-  return {output, final_state};
 }
 
 void gdn_decode_mixed_qkv_global_state(torch::Tensor mixed_qkv,
@@ -1002,4 +989,35 @@ void gdn_decode_mixed_qkv_global_state(torch::Tensor mixed_qkv,
   }
 
   check_cuda(cudaGetLastError(), "gdn_decode_mixed_qkv_global_state launch");
+}
+
+// K08: registration in the _sm70_C namespace (replaces the fork's pybind11
+// module). Out ops return nothing; fakes live in vllm_sm70/gdn/kernels.py.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def(
+      "gdn_forward_vlk_varlen_out(Tensor(a!) output, Tensor(b!) final_state, "
+      "Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
+      "Tensor? initial_state, Tensor cu_seqlens, float scale, "
+      "bool gate_is_exp) -> ()");
+  m.def(
+      "gdn_decode_mixed_qkv_global_state(Tensor mixed_qkv, Tensor a, "
+      "Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a!) state, "
+      "Tensor state_indices, Tensor(b!) output, float scale, "
+      "bool use_qk_l2norm) -> ()");
+  m.def(
+      "gdn_resolve_column_groups_per_block(int tokens, int q_heads, "
+      "int v_heads) -> int");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("gdn_forward_vlk_varlen_out", &gdn_forward_vlk_varlen_out);
+  m.impl("gdn_decode_mixed_qkv_global_state",
+         &gdn_decode_mixed_qkv_global_state);
+}
+
+// No tensor arguments: an empty dispatch key set, so it needs this key (as
+// abi_version in torch_bindings_sm70.cpp).
+TORCH_LIBRARY_IMPL(_sm70_C, CompositeExplicitAutograd, m) {
+  m.impl("gdn_resolve_column_groups_per_block",
+         &gdn_resolve_column_groups_per_block);
 }
