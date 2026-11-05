@@ -78,10 +78,12 @@ dependencies = [
   "opentelemetry-semantic-conventions-ai>=0.4.1",
 ]
 # Dropped from requirements/cuda.txt (sm80+ / cu13-only / optional, all lazily imported):
-#   flashinfer-python, apache-tvm-ffi, tilelang, nvidia-cudnn-frontend, fastsafetensors,
+#   flashinfer-python, tilelang, nvidia-cudnn-frontend, fastsafetensors,
 #   instanttensor, nvidia-cutlass-dsl[cu13], quack-kernels, tokenspeed-mla,
 #   humming-kernels[cu13], PyNvVideoCodec, torchcodec, torchaudio (2.11.0 is built
 #   against torch 2.11; only audio models import it).
+# apache-tvm-ffi is not a direct dependency (cuda.txt pins 0.1.11), but xgrammar
+# pulls it in, so uv.lock has 0.1.15.post2.
 
 [dependency-groups]
 # setup.py build_ext (pyproject [build-system] + requirements/build/cuda.txt).

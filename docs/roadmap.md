@@ -108,7 +108,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 
 ## Series order for `patches/`
 
-1. 0001–0099 build: none. FetchContent is fed by Nix.
+1. 0001–0099 build: 0001 trims the external projects that build nothing for sm_70 (`VLLM_SM70_TRIM_EXTERNALS=1`, set by nix/package.nix; unset or ≠1 → upstream). The remaining FetchContent sources are fed by Nix.
 2. 0100–0199 platform: U1, U2, U3, U4, then U5 last.
 3. 0500–0699 models: none. The M7 subclass route works without a patch.
 4. 0700–0799 kv: none.
