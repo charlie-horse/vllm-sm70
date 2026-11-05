@@ -43,6 +43,10 @@ New code goes in `sm70/`, as one PR per feature, with the header fields from `do
 
 To move to a new upstream release, rebase `sm70` onto the new tag, then repeat steps 3–4.
 
+## Releases
+
+Hosts use the `latest` branch, not `main`. It only moves forward, to a commit that passed CI, the C1 bench, a GPU gate and review. See [docs/release.md](docs/release.md).
+
 ## License
 
 Apache-2.0, the same as vLLM. Each patch is a derivative of vLLM and keeps its license.
