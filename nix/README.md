@@ -57,6 +57,8 @@ rejects them at startup until the patch series adds them:
   full-chunk request within `--worker-registration-grace-seconds` (1 h) of
   registering is reaped while alive and never re-registers, so every STORE is
   rejected until vLLM restarts. See `docs/upstream/lmcache-heartbeat-issue.md`.
+  Verified on hardware by check 6 (`scripts/check6-lmcache-reaper.py`, steps in
+  `docs/checks.md`).
 
 `services.lmcache-sm70.extraArgs` appends extra `lmcache server` flags, e.g.
 `[ "--worker-registration-grace-seconds" "604800" ]`.
