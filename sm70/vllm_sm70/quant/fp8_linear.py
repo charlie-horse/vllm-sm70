@@ -28,14 +28,17 @@ M8 (block QPN8 decode): when ``Sm70Config.fp8_block_qpn8`` is True (the
   (vllm_sm70.ops.qpn8), ``qpn8_rejection(N, K)`` is None and the scale
   raster is [N/128, K/128] (FORK kernels/linear/qpn/fp8_block.py:160-195),
   the layer is repacked at load with ``qpn8_prepare`` instead of TurboMind
-  and served by ``qpn8_linear``. M<=QPN8_MAX_M (read from K09) runs the
-  QPN8 GEMV. Larger M uses the TurboMind copy when one is kept, else a
+  and served by ``qpn8_linear``. M<=max_m runs the QPN8 GEMV, with max_m =
+  K09's ``qpn8_max_m(block_scaled=True)``: 8 by default, 32 with
+  VLLM_SM70_FP8_QPN8_M32=1 (K09's opt-in). Larger M uses the TurboMind copy when one is kept, else a
   dequantize into one shared per-device fp16 scratch (allocated at load)
-  and torch.mm. The copy follows ``fp8_block_qpn8_turbomind_copy``: None
-  (auto, FORK fp8_block.py:204-213) keeps it iff max_num_seqs *
-  (num_speculative_tokens + 1) > QPN8_MAX_M; it roughly doubles the dense
-  FP8 weight bytes per GPU. The M choice is inside K09's opaque op, so a
-  graph traced at small M stays correct. ``Sm70Config.fp8_qpn8`` (the
+  and torch.mm. ``fp8_block_qpn8_turbomind_copy`` decides (rows =
+  max_num_seqs * (num_speculative_tokens + 1)): None (default) admits QPN8
+  with no copy iff rows <= max_m and otherwise leaves the model on M6, so
+  the default never holds two weight copies; True admits and keeps a
+  TurboMind copy (the fork's two-copy behaviour, ~+12 GiB per GPU on
+  Qwen3.8-27B at TP2); False admits with no copy. The M choice is inside
+  K09's opaque op, so a graph traced at small M stays correct. ``Sm70Config.fp8_qpn8`` (the
   fork's sm70_native qpn8 selector) does not gate this. The fork's PP2/TP4
   QPN8 variant is not carried. Every other case is the M6 TurboMind path
   unchanged.
@@ -89,7 +92,7 @@ QPN8_API = ("qpn8_prepare", "qpn8_linear", "qpn8_rejection", "Qpn8Prepared")
 # QPN8 meaning (PP2/TP4 tables) is not carried.
 QPN8_TP_SIZES = (1, 2)
 QPN8_SCRATCH = "sm70_qpn8_dense_scratch"
-QPN8_DEFAULT_MAX_M = 8  # used only if the K09 module names no QPN8_MAX_M
+QPN8_DEFAULT_MAX_M = 8  # used only if K09 has no qpn8_max_m()
 
 
 def check_fp8_sm70_config(quant_config: Any) -> None:
@@ -157,17 +160,31 @@ def qpn8_max_rows(vllm_config: Any = None) -> int | None:
 
 
 def qpn8_max_m(qpn8: Any) -> int:
-    """K09's largest QPN8 GEMV M (QPN8_MAX_M), 8 if the module names none."""
-    return int(getattr(qpn8, "QPN8_MAX_M", QPN8_DEFAULT_MAX_M))
+    """K09's largest block-scaled QPN8 GEMV M: ``qpn8_max_m(block_scaled=True)``
+    (8 by default, 32 with VLLM_SM70_FP8_QPN8_M32=1; QPN8_MAX_M is only the
+    compiled kernel bound). 8 if the module has no such function."""
+    fn = getattr(qpn8, "qpn8_max_m", None)
+    if not callable(fn):
+        return QPN8_DEFAULT_MAX_M
+    return int(fn(block_scaled=True))
 
 
-def qpn8_keep_turbomind_copy(policy: bool | None, rows: int | None, max_m: int) -> bool:
-    """fp8_block_qpn8_turbomind_copy resolved (FORK fp8_block.py:204-213):
-    explicit True/False wins; None keeps the copy iff rows > max_m, or when
-    rows is unknown."""
-    if policy is not None:
-        return bool(policy)
-    return rows is None or rows > max_m
+def qpn8_copy_decision(
+    policy: bool | None, rows: int | None, max_m: int
+) -> tuple[bool, bool]:
+    """(admit QPN8, keep a TurboMind copy) from fp8_block_qpn8_turbomind_copy.
+
+    None (default, safe): admit with no copy iff rows <= max_m; otherwise
+      (or rows unknown) do not admit, so the layer stays M6 with one copy.
+      This deliberately differs from the fork's auto, which kept the copy
+      when rows > 8 (FORK config/kernel.py:388, fp8_block.py:204-213): the
+      default must not double the weights on a 32 GB V100.
+    True: admit and always keep the copy (the fork's two-copy behaviour).
+    False: admit with no copy; rows above max_m use K09's dense fallback.
+    """
+    if policy is None:
+        return (rows is not None and rows <= max_m), False
+    return True, bool(policy)
 
 
 class _Qpn8DenseScratch:
@@ -225,10 +242,14 @@ def _count_copy_bytes(device: torch.device, nbytes: int) -> None:
     before = _COPY_BYTES.get(key, 0)
     _COPY_BYTES[key] = after = before + nbytes
     if after >> 30 > before >> 30 or before == 0:
-        _log_once(
+        msg = (
             f"SM70 FP8 QPN8 TurboMind copy on {key}: {after / 2**30:.2f} GiB so far "
-            "(logged at each GiB crossed)"
+            "(logged at each GiB crossed; fp8_block_qpn8_turbomind_copy=True "
+            "holds two copies of each dense FP8 weight)"
         )
+        if msg not in _LOGGED:
+            _LOGGED.add(msg)
+            m8_logger.warning(msg)
 
 
 def clear_qpn8_scratch() -> None:
@@ -345,7 +366,17 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             return False
         max_m = qpn8_max_m(qpn8)
         rows = self.qpn8_max_rows
-        keep_copy = qpn8_keep_turbomind_copy(self.qpn8_copy_policy, rows, max_m)
+        admit, keep_copy = qpn8_copy_decision(self.qpn8_copy_policy, rows, max_m)
+        if not admit:
+            _log_once(
+                "SM70 FP8 QPN8 not used: decode/verify can reach "
+                f"rows={rows if rows is not None else 'unknown'} (max_num_seqs x "
+                f"(num_speculative_tokens + 1)) > max_m={max_m} and "
+                "fp8_block_qpn8_turbomind_copy is None (safe default: no second "
+                "weight copy); using TurboMind FP8. Set VLLM_SM70_FP8_QPN8_M32=1, "
+                "lower max_num_seqs, or set the copy policy explicitly."
+            )
+            return False
         if weight.dim() != 2:
             return False
         n, k = (int(d) for d in weight.shape)

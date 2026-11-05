@@ -10,8 +10,9 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
     never enabling), fp8_qpn8 / VLLM_SM70_FP8_QPN8 not affecting it, the TP
     gate (1 and 2 only);
   - the TurboMind copy policy (fp8_block_qpn8_turbomind_copy auto / True /
-    False across rows = max_num_seqs * (k + 1) vs QPN8_MAX_M);
-  - the M boundary inside K09's op (QPN8_MAX_M read from the module): up to
+    False across rows = max_num_seqs * (k + 1) vs K09's
+    qpn8_max_m(block_scaled=True): 8, or 32 with VLLM_SM70_FP8_QPN8_M32=1);
+  - the M boundary inside K09's op (qpn8_max_m() read from the module): up to
     it the QPN8 GEMV, above it the dequantize into the layer's load-time
     scratch, never the GEMV;
   - missing K09 module / ops / rejected shape -> the plain M6 path;
@@ -23,7 +24,7 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m8_qpn8_wiring.py -m gpu
   QPN8 route vs M6 route at the Qwen3.8-27B TP2 dense shapes, M in {1, 2, 8}
   (K09 tolerances: max-abs-rel < 1e-2, rel-L2 < 1e-3 vs the dequantized
-  reference), M=QPN8_MAX_M+1 falls back off the GEMV, and an M=1 CUDA
+  reference), M=qpn8_max_m()+1 falls back off the GEMV, and an M=1 CUDA
   graph replay.
 Why: a wrong route or scale layout is silent garbage, not a crash.
 Kill-switch: VLLM_SM70_FP8_BLOCK_QPN8=0.
@@ -153,6 +154,7 @@ def _env(monkeypatch):
         "VLLM_SM70_FP8_TURBOMIND",
         "VLLM_SM70_FP8_QPN8",
         "VLLM_SM70_FP8_BLOCK_QPN8",
+        "VLLM_SM70_FP8_QPN8_M32",
     ):
         monkeypatch.delenv(name, raising=False)
     import vllm.distributed as dist
@@ -334,51 +336,40 @@ def test_tp_gate(mods, engine, tp, routed):
 # --------------------------------------------------------------------------
 # CPU: TurboMind copy policy (FORK fp8_block.py:204-213)
 # --------------------------------------------------------------------------
+@pytest.mark.parametrize("m32", ["0", "1"], ids=["max8", "max32"])
 @pytest.mark.parametrize(
-    "policy, max_num_seqs, spec_k, max_m, keep",
-    [
-        (None, 1, 7, 8, False),  # rows 8 <= 8
-        (None, 2, 7, 8, True),  # rows 16 > 8
-        (None, 8, None, 8, False),
-        (None, 9, None, 8, True),
-        (None, 4, 7, 32, False),  # rows 32 <= 32
-        (None, 5, 7, 32, True),
-        (True, 1, 7, 32, True),  # explicit: always
-        (False, 5, 7, 32, False),  # explicit: never
-        (None, 4, 7, None, None),  # K09's real constant
-        (None, 5, 7, None, None),
-    ],
-    ids=[
-        "auto-1x8-max8",
-        "auto-2x8-max8",
-        "auto-8x1-max8",
-        "auto-9x1-max8",
-        "auto-4x8-max32",
-        "auto-5x8-max32",
-        "true-1x8",
-        "false-5x8",
-        "auto-4x8-real",
-        "auto-5x8-real",
-    ],
+    "max_num_seqs, spec_k",
+    [(1, 7), (2, 7), (4, 7), (5, 7), (8, None), (9, None)],
+    ids=["1x8", "2x8", "4x8", "5x8", "8x1", "9x1"],
 )
+@pytest.mark.parametrize("policy", [None, True, False], ids=["none", "true", "false"])
 def test_turbomind_copy_policy(
-    mods, engine, monkeypatch, policy, max_num_seqs, spec_k, max_m, keep
+    mods, engine, monkeypatch, policy, max_num_seqs, spec_k, m32
 ):
+    """None (safe default): QPN8 with no copy iff rows <= max_m, else M6.
+    True: QPN8 + TurboMind copy. False: QPN8, dense fallback above max_m."""
     lin, qpn8, calls = mods()
-    if max_m is not None:
-        monkeypatch.setattr(qpn8, "QPN8_MAX_M", max_m)
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", m32)
+    max_m = 32 if m32 == "1" else 8
+    assert qpn8.qpn8_max_m() == max_m == lin.qpn8_max_m(qpn8)
     rows = max_num_seqs * ((spec_k or 0) + 1)
-    if keep is None:
-        keep = rows > qpn8.QPN8_MAX_M
+    admit = rows <= max_m if policy is None else True
+    keep = policy is True
     sm70 = {} if policy is None else {"fp8_block_qpn8_turbomind_copy": policy}
     engine(_vllm_config(sm70, max_num_seqs=max_num_seqs, spec_k=spec_k))
     method, layer, w, s = _layer(lin, 256, [256])
-    assert layer.sm70_fp8_qpn8 is True  # QPN8 either way; only the copy changes
+    assert layer.sm70_fp8_qpn8 is admit
     names = {n for n, _ in layer.named_buffers()}
+    if not admit:  # plain M6, one copy
+        assert names == set() and [c[0] for c in calls.tm] == ["tm_prepare"]
+        x = _x(2, 256)
+        _close(method.apply(layer, x), x.float() @ _ref_dequant(w, s).t())
+        assert calls.tm[-1] == ("tm_gemm", 2) and calls.qpn8 == []
+        return
     assert ("sm70_qpn8_tm_weight" in names) is keep
     assert (lin.QPN8_SCRATCH in names) is (not keep)
     assert [c[0] for c in calls.tm] == (["tm_prepare"] if keep else [])
-    big = qpn8.QPN8_MAX_M + 1
+    big = max_m + 1
     calls.qpn8.clear()
     x = _x(big, 256)
     _close(method.apply(layer, x), x.float() @ _ref_dequant(w, s).t())
@@ -387,22 +378,27 @@ def test_turbomind_copy_policy(
     else:
         assert [c[0] for c in calls.qpn8] == ["dequant"]
     calls.qpn8.clear()
-    method.apply(layer, _x(qpn8.QPN8_MAX_M, 256))
+    method.apply(layer, _x(max_m, 256))
     assert [c[0] for c in calls.qpn8] == ["qpn8"]
 
 
-def test_keep_copy_resolution():
-    k = lambda p, r, m: __import__(  # noqa: E731
-        "vllm_sm70.quant.fp8_linear", fromlist=["x"]
-    ).qpn8_keep_turbomind_copy(p, r, m)
-    assert k(None, 8, 8) is False and k(None, 9, 8) is True
-    assert k(None, None, 32) is True  # unknown rows: keep (fork, no engine)
-    assert k(True, 1, 32) is True and k(False, 99, 32) is False
+def test_copy_decision():
+    from vllm_sm70.quant.fp8_linear import qpn8_copy_decision as d
+
+    assert d(None, 8, 8) == (True, False)
+    assert d(None, 9, 8) == (False, False)  # safe default: M6, never two copies
+    assert d(None, 32, 32) == (True, False) and d(None, 33, 32) == (False, False)
+    assert d(None, None, 32) == (False, False)  # rows unknown: M6
+    assert d(True, 1, 8) == (True, True) and d(True, 99, 8) == (True, True)
+    assert d(False, 99, 8) == (True, False)
 
 
-def test_missing_max_m_constant_is_8(mods, engine, monkeypatch):
+def test_max_m_reads_k09_qpn8_max_m(mods, engine, monkeypatch):
     lin, qpn8, _ = mods()
-    monkeypatch.delattr(qpn8, "QPN8_MAX_M")
+    assert lin.qpn8_max_m(qpn8) == 8  # K09 default
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", "1")
+    assert lin.qpn8_max_m(qpn8) == 32
+    monkeypatch.delattr(qpn8, "qpn8_max_m")
     assert lin.qpn8_max_m(qpn8) == 8
 
 
@@ -415,9 +411,12 @@ def test_no_vllm_config_is_m6(mods, engine):
 # --------------------------------------------------------------------------
 # CPU: M range (inside K09's opaque op)
 # --------------------------------------------------------------------------
+@pytest.mark.parametrize("m32", ["0", "1"], ids=["max8", "m32-optin"])
 @pytest.mark.parametrize("m", [0, 1, 2, 8, 9, 32, 33, 64])
-def test_m_boundary(mods, engine, m):
+def test_m_boundary(mods, engine, monkeypatch, m, m32):
     lin, qpn8, calls = mods()
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", m32)
+    assert qpn8.qpn8_max_m() == (32 if m32 == "1" else 8)
     engine(_vllm_config({}))
     method, layer, w, s = _layer(lin, 512, [384])
     calls.qpn8.clear()
@@ -429,7 +428,7 @@ def test_m_boundary(mods, engine, m):
         assert kinds == []
         return
     _close(out, x.float() @ _ref_dequant(w, s).t())
-    if m <= qpn8.QPN8_MAX_M:
+    if m <= qpn8.qpn8_max_m():
         assert kinds == ["qpn8"]
     else:
         scratch = getattr(layer, lin.QPN8_SCRATCH)
@@ -658,7 +657,7 @@ def test_gpu_above_max_m_falls_back_off_the_gemv(
         "fp8_qpn8_gemm_sm70_out",
         lambda *a, **kw: gemv.append(1) or real(*a, **kw),
     )
-    m_max = qpn8.QPN8_MAX_M  # 32 with K09 M9..32
+    m_max = qpn8.qpn8_max_m()  # 8; 32 with VLLM_SM70_FP8_QPN8_M32=1
     x = _x(m_max + 1, k, device="cuda")
     yq = q8.apply(lq, x)
     assert gemv == []

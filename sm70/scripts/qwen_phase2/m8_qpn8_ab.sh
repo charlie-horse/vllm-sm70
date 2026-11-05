@@ -6,13 +6,15 @@
 #
 # Serves Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2 (qwen_matrix.sh row-4
 # settings: dflash, k=7, probabilistic) with --max-num-seqs 4, twice:
-#   on   default (block QPN8, Sm70Config.fp8_block_qpn8=True)
+#   on   block QPN8 (Sm70Config.fp8_block_qpn8=True),
+#        VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32 (default 1: K09 M9..32 opt-in)
 #   off  VLLM_SM70_FP8_BLOCK_QPN8=0 (plain M6 TurboMind)
-# QP2_QPN8_COPY=auto|true|false (default auto) sets
+# QP2_QPN8_COPY=auto|true|false (default auto = None) sets
 # Sm70Config.fp8_block_qpn8_turbomind_copy via --additional-config, on both
-# arms. auto keeps a second TurboMind copy of each weight iff
-# 4 x (7 + 1) = 32 > K09 QPN8_MAX_M (no copy at QPN8_MAX_M 32, a copy at 8:
-# ~2x dense FP8 per GPU). Use false if the "on" arm runs out of memory.
+# arms. rows = 4 x (7 + 1) = 32. auto admits QPN8 with no copy iff
+# rows <= max_m (32 with M32=1; 8 with M32=0, then auto leaves the "on" arm
+# on M6). true keeps a second TurboMind copy (~2x dense FP8 per GPU); false
+# admits QPN8 with no copy, dense fallback above max_m.
 # Each: 127.0.0.1:8100 -> /health -> probe.py ab-run (decode tok/s at
 # concurrency 1-4: ~1K-token prompt, 256 forced tokens with ignore_eos,
 # temperature 0, median of 3; greedy first 32 tokens of 5 fixed prompts)
@@ -22,7 +24,8 @@
 # Never touches systemd, the vllm service, /etc/nixos or activeModel.
 #
 # Env: VLLM_BIN, VLLM_PY (required), QWEN_STAGE, OUT, MAX_MODEL_LEN (32768),
-#      HEALTH_TIMEOUT (seconds, 1500), GPU_MEM_UTIL (0.85), QP2_QPN8_COPY (auto).
+#      HEALTH_TIMEOUT (seconds, 1500), GPU_MEM_UTIL (0.85), QP2_QPN8_COPY (auto),
+#      QP2_QPN8_M32 (1).
 # Exit: 0 PASS, 1 FAIL, 2 refused to start.
 set -euo pipefail
 
@@ -39,8 +42,11 @@ TARGET="$QWEN_STAGE/Qwen3.8-27B-FP8"
 DRAFT="$QWEN_STAGE/Qwen3.8-27B-DFlash2"
 M8_LOG_RE='SM70 FP8 QPN8'
 QP2_QPN8_COPY="${QP2_QPN8_COPY:-auto}"
+QP2_QPN8_M32="${QP2_QPN8_M32:-1}"
 
-[[ $# -eq 0 ]] || { sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $# -eq 0 ]] || { sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ "$QP2_QPN8_M32" == 0 || "$QP2_QPN8_M32" == 1 ]] \
+  || qp2_refuse "QP2_QPN8_M32=$QP2_QPN8_M32 (want 0 or 1)"
 case "$QP2_QPN8_COPY" in
   auto) EXTRA_CFG=() ;;
   true|false) EXTRA_CFG=(--additional-config "{\"sm70\": {\"fp8_block_qpn8_turbomind_copy\": $QP2_QPN8_COPY}}") ;;
@@ -56,12 +62,16 @@ if qp2_port_in_use "$PORT"; then qp2_refuse "something already listens on port $
 qp2_check_gpus_idle
 AB="$OUT/m8"
 mkdir -p "$AB"
-qp2_log "OUT=$AB max_num_seqs=$MAX_NUM_SEQS max_model_len=$MAX_MODEL_LEN qpn8_copy=$QP2_QPN8_COPY"
+qp2_log "OUT=$AB max_num_seqs=$MAX_NUM_SEQS max_model_len=$MAX_MODEL_LEN qpn8_copy=$QP2_QPN8_COPY qpn8_m32=$QP2_QPN8_M32"
 
 # ---------------------------------------------------------------- one arm
 run_arm() {  # ARM (on|off)  (runs in a subshell: its EXIT trap stops the server)
-  local arm="$1" dir="$AB/$1" kill_env=()
-  [[ "$arm" == off ]] && kill_env=(VLLM_SM70_FP8_BLOCK_QPN8=0)
+  local arm="$1" dir="$AB/$1" arm_env=()
+  if [[ "$arm" == off ]]; then
+    arm_env=(VLLM_SM70_FP8_BLOCK_QPN8=0 "VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32")
+  else
+    arm_env=(VLLM_SM70_FP8_BLOCK_QPN8=1 "VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32")
+  fi
   mkdir -p "$dir" || { qp2_log "$arm: cannot create $dir"; return 1; }
   rm -f "$dir/ab.json" "$dir/m8_log.txt"
   local spec="{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}"
@@ -72,12 +82,13 @@ run_arm() {  # ARM (on|off)  (runs in a subshell: its EXIT trap stops the server
     --host 127.0.0.1 --port "$PORT" --speculative-config "$spec" "${EXTRA_CFG[@]}")
   {
     printf 'arm=%s\n' "$arm"
-    printf 'env: CUDA_VISIBLE_DEVICES=0,1 %s\n' "${kill_env[*]:-}"
+    printf 'env: CUDA_VISIBLE_DEVICES=0,1 %s\n' "${arm_env[*]}"
+    printf 'qpn8_copy=%s\n' "$QP2_QPN8_COPY"
     printf '%q ' "${cmd[@]}"; echo
   } >"$dir/cmd.txt" || { qp2_log "$arm: cannot write $dir/cmd.txt"; return 1; }
 
-  qp2_log "$arm: starting server${kill_env[*]:+ (${kill_env[*]})}"
-  env CUDA_VISIBLE_DEVICES=0,1 "${kill_env[@]}" setsid "${cmd[@]}" >"$dir/server.log" 2>&1 &
+  qp2_log "$arm: starting server (${arm_env[*]})"
+  env CUDA_VISIBLE_DEVICES=0,1 "${arm_env[@]}" setsid "${cmd[@]}" >"$dir/server.log" 2>&1 &
   SERVER_PID=$!
   trap stop_server EXIT
   trap 'exit 130' INT TERM HUP

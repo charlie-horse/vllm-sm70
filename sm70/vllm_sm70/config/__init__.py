@@ -127,15 +127,19 @@ class Sm70Config(BaseModel):
     applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0."""
 
     fp8_block_qpn8_turbomind_copy: bool | None = None
-    """Keep a second, TurboMind-packed copy of each block QPN8 weight for
-    rows above K09's QPN8_MAX_M. None (auto): keep it iff
-    max_num_seqs * (num_speculative_tokens + 1) > QPN8_MAX_M. True: always.
-    False: never; rows above QPN8_MAX_M dequantize to fp16 and run torch.mm.
-    Evidence: FORK cf9492a block_qpn8_volta_turbomind_prefill = None
-    (config/kernel.py:388) and _keep_volta_turbomind_copy
-    (kernels/linear/qpn/fp8_block.py:204-213; fork max M = 8). The copy
-    doubles the dense FP8 weight bytes on the GPU. No kill switch (a
-    policy, not a feature)."""
+    """Block QPN8 vs a second, TurboMind-packed weight copy. rows =
+    max_num_seqs * (num_speculative_tokens + 1); max_m = K09's
+    qpn8_max_m(block_scaled=True): 8, or 32 with VLLM_SM70_FP8_QPN8_M32=1.
+    None (default, safe): admit block QPN8 with no copy iff rows <= max_m;
+    otherwise do NOT admit it (plain M6, one copy). True: admit and keep the
+    TurboMind copy for rows above max_m (two copies; bench/explicit only).
+    False: admit with no copy; rows above max_m use K09's dense fallback.
+    None deliberately differs from the fork's auto, which kept the copy
+    when rows > 8 (FORK config/kernel.py:388 block_qpn8_volta_turbomind_prefill,
+    kernels/linear/qpn/fp8_block.py:204-213): the default must not double
+    the dense FP8 weights on 32 GB V100s (~+12 GiB per GPU on Qwen3.8-27B
+    at TP2). True reproduces the fork's two-copy behaviour. No kill switch
+    (a policy, not a feature)."""
 
     dflash2_verifier: VerifierMode = "auto"
     """The DFlash2 verifier bundle: 17 fork SM70_DFLASH2_* flags plus FP8_QPN8

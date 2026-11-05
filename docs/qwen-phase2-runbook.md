@@ -123,21 +123,33 @@ settings and teardown as `qwen_matrix.sh`:
 
 | arm | env | expected M8 route |
 |---|---|---|
-| `on` | default | block QPN8 (`Sm70Config.fp8_block_qpn8`, default True) for M ≤ K09 `QPN8_MAX_M` |
-| `off` | `VLLM_SM70_FP8_BLOCK_QPN8=0` | M6 TurboMind |
+| `on` | `VLLM_SM70_FP8_BLOCK_QPN8=1 VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32` (default 1) | block QPN8 for M ≤ max_m (32 with M32=1) |
+| `off` | `VLLM_SM70_FP8_BLOCK_QPN8=0 VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32` | M6 TurboMind |
 
+Both env values and the copy policy are recorded in each arm's `cmd.txt`.
 `VLLM_SM70_FP8_QPN8` / `fp8_qpn8` is the fork's separate sm70_native selector,
-and M8 does not read it.
+and M8 does not read it. max_m is K09's `qpn8_max_m(block_scaled=True)`:
+8 by default, and 32 with `VLLM_SM70_FP8_QPN8_M32=1` (K09's opt-in for
+block-scaled M9–32, not yet validated on V100). The script sets it to 1 by
+default so that the `on` arm measures that path.
 
-**TurboMind copy.** `QP2_QPN8_COPY=auto|true|false` (default `auto`) passes
+**Copy policy.** `QP2_QPN8_COPY=auto|true|false` (default `auto`, which is
+`None`) passes
 `--additional-config '{"sm70": {"fp8_block_qpn8_turbomind_copy": ...}}'` to
-both arms. `auto` follows the fork rule: it keeps a second, TurboMind-packed
-copy of each weight when 4 × (7 + 1) = 32 > `QPN8_MAX_M`. That copy is about
-2× the dense FP8 bytes per GPU, about +12 GiB on Qwen3.8-27B at TP2. If K09
-exposes `QPN8_MAX_M` 32, auto keeps no copy. If it exposes 8 (M9–32 still
-opt-in), auto keeps one. If the `on` arm fails at startup with OOM or "estimated maximum model
-length", rerun with `QP2_QPN8_COPY=false`. Rows above `QPN8_MAX_M` (prefill)
-then dequantize to fp16 and run torch.mm. Record which setting the PASS used.
+both arms. Here rows = 4 × (7 + 1) = 32.
+- `auto` (safe default): admits QPN8 with no copy iff rows ≤ max_m.
+  Otherwise the model stays on M6, so it never holds two weight copies.
+  With `QP2_QPN8_M32=1` (default), 32 ≤ 32 and QPN8 is admitted with no copy.
+  **With `QP2_QPN8_M32=0`, auto leaves the `on` arm on M6 (no QPN8).** Use
+  M32=1, or set the copy policy explicitly.
+- `true`: admits QPN8 and keeps a second, TurboMind-packed copy for rows above
+  max_m. That is about 2× the dense FP8 bytes per GPU, roughly +12 GiB on
+  Qwen3.8-27B at TP2. With `QP2_QPN8_M32=0` and max_num_seqs 4 it may OOM;
+  use `QP2_QPN8_COPY=false` then.
+- `false`: admits QPN8 with no copy. Rows above max_m dequantize to fp16 and
+  run torch.mm.
+
+Record which settings the PASS used.
 
 `probe.py ab-run` sends a fixed ~1K-token prompt at concurrency 1, 2, 3 and 4.
 Each stream decodes 256 tokens (`ignore_eos`, temperature 0), and each
@@ -151,7 +163,9 @@ records the greedy first 32 tokens of 5 fixed prompts.
 The script also greps `server.log` for `SM70 FP8 QPN8` into
 `$OUT/m8/<arm>/m8_log.txt`. In `on`, expect
 "SM70 FP8 QPN8 decode (M<=N) enabled ...: rows=32, max_m=N, keep_copy=...",
-and, with a copy, "TurboMind copy on cuda:X: G GiB so far" lines (one per GiB).
+and, with a copy, "TurboMind copy on cuda:X: G GiB so far" warnings (one per GiB).
+"SM70 FP8 QPN8 not used: ... rows=32 ... > max_m=8" means auto refused, so
+the A/B compared M6 with M6.
 `off` has no line, because the kill switch stops M8 before it logs.
 
 Results: `$OUT/m8/{on,off}/` hold `ab.json`, `server.log`, `probe.log`,
