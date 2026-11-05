@@ -1,0 +1,34 @@
+TurboMind GEMM core, vendored from LMDeploy
+============================================
+
+Origin
+- Upstream project: LMDeploy, https://github.com/InternLM/lmdeploy
+  (TurboMind, src/turbomind). Copyright (c) OpenMMLab. Apache License 2.0
+  (see LICENSE in this directory).
+- Upstream commit: NOT RECORDED. The fork imported this tree in ee0bc6a87
+  ("[Core] Add SM70 V100 migration paths") and modified it afterwards
+  (last touches e64d39aa7, e150e9da8, de0dd17fb, ...). It does not name the
+  lmdeploy commit it started from.
+- Immediate source: charlie-horse/vLLM (a fork of 1CatAI/1Cat-vLLM),
+  commit cf9492a01, path csrc/sm70_turbomind/lmdeploy/.
+
+What is here
+- 105 files, the #include closure of the TurboMind GEMM translation units
+  that the fork compiled (fork CMakeLists.txt:381-405), kept at their
+  lmdeploy-relative paths under src/turbomind/. Files that nothing includes
+  (the sm90/sm80 mainloops, cuda_type_utils, bf16 fallbacks, ...) were left
+  out.
+- The 1Cat SM70 changes in these files (V100 tile configs, NVFP4/FP8
+  converters, GGUF hooks in config_sm70_s884.h/transform.h/types.h) are kept
+  as the fork has them.
+
+Local modifications (vllm-sm70), listed per file in ../PROVENANCE.md:
+- kernels/gemm/kernel/sm70_884_4.cu, sm70_884_8.cu: kernel registrations
+  deleted (GGUF, MXFP4, U8 affine, two Qwen3.8-TP4 NVFP4 entries). The
+  AWQ/int4 blocks are guarded by VLLM_SM70_TM_AWQ.
+- Every other file is byte-identical to fork cf9492a01.
+
+LICENSE in this directory is LMDeploy's own LICENSE (Apache License 2.0,
+"Copyright 2023-2024 Shanghai AI Laboratory"), fetched 2026-11-04 from
+https://raw.githubusercontent.com/InternLM/lmdeploy/main/LICENSE.
+The fork shipped no separate lmdeploy LICENSE file.
