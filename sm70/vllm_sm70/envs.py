@@ -153,6 +153,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K18 (vllm_sm70/ops/dflash2.py): "0" -> the DFlash2 draft's
+        # unquantized linears keep F.linear for M<=8
+        # (Sm70CudaPlatform.get_unquantized_gemm returns None and no weight is
+        # repacked). Read when the layers are built and loaded.
+        "VLLM_SM70_DFLASH2_FP16": kill_switch("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
