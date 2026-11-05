@@ -187,6 +187,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS": opt_in(
             "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
         ),
+        # K07: "0" -> verify rows take the causal paged prefill (K06) instead
+        # of the smallq -> XQA expansion; graphs then cover 1-token decode.
+        "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
     },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {

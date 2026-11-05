@@ -618,10 +618,10 @@ def compare(fork: Tree, port: Tree, cfg: Config, ctx: int) -> list[dict]:
     by_body: dict[str, list[str]] = {}
     movable = ("func", "kernel", "method", "class", "macro")   # consts/imports are too generic
     for k, e in drop.items():
-        if len(e.body) > 40 and e.kind in movable:
+        if len(e.body) > 40 and e.kind in movable and not _trivial_record(e):
             by_body.setdefault(anon(e), []).append(k)
     for pk, pe in list(new.items()):
-        ks = by_body.get(anon(pe)) if pe.kind in movable else None
+        ks = by_body.get(anon(pe)) if pe.kind in movable and not _trivial_record(pe) else None
         if ks:
             fk = ks.pop(0)
             fe = drop.pop(fk)
@@ -641,6 +641,20 @@ def compare(fork: Tree, port: Tree, cfg: Config, ctx: int) -> list[dict]:
              "NEW(expected)": 5, "IDENTICAL": 6}
     res.sort(key=lambda r: (order[r["status"]], r.get("port") or r.get("fork") or "", r["name"]))
     return res
+
+
+def _trivial_record(e: Entity) -> bool:
+    """A class whose body, without its methods, is only a header (and pass).
+
+    Such bodies match each other by shape alone, so pairing them as MOVED
+    would be noise (seen on PR M5: FlintSm70SparseMoeBlock "was" FlintAttention).
+    """
+    if e.kind != "class":
+        return False
+    lines = [l.strip() for l in e.body.splitlines() if l.strip()]
+    if e.file.endswith(tuple(PY_EXT)):
+        return all(l.startswith("class ") or l == "pass" for l in lines)
+    return e.body.count(";") <= 1
 
 
 def _name(k: str) -> str:

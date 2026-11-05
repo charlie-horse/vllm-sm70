@@ -70,18 +70,20 @@ def run_decode(
     window: tuple[int, int],
     sinks: torch.Tensor | None,
 ) -> None:
-    """Rows [0, num) with one query token each (row i <-> token i).
+    """Decode rows [0, decode_rows), one query token each (row i <-> token i).
 
-    Padding rows of a captured batch may have zero query tokens; they sit at
-    the end, so min(num_decodes, num_decode_tokens) rows keep the mapping.
+    Without spec decode a row is a request (padding rows of a captured batch
+    have zero tokens and sit at the end). With the K07 verify expansion a
+    row is a verify token, with its own visible length and block-table row
+    (metadata.decode_seq_lens / decode_block_table, persistent buffers).
     """
-    num = min(metadata.num_decodes, metadata.num_decode_tokens)
+    num = metadata.decode_rows
     if num == 0:
         return
     q = query[:num]
     out = output[:num]
-    seq_lens = metadata.seq_lens[:num]
-    block_table = metadata.block_table[:num]
+    seq_lens = metadata.decode_seq_lens
+    block_table = metadata.decode_block_table
     if metadata.cudagraph_capture or _capturing():
         envelope = max(metadata.max_model_len, metadata.max_seq_len, 1)
         hints = dict(max_seq_len_hint=envelope, workspace_seq_capacity_hint=envelope)
@@ -136,7 +138,7 @@ def run_prefill(
             key_cache,
             value_cache,
             metadata.block_table.index_select(0, group.rows),
-            metadata.seq_lens.index_select(0, group.rows),
+            metadata.fv_seq_lens.index_select(0, group.rows),
             softmax_scale=scale,
             causal=causal,
             window_size=window,
