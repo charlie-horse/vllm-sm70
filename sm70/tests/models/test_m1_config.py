@@ -251,6 +251,15 @@ def _dflash2_emulation_off(name):
     assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
 
 
+def _flint_moe_decode_off():
+    """M4: the M<=2 decode fast path is not admitted (dense stage only)."""
+    pytest.importorskip("vllm.envs")
+    from vllm_sm70.quant import nvfp4_moe
+
+    assert not nvfp4_moe.decode_policy_enabled(_vc({}))
+    assert not nvfp4_moe.decode_policy_enabled(_vc({"flint_moe_qpn_decode": True}))
+
+
 def _getter_only(name):
     # TODO: replace with a path test in the patch named in PENDING.
     assert getattr(envs, name) is False
@@ -261,6 +270,8 @@ def _path_off(name):
         _field_off(name)
         if name == "VLLM_SM70_MODELOPT_NVFP4_GEMV":
             _nvfp4_gemv_not_selected()
+        if name == "VLLM_SM70_FLINT_MOE_QPN_DECODE":
+            _flint_moe_decode_off()
     elif name == "VLLM_SM70_FP8_TURBOMIND":
         _fp8_refuses(name)
     elif name == "VLLM_SM70_QUANT":
