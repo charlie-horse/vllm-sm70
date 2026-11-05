@@ -85,10 +85,31 @@ class Sm70ModelOptNvFp4Config(ModelOptNvFp4Config):
     def get_min_capability(cls) -> int:
         return _min_capability(super().get_min_capability())
 
-    # HOOK(M3/M4): LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] (M3, installed
-    # below by _install_m3) and the FusedMoEMethodCls dispatch (M4) are
-    # installed next to this class, at import time, for the same unpickling
-    # reason as the registration.
+    # M3: LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] is installed below by
+    # _install_m3, at import time, for the same unpickling reason as the
+    # registration.
+
+    def get_quant_method(self, layer, prefix: str):
+        """M4: routed experts -> the SM70 TurboMind NVFP4 MoE method.
+
+        Only when is_sm70_ready() (K01) and the layer is not excluded (UP
+        modelopt.py:236-239). Everything else, and every non-SM70 device,
+        goes to upstream (modelopt.py:226-262), whose FusedMoEMethodCls
+        (:1199) would select an NVFP4 MoE backend that cc 7.0 doesn't have.
+        """
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts,
+        )
+
+        if (
+            isinstance(layer, RoutedExperts)
+            and sm70_platform.is_sm70_ready()
+            and not self.is_layer_excluded(prefix)
+        ):
+            from vllm_sm70.quant.nvfp4_moe import build_moe_method
+
+            return build_moe_method(self, layer.moe_config)
+        return super().get_quant_method(layer, prefix)
 
 
 # Registered name -> our class.
@@ -167,6 +188,8 @@ def register() -> None:
                 "vllm_sm70: LINEAR_METHOD_BUILDERS['W4A16_NVFP4'] was replaced "
                 "after M3 installed it."
             )
+    if "get_quant_method" not in Sm70ModelOptNvFp4Config.__dict__:
+        raise RuntimeError("vllm_sm70: Sm70ModelOptNvFp4Config lost its M4 MoE hook.")
     detected = Sm70ModelOptNvFp4Config.override_quantization_method(
         _FLINT_QUANT_CFG, None
     )
