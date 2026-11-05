@@ -154,7 +154,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_PROFILE_TRACE",
         )
     },
-    "attention": {},
+    "attention": {
+        # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
+        "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+    },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {
         # "0": GDN chunked prefill stays on upstream Triton/FLA (read when
