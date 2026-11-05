@@ -603,7 +603,7 @@ def _has_k11_gemv() -> bool:
 # (sm70/csrc/turbomind/PROVENANCE.md:258). Without it, admission refuses the
 # layer and the GEMM serves every M, which is correct behaviour.
 needs_k11_gemv = pytest.mark.skipif(
-    "not _has_k11_gemv()",
+    not _has_k11_gemv(),
     reason="needs _sm70_C::nvfp4_tm_gemv_dispatch_sm70_out (K11, not in K03)",
 )
 
