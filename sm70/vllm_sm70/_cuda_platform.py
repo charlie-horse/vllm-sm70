@@ -113,11 +113,27 @@ class Sm70CudaPlatform(CudaPlatform):
         attn_selector_config: Any,
         num_heads: int | None = None,
     ) -> str:
-        # K06 adds Flash-V100 here; until then, upstream selection
-        # (TRITON_ATTN on SM70).
-        return super().get_attn_backend_cls(
+        # K06: Flash-V100 (AttentionBackendEnum.CUSTOM) for fp16 decoder
+        # layers with head size 128/256 when no backend was chosen and the
+        # K05 ops are built; otherwise upstream (TRITON_ATTN on SM70).
+        from vllm_sm70 import attention
+
+        reason = attention.flash_v100_rejection(selected_backend, attn_selector_config)
+        if reason is None:
+            capability = cls.get_device_capability()
+            invalid = attention.validate(attn_selector_config, capability)
+            if not invalid:
+                attention.log_choice_once(
+                    "FLASH_ATTN_V100",
+                    f"head_size={attn_selector_config.head_size}",
+                )
+                return attention.custom_backend_path()
+            reason = "; ".join(invalid)
+        path = super().get_attn_backend_cls(
             selected_backend, attn_selector_config, num_heads
         )
+        attention.log_choice_once(path.rsplit(".", 1)[-1], reason)
+        return path
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
