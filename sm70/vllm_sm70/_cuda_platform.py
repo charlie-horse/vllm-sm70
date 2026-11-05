@@ -178,3 +178,43 @@ class Sm70CudaPlatform(CudaPlatform):
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
         return None
+
+    # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
+    # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
+    # KernelConfig.ir_op_priority at config/kernel.py:461-478; a user-set
+    # priority stays first). Under Inductor upstream picks ["native"], whose
+    # fused_add_rms_norm keeps the residual sum in FP32 before rounding
+    # (UP ir/ops/layernorm.py:44-62). On SM70 pin the C kernel (FP16
+    # residual, __hadd2), so the unfused graph, the kill-switched path and
+    # the fused TP2 all-reduce + RMSNorm collective (K17) share one rounding.
+    # "native" stays as the fallback for args vllm_c does not support (a
+    # weight dtype other than the input's, variance_size).
+    SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> Any:
+        import dataclasses
+
+        priority = super().get_default_ir_op_priority(vllm_config)
+        # Flint only (K17 admission): there the fused AR kernel keeps the
+        # residual in fp16, so the unfused path (switch off) must too. Other
+        # models keep upstream's priority (fork parity).
+        if not _k17_admits(vllm_config):
+            return priority
+        return dataclasses.replace(
+            priority, fused_add_rms_norm=list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        )
+
+
+def _k17_admits(vllm_config: Any) -> bool:
+    """True when K17's rejection() is None for this engine config."""
+    if getattr(vllm_config, "model_config", None) is None:
+        return False
+    try:
+        from vllm_sm70 import ar_rms_fusion
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        return ar_rms_fusion.rejection(vllm_config, tp) is None
+    except Exception:
+        logger.debug("vllm_sm70: K17 admission check failed", exc_info=True)
+        return False

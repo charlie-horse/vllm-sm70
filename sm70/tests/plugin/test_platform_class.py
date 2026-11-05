@@ -120,3 +120,74 @@ def test_get_attn_backend_cls_falls_through(platform_cls, monkeypatch):
     )
     assert platform_cls.get_attn_backend_cls(None, "cfg", 8) == "upstream.Backend"
     assert seen == [(None, "cfg", 8)]
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+@pytest.mark.parametrize("inductor", [True, False])
+def test_fused_add_rms_norm_priority_is_vllm_c(
+    platform_cls, monkeypatch, inductor, admitted
+):
+    """K17: when K17 admits the model (Flint), fused_add_rms_norm lowers to
+    vllm_c (FP16 residual) under Inductor too, where upstream's CUDA default
+    is ["native"] (FP32 residual). Other models (e.g. Qwen) keep upstream's
+    priority (fork parity). Other ops always keep upstream's defaults."""
+    from vllm.config.compilation import CompilationMode
+    from vllm.platforms.cuda import CudaPlatform
+
+    from vllm_sm70 import ar_rms_fusion
+
+    monkeypatch.setattr(
+        ar_rms_fusion,
+        "rejection",
+        lambda config, tp: None if admitted else "it is Flint-only",
+    )
+
+    cc = SimpleNamespace(
+        backend="inductor" if inductor else "eager",
+        mode=CompilationMode.VLLM_COMPILE if inductor else CompilationMode.NONE,
+    )
+    cfg = SimpleNamespace(
+        compilation_config=cc,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    ours = platform_cls.get_default_ir_op_priority(cfg)
+    theirs = CudaPlatform.get_default_ir_op_priority(cfg)
+    if admitted:
+        assert ours.fused_add_rms_norm == ["vllm_c", "native"]
+    else:
+        assert ours.fused_add_rms_norm == theirs.fused_add_rms_norm
+    assert ours.rms_norm == theirs.rms_norm
+    assert ours.gelu_and_mul_sparse == theirs.gelu_and_mul_sparse
+    if inductor:
+        assert theirs.fused_add_rms_norm == ["native"]
+
+
+def test_fused_add_rms_norm_priority_merges_into_kernel_config(
+    platform_cls, monkeypatch
+):
+    """Through upstream's KernelConfig.set_platform_defaults (config/kernel.py:
+    451-478): vllm_c first unless the user set a priority."""
+    import vllm.platforms
+    from vllm.config.compilation import CompilationMode
+    from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
+
+    from vllm_sm70 import ar_rms_fusion
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", platform_cls())
+    monkeypatch.setattr(ar_rms_fusion, "rejection", lambda config, tp: None)
+    cc = SimpleNamespace(backend="inductor", mode=CompilationMode.VLLM_COMPILE)
+    cfg = SimpleNamespace(
+        compilation_config=cc,
+        model_config=SimpleNamespace(architectures=["FlintSm70ForCausalLM"]),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    kc = KernelConfig()
+    monkeypatch.setattr(
+        "vllm.config.kernel.bind_passthrough_all2all_backend", lambda *a: None
+    )
+    kc.set_platform_defaults(cfg)
+    assert kc.ir_op_priority.fused_add_rms_norm[0] == "vllm_c"
+    user = KernelConfig(ir_op_priority=IrOpPriorityConfig(fused_add_rms_norm=["native"]))
+    user.set_platform_defaults(cfg)
+    assert user.ir_op_priority.fused_add_rms_norm == ["native", "vllm_c"]

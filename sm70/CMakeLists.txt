@@ -113,6 +113,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
 endif()
 
+# Hook for K17 (TP2 all-reduce + RMSNorm). Same contract; needs
+# $ENV{VLLM_SM70_VLLM_CSRC_DIR} (vLLM's csrc headers) for its one source.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+endif()
+
 # Hook for K09 (QPN8 block-FP8 decode GEMV). Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
