@@ -211,6 +211,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
     },
+    # Kai (K16 top-k candidate sampler). Kill switch only.
+    "sampler": {
+        # "0": Sm70CudaPlatform.get_hidden_state_sampler() returns None, so
+        # the V1 runner keeps compute_logits + the upstream Sampler (read
+        # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
+        "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
+    },
     "passes": {},
 }
 

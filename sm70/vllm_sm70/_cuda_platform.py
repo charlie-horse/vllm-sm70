@@ -163,11 +163,22 @@ class Sm70CudaPlatform(CudaPlatform):
         # K13 (risk R4): admit the fused router and allocate its per-layer
         # workspace before CUDA graph capture.
         get_model = getattr(worker, "get_model", None)
-        if get_model is None:
-            return
-        from vllm_sm70 import router
+        if get_model is not None:
+            from vllm_sm70 import router
 
-        router.prepare_model(get_model())
+            router.prepare_model(get_model())
+        # Runs after model load and before CUDA graph capture (U1). K16:
+        # bind the V1 hidden-state sampler and create its device counter
+        # here, never lazily during capture (R4).
+        if _flint_sampler_enabled():
+            try:
+                from vllm_sm70 import sample_v1
+
+                sample_v1.prepare_worker(worker)
+            except Exception:
+                # Unprepared, the sampler returns None: upstream sampling.
+                logger.exception("vllm_sm70: preparing the K16 sampler failed")
+        return None
 
     # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
     # the gate; the provider caches its route per layer (vllm_sm70/router.py).
@@ -176,3 +187,18 @@ class Sm70CudaPlatform(CudaPlatform):
         from vllm_sm70 import router
 
         return router.provider()
+
+    # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
+    @classmethod
+    def get_hidden_state_sampler(cls) -> Any:
+        # K16: TP-local exact top-k (k <= 20) sampling for models that opt in
+        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 -> upstream.
+        if not _flint_sampler_enabled():
+            return None
+        from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
+
+        return Sm70HiddenStateSampler()
+
+
+def _flint_sampler_enabled() -> bool:
+    return os.environ.get("VLLM_SM70_FLINT_SAMPLER") != "0"
