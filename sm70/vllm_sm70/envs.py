@@ -62,6 +62,18 @@ def _build_time(name: str) -> Callable[[], None]:
     return getter
 
 
+def _tuning(name: str) -> Callable[[], str | None]:
+    """Raw value of a C++ tuning knob (read by csrc/turbomind/ops/tm_config.h
+    via one cached getenv). Registered so validate_environ accepts it; the
+    Python side never acts on it."""
+
+    def getter() -> str | None:
+        return os.environ.get(name)
+
+    getter.__name__ = f"tuning_{name}"
+    return getter
+
+
 def _ext_fingerprint() -> str:
     from vllm_sm70._ext import fingerprint
 
@@ -89,8 +101,53 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # changes whenever _sm70_C is rebuilt (abi_version + .so sha256).
         # vLLM hashes .py files, not the .so (UP compilation/backends.py:1064).
         "VLLM_SM70_EXT_FINGERPRINT": _ext_fingerprint,
+        # Escape hatch: "0" turns the SM70 fail-fast on failed areas
+        # (Sm70CudaPlatform._enforce_strict) into a warning.
+        "VLLM_SM70_PLUGIN_STRICT": kill_switch("VLLM_SM70_PLUGIN_STRICT"),
     },
-    "ops": {},
+    # TurboMind tuning knobs, read only by C++ (tm_config.h, K02). Values are
+    # passed through; defaults live in tm_config.h.
+    "ops": {
+        name: _tuning(name)
+        for name in (
+            "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M",
+            "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY",
+            "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS",
+            "VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR",
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY",
+            "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE",
+            "VLLM_SM70_AWQ_TP2_FAST_SELECTOR",
+            "VLLM_SM70_AWQ_TP2_FAST_TARGETS",
+            "VLLM_SM70_AWQ_TP4_QKV_CTA64",
+            "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES",
+            "VLLM_SM70_BATCH_GEMM_LAYOUTS",
+            "VLLM_SM70_DFLASH2_QPN8_RERANK",
+            "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW",
+            "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+            "VLLM_SM70_F16_DENSE_MAX_M",
+            "VLLM_SM70_F16_DENSE_TUNE_MAX_M",
+            "VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR",
+            "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
+            "VLLM_SM70_FP8_GROUPED_BMM_DECODE",
+            "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH",
+            "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR",
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS",
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY",
+            "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE",
+            "VLLM_SM70_FP8_SAFE_FAST_SELECTOR",
+            "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+            "VLLM_SM70_MXFP4_MOE_GROUPED_M8",
+            "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR",
+            "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+            "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS",
+            "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL",
+            "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS",
+            "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL",
+            "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR",
+            "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+        )
+    },
     "attention": {},
     "gdn": {},
     "fused_moe": {},
