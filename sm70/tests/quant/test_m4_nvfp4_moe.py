@@ -133,7 +133,7 @@ def make_mock_tm(indexed=True):
     return tm
 
 
-def make_fake_flint_moe(admit=True):
+def make_fake_flint_moe(admit=True, ops_present=True):
     """Fake vllm_sm70.ops.flint_moe (K12): records every call.
 
     admit_layer admits iff the policy is on and ``admit``; can_decode takes
@@ -193,6 +193,7 @@ def make_fake_flint_moe(admit=True):
         flint_moe_decode_out,
     ):
         setattr(fm, fn.__name__, fn)
+    fm.available = lambda: ops_present
     fm.DecodePlan = DecodePlan
     return fm
 
@@ -564,6 +565,55 @@ def test_decode_off_when_flint_moe_absent(mods):
     tm.calls.clear()
     method.apply(layer, x, weights, ids, None, None)
     assert [c[0] for c in tm.calls] == ["dense", "dense"]
+
+
+FLINT_TP2 = (256, 2048, 256, 6)
+
+
+@pytest.mark.parametrize("flint", ["absent", "no_ops"])
+def test_explicit_decode_switch_raises_when_ops_missing(mods, monkeypatch, flint):
+    """fork nvfp4_sm70_moe.py:240-251: VLLM_SM70_FLINT_MOE_QPN_DECODE=1 with
+    the K12 ops missing on a Flint TP2 layer is an error, not a fallback."""
+    fm = None if flint == "absent" else make_fake_flint_moe(ops_present=False)
+    m4, _tm = mods(flint=fm)
+    method, layer, _ = _build(m4)
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1")
+    with pytest.raises(RuntimeError, match="VLLM_SM70_FLINT_MOE_QPN_DECODE=1"):
+        method._prepare_decode(layer, FLINT_TP2)
+
+
+@pytest.mark.parametrize("env", [None, "", "true"])
+def test_implicit_decode_switch_warns_and_stays_dense(mods, monkeypatch, env):
+    fm = make_fake_flint_moe(ops_present=False)
+    m4, _tm = mods(flint=fm)
+    method, layer, _ = _build(m4)
+    if env is None:
+        monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", env)
+    monkeypatch.setattr(m4, "_warned_decode_ops_absent", False)
+    method._prepare_decode(layer, FLINT_TP2)  # no raise
+    assert m4._warned_decode_ops_absent
+
+
+def test_explicit_switch_does_not_raise_off_contract_or_when_killed(
+    mods, monkeypatch
+):
+    fm = make_fake_flint_moe(ops_present=False)
+    m4, _tm = mods(flint=fm)
+    method, layer, _ = _build(m4)
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1")
+    method._prepare_decode(layer, (128, 2048, 256, 8))  # not Flint TP2
+    method.decode_enabled = False  # policy off (config or kill switch)
+    method._prepare_decode(layer, FLINT_TP2)
+
+
+def test_explicit_switch_with_ops_present_does_not_raise(mods, monkeypatch):
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    method, layer, _ = _build(m4)
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1")
+    method._prepare_decode(layer, FLINT_TP2)
 
 
 def test_admit_layer_gets_contract_banks_and_policy(mods):
