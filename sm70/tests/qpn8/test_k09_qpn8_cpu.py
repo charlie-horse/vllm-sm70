@@ -82,18 +82,55 @@ def test_gemm_guards_are_shape_generic():
     assert "requires channel scales" not in joined
 
 
-def test_m_cap_has_one_source(qpn8_stub):
-    """QPN8_MAX_M (read by M8) equals the C++ M bound, the dispatch and the
-    TurboMind-copy rule."""
+@pytest.fixture
+def m32(monkeypatch):
+    """Set VLLM_SM70_FP8_QPN8_M32: m32(True) -> "1", m32(False) -> unset."""
+
+    def apply(on: bool):
+        if on:
+            monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", "1")
+        else:
+            monkeypatch.delenv("VLLM_SM70_FP8_QPN8_M32", raising=False)
+
+    apply(False)
+    return apply
+
+
+def test_m_cap_has_one_source(qpn8_stub, m32):
+    """QPN8_MAX_M is the compiled C++ bound; qpn8_max_m() derives from it and
+    is what the dispatch and the TurboMind-copy rule use."""
     cap = qpn8_stub.QPN8_MAX_M
     assert isinstance(cap, int) and cap == 32
     bounds = re.findall(r"m >= 1 && m <= (\d+)", _gemm_checks())
     assert bounds == [str(cap)], bounds
     src = QPN8_PY.read_text()
-    assert "if m <= QPN8_MAX_M:" in src
-    assert "> QPN8_MAX_M" in src.split("def needs_turbomind_fallback", 1)[1]
-    assert qpn8_stub.needs_turbomind_fallback(cap, 0) is False
-    assert qpn8_stub.needs_turbomind_fallback(cap + 1, 0) is True
+    assert "if m <= qpn8_max_m(block_scaled):" in src
+    assert (
+        "> qpn8_max_m(block_scaled)" in src.split("def needs_turbomind_fallback", 1)[1]
+    )
+    for on, block_cap in ((False, 8), (True, cap)):
+        m32(on)
+        assert qpn8_stub.qpn8_max_m() == block_cap
+        assert qpn8_stub.qpn8_max_m(block_scaled=True) == block_cap
+        assert qpn8_stub.qpn8_max_m(block_scaled=False) == cap
+        assert qpn8_stub.needs_turbomind_fallback(block_cap, 0) is False
+        assert qpn8_stub.needs_turbomind_fallback(block_cap + 1, 0) is True
+        assert qpn8_stub.needs_turbomind_fallback(cap, 0, block_scaled=False) is False
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "true", "on", " 1"])
+def test_m32_switch_only_1_enables(qpn8_stub, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("VLLM_SM70_FP8_QPN8_M32", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", value)
+    assert qpn8_stub.qpn8_max_m() == 8
+
+
+def test_m32_switch_registered():
+    from vllm_sm70 import envs
+
+    assert "VLLM_SM70_FP8_QPN8_M32" in envs.environment_variables()
 
 
 def test_sources_cmake_lists_the_tu():
@@ -193,20 +230,24 @@ def test_unaligned_and_empty_weights_report_reason(qpn8_stub, n, k):
 
 
 @pytest.mark.parametrize(
-    "max_num_seqs, spec, copy",
+    "max_num_seqs, spec, copy_default, copy_m32",
     [
-        (1, 5, False),
-        (8, 0, False),
-        (9, 0, False),
-        (2, 5, False),
-        (1, 7, False),
-        (4, 7, False),  # Qwen3.8 + DFlash2 k=7, 4 requests: 32 rows
-        (5, 7, True),
-        (33, 0, True),
+        (1, 5, False, False),
+        (8, 0, False, False),
+        (9, 0, True, False),
+        (2, 5, True, False),
+        (1, 7, False, False),  # Qwen3.8 + DFlash2 k=7, 1 request: 8 rows
+        (4, 7, True, False),  # 4 requests: 32 rows
+        (5, 7, True, True),
+        (33, 0, True, True),
     ],
 )
-def test_turbomind_fallback_follows_decode_rows(qpn8_stub, max_num_seqs, spec, copy):
-    assert qpn8_stub.needs_turbomind_fallback(max_num_seqs, spec) is copy
+def test_turbomind_fallback_follows_decode_rows(
+    qpn8_stub, m32, max_num_seqs, spec, copy_default, copy_m32
+):
+    assert qpn8_stub.needs_turbomind_fallback(max_num_seqs, spec) is copy_default
+    m32(True)
+    assert qpn8_stub.needs_turbomind_fallback(max_num_seqs, spec) is copy_m32
 
 
 # ------------------------------------------------- the opaque linear op
@@ -255,13 +296,45 @@ def test_empty_activation_does_not_launch(recorder, qpn8_stub):
     assert recorder == []
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 16, 17, 24, 32])
-def test_m_le_32_uses_qpn8(recorder, qpn8_stub, m):
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+def test_block_m_le_8_uses_qpn8_by_default(recorder, qpn8_stub, m32, m):
     codes, scales = _operands()
     y = qpn8_stub._qpn8_native_linear_impl(
         torch.ones(m, 512, dtype=torch.float16), codes, scales, 16, 2, False
     )
     assert recorder == [("qpn8", m, 16, 2)] and y.shape == (m, 256)
+
+
+@pytest.mark.parametrize("m", [9, 16, 17, 24, 32])
+def test_block_m9_32_default_takes_the_fallback(recorder, qpn8_stub, m32, m):
+    codes, scales = _operands()
+    x = torch.ones(m, 512, dtype=torch.float16)
+    qpn8_stub._qpn8_native_linear_impl(x, codes, scales, 16, 2, False)
+    assert recorder == [("dequant", (512, 256))]
+    recorder.clear()
+    w, s = torch.zeros(1), torch.zeros(1)
+    qpn8_stub._qpn8_native_linear_impl(x, codes, scales, 16, 2, False, w, s, 7, 9)
+    assert recorder == [("turbomind", m, 7, 9)]
+
+
+@pytest.mark.parametrize("m", [9, 16, 17, 24, 32])
+def test_block_m9_32_with_opt_in_uses_qpn8(recorder, qpn8_stub, m32, m):
+    m32(True)
+    codes, scales = _operands()
+    y = qpn8_stub._qpn8_native_linear_impl(
+        torch.ones(m, 512, dtype=torch.float16), codes, scales, 16, 2, False
+    )
+    assert recorder == [("qpn8", m, 16, 2)] and y.shape == (m, 256)
+
+
+@pytest.mark.parametrize("m", [9, 16, 32])
+def test_channel_m9_32_uses_qpn8_by_default(recorder, qpn8_stub, m32, m):
+    codes = torch.zeros(512, 256, dtype=torch.uint8)
+    scales = torch.zeros(1, 256, dtype=torch.float16)  # channel scales [1, N]
+    qpn8_stub._qpn8_native_linear_impl(
+        torch.ones(m, 512, dtype=torch.float16), codes, scales, 16, 2, False
+    )
+    assert recorder == [("qpn8", m, 16, 2)]
 
 
 def test_m_gt_32_uses_turbomind_when_held(recorder, qpn8_stub):

@@ -9,7 +9,8 @@ What:
   the TurboMind FP8 copy; M>32 with the copy equals TurboMind FP8 bit for
   bit; without it, the dequantize + mm path, with or without a caller
   scratch; two streams with their own per-call scratch.
-- Accuracy at the Qwen3.6 / Qwen3.8 TP2 dense shapes (qkv, o, GDN in/out,
+- With VLLM_SM70_FP8_QPN8_M32 unset (default) and =1 (opt-in QPN8 M9..32):
+  accuracy at the Qwen3.6 / Qwen3.8 TP2 dense shapes (qkv, o, GDN in/out,
   MLP / shared expert), M in {1, 2, 4, 8, 9, 16, 17, 24, 32} (M 9..32 is the
   block-scaled two-row-tile path, DFlash2 k=7 verify for 2-4 requests): max|y - ref| / max|ref| < 1e-2
   and rel-L2 < 1e-3 against x @ dequant(W)^T in float32.
@@ -78,9 +79,25 @@ def test_matches_dequantized_reference(qpn8_gpu, n, k, m, turbomind, scale_dtype
         assert rel_l2(y, x.float() @ reference.t()) < 1e-3
 
 
+@pytest.fixture
+def m32(monkeypatch):
+    def apply(on: bool):
+        if on:
+            monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", "1")
+        else:
+            monkeypatch.delenv("VLLM_SM70_FP8_QPN8_M32", raising=False)
+
+    apply(False)
+    return apply
+
+
+@pytest.mark.parametrize("route", ["default", "m32"])
 @pytest.mark.parametrize("name", sorted(TP2_SHAPES))
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 16, 17, 24, 32])
-def test_tp2_dense_shapes_accuracy(qpn8_gpu, name, m):
+def test_tp2_dense_shapes_accuracy(qpn8_gpu, m32, route, name, m):
+    # default: M>8 takes dequantize + mm; m32: the opt-in QPN8 M9..32 path.
+    m32(route == "m32")
+    assert qpn8_gpu.qpn8_max_m() == (32 if route == "m32" else 8)
     n, k = TP2_SHAPES[name]
     weight, scales, reference = _weight(n, k)
     prepared = qpn8_gpu.qpn8_prepare(weight, scales)
@@ -210,7 +227,8 @@ def test_opcheck(qpn8_gpu):
 
 
 @pytest.mark.parametrize("m", [1, 16, 32])
-def test_decode_replays_in_a_cuda_graph(qpn8_gpu, m):
+def test_decode_replays_in_a_cuda_graph(qpn8_gpu, m32, m):
+    m32(True)
     n, k = TP2_SHAPES["qwen3.8-mlp.down_proj"]
     weight, scales, reference = _weight(n, k)
     p = qpn8_gpu.qpn8_prepare(weight, scales)

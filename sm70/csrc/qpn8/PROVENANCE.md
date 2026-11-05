@@ -86,6 +86,12 @@ In `fp8_qpn8_gemm_sm70_out` (CHANGED):
 - **Shape-dependent `if` heuristics:** the pair path needs N≥2048, K≥1536; the packed two-phase path needs N≥2048 and K≥4096 or K≥1536. Both are channel-only and never route block-scaled weights.
 - **Split-K at TP2:** the Python split-K table (`QPN8_CONFIGS`) holds only TP4 shapes. All 12 TP2 Qwen3.6/3.8 dense shapes use the generic split 16 (8 if K%256), which is always ≤16, so M up to 32 is admitted.
 
+### Python routing (`vllm_sm70/ops/qpn8.py`) after review of #50
+- **`QPN8_MAX_M = 32`:** the compiled C++ bound.
+- **`qpn8_max_m(block_scaled=True)`:** the effective cap, used by the dispatch inside `qpn8_native_linear` and by `needs_turbomind_fallback`.
+  - **Block-scaled weights (the block-FP8 checkpoints):** 8 by default, matching the fork's block route (`fp8_block.py:45`). With `VLLM_SM70_FP8_QPN8_M32=1` (opt-in, only "1"; registered in envs.py) it is 32 and the commit-5 path is used. Off, block-scaled M>8 takes TurboMind FP8 if held, else dequantize + mm. It stays off until a V100 accuracy check and an M16/M32 bench against TurboMind pass.
+  - **Channel-scaled weights:** M9..32 is **kept on by default** (cap 32). These are the fork's own pair and two-phase kernels, unchanged.
+
 Everything else is unchanged:
 - `fp8x8_to_half2x4` and `_fast`, the lane/column/physical-K helpers, `fp8_qpn8_prepack_sm70_kernel`, both scale kernels, `fp8_qpn8_dequantize_sm70_kernel`, `VLLM_SM70_MMA_8N8K4`.
 - `fp8_qpn8_sm70_kernel`, including its now-unused `FusedBA` / `SplitOutputs` / `RowTiles=2` template branches, kept so the instantiated M≤8 code is byte-identical.

@@ -170,6 +170,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
+        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
+        # the other opt_in switches this one selects a kernel.
+        "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
@@ -229,9 +237,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     },
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
-        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
-            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
-        ),
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".
