@@ -10,31 +10,34 @@ gate as loaded, accumulates in FP32 and selects the renormalized sigmoid top
 six in the same launch, with ``topk_sigmoid``'s scoring, tie-breaking and
 normalization. Only the FP32 summation order of the logits differs.
 
-Contract (U3, Penny's upstream patch, fork contract):
-``MoERunner.router_provider(runner) -> route | None`` is bound once per
-layer; ``route.try_route(hidden_states) -> (topk_weights fp32, topk_ids
-int32) | None`` and the runner skips the gate GEMM and the router when it
-returns a pair. This module supplies the provider
-(:func:`admit_flint_fused_router`), returned by
-``Sm70CudaPlatform.get_moe_router_provider()``, and :func:`prepare_model`,
-which the platform's U1 ``kernel_warmup`` hook calls before CUDA graph
-capture.
+Contract (U3, patches/0004 from PR #43): when a MoE runner holds the gate,
+every forward calls ``current_platform.get_moe_router_provider()``, then
+``provider(runner) -> route | None`` and ``route.try_route(hidden_states)
+-> (topk_weights fp32, topk_ids int32) | None``. A pair skips the gate GEMM
+and ``select_experts`` (UP moe_runner.py:907, :630); monolithic kernels
+assert. U3 caches nothing, so this module does: :func:`flint_router_provider`
+decides once per layer and stores the route on the runner.
+``Sm70CudaPlatform.get_moe_router_provider()`` returns it, and the U1
+``kernel_warmup`` hook calls :func:`prepare_model` before CUDA graph capture.
 
 Capture safety (risk R4): the per-layer workspace (FP32 logits) and the
-INT32 arrival counter are allocated when the layer is admitted, i.e. at
-warmup or on the first *eager* forward, never during capture (U3 refuses to
-admit under capture). The kernel's last CTA re-arms the counter, so every
-graph and every eager call can share one counter per layer in any order.
+INT32 arrival counter are allocated only when a layer is decided, i.e. at
+warmup or on the first *eager* forward. Under capture an undecided layer
+gets no route and nothing is cached or allocated. The kernel's last CTA
+re-arms the counter, so every graph and every eager call can share one
+counter per layer in any order.
 
 Ported from fork cf9492a vllm/model_executor/layers/fused_moe/router/
 sm70_flint_router.py (205 lines, last touch 3629e29f6). See
 csrc/router/PROVENANCE.md for the function map.
 
-Kill switch: VLLM_SM70_FLINT_FUSED_ROUTER=0 (read at admission).
+Kill switch: VLLM_SM70_FLINT_FUSED_ROUTER=0 (read once, when the platform
+getter is first asked; then the getter returns None and U3 runs upstream).
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +60,10 @@ TOP_K = 6
 MAX_TOKENS = 2
 # FP32 logits for MAX_TOKENS rows; the counter is a separate INT32 tensor.
 _LOGITS = MAX_TOKENS * NUM_EXPERTS
+
+# Per-layer decision, stored on the runner: FlintFusedRouter or None.
+_ROUTE_ATTR = "_sm70_flint_route"
+_UNDECIDED = object()
 
 _logged: set[str] = set()
 
@@ -225,8 +232,13 @@ def _rejection(runner: Any) -> str | None:
     ):
         return "the layer fuses gates, transforms inputs, overlaps or is monolithic"
     moe = runner.moe_config
-    if moe.dp_size != 1 or moe.pcp_size != 1 or moe.use_ep:
-        return "the layer dispatches tokens (DP, PCP or EP)"
+    if (
+        moe.dp_size != 1
+        or moe.pcp_size != 1
+        or getattr(moe, "sp_size", 1) != 1
+        or moe.use_ep
+    ):
+        return "the layer dispatches tokens (DP, PCP, SP or EP)"
     return None
 
 
@@ -264,35 +276,57 @@ def admit_flint_fused_router(runner: MoERunner) -> FlintFusedRouter | None:
     return FlintFusedRouter(op, runner.gate.weight, runner)
 
 
+def flint_router_provider(runner: MoERunner) -> FlintFusedRouter | None:
+    """U3 provider, called on every forward: the layer's cached route.
+
+    Decides once per layer (and caches the decision, including "no") in an
+    eager pass. While a CUDA graph captures, an undecided layer gets None
+    and nothing is cached or allocated.
+    """
+    route = runner.__dict__.get(_ROUTE_ATTR, _UNDECIDED)
+    if route is not _UNDECIDED:
+        return route
+    if _capturing():
+        return None
+    route = admit_flint_fused_router(runner)
+    runner.__dict__[_ROUTE_ATTR] = route
+    return route
+
+
+@functools.cache
 def provider() -> Any | None:
-    """The provider for ``Platform.get_moe_router_provider()``, or None."""
-    return admit_flint_fused_router if enabled() else None
+    """For ``Platform.get_moe_router_provider()``; None when killed.
+
+    Cached: U3 asks on every MoE forward, so the kill switch is read once.
+    """
+    return flint_router_provider if enabled() else None
+
+
+def _is_moe_runner(module: Any) -> bool:
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    return isinstance(module, MoERunner)
+
+
+def _u3_present() -> bool:
+    from vllm.platforms.interface import Platform
+
+    return hasattr(Platform, "get_moe_router_provider")
 
 
 def prepare_model(model: torch.nn.Module) -> int:
-    """Bind and admit every MoE runner before CUDA graph capture.
+    """Decide every MoE runner's route before CUDA graph capture (R4).
 
     Called from the platform's U1 ``kernel_warmup`` hook (eager, before
-    capture). Binds the provider on runners that have the U3 attribute but
-    none bound, then decides admission so the workspace exists before the
-    first capture. Returns the number of admitted layers. A no-op without
-    U3 (no ``router_provider`` attribute) or with the kill switch engaged.
+    capture). Returns the number of admitted layers. A no-op without U3,
+    with the kill switch engaged, or under capture.
     """
-    if not enabled() or _capturing():
+    if provider() is None or _capturing() or not _u3_present():
         return 0
     admitted = 0
     for module in model.modules():
-        if not hasattr(module, "router_provider") or getattr(module, "gate", 1) is None:
-            continue
-        if module.router_provider is None:
-            module.router_provider = admit_flint_fused_router
-        if module.router_provider is not admit_flint_fused_router:
-            continue  # someone else's provider: leave it alone
-        if not getattr(module, "_precomputed_route_decided", True):
-            module._precomputed_route = admit_flint_fused_router(module)
-            module._precomputed_route_decided = True
-        if isinstance(getattr(module, "_precomputed_route", None), FlintFusedRouter):
-            admitted += 1
+        if _is_moe_runner(module) and module.gate is not None:
+            admitted += flint_router_provider(module) is not None
     if admitted:
         _log_once(
             logging.INFO, "vllm_sm70: fused router admitted on %d layers", admitted

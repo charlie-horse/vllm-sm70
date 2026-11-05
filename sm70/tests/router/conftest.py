@@ -14,14 +14,19 @@ from types import SimpleNamespace
 
 import pytest
 
-torch = pytest.importorskip("torch")
-pytest.importorskip("vllm.model_executor.layers.fused_moe.router.gate_linear")
+try:
+    import torch
+except ImportError:  # the test modules importorskip torch and vllm
+    torch = None
+
+_F32 = "float32"
 
 
-def make_gate(
-    shape=(256, 2048), dtype=torch.float32, out_dtype=torch.float32, device="cpu"
-):
+def make_gate(shape=(256, 2048), dtype=_F32, out_dtype=_F32, device="cpu"):
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    dtype = torch.float32 if dtype == _F32 else dtype
+    out_dtype = torch.float32 if out_dtype == _F32 else out_dtype
 
     gate = GateLinear.__new__(GateLinear)
     torch.nn.Module.__init__(gate)
@@ -67,7 +72,9 @@ def router_mod(monkeypatch):
 
     monkeypatch.delenv("VLLM_SM70_FLINT_FUSED_ROUTER", raising=False)
     router._logged.clear()
-    return router
+    router.provider.cache_clear()
+    yield router
+    router.provider.cache_clear()
 
 
 @pytest.fixture

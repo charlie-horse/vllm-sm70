@@ -13,8 +13,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
-from conftest import make_gate, make_router, make_runner
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.model_executor.layers.fused_moe.router.gate_linear")
+
+from conftest import make_gate, make_router, make_runner  # noqa: E402
 
 
 def test_kill_switch_is_registered():
@@ -30,7 +33,7 @@ def test_kill_switch_only_zero_disables(router_mod, monkeypatch, raw, on):
     if raw is not None:
         monkeypatch.setenv("VLLM_SM70_FLINT_FUSED_ROUTER", raw)
     assert router_mod.enabled() is on
-    assert (router_mod.provider() is router_mod.admit_flint_fused_router) is on
+    assert (router_mod.provider() is router_mod.flint_router_provider) is on
 
 
 def test_admits_flint_router(admitted, router_mod):
@@ -151,45 +154,55 @@ def test_try_route_defers_to_generic_route(admitted, router_mod):
     assert len(admitted) == 2
 
 
-def _u3_hook():
-    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-
-    hook = getattr(MoERunner, "_maybe_precomputed_route", None)
-    if hook is None:
-        pytest.skip("vLLM without the U3 router-provider hook (Penny's patch)")
-    return hook
-
-
-def _bindable_runner(**kw):
-    return make_runner(
-        router_provider=None,
-        _precomputed_route=None,
-        _precomputed_route_decided=False,
-        **kw,
-    )
+def test_provider_decides_once_per_layer(admitted, router_mod):
+    """U3 calls the provider on every forward; the route is cached."""
+    runner = make_runner()
+    other = make_runner(_fse_fuse_gate=True)
+    first = router_mod.flint_router_provider(runner)
+    assert isinstance(first, router_mod.FlintFusedRouter)
+    assert router_mod.flint_router_provider(runner) is first
+    assert router_mod.flint_router_provider(other) is None
+    # "no route" is cached too: not re-evaluated on each forward.
+    other._fse_fuse_gate = False
+    assert router_mod.flint_router_provider(other) is None
 
 
-def test_u3_runner_hook_admits_once_outside_capture(admitted, router_mod, monkeypatch):
-    hook = _u3_hook()
-    x = torch.zeros(1, 2048, dtype=torch.float16)
-    runner = _bindable_runner()
-    # Unbound layers (every other model) keep the gate route untouched.
-    assert hook(runner, x) is None and not runner._precomputed_route_decided
+def test_provider_under_capture_caches_and_allocates_nothing(
+    admitted, router_mod, monkeypatch
+):
+    """R4: an undecided layer seen first under capture gets no route, and
+    the decision waits for the next eager forward."""
+    runner = make_runner()
+    allocations = []
+    real_init = router_mod.FlintFusedRouter.__init__
 
-    calls = []
+    def counting_init(self, *a, **k):
+        allocations.append(1)
+        real_init(self, *a, **k)
 
-    def provider(layer):
-        calls.append(layer)
-        return router_mod.admit_flint_fused_router(layer)
-
-    runner.router_provider = provider
+    monkeypatch.setattr(router_mod.FlintFusedRouter, "__init__", counting_init)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert hook(runner, x) is None and not calls
+    assert router_mod.flint_router_provider(runner) is None
+    assert router_mod._ROUTE_ATTR not in runner.__dict__ and not allocations
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    weights, ids = hook(runner, x)
-    assert weights.shape == ids.shape == (1, 6)
-    assert hook(runner, x) is not None
-    assert calls == [runner] and len(admitted) == 2
+    route = router_mod.flint_router_provider(runner)
+    assert isinstance(route, router_mod.FlintFusedRouter) and allocations == [1]
+    # Decided layers return the cached route during capture as well.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert router_mod.flint_router_provider(runner) is route
+    assert allocations == [1]
+
+
+def test_no_route_for_sp(admitted, router_mod):
+    moe = SimpleNamespace(dp_size=1, pcp_size=1, sp_size=2, use_ep=False)
+    assert router_mod.admit_flint_fused_router(make_runner(moe_config=moe)) is None
+
+
+class _Runner(torch.nn.Module):
+    def __init__(self, **kw):
+        super().__init__()
+        for k, v in vars(make_runner(**kw)).items():
+            object.__setattr__(self, k, v)
 
 
 class _Model(torch.nn.Module):
@@ -198,49 +211,53 @@ class _Model(torch.nn.Module):
         self.layers = torch.nn.ModuleList(runners)
 
 
-class _Runner(torch.nn.Module):
-    def __init__(self, **kw):
-        super().__init__()
-        for k, v in vars(_bindable_runner(**kw)).items():
-            object.__setattr__(self, k, v)
+@pytest.fixture
+def fake_runners(router_mod, monkeypatch):
+    monkeypatch.setattr(router_mod, "_is_moe_runner", lambda m: isinstance(m, _Runner))
+    monkeypatch.setattr(router_mod, "_u3_present", lambda: True)
 
 
-def test_prepare_model_admits_before_capture(admitted, router_mod):
+def test_prepare_model_admits_before_capture(admitted, router_mod, fake_runners):
     """R4: kernel_warmup allocates every workspace eagerly, once."""
     good, other = _Runner(), _Runner(router=make_router(top_k=8))
     model = _Model(good, other, torch.nn.Linear(2, 2))
     assert router_mod.prepare_model(model) == 1
-    assert isinstance(good._precomputed_route, router_mod.FlintFusedRouter)
-    assert good._precomputed_route_decided and other._precomputed_route_decided
-    assert other._precomputed_route is None
-    first = good._precomputed_route
+    first = good.__dict__[router_mod._ROUTE_ATTR]
+    assert isinstance(first, router_mod.FlintFusedRouter)
+    assert other.__dict__[router_mod._ROUTE_ATTR] is None
     assert router_mod.prepare_model(model) == 1
-    assert good._precomputed_route is first  # no re-allocation
+    assert good.__dict__[router_mod._ROUTE_ATTR] is first  # no re-allocation
+    assert router_mod.flint_router_provider(good) is first
 
 
-def test_prepare_model_respects_foreign_provider_and_capture(
-    admitted, router_mod, monkeypatch
-):
-    foreign = _Runner()
-    foreign.router_provider = lambda layer: None
-    assert router_mod.prepare_model(_Model(foreign)) == 0
-    assert not foreign._precomputed_route_decided
-
+def test_prepare_model_noops(admitted, router_mod, fake_runners, monkeypatch):
     fresh = _Runner()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert router_mod.prepare_model(_Model(fresh)) == 0
-    assert not fresh._precomputed_route_decided
-
-
-def test_prepare_model_noop_with_kill_switch_or_without_u3(
-    admitted, router_mod, monkeypatch
-):
-    plain = torch.nn.Module()  # no router_provider attribute: no U3
-    assert router_mod.prepare_model(_Model(plain)) == 0
-    runner = _Runner()
+    assert router_mod._ROUTE_ATTR not in fresh.__dict__
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(router_mod, "_u3_present", lambda: False)
+    assert router_mod.prepare_model(_Model(fresh)) == 0
+    monkeypatch.setattr(router_mod, "_u3_present", lambda: True)
     monkeypatch.setenv("VLLM_SM70_FLINT_FUSED_ROUTER", "0")
-    assert router_mod.prepare_model(_Model(runner)) == 0
-    assert runner.router_provider is None
+    router_mod.provider.cache_clear()
+    assert router_mod.prepare_model(_Model(fresh)) == 0
+    assert router_mod._ROUTE_ATTR not in fresh.__dict__
+
+
+def test_u3_contract_present_in_vllm():
+    """Against vLLM with patches/0004 (PR #43): the getter exists and the
+    gate site asks it. Skips on a vLLM without U3."""
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+    from vllm.platforms.interface import Platform
+
+    if not hasattr(Platform, "get_moe_router_provider"):
+        pytest.skip("vLLM without patches/0004 (U3)")
+    assert Platform.get_moe_router_provider() is None
+    src = inspect.getsource(moe_runner.MoERunner._forward_impl)
+    assert "get_moe_router_provider()" in src and "try_route(" in src
 
 
 def test_platform_hooks(router_mod, monkeypatch):
@@ -259,9 +276,10 @@ def test_platform_hooks(router_mod, monkeypatch):
     from vllm_sm70._cuda_platform import Sm70CudaPlatform
 
     assert Sm70CudaPlatform.get_moe_router_provider() is (
-        router_mod.admit_flint_fused_router
+        router_mod.flint_router_provider
     )
     monkeypatch.setenv("VLLM_SM70_FLINT_FUSED_ROUTER", "0")
+    router_mod.provider.cache_clear()
     assert Sm70CudaPlatform.get_moe_router_provider() is None
     seen = []
     monkeypatch.setattr(router_mod, "prepare_model", seen.append)

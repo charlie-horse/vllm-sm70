@@ -2,13 +2,15 @@
 
 Source: charlie-horse/vLLM at **cf9492a01**. Line counts are `wc -l`. "fork last-touch" is `git log -1 --format=%h -- <fork path>`.
 
-**Depends on U3 (Penny's upstream PR, not in this branch).** K13 implements the fork's router-provider contract at the gate site of UP `model_executor/layers/fused_moe/runner/moe_runner.py:907` (fork `moe_runner.py:205-216,307-309,351-369,995-1028`):
+**Depends on U3: Penny's PR #43 (`patches/0004`), which is not in this branch.** The U3 contract at the gate site (UP `model_executor/layers/fused_moe/runner/moe_runner.py:907`, expert selection at `:630`) works like this:
 
-- `MoERunner.router_provider: Callable[[MoERunner], PrecomputedRoute | None]`, bound once per layer on the first eager forward and never during CUDA graph capture.
-- `PrecomputedRoute.try_route(hidden_states) -> (topk_weights fp32, topk_ids int32) | None`. The runner skips the gate GEMM and `select_experts` when it returns a pair, and hands the pair to the quant method as `precomputed_topk`.
-- A platform getter that is probably `Platform.get_moe_router_provider()`. `Sm70CudaPlatform` implements it.
+- When a runner holds the gate, every forward calls `current_platform.get_moe_router_provider()`, then `provider(runner) -> route | None`, then `route.try_route(hidden_states) -> (topk_weights fp32, topk_ids int32) | None`.
+- A returned pair skips the gate GEMM and `select_experts`, and goes to the quant method as `precomputed_topk`. Monolithic kernels assert.
+- U3 caches nothing. So `flint_router_provider` caches the decision per layer itself, in `runner.__dict__["_sm70_flint_route"]`, including a "no" decision.
+- The route is decided in an eager pass before capture: `prepare_model` from the U1 `kernel_warmup` hook, or the first eager forward.
+- The fork bound a provider per layer in the model (`MoERunner.router_provider`, fork `moe_runner.py:205-216,307-309,351-369`, set at fork `models/flint/model.py:229`). That doesn't fit a plugin, so U3 moved the binding into the platform getter.
 
-Without U3 everything in this patch is inert: no runner calls the provider, and `prepare_model` binds nothing because no module has `router_provider`. The CPU hook test (`test_u3_runner_hook_admits_once_outside_capture`) skips on a vLLM without U3. It was run against a local copy of the contract, which is not shipped.
+Without U3, everything in this patch is inert. Nothing asks the getter, and `prepare_model` returns 0 because `Platform` has no `get_moe_router_provider`. The CPU contract test `test_u3_contract_present_in_vllm` skips on a vLLM without U3. It was run against #43's `0004` applied locally; that copy is not shipped here.
 
 ## Files
 
@@ -33,7 +35,7 @@ Without U3 everything in this patch is inert: no runner calls the provider, and 
 | `router.py` `admit_flint_fused_router` | `:179-205` | the kill switch is read from `vllm_sm70.envs` (fork: `Sm70MoERoutingPolicy`). Admission refuses under capture |
 | `router.py` `_flint_route_op`, `has_op` | `:42-51` | `_ext.load()` plus `torch.ops._sm70_C` in place of `vllm._sm70_router_C` |
 | `router.py` `_is_exact_sm70` | `:60-64` | cc 7.0 only (the fork also accepted 7.2) |
-| `router.py` `provider`, `prepare_model`, `register`, `_register_fake`, `_capturing` | – | new: the platform getter, the warmup-time admission (R4), the fake |
+| `router.py` `flint_router_provider`, `provider`, `prepare_model`, `register`, `_register_fake`, `_capturing` | fork `moe_runner.py:351-369` (`_maybe_precomputed_route`: decide once, never under capture) | the decide-once logic moves from the runner into the provider, because U3 caches nothing. `provider()` is the getter's answer, with the kill switch read once |
 | `Sm70CudaPlatform.get_moe_router_provider`, `.kernel_warmup` | fork `models/flint/model.py:229` bound the provider per layer in the model | the plugin can't edit the model, so the platform getter (U3) and the U1 warmup hook bind it |
 
 ## Dropped
@@ -48,8 +50,8 @@ Without U3 everything in this patch is inert: no runner calls the provider, and 
 The decision is made once per layer, at admission:
 - gate: an unquantized `GateLinear` with an **FP32** weight `[256, 2048]`, contiguous, 16-byte aligned, no bias, `out_dtype == float32`
 - router: exactly `FusedTopKRouter` with sigmoid, renormalize, top_k 6, 256 global experts, no EPLB
-- layer: no fused shared gate, no routed-input transform, no DBO, not monolithic
-- parallelism: `dp_size == pcp_size == 1`, no EP. Any TP size works: the gate is replicated, so TP2 on 2×V100 is admitted
+- layer: no fused shared-expert gate (FSE), no routed-input transform, no DBO, not monolithic
+- parallelism: `dp_size == pcp_size == sp_size == 1`, no EP. Any TP size works: the gate is replicated, so TP2 on 2×V100 is admitted
 - device: cc 7.0
 
 Then on each call, from tensor metadata only (fixed for a captured graph):
@@ -62,6 +64,7 @@ Everything else takes the generic route. The tests cover each rejection (`sm70/t
 
 ## Capture safety (R4)
 
-- The per-layer workspace (FP32 logits `[2*256]`) and the INT32 arrival counter are allocated only at admission, which happens in `prepare_model` (the U1 `kernel_warmup` hook, eager, before capture) or on the first eager forward (U3). Admission returns None under capture.
+- The per-layer workspace (FP32 logits `[2*256]`) and the INT32 arrival counter are allocated only when a layer is decided. That happens in `prepare_model` (the U1 `kernel_warmup` hook, eager, before capture) or on the first eager forward.
+- Under capture, an undecided layer gets None, and nothing is cached or allocated. A decided layer returns its cached route.
 - The kernel's last CTA re-arms the counter, so graphs of any batch size can replay in any order.
 - Regression test: `test_descending_capture_regression` (GPU). It captures batch 2 then batch 1 on a fresh stream and a poisoned shared pool, replays batch 1 first, and checks that capture created no new tensors.

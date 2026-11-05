@@ -169,7 +169,8 @@ class Sm70CudaPlatform(CudaPlatform):
 
         router.prepare_model(get_model())
 
-    # U3 hook (Penny's patch, fork contract): MoERunner.router_provider.
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
     @classmethod
     def get_moe_router_provider(cls) -> Callable[..., Any] | None:
         from vllm_sm70 import router

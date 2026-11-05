@@ -17,9 +17,12 @@ pool, the smallest replayed first, with the workspace admitted eagerly.
 from __future__ import annotations
 
 import pytest
-import torch
-import torch.nn.functional as F
-from conftest import make_gate, make_runner
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.model_executor.layers.fused_moe.router.gate_linear")
+
+import torch.nn.functional as F  # noqa: E402
+from conftest import make_gate, make_runner  # noqa: E402
 
 pytestmark = pytest.mark.gpu
 
@@ -214,7 +217,7 @@ def _poison_pool(pool, stream, device):
 
 @torch.inference_mode()
 def test_descending_capture_regression(router_gpu, monkeypatch):
-    """Black box (R4): admission through the runner hook, capture 2 then 1
+    """Black box (R4): admission through the U3 provider, capture 2 then 1
     on a fresh stream and a poisoned shared pool with no eager route call,
     then replay 1 before 2. A workspace or counter created lazily under
     capture would come from the poisoned pool (or only be zeroed by the
@@ -224,19 +227,9 @@ def test_descending_capture_regression(router_gpu, monkeypatch):
     w = gate_weight(r, 314)
     runner = make_runner(gate=make_gate(device=device))
     runner.gate.weight.data = w
-    model = torch.nn.Module()
-    holder = torch.nn.Module()
-    for k, v in dict(
-        router_provider=None,
-        _precomputed_route=None,
-        _precomputed_route_decided=False,
-        **vars(runner),
-    ).items():
-        object.__setattr__(holder, k, v)
-    model.layer = holder
-    # Warmup (U1 kernel_warmup): the only place the workspace is created.
-    assert r.prepare_model(model) == 1
-    state = holder._precomputed_route
+    # Warmup (U1 kernel_warmup / first eager forward): the only place the
+    # workspace is created. Then U3 asks the provider on every forward.
+    state = r.flint_router_provider(runner)
     assert isinstance(state, r.FlintFusedRouter)
     counter_ptr, logits_ptr = state.counter.data_ptr(), state.logits.data_ptr()
 
@@ -248,11 +241,12 @@ def test_descending_capture_regression(router_gpu, monkeypatch):
     for batch in (2, 1):  # descending, as vLLM captures
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=pool, stream=stream):
-            outs[batch] = state.try_route(x[:batch])
+            route = r.flint_router_provider(runner)  # as U3 does per forward
+            outs[batch] = route.try_route(x[:batch])
         assert outs[batch] is not None
         graphs[batch] = g
     # Capture created nothing new.
-    assert holder._precomputed_route is state
+    assert r.flint_router_provider(runner) is state
     assert (state.counter.data_ptr(), state.logits.data_ptr()) == (
         counter_ptr,
         logits_ptr,
