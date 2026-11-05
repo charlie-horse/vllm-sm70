@@ -6,16 +6,17 @@ What:
   vllm_sm70.ops.qpn8 (qpn8_prepare + qpn8_linear instead of the fork's
   QPN8Fp8BlockScaledMMLinearKernel): output vs the dequantized reference
   (rel-L2 < 1e-3) for M in {0, 1, 6, 8, 9, 20, 64, 512}, with and without
-  the TurboMind FP8 copy; M>8 with the copy equals TurboMind FP8 bit for
+  the TurboMind FP8 copy; M>32 with the copy equals TurboMind FP8 bit for
   bit; without it, the dequantize + mm path, with or without a caller
   scratch; two streams with their own per-call scratch.
 - Accuracy at the Qwen3.6 / Qwen3.8 TP2 dense shapes (qkv, o, GDN in/out,
-  MLP / shared expert), M in {1, 2, 4, 8}: max|y - ref| / max|ref| < 1e-2
+  MLP / shared expert), M in {1, 2, 4, 8, 9, 16, 17, 24, 32} (M 9..32 is the
+  block-scaled two-row-tile path, DFlash2 k=7 verify for 2-4 requests): max|y - ref| / max|ref| < 1e-2
   and rel-L2 < 1e-3 against x @ dequant(W)^T in float32.
 - Kernel-level parts of fork tests/quantization/
   test_block_fp8_qpn8_capabilities.py: unaligned shapes are refused,
-  prepare/dequantize round-trip, opcheck on the three ops, and a CUDA graph
-  capture of the M=1 decode GEMV.
+  prepare/dequantize round-trip, opcheck on the three ops, and CUDA graph
+  capture of the GEMV at M=1, 16 and 32.
 
 Run from the repo root: pytest -m gpu sm70/tests/qpn8
 """
@@ -78,7 +79,7 @@ def test_matches_dequantized_reference(qpn8_gpu, n, k, m, turbomind, scale_dtype
 
 
 @pytest.mark.parametrize("name", sorted(TP2_SHAPES))
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 16, 17, 24, 32])
 def test_tp2_dense_shapes_accuracy(qpn8_gpu, name, m):
     n, k = TP2_SHAPES[name]
     weight, scales, reference = _weight(n, k)
@@ -95,8 +96,8 @@ def test_tp2_dense_shapes_accuracy(qpn8_gpu, name, m):
     torch.testing.assert_close(y3.view(m, n), y + bias, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("m", [9, 64])
-def test_m_gt_8_with_copy_is_turbomind(qpn8_gpu, m):
+@pytest.mark.parametrize("m", [33, 64])
+def test_m_gt_32_with_copy_is_turbomind(qpn8_gpu, m):
     from vllm_sm70.ops import tm
 
     weight, scales, _ = _weight(1536, 4096)
@@ -118,7 +119,7 @@ def test_m_gt_8_with_copy_is_turbomind(qpn8_gpu, m):
     )
 
 
-@pytest.mark.parametrize("m", [9, 64, 512])
+@pytest.mark.parametrize("m", [33, 64, 512])
 def test_one_layout_uses_caller_scratch(qpn8_gpu, m):
     weight, scales, reference = _weight(1536, 4096)
     prepared = qpn8_gpu.qpn8_prepare(weight, scales)
@@ -170,12 +171,13 @@ def test_prepare_dequantize_round_trip(qpn8_gpu):
     torch.testing.assert_close(dense.float(), reference.t(), rtol=1e-3, atol=1e-6)
 
 
-def test_gemm_rejects_m_above_8(qpn8_gpu):
+def test_gemm_rejects_m_above_cap(qpn8_gpu):
+    cap = qpn8_gpu.QPN8_MAX_M
     weight, scales, _ = _weight(256, 512)
     p = qpn8_gpu.qpn8_prepare(weight, scales)
-    x = torch.zeros(9, 512, device="cuda", dtype=torch.float16)
-    out = torch.empty(9, 256, device="cuda", dtype=torch.float16)
-    with pytest.raises(RuntimeError, match=r"M must be in \[1, 8\]"):
+    x = torch.zeros(cap + 1, 512, device="cuda", dtype=torch.float16)
+    out = torch.empty(cap + 1, 256, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match=rf"M must be in \[1, {cap}\]"):
         qpn8_gpu.fp8_qpn8_gemm_sm70_out(out, x, p.codes, p.group_scales, 16, 2)
 
 
@@ -207,17 +209,18 @@ def test_opcheck(qpn8_gpu):
     )
 
 
-def test_m1_decode_replays_in_a_cuda_graph(qpn8_gpu):
+@pytest.mark.parametrize("m", [1, 16, 32])
+def test_decode_replays_in_a_cuda_graph(qpn8_gpu, m):
     n, k = TP2_SHAPES["qwen3.8-mlp.down_proj"]
     weight, scales, reference = _weight(n, k)
     p = qpn8_gpu.qpn8_prepare(weight, scales)
-    x = torch.zeros(1, k, device="cuda", dtype=torch.float16)
+    x = torch.zeros(m, k, device="cuda", dtype=torch.float16)
     qpn8_gpu.qpn8_linear(x, p)  # warm up outside capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         y = qpn8_gpu.qpn8_linear(x, p)
-    x.copy_(torch.randn(1, k, device="cuda", dtype=torch.float16) * 0.1)
+    x.copy_(torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.1)
     graph.replay()
     torch.cuda.synchronize()
     assert rel_l2(y, x.float() @ reference.t()) < 1e-3
