@@ -6,8 +6,10 @@ QPN8 is a weight-only FP8 layout for block-quantized checkpoints (E4M3
 weights with 128 x 128 fp32 block scales, e.g. Qwen3.6-35B-A3B-FP8 and
 Qwen3.8-27B-FP8). Each [N, K] weight is repacked once into uint8 codes
 [K, N] (in QPN8 tile order) plus fp16 group scales [K/128, N/32] (scale *
-256). The M<=8 GEMV decodes FP8 to half in registers and runs split-K
-mma.m8n8k4 tiles; activations and output are fp16.
+256). The M<=32 GEMV decodes FP8 to half in registers and runs split-K
+mma.m8n8k4 tiles; activations and output are fp16. M<=8 is one 8-row
+tile, M=9..16 two, M=17..32 two 16-row passes (block scales; see
+sm70/csrc/qpn8/PROVENANCE.md).
 
 Ported from fork cf9492a:
 - csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu ops, now sm70/csrc/qpn8/ (see
@@ -30,12 +32,12 @@ switch; M8 reads VLLM_SM70_FP8_QPN8 and decides whether to call it.
           [N/128, K/128], cast to float32. N and K must be multiples of 128
           (`qpn8_rejection(n, k)` says why not). With
           turbomind_fallback=True the TurboMind FP8 operands (K03
-          fp8_sm70_prepare) are kept too, for M>8; otherwise M>8 runs a
+          fp8_sm70_prepare) are kept too, for M>32; otherwise M>32 runs a
           dequantize into a [K, N] fp16 scratch and torch.mm. The caller
           frees the checkpoint weight afterwards.
     y = qpn8_linear(x, prepared, bias=None, dense_scratch=None)
         x: [..., K] fp16 (flattened to [M, K]). Returns [..., N] fp16.
-          M == 0: empty output. 1 <= M <= 8: the QPN8 GEMV. M > 8: TurboMind
+          M == 0: empty output. 1 <= M <= 32: the QPN8 GEMV. M > 32: TurboMind
           FP8 if prepared has the fallback operands, else dequantize +
           mm, into `dense_scratch` (fp16, >= K*N elements, mutated) when
           given, else a per-call allocation. The M decision is inside the
@@ -59,7 +61,10 @@ except ImportError:  # torch < 2.4
 
 NAMESPACE = "_sm70_C"
 BLOCK = 128
-QPN8_MAX_M = 8  # fork fp8_block.py:45 (_QPN8_MAX_M)
+# Fork fp8_block.py:45 had 8 (its block path sent M>8 to TurboMind); the
+# K09 kernel serves block-scaled M=9..32 too, covering DFlash2 k=7 verify
+# for up to 4 requests (8 rows each).
+QPN8_MAX_M = 32
 
 # Load _sm70_C before any has_op() check below (see ops/tm.py).
 from vllm_sm70 import _ext  # noqa: E402
@@ -138,7 +143,7 @@ def fp8_qpn8_gemm_sm70_out(
     fast_decoder: bool = True,
     prefetch_codes: bool = False,
 ) -> None:
-    """out[M, N] = input[M, K] @ W, 1 <= M <= 8, fp16."""
+    """out[M, N] = input[M, K] @ W, 1 <= M <= 32, fp16 (split_k <= 16 for M > 8)."""
     _op("fp8_qpn8_gemm_sm70_out")(
         out,
         input,
@@ -213,7 +218,8 @@ def qpn8_config(k: int, n: int, gated: bool = False) -> tuple[int, int, bool]:
 
 def _valid_config(k: int, split_k: int, chains: int, prefetch: bool) -> bool:
     # Mirrors the TORCH_CHECKs of fp8_qpn8_gemm_sm70_out.
-    if split_k not in _SPLITS or chains not in (1, 2) or k % 16:
+    # split 32 is valid only up to M=8; configs here must serve M<=32.
+    if split_k not in _SPLITS or split_k > 16 or chains not in (1, 2) or k % 16:
         return False
     if (k // 16) % split_k:
         return False
@@ -231,8 +237,9 @@ def qpn8_rejection(n: int, k: int) -> str | None:
 def needs_turbomind_fallback(
     max_num_seqs: int, num_speculative_tokens: int = 0
 ) -> bool:
-    """Keep TurboMind FP8 operands when decode/verify can exceed M=8
-    (fork fp8_block.py:204-213 _keep_volta_turbomind_copy)."""
+    """Keep TurboMind FP8 operands when decode/verify rows can exceed
+    QPN8_MAX_M=32 (fork fp8_block.py:204-213 _keep_volta_turbomind_copy,
+    which used 8)."""
     return max_num_seqs * (1 + num_speculative_tokens) > QPN8_MAX_M
 
 
@@ -252,7 +259,7 @@ class Qpn8Prepared:
     split_k: int
     accumulator_chains: int
     prefetch_codes: bool
-    # TurboMind FP8 operands for M > 8 (K03 fp8_sm70_prepare), or None.
+    # TurboMind FP8 operands for M > 32 (K03 fp8_sm70_prepare), or None.
     tm_weight: torch.Tensor | None = None
     tm_scales: torch.Tensor | None = None
     tm_k_ld: int = 0

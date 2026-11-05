@@ -58,10 +58,8 @@ def test_cuda_impls_and_trim():
     assert set(re.findall(r'm\.impl\("(\w+)"', block.group(1))) == set(qpn8_schemas())
     for gone in (
         "sm70_policy.h",
-        "qpn_pair_sm70.cuh",
         "dense_weight_ptr",
         "from_blob",
-        "twophase",
         "gated_pair_sm70_out",
         "hc_dispatch",
         "TORCH_LIBRARY_FRAGMENT(_C",
@@ -69,14 +67,33 @@ def test_cuda_impls_and_trim():
         assert gone not in text, gone
 
 
-def test_gemm_guards_are_m8_and_shape_generic():
-    """The TP4-only lesson (#34/#40): no guard may name a model shape."""
+def _gemm_checks() -> str:
     body = QPN8_CU.read_text().split("void fp8_qpn8_gemm_sm70_out(", 1)[1]
-    checks = re.findall(r"TORCH_CHECK\((.*?)\);", body, re.S)
-    joined = " ".join(checks)
-    assert "m >= 1 && m <= 8" in joined
+    body = body.split("\n}\n", 1)[0]
+    return " ".join(re.findall(r"TORCH_CHECK\((.*?)\);", body, re.S))
+
+
+def test_gemm_guards_are_shape_generic():
+    """The TP4-only lesson (#34/#40): no guard may name a model shape, and
+    block scales are not refused above M=8 any more."""
+    joined = _gemm_checks()
     for literal in re.findall(r"\b\d{3,}\b", joined):
         assert literal in ("128",), f"shape literal {literal} in a guard"
+    assert "requires channel scales" not in joined
+
+
+def test_m_cap_has_one_source(qpn8_stub):
+    """QPN8_MAX_M (read by M8) equals the C++ M bound, the dispatch and the
+    TurboMind-copy rule."""
+    cap = qpn8_stub.QPN8_MAX_M
+    assert isinstance(cap, int) and cap == 32
+    bounds = re.findall(r"m >= 1 && m <= (\d+)", _gemm_checks())
+    assert bounds == [str(cap)], bounds
+    src = QPN8_PY.read_text()
+    assert "if m <= QPN8_MAX_M:" in src
+    assert "> QPN8_MAX_M" in src.split("def needs_turbomind_fallback", 1)[1]
+    assert qpn8_stub.needs_turbomind_fallback(cap, 0) is False
+    assert qpn8_stub.needs_turbomind_fallback(cap + 1, 0) is True
 
 
 def test_sources_cmake_lists_the_tu():
@@ -154,8 +171,8 @@ def test_tp2_dense_shapes_are_admitted(qpn8_stub, name):
     n, k = TP2_SHAPES[name]
     assert qpn8_stub.qpn8_rejection(n, k) is None
     split, chains, prefetch = qpn8_stub.qpn8_config(k, n)
-    # Exactly the C++ guards of fp8_qpn8_gemm_sm70_out.
-    assert split in (4, 8, 12, 16, 32) and (k // 16) % split == 0
+    # The C++ guards of fp8_qpn8_gemm_sm70_out for M up to 32 (split <= 16).
+    assert split in (4, 8, 12, 16) and (k // 16) % split == 0
     assert chains in (1, 2)
     assert split != 12 or (chains == 2 and not prefetch)
     assert (k, n, False) not in qpn8_stub.QPN8_CONFIGS  # generic at TP2
@@ -180,10 +197,12 @@ def test_unaligned_and_empty_weights_report_reason(qpn8_stub, n, k):
     [
         (1, 5, False),
         (8, 0, False),
-        (9, 0, True),
-        (2, 5, True),
+        (9, 0, False),
+        (2, 5, False),
         (1, 7, False),
-        (4, 7, True),
+        (4, 7, False),  # Qwen3.8 + DFlash2 k=7, 4 requests: 32 rows
+        (5, 7, True),
+        (33, 0, True),
     ],
 )
 def test_turbomind_fallback_follows_decode_rows(qpn8_stub, max_num_seqs, spec, copy):
@@ -236,8 +255,8 @@ def test_empty_activation_does_not_launch(recorder, qpn8_stub):
     assert recorder == []
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
-def test_m_le_8_uses_qpn8(recorder, qpn8_stub, m):
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 9, 16, 17, 24, 32])
+def test_m_le_32_uses_qpn8(recorder, qpn8_stub, m):
     codes, scales = _operands()
     y = qpn8_stub._qpn8_native_linear_impl(
         torch.ones(m, 512, dtype=torch.float16), codes, scales, 16, 2, False
@@ -245,25 +264,34 @@ def test_m_le_8_uses_qpn8(recorder, qpn8_stub, m):
     assert recorder == [("qpn8", m, 16, 2)] and y.shape == (m, 256)
 
 
-def test_m_gt_8_uses_turbomind_when_held(recorder, qpn8_stub):
+def test_m_gt_32_uses_turbomind_when_held(recorder, qpn8_stub):
     codes, scales = _operands()
     w, s = torch.zeros(1), torch.zeros(1)
     y = qpn8_stub._qpn8_native_linear_impl(
-        torch.ones(9, 512, dtype=torch.float16), codes, scales, 16, 2, False, w, s, 7, 9
+        torch.ones(33, 512, dtype=torch.float16),
+        codes,
+        scales,
+        16,
+        2,
+        False,
+        w,
+        s,
+        7,
+        9,
     )
-    assert recorder == [("turbomind", 9, 7, 9)] and bool((y == 2).all())
+    assert recorder == [("turbomind", 33, 7, 9)] and bool((y == 2).all())
 
 
-def test_m_gt_8_dequantizes_into_caller_scratch(recorder, qpn8_stub):
+def test_m_gt_32_dequantizes_into_caller_scratch(recorder, qpn8_stub):
     codes, scales = _operands()
     scratch = torch.zeros(512 * 256 + 10, dtype=torch.float16)
-    x = torch.ones(16, 512, dtype=torch.float16)
+    x = torch.ones(48, 512, dtype=torch.float16)
     y = qpn8_stub._qpn8_native_linear_impl(
         x, codes, scales, 16, 2, False, dense_scratch=scratch
     )
     assert recorder == [("dequant", (512, 256))]
     assert bool((scratch[: 512 * 256] == 0.5).all())  # written in place
-    assert torch.allclose(y.float(), torch.full((16, 256), 256.0))
+    assert torch.allclose(y.float(), torch.full((48, 256), 256.0))
     recorder.clear()
     y2 = qpn8_stub._qpn8_native_linear_impl(x, codes, scales, 16, 2, False)
     assert recorder == [("dequant", (512, 256))]
