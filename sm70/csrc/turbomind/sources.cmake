@@ -67,6 +67,8 @@ set(VLLM_SM70_TM_SRCS
   "${_VLLM_SM70_TM_ROOT}/ops/tm_nvfp4_sm70.cu"
   "${_VLLM_SM70_TM_ROOT}/ops/tm_moe_sm70.cu"
   "${_VLLM_SM70_TM_ROOT}/ops/qwen38_prefill_cutlass.cu"
+  # K11: Flint NVFP4 M<=2 GEMV; calls K03's nvfp4_gemm_sm70_out for M > 2.
+  "${_VLLM_SM70_TM_ROOT}/ops/nvfp4_tm_gemv_sm70.cu"
   # K04: AWQ/int4 dense; an empty TU unless VLLM_SM70_TM_AWQ is on.
   "${_VLLM_SM70_TM_ROOT}/ops/tm_awq_sm70.cu")
 
