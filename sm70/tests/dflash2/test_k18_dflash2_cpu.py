@@ -299,12 +299,145 @@ def test_mark_skips_quantized_and_kill_switch(monkeypatch):
     assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
 
 
-def test_m7_marks_and_packs():
-    """M7's draft classes call into K18 (constructor marks, load_weights packs)."""
-    import inspect
+# ------------------------------------------------- reload / no autograd
+def test_reload_repacks_in_place_without_autograd(monkeypatch):
+    """A second prepare refills the same buffer (no 2nd copy, never stale)."""
+    monkeypatch.setattr(dflash2, "enabled", lambda: True)
+    monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
+    calls = []
+    real_pack = dflash2.pack_weight
 
-    from vllm_sm70.models.qwen import dflash_sm70
+    def spy_pack(weight, tile, out=None):
+        calls.append(out)
+        return real_pack(weight, tile, out=out)
 
-    src = inspect.getsource(dflash_sm70._build_classes)
-    assert "dflash2.mark_draft_linears(self)" in src
-    assert "dflash2.prepare_marked(self)" in src
+    monkeypatch.setattr(dflash2, "pack_weight", spy_pack)
+    torch.manual_seed(0)
+    layer = nn.Linear(2048, 512, bias=False).half()  # (512, 2048): admitted
+    assert layer.weight.requires_grad
+    assert dflash2.mark_and_prepare(layer)
+    packed = getattr(layer, dflash2.PACKED_ATTR)
+    ptr = packed.data_ptr()
+    assert calls == [None]  # first call allocates
+    assert torch.equal(packed, real_pack(layer.weight.detach(), 16))
+    # no_grad, not inference_mode: no graph, and still writable in place.
+    assert not packed.requires_grad and packed.grad_fn is None
+    assert not packed.is_inference()
+    old = packed.clone()
+
+    with torch.no_grad():
+        layer.weight.copy_(torch.randn_like(layer.weight))  # "reload"
+    assert dflash2.prepare_marked(layer) == 1
+    again = getattr(layer, dflash2.PACKED_ATTR)
+    assert again is packed and again.data_ptr() == ptr
+    assert len(calls) == 2 and calls[1] is packed  # repacked into it
+    assert torch.equal(again, real_pack(layer.weight.detach(), 16))
+    assert not torch.equal(again, old)
+    assert not again.requires_grad and again.grad_fn is None
+    assert list(layer.state_dict()) == ["weight"]
+
+
+# ------------------------------------------- M7 hook (regression guard)
+def _m7_classes(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.models import qwen3_dflash2
+
+    from vllm_sm70.models.qwen import dflash_sm70 as m7
+
+    method = object.__new__(UnquantizedLinearMethod)
+
+    def proj():
+        m = nn.Module()
+        m.quant_method = method
+        return m
+
+    def fake_base_init(
+        self,
+        vllm_config,
+        *,
+        config,
+        layer_idx,
+        cache_config=None,
+        quant_config=None,
+        prefix="",
+    ):
+        nn.Module.__init__(self)
+        self.self_attn = nn.Module()
+        self.self_attn.qkv_proj = proj()
+        self.self_attn.o_proj = proj()
+        self.mlp = nn.Module()
+        self.mlp.gate_up_proj = proj()
+        self.mlp.down_proj = proj()
+        self.attention_conv = nn.Module()
+        self.attention_conv.kernel_projection = proj()
+        self.mlp_conv = nn.Module()
+        self.mlp_conv.kernel_projection = proj()
+        # an unrelated linear must stay unmarked
+        self.other = proj()
+
+    monkeypatch.setattr(
+        qwen3_dflash2.DFlash2Qwen3DecoderLayer, "__init__", fake_base_init
+    )
+    monkeypatch.setattr(m7, "emulation_enabled", lambda config, dtype: True)
+    monkeypatch.setattr(m7, "_CLASSES", None)
+    return m7
+
+
+def _build_m7_layer(m7):
+    from types import SimpleNamespace
+
+    cls = m7.DFlash2SM70Qwen3DecoderLayer
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16))
+    config = SimpleNamespace(hidden_size=64, rms_norm_eps=1e-6)
+    return cls(vllm_config, config=config, layer_idx=0)
+
+
+def _marked(layer):
+    return {
+        name
+        for name, m in layer.named_modules()
+        if getattr(m, dflash2.MARK_ATTR, False)
+    }
+
+
+def test_m7_layer_marks_exactly_six_projections(monkeypatch):
+    m7 = _m7_classes(monkeypatch)
+    layer = _build_m7_layer(m7)
+    assert layer.use_sm70_bf16_emulation
+    assert _marked(layer) == {
+        "self_attn.qkv_proj",
+        "self_attn.o_proj",
+        "mlp.gate_up_proj",
+        "mlp.down_proj",
+        "attention_conv.kernel_projection",
+        "mlp_conv.kernel_projection",
+    }
+
+
+def test_m7_layer_marks_nothing_when_killed(monkeypatch):
+    m7 = _m7_classes(monkeypatch)
+    monkeypatch.setenv(KILL, "0")
+    assert _marked(_build_m7_layer(m7)) == set()
+
+
+def test_m7_load_weights_calls_prepare_marked(monkeypatch):
+    m7 = _m7_classes(monkeypatch)
+    from vllm.model_executor.models import qwen3_dflash
+
+    order = []
+
+    def fake_super_load(self, weights):
+        order.append("load")
+        return {"w"}
+
+    monkeypatch.setattr(
+        qwen3_dflash.DFlashQwen3ForCausalLM, "load_weights", fake_super_load
+    )
+    monkeypatch.setattr(
+        dflash2, "prepare_marked", lambda model: order.append(("prepare", model))
+    )
+    cls = m7.DFlash2SM70Qwen3ForCausalLM
+    model = object.__new__(cls)
+    assert cls.load_weights(model, iter(())) == {"w"}
+    assert order == ["load", ("prepare", model)]

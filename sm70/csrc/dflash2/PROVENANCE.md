@@ -42,7 +42,7 @@ The registrations in the fork lived in `csrc/torch_bindings.cpp:713-721` (`ops.d
 |---|---|---|
 | `GEOMETRY`, `DRAFT_SHAPES_TP2` | `quantization/sm70_dflash2_fp16.py:14-20` `_GEOMETRY` | changed: see "Admitted shapes" |
 | `pack_weight` | `sm70_dflash2_fp16.py:44-56` | split out of `prepare_dflash2_fp16_m8`, body identical |
-| `prepare_dflash2_fp16_m8` | `sm70_dflash2_fp16.py:23-67` | changed: `hasattr(torch.ops._C, ...)` → `enabled()` (kill switch + `_sm70_C` ops); `current_platform.is_device_capability(70)` → `torch.cuda.get_device_capability(dev) == (7, 0)`; dropped the `VLLM_BATCH_INVARIANT` check (UP `UnquantizedLinearMethod.apply`, linear.py:238-241, handles batch-invariant mode before calling the U1 GEMM); logs unadmitted shapes |
+| `prepare_dflash2_fp16_m8` | `sm70_dflash2_fp16.py:23-67` | changed: runs under `torch.no_grad()`; a second call repacks in place into the existing buffer (`index_select(out=)`); `hasattr(torch.ops._C, ...)` → `enabled()` (kill switch + `_sm70_C` ops); `current_platform.is_device_capability(70)` → `torch.cuda.get_device_capability(dev) == (7, 0)`; dropped the `VLLM_BATCH_INVARIANT` check (UP `UnquantizedLinearMethod.apply`, linear.py:238-241, handles batch-invariant mode before calling the U1 GEMM); logs unadmitted shapes |
 | `apply_dflash2_fp16_m8` | `sm70_dflash2_fp16.py:70-92` | changed: eager admits M 1..8 (fork: M == 8); dropped the `_sm70_f16_prepared` (TurboMind F16 dense, not ported) and `VLLM_BATCH_INVARIANT` checks |
 | `dflash2_unquantized_gemm` | `linear.py:404-411` (`UnquantizedLinearMethod.apply` calls it first) | new home: the U1 callable; falls back to `F.linear` (UP `default_unquantized_gemm`) |
 | `select_unquantized_gemm` | – | new: what `Sm70CudaPlatform.get_unquantized_gemm` returns; None (upstream dispatch) when the kill switch is 0, the ops are missing, or an explicit FlashInfer BF16 backend was chosen |
@@ -76,5 +76,5 @@ Memory: packing keeps a second copy of each admitted weight (as the fork did). Q
 ## Known limits
 
 - `compact_half_topk` has **no consumer** in upstream v0.33.0 (the fork's was the DFlash2 target probe in `logits_processor.py:620-631`), and its 16-bit index packing caps the width at 65535: the 248320-token vocab is 62080 per rank at TP4 but 124160 at TP2, so at TP2 the guard returns None (GPU test `test_tp2_vocab_shard_falls_back`). Ported as an op for a future consumer.
-- The packed copy is built once in `load_weights`; a later in-place weight update (weight reload / RLHF sync) would leave it stale.
+- The packed copy is built in `load_weights`. Another `load_weights` call (weight reload, sleep/wake) repacks in place into the same buffer, with no second copy (CPU test `test_reload_repacks_in_place_without_autograd`). A weight update that bypasses `load_weights` (e.g. a direct `copy_` from an RLHF sync) still needs `dflash2.prepare_marked(model)` afterwards.
 - M > 8 (several draft requests per step) keeps `F.linear`.

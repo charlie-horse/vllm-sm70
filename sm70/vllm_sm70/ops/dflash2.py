@@ -132,6 +132,8 @@ def enabled() -> bool:
 
 
 def _is_sm70(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     try:
         return torch.cuda.get_device_capability(device) == (7, 0)
     except Exception:
@@ -211,8 +213,15 @@ def mark_draft_linears(decoder_layer: torch.nn.Module) -> list[torch.nn.Module]:
     return marked
 
 
-def pack_weight(weight: torch.Tensor, tile: int) -> torch.Tensor:
-    """[N, K] fp16 -> the kernel's [N/tile, K/16, tile, 16] slot order."""
+@torch.no_grad()
+def pack_weight(
+    weight: torch.Tensor, tile: int, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """[N, K] fp16 -> the kernel's [N/tile, K/16, tile, 16] slot order.
+
+    With ``out`` (same shape/dtype/device, contiguous) the result is written
+    into it in place, without allocating a second packed copy.
+    """
     # ported from FORK sm70_dflash2_fp16.py:45-56
     n, k = weight.shape
     slots = torch.arange(tile, device=weight.device)
@@ -221,16 +230,25 @@ def pack_weight(weight: torch.Tensor, tile: int) -> torch.Tensor:
         if tile == 32
         else (slots & 3) | ((slots & 4) << 1) | ((slots & 8) >> 1)
     )
-    return (
-        weight.view(n // tile, tile, k // 16, 16)
-        .permute(0, 2, 1, 3)
-        .index_select(2, columns)
-        .contiguous()
-    )
+    source = weight.view(n // tile, tile, k // 16, 16).permute(0, 2, 1, 3)
+    if out is None:
+        out = torch.empty(
+            (n // tile, k // 16, tile, 16), dtype=weight.dtype, device=weight.device
+        )
+    # index_select(out=) writes the gathered slots straight into `out`.
+    torch.index_select(source, 2, columns, out=out)
+    return out
 
 
+@torch.no_grad()
 def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
-    """Pack a marked layer's weight once, after load. True if packed."""
+    """Pack a marked layer's weight after load. True if packed.
+
+    A repeated call (weight reload, sleep/wake) repacks in place into the
+    existing buffer: no second copy, and never stale. no_grad (not
+    inference_mode), so the buffer stays an ordinary tensor that a later
+    in-place repack may write to.
+    """
     # ported from FORK sm70_dflash2_fp16.py:23-67
     if not getattr(layer, MARK_ATTR, False):
         return False
@@ -241,7 +259,6 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
         weight is None
         or weight.ndim != 2
         or weight.dtype != torch.float16
-        or not weight.is_cuda
         or not weight.is_contiguous()
         or getattr(layer, "bias", None) is not None
         or not _is_sm70(weight.device)
@@ -260,6 +277,17 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
     n, k = weight.shape
     if not geometry_valid(n, k, tile, warps):  # pragma: no cover - table bug
         return False
+    existing = getattr(layer, PACKED_ATTR, None)
+    if (
+        existing is not None
+        and existing.shape == (n // tile, k // 16, tile, 16)
+        and existing.dtype == weight.dtype
+        and existing.device == weight.device
+        and existing.is_contiguous()
+        and getattr(layer, GEOMETRY_ATTR, None) == geometry
+    ):
+        pack_weight(weight.detach(), tile, out=existing)
+        return True
     packed = pack_weight(weight.detach(), tile)
     # Retain the original matrix for prefill, batched drafting, and context KV.
     layer.register_buffer(PACKED_ATTR, packed, persistent=False)
@@ -274,8 +302,12 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
     return True
 
 
+@torch.no_grad()
 def prepare_marked(modules: Iterable[torch.nn.Module] | torch.nn.Module) -> int:
-    """Pack every marked layer under ``modules``; returns how many were packed."""
+    """Pack every marked layer under ``modules``; returns how many were packed.
+
+    Safe to call again after a weight reload: existing buffers are refilled.
+    """
     if isinstance(modules, torch.nn.Module):
         modules = modules.modules()
     return sum(1 for m in modules if prepare_dflash2_fp16_m8(m))
