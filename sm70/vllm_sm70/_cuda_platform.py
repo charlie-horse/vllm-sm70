@@ -160,4 +160,18 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        return None
+        # K13 (risk R4): admit the fused router and allocate its per-layer
+        # workspace before CUDA graph capture.
+        get_model = getattr(worker, "get_model", None)
+        if get_model is None:
+            return
+        from vllm_sm70 import router
+
+        router.prepare_model(get_model())
+
+    # U3 hook (Penny's patch, fork contract): MoERunner.router_provider.
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()

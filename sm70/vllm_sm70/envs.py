@@ -173,7 +173,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # fused_recurrent.py, which only checks for "0").
         "VLLM_SM70_FLA_RECURRENT_SCHED": kill_switch("VLLM_SM70_FLA_RECURRENT_SCHED"),
     },
-    "fused_moe": {},
+    "fused_moe": {
+        # K13: fused E256/K6 sigmoid decode router (vllm_sm70/router.py).
+        "VLLM_SM70_FLINT_FUSED_ROUTER": kill_switch("VLLM_SM70_FLINT_FUSED_ROUTER"),
+    },
     # Mara (M1 sm70-config, M2 sm70-quant-gates). Kill switches only.
     "quant": {
         # M2: "0" skips registering the SM70 "fp8"/"modelopt_fp4" configs;
