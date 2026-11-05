@@ -7,7 +7,7 @@ Locked 2026-11-04. Change a pin only through a PR that updates this file.
 ## Pins
 | component | pin | source | hash | evidence |
 |---|---|---|---|---|
-| vLLM | v0.33.0 = 4ba787ec9959e566d3b587a796dff07673324da5 (== v0.33.0rc3) | github:vllm-project/vllm | fetchFromGitHub `sha256-I72HXJjBOCmNSwbuK/D3KB5/YGGJ0f1OY5BhWDevI/w=` | `git ls-remote` shows v0.33.0^{} = 4ba787e, commit date 2026-10-31. Release published 11-02 and marked Latest. Hash = `nix hash path` of `git archive HEAD` (there is no .gitattributes, so it should equal the GH tarball). Re-confirmed with `nix flake prefetch github:vllm-project/vllm/v0.33.0` |
+| vLLM | v0.33.0 = 4ba787ec9959e566d3b587a796dff07673324da5 (== v0.33.0rc3) | github:vllm-project/vllm | fetchFromGitHub `sha256-I72HXJjBOCmNSwbuK/D3KB5/YGGJ0f1OY5BhWDevI/w=` | `git ls-remote` shows v0.33.0^{} = 4ba787e, commit date 2026-10-31. Release published 11-02 and marked Latest. Hash = `nix flake prefetch github:vllm-project/vllm/v0.33.0` (the authoritative value; it hashes GitHub's tarball). It equals `nix hash path` of a `git archive` export only because the tag has no `.gitattributes` with `export-ignore`/`export-subst`. Re-check that if a future tag adds one |
 | torch | 2.14.0+cu126, cp313 manylinux_2_28_x86_64 | https://download-r2.pytorch.org/whl/cu126/torch-2.14.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl | sha256 `ac9d1ce1093606f5cb1deb4f612d2fcb273ed10ff4a33703abba09cc16c5dcc8` = `sha256-rJ0c4Qk2BvXLHetPYS0vyyc+0Q/0ozcDq7oJzBbF3Mg=` (869,176,671 B) | Download sha256sum matches the index `#sha256`. **sm_70 SASS:** a .nv_fatbin parse of torch/lib/libtorch_cuda.so finds ELF cubins sm_50/60/**70**/75/80/86 ×418 each, sm_90 ×422, no PTX. The embedded build flags string is `-gencode;arch=compute_70,code=sm_70;…compute_90,code=sm_90`. cp310–cp315 all exist |
 | triton | 3.8.0, cp313 manylinux_2_27/2_28 x86_64 | https://files.pythonhosted.org/packages/b0/b6/3394d5548404c1cabd1dadadd28d0b3f9478db1dff8180da53bb3f0a1e19/triton-3.8.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl | sha256 `1f0497218e26b7d79773ad9c2a3fa3b539ee69f587a13fac2e552b1d322a8015` = `sha256-HwSXIY4mt9eXc62cKj+jtTnuafWHoT+sLlUrHTIqgBU=` (247,975,122 B) | torch METADATA `triton~=3.8.0`. Bundled `backends/nvidia/bin/ptxas` reports "release 12.9, V12.9.86", and its strings include `.target sm_70` (sm_70 OK). ptxas-blackwell is 13.3, and cuobjdump/nvdisasm are 13.1 |
 | python | CPython 3.13.17 (python3 → python313) | nixos-26.05 all-packages.nix:4831 | – | nix eval |
@@ -60,20 +60,24 @@ Full URLs are in the PyPI JSON (`/pypi/<name>/<ver>/json`).
 - **Constraints:** requires-python <3.14 and `numpy<=2.2.6`.
 
 ## Build-time fetches (all FetchContent, all fetched unconditionally for CUDA builds; the arch gate only skips compiling. The Nix sandbox has no network, so feed every one via its env var or patch out the include)
-Hash = `nix hash path` of `git archive` **without submodules**. FetchContent's default recursively inits submodules, so check whether each one needs them.
-| dep | rev | env override | subm. | Nix hash (no submodules) | sm_70? |
-|---|---|---|---|---|---|
-| cutlass | v4.7.1 = cb4247394dd82148787aed73e5dc7cef33cbf862 (CMakeLists.txt:512) | VLLM_CUTLASS_SRC_DIR | 0 | sha256-z/jASQGRj9fYwgyJKvzWgowG7j2zNKb3xeFUzYwwLQA= | Header-only; needed by core _C (scaled_mm/machete sources are arch-gated, but the include path is always used). Keep |
-| vllm-flash-attn | b273a02621d3c94bc747df67204f591b67f38fae | VLLM_FLASH_ATTN_SRC_DIR | 3 (cutlass, composable_kernel, aiter) | sha256-8qGtJl18nIo8Kd/jPYlDK8K83uuu4W1mZ0x0oTvXU8w= | No: FA's own CUDA_SUPPORTED_ARCHS is "8.0;8.6;8.9;9.0(+10/12)" (its CMakeLists.txt:25), and FA2 is "8.0+PTX". Its arch list ends up empty but doesn't FATAL. Patch out CMakeLists.txt:1713 or feed the source; it builds nothing for 7.0 |
-| triton_kernels | triton-lang/triton v3.5.1 = 0add68262ab0a2e33b84524346cb27cbb2787356 (SOURCE_SUBDIR python/triton_kernels) | TRITON_KERNELS_SRC_DIR (point it at the python/triton_kernels/triton_kernels dir) | 0 | sha256-dyNRtS1qtU8C/iAf0Udt/1VgtKGSvng1+r2BtvT9RB4= | Python-only (MoE matmul_ogs); mostly Hopper paths. Can feed it or patch out CMakeLists.txt:1686-1688. **Note the v3.5.1 vs runtime triton 3.8 mismatch** |
-| DeepGEMM | vllm-project/DeepGEMM 0820030756945b2daec208e8e8255268360f337d (deepgemm.cmake:40) | DEEPGEMM_SRC_DIR | 2 | sha256-xBqbHoQw0P0N3zPF1H4dYEpuB6wMfeC3N78ts/Sgd1U= | No (9.0a/10.x/12.x only) |
-| DeepSelect | d96d33afe1fab0d6066da49cdc91e64c2bee65ea | DEEPSELECT_SRC_DIR | 1 | sha256-7+lmKQH08v9dhQ9KaZtcs25haMdkwKOEk5noS9/GiB8= | No (10.0f, nvcc≥12.9) |
-| FMHA_SM100 (MSA) | 968061ab16cb14991a5c7d4c0e8eabf531be0dcf | FMHA_SM100_SRC_DIR | 1 | sha256-gEkRT++7MDBokuqzDHp4F/e3yCXSt8xuUz0vmJ5CN60= | No (SM100 python/JIT; always populated and installed) |
-| FlashMLA | e2afa5fd8c220fbd05fe03fc24c9d5e64c24641b | FLASH_MLA_SRC_DIR | 1 | sha256-HN0iqHMYSXYb2XZ5/5QWYdZ9/Hi6DU9XdboPwFao9LU= | No (9.0a/10.x) |
-| FlashKDA | 17a037d98da546deb4591e967cf961a43c034d8b | FLASH_KDA_SRC_DIR | 1 | sha256-3+y7I5QNs+Vr/vDeBhqyy2WwZvQEo8JiB8Jskc3zuvs= | No (9.0a/10.x/12.x) |
-| qutlass | IST-DASLab/qutlass e74319e3405ce6d71965732880f5dc1f52371f64 (qutlass.cmake:25) | QUTLASS_SRC_DIR | 1 | sha256-Gzl3KuYXXLXMrVciEYrBPu1FH2cplGUPTFpWzFfUmMo= | No (10.x/12.x) |
-| tml-fa4 | 75765e76a9c2c012c1f6ecd64577eb646eb4d303 | TML_FA4_SRC_DIR | 0 | sha256-zw19GAgsA0+5XzJNGLInIMN4GMRXqJsLkiVViRkv6fI= | No (CuteDSL FA4, Blackwell) |
-| oneDNN | 9c5be1cc… / v3.13 | – | – | – | CPU build only, not pulled for CUDA |
+Two hashes per dependency:
+- **without submodules:** `nix hash path` of a `git archive` export;
+- **with submodules:** `fetchSubmodules = true`, reproduced with `git submodule update --init --recursive`, `.git` stripped, then `nix hash path`. This matches `nix/deps.nix`.
+
+FetchContent's default recursively inits submodules. DeepSelect and qutlass have a cutlass submodule that we don't fetch: DeepSelect only uses it for 10.0f (nvcc ≥ 12.9), and qutlass prefers vLLM's cutlass. Once patch 0001 (`build`, PR #15) lands, only cutlass will be fetched; the other rows will then document what `VLLM_SM70_TRIM_EXTERNALS=0` brings back. Until then, all ten are fetched.
+| dep | rev | env override | subm. | Nix hash (no submodules) | Nix hash (with submodules) | sm_70? |
+|---|---|---|---|---|---|---|
+| cutlass | v4.7.1 = cb4247394dd82148787aed73e5dc7cef33cbf862 (CMakeLists.txt:512) | VLLM_CUTLASS_SRC_DIR | 0 | sha256-z/jASQGRj9fYwgyJKvzWgowG7j2zNKb3xeFUzYwwLQA= | same (no submodules) | Header-only; needed by core _C (scaled_mm/machete sources are arch-gated, but the include path is always used). Keep |
+| vllm-flash-attn | b273a02621d3c94bc747df67204f591b67f38fae | VLLM_FLASH_ATTN_SRC_DIR | 3 (cutlass, composable_kernel, aiter) | sha256-8qGtJl18nIo8Kd/jPYlDK8K83uuu4W1mZ0x0oTvXU8w= | `sha256-0akJwKOdunEZeU289NbdvYH/3QXqeiMCRLdmId4ONRY=` | No: FA's own CUDA_SUPPORTED_ARCHS is "8.0;8.6;8.9;9.0(+10/12)" (its CMakeLists.txt:25), and FA2 is "8.0+PTX". Its arch list ends up empty but doesn't FATAL. Patch out CMakeLists.txt:1713 or feed the source; it builds nothing for 7.0 |
+| triton_kernels | triton-lang/triton v3.5.1 = 0add68262ab0a2e33b84524346cb27cbb2787356 (SOURCE_SUBDIR python/triton_kernels) | TRITON_KERNELS_SRC_DIR (point it at the python/triton_kernels/triton_kernels dir) | 0 | sha256-dyNRtS1qtU8C/iAf0Udt/1VgtKGSvng1+r2BtvT9RB4= | same (no submodules) | Python-only (MoE matmul_ogs); mostly Hopper paths. Can feed it or patch out CMakeLists.txt:1686-1688. **Note the v3.5.1 vs runtime triton 3.8 mismatch** |
+| DeepGEMM | vllm-project/DeepGEMM 0820030756945b2daec208e8e8255268360f337d (deepgemm.cmake:40) | DEEPGEMM_SRC_DIR | 2 | sha256-xBqbHoQw0P0N3zPF1H4dYEpuB6wMfeC3N78ts/Sgd1U= | `sha256-Qbup5RiPYdbREooAt8m2Gq5C/B8EB4ywkTJjFJIxRbU=` | No (9.0a/10.x/12.x only) |
+| DeepSelect | d96d33afe1fab0d6066da49cdc91e64c2bee65ea | DEEPSELECT_SRC_DIR | 1 | sha256-7+lmKQH08v9dhQ9KaZtcs25haMdkwKOEk5noS9/GiB8= | not fetched; see above | No (10.0f, nvcc≥12.9) |
+| FMHA_SM100 (MSA) | 968061ab16cb14991a5c7d4c0e8eabf531be0dcf | FMHA_SM100_SRC_DIR | 1 | sha256-gEkRT++7MDBokuqzDHp4F/e3yCXSt8xuUz0vmJ5CN60= | `sha256-KDDjfMXys47XeYTMS3eQC+qa257XU88PikoEsMaCO9g=` | No (SM100 python/JIT; always populated and installed) |
+| FlashMLA | e2afa5fd8c220fbd05fe03fc24c9d5e64c24641b | FLASH_MLA_SRC_DIR | 1 | sha256-HN0iqHMYSXYb2XZ5/5QWYdZ9/Hi6DU9XdboPwFao9LU= | `sha256-ffqgYT/L2cYs/PY1QZPsSskPz56Rw3F5XAvaUHbytK8=` | No (9.0a/10.x) |
+| FlashKDA | 17a037d98da546deb4591e967cf961a43c034d8b | FLASH_KDA_SRC_DIR | 1 | sha256-3+y7I5QNs+Vr/vDeBhqyy2WwZvQEo8JiB8Jskc3zuvs= | `sha256-1IYJcMN70jY9gT/OWNhyEZswc1h1+b+HsSbZ8uLPQSQ=` | No (9.0a/10.x/12.x) |
+| qutlass | IST-DASLab/qutlass e74319e3405ce6d71965732880f5dc1f52371f64 (qutlass.cmake:25) | QUTLASS_SRC_DIR | 1 | sha256-Gzl3KuYXXLXMrVciEYrBPu1FH2cplGUPTFpWzFfUmMo= | not fetched; see above | No (10.x/12.x) |
+| tml-fa4 | 75765e76a9c2c012c1f6ecd64577eb646eb4d303 | TML_FA4_SRC_DIR | 0 | sha256-zw19GAgsA0+5XzJNGLInIMN4GMRXqJsLkiVViRkv6fI= | same (no submodules) | No (CuteDSL FA4, Blackwell) |
+| oneDNN | 9c5be1cc… / v3.13 | – | – | – | – | CPU build only, not pulled for CUDA |
 
 How to disable them:
 - Simplest: patch CMakeLists.txt:1686-1714 to include only cutlass (plus triton_kernels if wanted).
