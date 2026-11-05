@@ -15,6 +15,14 @@
 //     std::nullopt / 0.
 //   * No policy object: knobs are compile-time (fv100_config.h).
 //
+// K14 adds a sixth op under `#ifdef VLLM_SM70_FV100_FUSED_DECODE` (on by
+// default, see sources.cmake): `fv100_decode_paged_sinks_fused`, the fork's
+// decode_paged_sinks_fused_fwd. It is fv100_decode_paged_sinks with required
+// sinks plus the int32 arrival counters, `Tensor(e!) counters`, of the
+// one-launch grouped GQA-8 D128 sink decode (>= B * H_kv entries, zero
+// between launches; the kernel's last CTA re-zeroes its counter). Shapes the
+// fused kernel does not take ignore the counters and decode in two launches.
+//
 // KV cache views: k_cache and v_cache are [num_blocks, block_size, H_kv, D]
 // views with arbitrary strides in the first three dims and a contiguous last
 // dim. Upstream v0.33.0 (LBNHC) interleaves K and V per head, so a view has
@@ -87,6 +95,31 @@ void decode_paged_sinks(at::Tensor out, const at::Tensor& q,
       static_cast<int>(window_size_left), static_cast<int>(window_size_right),
       std::nullopt, 0, sinks);
 }
+
+#ifdef VLLM_SM70_FV100_FUSED_DECODE
+// fork flash_attention_decode_paged_sinks_fused (flash_decode_paged.cu)
+void decode_paged_sinks_fused(
+    at::Tensor out, const at::Tensor& q, const at::Tensor& k_cache,
+    const at::Tensor& v_cache, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor tmp_out, at::Tensor max_logits,
+    at::Tensor exp_sums, const at::Tensor& active_num_partitions,
+    double softmax_scale, int64_t partition_size,
+    int64_t launch_num_partitions, const std::string& kv_cache_dtype,
+    double k_scale, double v_scale, int64_t window_size_left,
+    int64_t window_size_right, const at::Tensor& sinks, at::Tensor counters) {
+  check_out(out, q, "fv100_decode_paged_sinks_fused");
+  std::optional<at::Tensor> out_opt(out);
+  const std::optional<at::Tensor> sinks_opt(sinks);
+  flash_attention_decode_paged_sinks_fused(
+      q, k_cache, v_cache, out_opt, block_table, seq_lens, tmp_out,
+      max_logits, exp_sums, active_num_partitions,
+      static_cast<float>(softmax_scale), static_cast<int>(partition_size),
+      static_cast<int>(launch_num_partitions), kv_cache_dtype,
+      static_cast<float>(k_scale), static_cast<float>(v_scale),
+      static_cast<int>(window_size_left), static_cast<int>(window_size_right),
+      std::nullopt, 0, sinks_opt, counters);
+}
+#endif  // VLLM_SM70_FV100_FUSED_DECODE
 
 // fork flash_attention_decode_paged_xqa (flash_decode_paged.cu)
 void decode_paged_xqa(at::Tensor out, const at::Tensor& q,
@@ -206,3 +239,22 @@ TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
   m.impl("fv100_prefill_paged", &vllm_sm70::fv100::prefill_paged);
   m.impl("fv100_prefill_paged_sinks", &vllm_sm70::fv100::prefill_paged_sinks);
 }
+
+#ifdef VLLM_SM70_FV100_FUSED_DECODE
+// K14 (C4): fork fused_mha_api.cpp:29 decode_paged_sinks_fused_fwd.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def(
+      "fv100_decode_paged_sinks_fused(Tensor(a!) out, Tensor q, Tensor "
+      "k_cache, Tensor v_cache, Tensor block_table, Tensor seq_lens, "
+      "Tensor(b!) tmp_out, Tensor(c!) max_logits, Tensor(d!) exp_sums, Tensor "
+      "active_num_partitions, float softmax_scale, int partition_size, int "
+      "launch_num_partitions, str kv_cache_dtype, float k_scale, float "
+      "v_scale, int window_size_left, int window_size_right, Tensor sinks, "
+      "Tensor(e!) counters) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("fv100_decode_paged_sinks_fused",
+         &vllm_sm70::fv100::decode_paged_sinks_fused);
+}
+#endif  // VLLM_SM70_FV100_FUSED_DECODE

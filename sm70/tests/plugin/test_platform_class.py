@@ -53,6 +53,39 @@ def test_check_and_update_config_installs_pass(platform_cls, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("kill", [None, "0"])
+def test_check_and_update_config_installs_flint_splitting_op(
+    platform_cls, monkeypatch, kill
+):
+    """K15: the fused Flint q/k-norm+RoPE+KV op is split out next to
+    unified_kv_cache_update unless VLLM_SM70_FLINT_QK_ROPE_KV=0."""
+    from vllm.config import CompilationConfig
+    from vllm.config.compilation import CompilationMode
+    from vllm.platforms.cuda import CudaPlatform
+
+    from vllm_sm70.config import clear_cache
+    from vllm_sm70.flint import QK_ROPE_KV_SPLITTING_OP
+
+    if kill is None:
+        monkeypatch.delenv("VLLM_SM70_FLINT_QK_ROPE_KV", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", kill)
+    clear_cache()
+    monkeypatch.setattr(
+        CudaPlatform, "check_and_update_config", classmethod(lambda cls, cfg: None)
+    )
+    cc = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE, use_inductor_graph_partition=False
+    )
+    cfg = SimpleNamespace(compilation_config=cc)
+    platform_cls.check_and_update_config(cfg)
+    clear_cache()
+    if kill is None:
+        assert QK_ROPE_KV_SPLITTING_OP in cc.splitting_ops
+    else:
+        assert cc.splitting_ops is None
+
+
 def test_get_attn_backend_cls_falls_through(platform_cls, monkeypatch):
     from vllm.platforms.cuda import CudaPlatform
 

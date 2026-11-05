@@ -35,7 +35,11 @@ let
       ]);
 
   # Runtime deps + the build group (cmake/ninja/setuptools-scm/... for setup.py).
-  venv = pythonSet.mkVirtualEnv "vllm-sm70-env" workspace.deps.default;
+  # The runtime env adds the `lmcache` group (LMCache's deps that vLLM's set
+  # lacks); buildVenv leaves it out, so it doesn't rebuild the tree.
+  venv = pythonSet.mkVirtualEnv "vllm-sm70-env" (
+    workspace.deps.default // { vllm-sm70-env = [ "lmcache" ]; }
+  );
   buildVenv = pythonSet.mkVirtualEnv "vllm-sm70-build-env" (
     workspace.deps.default // { vllm-sm70-env = [ "build" ]; }
   );
@@ -50,6 +54,11 @@ let
   sm70ext = import ./sm70-ext.nix {
     inherit pkgs lib cuda buildVenv site deps;
     vllmSrc = src;
+  };
+
+  # LMCache 0.5.6 from the sdist for sm_70 (./lmcache-build.nix).
+  lmcacheBuild = import ./lmcache-build.nix {
+    inherit pkgs lib cuda buildVenv site;
   };
 
   tree = cuda.backendStdenv.mkDerivation {
@@ -159,7 +168,7 @@ let
     pkgs.runCommand "vllm-sm70-${src.version}"
       {
         nativeBuildInputs = [ pkgs.makeWrapper ];
-        passthru = { inherit venv tree sm70ext python pythonSet; };
+        passthru = { inherit venv tree sm70ext lmcacheBuild python pythonSet; };
       }
       ''
         site=${venv}/${python.sitePackages}
@@ -172,19 +181,27 @@ let
         # sm70> (e.g. VLLM_PLUGINS=) turns both off and runs stock vLLM.
         # TRITON_PTXAS_PATH is only a default (12.6 ptxas): set it to Triton's
         # bundled ptxas (12.9) to compare.
+        # lmcacheBuild follows sm70ext: vLLM's LMCache MP connector imports it,
+        # and `lmcache` (`lmcache server`, services.lmcache-sm70) runs from it.
         # VLLM_USE_FLASHINFER_SAMPLER defaults to 1 upstream, and
         # flashinfer_sampler_supported() imports flashinfer before checking
         # the GPU (v1/sample/ops/topk_topp_sampler.py:117-124); flashinfer is
         # not in the env (sm80+), so default it off.
-        for exe in python vllm; do
+        # VLLM_USE_V2_MODEL_RUNNER defaults to 0 (V1) until D2 (V1 vs V2 on
+        # Flint) is decided: Flint ran V1 on the fork, and U4's sampler hook
+        # targets V1. Unset, v0.33.0 picks V2 whenever no unsupported feature
+        # is on (config/vllm.py:748-765). Set it to 1 to run V2.
+        for exe in python vllm lmcache; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
+          [ $exe = lmcache ] && args+=(--add-flags "-m lmcache.cli.main")
           makeWrapper ${venv}/bin/python $out/bin/$exe "''${args[@]}" \
-            --prefix PYTHONPATH : ${tree}:${sm70ext} \
+            --prefix PYTHONPATH : ${tree}:${sm70ext}:${lmcacheBuild} \
             --set CUDA_HOME ${cuda.cudatoolkit} \
             --set CUDA_PATH ${cuda.cudatoolkit} \
             --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
             --set-default VLLM_USE_FLASHINFER_SAMPLER 0 \
+            --set-default VLLM_USE_V2_MODEL_RUNNER 0 \
             --set TRITON_LIBCUDA_PATH /run/opengl-driver/lib \
             --set CC ${cuda.backendStdenv.cc}/bin/cc \
             --set CXX ${cuda.backendStdenv.cc}/bin/c++ \
@@ -194,5 +211,5 @@ let
       '';
 in
 {
-  inherit vllm tree venv buildVenv sm70ext;
+  inherit vllm tree venv buildVenv sm70ext lmcacheBuild;
 }
