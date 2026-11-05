@@ -166,6 +166,9 @@ class _Rec:
 
 @pytest.fixture
 def rec(fv100, monkeypatch):
+    # K06 routing on the two-launch ops whatever the build has; the K14
+    # fused route is tested in test_fv100_fused_decode_cpu.py.
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     r = _Rec()
     monkeypatch.setattr(fv100, "_op", r)
     return r

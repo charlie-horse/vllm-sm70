@@ -53,6 +53,7 @@ let
   # edit doesn't rebuild vLLM's tree. Owned by Kai (nix/sm70-ext.nix).
   sm70ext = import ./sm70-ext.nix {
     inherit pkgs lib cuda buildVenv site deps;
+    vllmSrc = src;
   };
 
   # LMCache 0.5.6 from the sdist for sm_70 (./lmcache-build.nix).
@@ -186,6 +187,10 @@ let
         # flashinfer_sampler_supported() imports flashinfer before checking
         # the GPU (v1/sample/ops/topk_topp_sampler.py:117-124); flashinfer is
         # not in the env (sm80+), so default it off.
+        # VLLM_USE_V2_MODEL_RUNNER defaults to 0 (V1) until D2 (V1 vs V2 on
+        # Flint) is decided: Flint ran V1 on the fork, and U4's sampler hook
+        # targets V1. Unset, v0.33.0 picks V2 whenever no unsupported feature
+        # is on (config/vllm.py:748-765). Set it to 1 to run V2.
         for exe in python vllm lmcache; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
@@ -196,6 +201,7 @@ let
             --set CUDA_PATH ${cuda.cudatoolkit} \
             --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
             --set-default VLLM_USE_FLASHINFER_SAMPLER 0 \
+            --set-default VLLM_USE_V2_MODEL_RUNNER 0 \
             --set TRITON_LIBCUDA_PATH /run/opengl-driver/lib \
             --set CC ${cuda.backendStdenv.cc}/bin/cc \
             --set CXX ${cuda.backendStdenv.cc}/bin/c++ \

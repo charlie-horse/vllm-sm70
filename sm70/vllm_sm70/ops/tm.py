@@ -679,6 +679,87 @@ if has_op("nvfp4_gemm_sm70_out"):
         return None
 
 
+# K11: Flint NVFP4 M<=2 GEMV (sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu).
+# Per-rank (K, N) that the kernel's launch table covers: the Flint ModelOpt
+# W4A16 dense layers at TP2 (qkv, o, shared-expert gate/up and down,
+# dense-MLP gate/up and down). The op falls back to nvfp4_gemm_sm70_out for
+# every other shape, for M > 2, and for operands the GEMV can't read
+# (non-16-byte-aligned or badly strided activations). Admission (which
+# layers call this op) is M3's (vllm_sm70/quant/nvfp4_linear.py
+# MODELOPT_NVFP4_GEMV_SHAPES); tests/ops/test_k11_nvfp4_tm_gemv_cpu.py keeps
+# the three sets equal.
+NVFP4_TM_GEMV_SHAPES = frozenset(
+    {
+        (2048, 2560),
+        (2048, 2048),
+        (2048, 1024),
+        (512, 2048),
+        (2048, 6144),
+        (3072, 2048),
+    }
+)
+NVFP4_TM_GEMV_MAX_ROWS = 2
+
+
+def nvfp4_tm_gemv_takes_gemv(
+    m: int, k: int, n: int, group_size: int, k_ld: int, q_ld: int
+) -> bool:
+    """True when nvfp4_tm_gemv_dispatch_sm70_out runs the GEMV, not TurboMind.
+
+    Mirrors the C++ shape gate (nvfp4_tm_gemv_dispatch_sm70_out). It leaves out
+    the operand checks (dtype, contiguity, 16-byte input alignment), which
+    the op also applies.
+    """
+    return (
+        1 <= m <= NVFP4_TM_GEMV_MAX_ROWS
+        and group_size == 16
+        and k_ld == 32 * k
+        and q_ld == n
+        and (k, n) in NVFP4_TM_GEMV_SHAPES
+    )
+
+
+# fork vllm/_sm70/linear.py:1805-1828
+def nvfp4_tm_gemv_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    scale_shift: int = 14,
+) -> None:
+    """M <= 2 GEMV on the TurboMind NVFP4 operands, TurboMind otherwise."""
+    _op("nvfp4_tm_gemv_dispatch_sm70_out")(
+        out,
+        input,
+        qweight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        scale_shift,
+    )
+
+
+# fork vllm/_sm70/linear.py:1831-1845
+if has_op("nvfp4_tm_gemv_dispatch_sm70_out"):
+
+    @register_fake("_sm70_C::nvfp4_tm_gemv_dispatch_sm70_out")
+    def _nvfp4_tm_gemv_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        scale_shift: int = 14,
+    ) -> None:
+        return None
+
+
 # fork vllm/_sm70/linear.py:1848-1870
 def nvfp4_gemm_sm70_prescaled_out(
     out: torch.Tensor,

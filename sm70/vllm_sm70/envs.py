@@ -4,6 +4,8 @@
 Rules:
 - Kill switches: only the value "0" acts, and it turns a feature off. The
   environment can never turn a feature on; defaults are decided in code.
+- Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
+  for fork compatibility: they add a check or a memset, never a kernel.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -39,6 +41,21 @@ def _debug_flag(name: str) -> Callable[[], bool]:
 
     def getter() -> bool:
         return os.environ.get(name, "") not in ("", "0")
+
+    getter.__name__ = f"env_{name}"
+    return getter
+
+
+def opt_in(name: str) -> Callable[[], bool]:
+    """Getter that is True only when `name` == "1".
+
+    For the few fork switches that default off and keep their fork meaning
+    (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
+    memset). They add work or checks; they never select a different kernel.
+    """
+
+    def getter() -> bool:
+        return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
     return getter
@@ -153,10 +170,31 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
+        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
+        # the other opt_in switches this one selects a kernel.
+        "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
         "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+        # K14 (C4): "0" -> Flint sink layers decode with the grouped
+        # partition kernel plus reducer (two launches) instead of the
+        # one-launch fused kernel. Read on every decode call
+        # (vllm_sm70/ops/fv100.py:fused_decode_enabled).
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE": kill_switch(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
+        ),
+        # K14 (C4), fork name and meaning, default off: "1" adds one memset
+        # of the arrival counters before every fused launch (captured into
+        # graphs too). Belt and braces; the kernel re-zeroes them itself.
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS": opt_in(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
+        ),
         # K07: "0" -> verify rows take the causal paged prefill (K06) instead
         # of the smallq -> XQA expansion; graphs then cover 1-token decode.
         "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
@@ -202,9 +240,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     },
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
-        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
-            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
-        ),
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".

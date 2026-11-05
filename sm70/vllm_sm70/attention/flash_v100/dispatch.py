@@ -147,6 +147,84 @@ def run_prefill(
         output.index_copy_(0, group.token_index, out.view(-1, num_heads, head_size))
 
 
-def fused_decode_hook(layer: torch.nn.Module, metadata: FlashAttnV100Metadata) -> None:
-    """K14 (C4) hook point: prepare the one-launch sink decode. No-op in K06."""
-    return None
+# ---------------------------------------------------------------------------
+# K14 (C4): one-launch sink decode. Ported from fork cf9492a
+# vllm/v1/attention/backends/flash_v100/impl.py:49-70 (capture summary) and
+# :894-920, :942-948 (_prepare_fused_sink_decode and its call in forward).
+# ---------------------------------------------------------------------------
+
+# A sink-layer forward ran under capture since the last eager one.
+_SINK_CAPTURE_PENDING = [False]
+_SINK_CAPTURE_REPORTED: list[tuple[int, int] | None] = [None]
+
+
+def _log_sink_capture_summary() -> None:
+    totals = fv100.flash_attn_decode_paged_sinks_capture_counts()
+    previous = _SINK_CAPTURE_REPORTED[0]
+    if not any(totals) or totals == previous:
+        return
+    _SINK_CAPTURE_REPORTED[0] = totals
+    # The totals grow with every captured size, so INFO only for the first
+    # report or a new two-launch fallback; later growth goes to DEBUG. Each
+    # fallback already warned with its reason when it was captured.
+    first_or_fallback = previous is None or totals[1] != previous[1]
+    (fv100.logger.info if first_or_fallback else fv100.logger.debug)(
+        "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
+        "one-launch, %d two-launch (partition kernel plus reducer).",
+        *totals,
+    )
+
+
+def init_fused_decode(impl) -> None:
+    """At layer construction: mark sink layers the one-launch kernel takes and
+    allocate the device's counters right away (R4: eager, before any capture).
+
+    vLLM v0.33.0's profile run has no attention metadata and the decode
+    graphs are captured largest batch first, so the layer's first eager
+    forward is only the capture warmup; allocating here does not depend on
+    it. `fused_decode_hook` repeats the (idempotent) prepare on the first
+    eager forward for devices that were not ready at construction.
+    """
+    impl._fv100_fused_sinks = bool(
+        getattr(impl, "_fv100_reason", None) is None
+        and impl.sinks is not None
+        and impl.head_size == fv100.FUSED_DECODE_HEAD_DIM
+        and impl.num_heads == fv100.FUSED_DECODE_GQA * impl.num_kv_heads
+    )
+    impl._fv100_fused_ready = False
+    if not impl._fv100_fused_sinks:
+        return
+    device = impl.sinks.device
+    if device.type != "cuda":
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return
+        device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        impl._fv100_fused_ready = fv100.flash_attn_decode_paged_sinks_prepare(device)
+    except Exception:  # never fail model construction over an optimisation
+        fv100.logger.debug("Flash-V100 fused decode prepare failed", exc_info=True)
+
+
+def fused_decode_hook(impl, metadata: FlashAttnV100Metadata) -> None:
+    """Every Flash-V100 forward: keep the one-launch sink decode ready.
+
+    Sink layers only. Under capture nothing is allocated (a graph without
+    counters decodes in two launches) and the capture is noted; the first
+    eager forward after a capture reports the capture totals; the layer's
+    first eager forward asks for the device's counters once (a no-op when
+    VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 or the op is not built).
+    """
+    if not getattr(impl, "_fv100_fused_sinks", False):
+        return
+    if _capturing():
+        _SINK_CAPTURE_PENDING[0] = True
+        return
+    if _SINK_CAPTURE_PENDING[0]:
+        _SINK_CAPTURE_PENDING[0] = False
+        _log_sink_capture_summary()
+    if impl._fv100_fused_ready:
+        return
+    impl._fv100_fused_ready = True
+    device = metadata.seq_lens.device
+    if device.type == "cuda":
+        fv100.flash_attn_decode_paged_sinks_prepare(device)

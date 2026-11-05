@@ -394,6 +394,9 @@ def cpu_ops(monkeypatch):
 
     from vllm_sm70.ops import fv100
 
+    # Two-launch ops whatever the build has (K14's fused route: see
+    # test_fv100_fused_decode_cpu.py).
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     ops = CpuOps()
     monkeypatch.setattr(fv100, "_op", ops)
     fv100.clear_workspaces()

@@ -24,20 +24,29 @@ Ported from fork cf9492a:
 Contract for the FP8 linear method (Mara, M8). This module has no runtime
 switch; M8 reads VLLM_SM70_FP8_QPN8 and decides whether to call it.
 
+M cap: `qpn8_max_m(block_scaled=True)` is the M up to which the QPN8 GEMV
+runs. It is 8 for block-scaled weights (the block-FP8 checkpoints) unless
+VLLM_SM70_FP8_QPN8_M32=1 opts in to the K09 block-scaled M=9..32 routing
+(not yet validated on V100), and QPN8_MAX_M = 32 (the compiled kernel bound)
+for channel-scaled weights (the fork's own M9..32 kernels, on by default).
+Dispatch and needs_turbomind_fallback() use it; use it for any M gate too.
+
     prepared = qpn8_prepare(weight, weight_scale_inv,
                             turbomind_fallback=needs_turbomind_fallback(
                                 max_num_seqs, num_speculative_tokens))
+                            # True when rows > qpn8_max_m()
         weight: [N, K] float8_e4m3fn, CUDA, contiguous (checkpoint layout,
           after process_fp8_weight_block_strategy). weight_scale_inv:
           [N/128, K/128], cast to float32. N and K must be multiples of 128
           (`qpn8_rejection(n, k)` says why not). With
           turbomind_fallback=True the TurboMind FP8 operands (K03
-          fp8_sm70_prepare) are kept too, for M>32; otherwise M>32 runs a
+          fp8_sm70_prepare) are kept too, for M > qpn8_max_m(); otherwise those run a
           dequantize into a [K, N] fp16 scratch and torch.mm. The caller
           frees the checkpoint weight afterwards.
     y = qpn8_linear(x, prepared, bias=None, dense_scratch=None)
         x: [..., K] fp16 (flattened to [M, K]). Returns [..., N] fp16.
-          M == 0: empty output. 1 <= M <= 32: the QPN8 GEMV. M > 32: TurboMind
+          M == 0: empty output. 1 <= M <= qpn8_max_m(): the QPN8 GEMV (8 by
+          default for block scales, 32 with VLLM_SM70_FP8_QPN8_M32=1). Above it: TurboMind
           FP8 if prepared has the fallback operands, else dequantize +
           mm, into `dense_scratch` (fp16, >= K*N elements, mutated) when
           given, else a per-call allocation. The M decision is inside the
@@ -61,10 +70,24 @@ except ImportError:  # torch < 2.4
 
 NAMESPACE = "_sm70_C"
 BLOCK = 128
-# Fork fp8_block.py:45 had 8 (its block path sent M>8 to TurboMind); the
-# K09 kernel serves block-scaled M=9..32 too, covering DFlash2 k=7 verify
-# for up to 4 requests (8 rows each).
+# Compiled kernel bound (fp8_qpn8_gemm_sm70_out admits M in [1, 32]). The
+# effective cap is qpn8_max_m(): fork fp8_block.py:45 used 8 for block
+# scales, which stays the default; VLLM_SM70_FP8_QPN8_M32=1 raises it to 32
+# (DFlash2 k=7 verify for up to 4 requests, 8 rows each).
 QPN8_MAX_M = 32
+QPN8_BLOCK_DEFAULT_MAX_M = 8
+M32_SWITCH = "VLLM_SM70_FP8_QPN8_M32"
+
+
+def qpn8_max_m(block_scaled: bool = True) -> int:
+    """Largest M the QPN8 GEMV serves: QPN8_MAX_M for channel scales; for
+    block scales QPN8_MAX_M only with VLLM_SM70_FP8_QPN8_M32=1, else 8."""
+    if not block_scaled:
+        return QPN8_MAX_M
+    from vllm_sm70 import envs
+
+    return QPN8_MAX_M if getattr(envs, M32_SWITCH) else QPN8_BLOCK_DEFAULT_MAX_M
+
 
 # Load _sm70_C before any has_op() check below (see ops/tm.py).
 from vllm_sm70 import _ext  # noqa: E402
@@ -235,12 +258,11 @@ def qpn8_rejection(n: int, k: int) -> str | None:
 
 
 def needs_turbomind_fallback(
-    max_num_seqs: int, num_speculative_tokens: int = 0
+    max_num_seqs: int, num_speculative_tokens: int = 0, block_scaled: bool = True
 ) -> bool:
     """Keep TurboMind FP8 operands when decode/verify rows can exceed
-    QPN8_MAX_M=32 (fork fp8_block.py:204-213 _keep_volta_turbomind_copy,
-    which used 8)."""
-    return max_num_seqs * (1 + num_speculative_tokens) > QPN8_MAX_M
+    qpn8_max_m() (fork fp8_block.py:204-213 _keep_volta_turbomind_copy)."""
+    return max_num_seqs * (1 + num_speculative_tokens) > qpn8_max_m(block_scaled)
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +352,9 @@ def _qpn8_native_linear_impl(
     m = x.shape[0]
     if m == 0:
         return out
-    if m <= QPN8_MAX_M:
+    # Channel scales are [1, N]; block scales [K/128, N/32].
+    block_scaled = not (group_scales.shape[0] == 1 and group_scales.shape[1] == n_dim)
+    if m <= qpn8_max_m(block_scaled):
         fp8_qpn8_gemm_sm70_out(
             out,
             x,

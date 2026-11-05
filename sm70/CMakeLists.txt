@@ -118,6 +118,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
 endif()
 
+# Hook for K12 (Flint NVFP4 MoE M<=2 QPN decode). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
+endif()
+
 if(SM70_CUDA_SRCS AND NOT (SM70_HAS_CUDA AND SM70_ARCHS))
   message(FATAL_ERROR "vllm_sm70: CUDA sources listed but no CUDA/sm_70 toolchain")
 endif()
