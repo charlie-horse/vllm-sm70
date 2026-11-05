@@ -113,6 +113,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
 endif()
 
+# Hook for K18 (DFlash2 draft FP16 M<=8 GEMM). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
+endif()
+
 # Hook for K12 (Flint NVFP4 MoE M<=2 QPN decode). Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")

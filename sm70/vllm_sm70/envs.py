@@ -6,6 +6,8 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
+  One reviewed exception selects a kernel: VLLM_SM70_DFLASH2_FP16 (K18),
+  off by default because the fork never ran it at TP2 (see its comment).
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -51,7 +53,8 @@ def opt_in(name: str) -> Callable[[], bool]:
 
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
-    memset). They add work or checks; they never select a different kernel.
+    memset). They add work or checks; they never select a different kernel,
+    except VLLM_SM70_DFLASH2_FP16 (K18, opt-in by review decision).
     """
 
     def getter() -> bool:
@@ -170,6 +173,16 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
+        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
+        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
+        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
+        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
+        # Off: get_unquantized_gemm returns None, nothing is marked or
+        # packed. Read once (selection cached) when layers are built/loaded.
+        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
