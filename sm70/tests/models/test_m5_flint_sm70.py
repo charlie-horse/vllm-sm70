@@ -1037,31 +1037,52 @@ def test_t5_golden_tokens_vs_fork():
 
     Golden file (Bea, captured from live fork Flint, raw /v1/completions,
     temperature 0, max_tokens 64): a JSON list of {"prompt",
-    "prompt_token_ids", "token_ids", "stable_across_2_runs", ...}. The fork
-    itself is not bit-stable past ~40 tokens across two runs (prefix-cache
-    path), so we require an exact match of the first GOLDEN_EXACT_TOKENS
-    tokens for every prompt, and report the full common prefix."""
+    "prompt_token_ids", "token_ids", "stable_across_2_runs", ...}.
+
+    Gate: prompts whose golden was stable across the fork's own two runs
+    must match the first GOLDEN_EXACT_TOKENS tokens exactly. Prompts the
+    fork itself could not reproduce are INFO only: we print the common
+    prefix and, at the first mismatch, whether the golden token is our #2
+    and our top-2 gap (one-sided near-tie check; the golden has no
+    logprobs). There must be at least one stable prompt."""
     from vllm import SamplingParams
 
     with open(os.environ["FLINT_SM70_GOLDEN"]) as f:
         golden = json.load(f)
+    assert any(g.get("stable_across_2_runs") for g in golden), "no stable prompt"
     llm = _llm()
-    outs = llm.generate(
-        [{"prompt_token_ids": g["prompt_token_ids"]} for g in golden],
-        SamplingParams(temperature=0, max_tokens=64),
-    )
+    try:
+        outs = llm.generate(
+            [{"prompt_token_ids": g["prompt_token_ids"]} for g in golden],
+            SamplingParams(temperature=0, max_tokens=64, logprobs=2),
+        )
+    finally:
+        _shutdown(llm)
     failures = []
     for g, o in zip(golden, outs):
-        ours, ref = list(o.outputs[0].token_ids), g["token_ids"]
+        c = o.outputs[0]
+        ours, ref = list(c.token_ids), g["token_ids"]
         common = next(
             (i for i, (a, b) in enumerate(zip(ours, ref)) if a != b),
             min(len(ours), len(ref)),
         )
+        stable = bool(g.get("stable_across_2_runs"))
+        note = ""
+        if common < min(len(ours), len(ref)):
+            lp = {t: x.logprob for t, x in c.logprobs[common].items()}
+            top2 = sorted(lp, key=lp.get, reverse=True)[:2]
+            gold = ref[common]
+            if gold in top2 and len(top2) == 2:
+                gap = abs(lp[top2[0]] - lp[top2[1]])
+                kind = "near-tie" if gap <= T4_NEAR_TIE else "confident"
+                note = f"; at {common}: golden is our #2, gap {gap:.4f} nats ({kind})"
+            else:
+                note = f"; at {common}: golden {gold} not in our top-2 {top2}"
         print(
-            f"T5 prompt {g['prompt'][:40]!r}: common prefix {common}/64 "
-            f"(fork stable={g.get('stable_across_2_runs')})"
+            f"T5 {'GATE' if stable else 'INFO'} prompt {g['prompt'][:40]!r}: "
+            f"common prefix {common}/64 (fork stable={stable}){note}"
         )
-        if common < GOLDEN_EXACT_TOKENS:
+        if stable and common < GOLDEN_EXACT_TOKENS:
             failures.append((g["prompt"][:40], common))
     assert not failures, f"diverged before {GOLDEN_EXACT_TOKENS} tokens: {failures}"
 
