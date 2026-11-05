@@ -165,6 +165,39 @@ def _field_off(name):
     }
 
 
+def _nvfp4_gemv_not_selected():
+    """M3 path: with the switch at "0", the SM70 W4A16 linear method reads
+    nvfp4_gemv=False and does not admit a Flint-shape layer to the GEMV, even
+    though the shape, layout and op all qualify (vllm_sm70/quant/nvfp4_linear.py)."""
+    import torch
+
+    from vllm_sm70.quant import nvfp4_linear as nvl
+
+    def flint_state():  # Flint TP2 shared-expert down, K=512, N=2048
+        k, n = 512, 2048
+        return nvl.SM70TurboMindLinearState(
+            weight=torch.zeros((k, n // 8), dtype=torch.int32),
+            scales=torch.ones((k // 16, n), dtype=torch.float16),
+            group_size=16,
+            k_ld=32 * k,
+            q_ld=n,
+            output_size=n,
+            padded_output_size=n,
+        )
+
+    method = nvl.ModelOptNvFp4Sm70LinearMethod(SimpleNamespace(group_size=16), "x")
+    assert method.gemv_enabled is False
+    mp = pytest.MonkeyPatch()
+    with mp.context() as m:
+        m.setattr(nvl, "has_tm_op", lambda op: True)
+        killed = flint_state()
+        assert not nvl.admit_modelopt_nvfp4_gemv(killed, enabled=method.gemv_enabled)
+        assert killed.provider == nvl.GEMM_OP
+        live = flint_state()  # the same layer is admitted when the switch is unset
+        assert nvl.admit_modelopt_nvfp4_gemv(live, enabled=True)
+        assert live.provider == nvl.GEMV_OP
+
+
 def _fp8_refuses(name):
     assert not fp8_turbomind_enabled()
     with pytest.raises(RuntimeError, match="VLLM_SM70_FP8_TURBOMIND=0"):
@@ -206,8 +239,7 @@ def _path_off(name):
     if name in KILL_SWITCHES:
         _field_off(name)
         if name == "VLLM_SM70_MODELOPT_NVFP4_GEMV":
-            # TODO(M3): also assert the NVFP4 W4A16 GEMV is not selected.
-            pass
+            _nvfp4_gemv_not_selected()
     elif name == "VLLM_SM70_FP8_TURBOMIND":
         _fp8_refuses(name)
     elif name == "VLLM_SM70_QUANT":
