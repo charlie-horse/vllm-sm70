@@ -8,8 +8,8 @@ What: the CPU tests mock Kai's ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` / ``_C``
   that process_weights_after_loading calls prepare per expert with UP-format
   [K, N] codes and [K/16, N] fp16 scales with the global folded in; apply
   against an independent ModelOpt-NVFP4 reference (dequant + top-k + SwiGLU
-  + weighted sum) for M in {1, 2, 64}, top-k 8, on both the indexed and the
-  materialized W13 route; that the decode fast path is off when the K12 ops
+  + weighted sum) for M in {1, 2, 64}, top-k 8, always on the materialized W13 route
+  (never the Qwen3.8-only indexed op, even when present); that the decode fast path is off when the K12 ops
   are absent or VLLM_SM70_FLINT_MOE_QPN_DECODE=0 (and on when present); that
   workspaces are persistent (no allocation in apply); and get_quant_method
   routing at cc 7.0 vs 8.0.
@@ -470,7 +470,7 @@ def test_apply_matches_reference(mods, m, indexed):
         out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
     )
     kinds = [c[0] for c in tm.calls]
-    assert kinds == (["indexed", "dense"] if indexed else ["dense", "dense"])
+    assert kinds == ["dense", "dense"]  # indexed op never used for Flint
     assert TorchMoeOps.allocations == 0  # no workspace allocation in forward
 
 
@@ -511,7 +511,7 @@ def test_decode_on_and_used_for_m_le_2(mods):
         out = method.apply(layer, x, weights, ids, None, None)
         kinds = [c[0] for c in tm.calls]
         assert kinds == (
-            ["decode_w13", "decode_w2"] if m <= 2 else ["indexed", "dense"]
+            ["decode_w13", "decode_w2"] if m <= 2 else ["dense", "dense"]
         )
         ref = _moe_reference(x, w, ids, weights, SMALL[1])
         torch.testing.assert_close(
@@ -543,7 +543,7 @@ def test_missing_ops_fail_closed(mods, monkeypatch):
 
 @pytest.mark.parametrize(
     "field, value",
-    [("tp_size", 8), ("num_experts", 32)],
+    [("tp_size", 4), ("tp_size", 8), ("num_experts", 32)],
 )
 def test_contract_rejects(mods, field, value):
     m4, _ = mods()
@@ -664,3 +664,25 @@ def test_gpu_cuda_graph_matches_eager(m):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_get_quant_method_tp_gate(mods, device, monkeypatch, tp):
+    """SM70 MoE is validated at TP1/TP2 only; TP4+ refuses, never falls back."""
+    m4, _ = mods()
+    device(7, 0, ops=True)
+
+    class UpstreamSentinel:
+        def __init__(self, quant_config, moe_config):
+            raise AssertionError("must not fall back to upstream")
+
+    monkeypatch.setattr(
+        up_modelopt.ModelOptNvFp4Config, "FusedMoEMethodCls", UpstreamSentinel
+    )
+    layer = _routed_layer(_moe_config(*SMALL, tp=tp))
+    if tp in (1, 2):
+        method = _quant_config().get_quant_method(layer, "model.layers.0.mlp.experts")
+        assert isinstance(method, m4.ModelOptNvFp4Sm70MoEMethod)
+    else:
+        with pytest.raises(NotImplementedError, match="tensor_parallel_size"):
+            _quant_config().get_quant_method(layer, "model.layers.0.mlp.experts")

@@ -548,8 +548,10 @@ def _gpu_ready() -> bool:
     return True
 
 
+# Boolean, not a string: a string condition is evaluated in the decorated
+# function's globals, which are torch's when @torch.inference_mode() wraps it.
 needs_sm70 = pytest.mark.skipif(
-    "not _gpu_ready()", reason="needs an SM70 GPU and vllm_sm70.ops"
+    not _gpu_ready(), reason="needs an SM70 GPU and vllm_sm70.ops"
 )
 
 # Flint TP2 per-rank (K, N), FORK sm70_turbomind.py:567-579
