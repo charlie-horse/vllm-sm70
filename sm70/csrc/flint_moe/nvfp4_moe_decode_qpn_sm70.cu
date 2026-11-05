@@ -34,14 +34,23 @@
 // scale). The kernel then uses prepared_scale * 2^(14 - s) and multiplies the
 // FP32 accumulator by 2^s. Both factors are exact, so s = 0 is the unshifted
 // arithmetic.
+//
+// vllm-sm70 port (K12, from fork cf9492a csrc/sm70_turbomind/ops/
+// nvfp4_moe_decode_qpn_sm70.cu): the single-launch fused_decode_kernel and
+// its op are dropped; the ops register in TORCH_LIBRARY_FRAGMENT(_sm70_C)
+// below instead of the fork's csrc/torch_bindings.cpp:1463-1478. Python
+// side: vllm_sm70/ops/flint_moe.py. See PROVENANCE.md in this directory.
 
 #include <torch/all.h>
+#include <torch/library.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace {
 namespace decode_qpn {
@@ -438,12 +447,13 @@ constexpr int kFlintW13SplitWarps = 2;
 constexpr int kFlintW13SplitCta = 16;
 constexpr int kFlintW2SplitWarps = 2;
 // Split-K workspace in elements. The caller allocates these sizes
-// (nvfp4_sm70_moe.py: _DECODE_QPN_PARTIALS and _DECODE_QPN_COUNTERS): the
-// W13 arrival counters, then the single-launch flags padded to 128 bytes.
+// (vllm_sm70/ops/flint_moe.py: DECODE_PARTIALS and DECODE_COUNTERS): the
+// W13 arrival counters, zero at load and re-armed by the kernel.
 constexpr int64_t kFlintCounters = kFlintMaxTokens * kFlintTopK * kFlintTiles;
 constexpr int64_t kFlintPartials = kFlintCounters * kFlintW13SplitCta * 2 * 32;
 static_assert(kFlintCounters == 96 && kFlintPartials == 98304,
               "update the Python workspace sizes with the split-K tuning");
+
 void check_bank(const char* name, const torch::Tensor& input,
                 const torch::Tensor& weights, const torch::Tensor& scales,
                 const torch::Tensor& expert_ids, const torch::Tensor& out,
@@ -466,6 +476,9 @@ void check_bank(const char* name, const torch::Tensor& input,
                   input.get_device() == expert_ids.get_device() &&
                   input.get_device() == out.get_device(),
               name, ": device mismatch");
+  // load_input reads each activation row with 16-byte uint4 loads.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0, name,
+              ": input must be 16-byte aligned");
   TORCH_CHECK(scale_shift >= 0 && scale_shift <= 14, name,
               ": scale_shift must be in [0, 14]");
   const auto* properties = at::cuda::getDeviceProperties(input.get_device());
@@ -576,6 +589,8 @@ void launch_w2(const torch::Tensor& out, const torch::Tensor& input,
 }  // namespace decode_qpn
 }  // namespace
 
+namespace vllm_sm70 {
+
 void nvfp4_moe_decode_w13_swiglu_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weights,
     torch::Tensor scales, torch::Tensor expert_ids, torch::Tensor partials,
@@ -603,4 +618,26 @@ void nvfp4_moe_decode_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   launch_w2(out, input, weights, scales, expert_ids, topk_weights, out.size(0),
             scale_shift);
+}
+
+}  // namespace vllm_sm70
+
+// Flint TP2 M<=2 routed-expert decode (W13+SwiGLU, then W2+reduce).
+// fork csrc/torch_bindings.cpp:1463-1478, minus `str? native_policy`.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def(
+      "nvfp4_moe_decode_w13_swiglu_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weights, Tensor scales, Tensor expert_ids, Tensor(b!) partials, "
+      "Tensor(c!) counters, int scale_shift) -> ()");
+  m.def(
+      "nvfp4_moe_decode_w2_reduce_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weights, Tensor scales, Tensor expert_ids, Tensor topk_weights, "
+      "int scale_shift) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("nvfp4_moe_decode_w13_swiglu_sm70_out",
+         &vllm_sm70::nvfp4_moe_decode_w13_swiglu_sm70_out);
+  m.impl("nvfp4_moe_decode_w2_reduce_sm70_out",
+         &vllm_sm70::nvfp4_moe_decode_w2_reduce_sm70_out);
 }
