@@ -25,6 +25,11 @@ Interface (fixed; tests pin it):
       normalized_out (a!), residual_out (b!), reg_buffer: int,
       reg_buffer_sz_bytes: int, epsilon: float, scale: float) -> ()
 
+Admitted models: Flint only (architecture FlintForCausalLM), as in the
+fork, where only FlintModelConfig requested the pass (fork models/config.py:
+341-372, MODELS_CONFIG_MAP["FlintForCausalLM"] :1052). Other hidden-2048
+models (e.g. GemmaRMSNorm-style fp32 weight + 1) are never matched.
+
 Admitted shapes (fused kernel): TP2, PP1, FP16, hidden 2048, 1-16 rows,
 contiguous and 16-byte aligned operands, scale 1 or a positive power of two.
 Anything else at runtime (prefill rows, a disabled or absent custom
@@ -60,6 +65,9 @@ KILL_SWITCH = "VLLM_SM70_FLINT_AR_RMSNORM"
 # Shapes of the kernel (sm70/csrc/custom_ar): one 256-thread row per pack row.
 HIDDEN_SIZE = 2048
 MAX_ROWS = 16
+
+# The fork keyed the request on this architecture (MODELS_CONFIG_MAP).
+FLINT_ARCHITECTURE = "FlintForCausalLM"
 
 # Attributes of upstream's CustomAllreduce the fused path reads.
 _CA_ATTRS = ("_ptr", "disabled", "rank", "world_size", "buffer_ptrs", "max_size")
@@ -268,22 +276,37 @@ def _norm_op():
     return torch.ops.vllm_ir.fused_add_rms_norm.default
 
 
+def _fp16_node(node: Any, dim: int, size: int) -> bool:
+    if not isinstance(node, fx.Node):
+        return False
+    value = node.meta.get("val")
+    return bool(
+        value is not None
+        and value.dtype == torch.float16
+        and value.dim() == dim
+        and value.shape[-1] == size
+    )
+
+
 def _match(match) -> bool:
-    """FP16 [M, 2048] collective input; M is checked again at runtime."""
+    """FP16 [M, 2048] collective input, FP16 residual and [2048] FP16 weight.
+
+    M is checked again at runtime. A non-FP16 weight (e.g. an fp32 weight + 1)
+    never matches: the kernel multiplies by an FP16 weight.
+    """
+    collective = norm = None
     for node in match.nodes:
-        if node.target != _all_reduce_op():
-            continue
-        input_node = node.args[0]
-        if not isinstance(input_node, fx.Node):
-            return False
-        value = input_node.meta.get("val")
-        return bool(
-            value is not None
-            and value.dtype == torch.float16
-            and value.dim() == 2
-            and value.shape[-1] == HIDDEN_SIZE
-        )
-    return False
+        if node.target == _all_reduce_op():
+            collective = node
+        elif node.target == _norm_op():
+            norm = node
+    if collective is None or norm is None:
+        return False
+    return (
+        _fp16_node(collective.args[0], 2, HIDDEN_SIZE)
+        and _fp16_node(norm.args[1], 2, HIDDEN_SIZE)
+        and _fp16_node(norm.args[2], 1, HIDDEN_SIZE)
+    )
 
 
 def _scaled_match(match) -> bool:
@@ -439,13 +462,16 @@ def unfused_boundaries(graph: fx.Graph) -> int:
 
 def rejection(config: Any, tp_size: int) -> str | None:
     """Why the fusion is off for this engine config, or None."""
+    model_config = config.model_config
+    architecture = getattr(model_config, "architecture", None)
+    if architecture != FLINT_ARCHITECTURE:
+        return f"it is Flint-only ({FLINT_ARCHITECTURE}), not {architecture}"
     parallel = config.parallel_config
     if tp_size != 2 or parallel.pipeline_parallel_size != 1:
         return "it needs TP2 without pipeline parallelism"
     if getattr(parallel, "disable_custom_all_reduce", False):
         return "the custom all-reduce is disabled"
-    model_config = config.model_config
-    if model_config is None or model_config.dtype != torch.float16:
+    if model_config.dtype != torch.float16:
         return "it needs an FP16 model"
     if model_config.get_hidden_size() != HIDDEN_SIZE:
         return f"hidden size {model_config.get_hidden_size()} is not supported"

@@ -92,7 +92,16 @@ def _norm(reduced, residual, weight, eps=EPS):
     return vllm.ir.ops.fused_add_rms_norm(reduced, residual, weight, eps)
 
 
-def _apply(fusion_mod, model, *, hidden=H, dtype=torch.float16, sum2=False, eps=EPS):
+def _apply(
+    fusion_mod,
+    model,
+    *,
+    hidden=H,
+    dtype=torch.float16,
+    sum2=False,
+    eps=EPS,
+    weight_dtype=None,
+):
     from torch._inductor.pattern_matcher import PatternMatcherPass
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.proxy_tensor import make_fx
@@ -103,7 +112,7 @@ def _apply(fusion_mod, model, *, hidden=H, dtype=torch.float16, sum2=False, eps=
             inputs.append(torch.empty(2, hidden, dtype=dtype))
         inputs += [
             torch.empty(2, hidden, dtype=dtype),
-            torch.empty(hidden, dtype=dtype),
+            torch.empty(hidden, dtype=weight_dtype or dtype),
         ]
         graph = make_fx(model)(*inputs)
         patterns = PatternMatcherPass()
@@ -200,6 +209,22 @@ def test_other_shapes_are_left_alone(tp_group, kwargs):
     assert matches == 0 and not fused
 
 
+@pytest.mark.parametrize("gemma_style", [False, True])
+def test_fp32_weight_is_not_matched(tp_group, gemma_style):
+    """A GemmaRMSNorm-style fp32 weight (+ 1) never matches."""
+
+    def model(x, residual, weight):
+        reduced = torch.ops.vllm.all_reduce(x.relu(), group_name="tp:0")
+        w = weight.float() + 1 if gemma_style else weight
+        return _norm(reduced, residual, w)
+
+    matches, fused, graph = _apply(
+        tp_group, model, weight_dtype=torch.float16 if gemma_style else torch.float32
+    )
+    assert matches == 0 and not fused
+    assert any(n.target == _all_reduce_op() for n in graph.graph.nodes)
+
+
 def test_unfused_boundary_counter(tp_group):
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.proxy_tensor import make_fx
@@ -247,8 +272,18 @@ def test_op_schema_and_fake(fusion):
 # ---------------------------------------------------------------------------
 
 
+FLINT = "FlintForCausalLM"
+QWEN36_LIKE = "Qwen3_5MoeForConditionalGeneration"  # hidden 2048, GemmaRMSNorm
+
+
 def _config(**overrides):
-    values = {"pp": 1, "dtype": torch.float16, "hidden": H, "disable_ca": False}
+    values = {
+        "pp": 1,
+        "dtype": torch.float16,
+        "hidden": H,
+        "disable_ca": False,
+        "arch": FLINT,
+    }
     values.update(overrides)
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -256,6 +291,7 @@ def _config(**overrides):
             disable_custom_all_reduce=values["disable_ca"],
         ),
         model_config=SimpleNamespace(
+            architecture=values["arch"],
             dtype=values["dtype"],
             get_hidden_size=lambda: values["hidden"],
             hf_text_config=SimpleNamespace(rms_norm_eps=1e-6),
@@ -274,6 +310,8 @@ def _config(**overrides):
         ({"dtype": torch.bfloat16}, 2, True, "FP16"),
         ({"hidden": 4096}, 2, True, "4096"),
         ({}, 2, False, "VLLM_SM70_VLLM_CSRC_DIR"),
+        ({"arch": QWEN36_LIKE}, 2, True, "Flint-only"),
+        ({"arch": "LlamaForCausalLM"}, 2, True, "Flint-only"),
     ],
 )
 def test_pass_admission(fusion, monkeypatch, overrides, tp, has_kernel, reason):
@@ -468,3 +506,56 @@ def test_op_falls_back_to_the_unfused_ops(fusion, monkeypatch, sum2, scale):
     reduced = total * 2 * scale if scale != 1.0 else total * 2
     assert torch.equal(res_out, reduced + res)
     assert torch.equal(out, reduced + res + w)
+
+
+def test_fork_keys_on_the_flint_architecture(fusion):
+    assert fusion[0].FLINT_ARCHITECTURE == FLINT
+    assert "Flint-only" in fusion[0].rejection(SimpleNamespace(model_config=None), 2)
+
+
+@pytest.mark.parametrize("arch, expect_patterns", [(QWEN36_LIKE, False), (FLINT, True)])
+def test_apply_builds_patterns_only_for_flint(
+    tp_group, fusion, monkeypatch, arch, expect_patterns
+):
+    """Qwen3.6-like (hidden 2048, FP16, TP2): rejected, no pattern built, graph
+    untouched. Flint: patterns built and the boundary fused."""
+    import vllm.config
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from vllm.distributed import parallel_state
+
+    mod = tp_group
+    import vllm.distributed
+
+    monkeypatch.setattr(mod, "kernel_available", lambda: True)
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config", lambda: _config(arch=arch)
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        vllm.distributed, "get_tp_group", lambda: SimpleNamespace(unique_name="tp:0")
+    )
+    mod._pattern_pass.cache_clear()
+    mod._log_once.cache_clear()
+
+    def model(x, residual, weight):
+        reduced = torch.ops.vllm.all_reduce(x.relu(), group_name="tp:0")
+        return _norm(reduced, residual, weight)
+
+    with FakeTensorMode():
+        graph = make_fx(model)(
+            torch.empty(2, H, dtype=torch.float16),
+            torch.empty(2, H, dtype=torch.float16),
+            torch.empty(H, dtype=torch.float16),
+        )
+        matched = mod.apply(graph.graph)
+    built = mod._pattern_pass.cache_info().currsize
+    mod._pattern_pass.cache_clear()
+    has_fused = any(n.target == _fused_op() for n in graph.graph.nodes)
+    if expect_patterns:
+        assert matched == 1 and built == 1 and has_fused
+    else:
+        assert matched == 0 and built == 0 and not has_fused
+        assert any(n.target == _all_reduce_op() for n in graph.graph.nodes)

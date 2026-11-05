@@ -51,7 +51,11 @@ the plain all-reduce is unaffected (it still registers, or copies when
 
 ## Admitted shape set
 
-TP2, PP1, FP16, hidden 2048, rows 1-16, all operands contiguous and 16-byte
+Flint only (`model_config.architecture == "FlintForCausalLM"`: the fork
+requested the pass only from `FlintModelConfig`, `MODELS_CONFIG_MAP`
+fork models/config.py:1052), TP2, PP1, FP16, hidden 2048, FP16 residual and
+FP16 `[2048]` weight in the matched graph (an fp32 GemmaRMSNorm-style
+weight + 1 never matches), rows 1-16, all operands contiguous and 16-byte
 aligned on one device, `scale` 1.0 or a positive power of two, eps from the
 model. The kernel hard-codes 256 threads x 8 halves per row, so hidden 2048
 is the only safe width; it is not widened. Rows > 16 (prefill), a disabled
@@ -66,3 +70,14 @@ unfused ops. Same set as the fork.
 * `UPSTREAM_HEADERS.sha256`: CMake refuses other header bytes;
   `sm70/tests/compile/test_k17_custom_ar_headers.py` checks the same pins,
   `patches/BASE`, and that no patch in `patches/series` edits the headers.
+
+## Numerics: fused_add_rms_norm provider
+
+Upstream lowers `vllm.ir.ops.fused_add_rms_norm` to `["native"]` under
+Inductor (UP platforms/cuda.py:712-734), which keeps the residual sum in FP32
+(UP ir/ops/layernorm.py:44-62). The kernel follows `_C.fused_add_rms_norm`
+(FP16 residual). `Sm70CudaPlatform.get_default_ir_op_priority` pins
+`fused_add_rms_norm` to `["vllm_c", "native"]` through upstream's platform
+hook (UP platforms/interface.py:1452, merged at config/kernel.py:461-478), so
+the unfused graph (switch off, prefill rows) and the fused collective round
+the same way. A user-set priority still comes first.
