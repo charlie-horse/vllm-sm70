@@ -125,6 +125,12 @@ class Sm70CudaPlatform(CudaPlatform):
         _ensure_areas_imported()
         vllm_sm70.retry_failed_areas()
         _enforce_strict()
+        logger.info(
+            "vllm_sm70: platform %s.%s; areas: %s",
+            cls.__module__,
+            cls.__qualname__,
+            vllm_sm70.registered_areas(),
+        )
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
