@@ -703,13 +703,48 @@ def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
         _shutdown(llm)
 
 
+# Fork contract for qk_norm_rope_kv: bitwise at decode sizes, <=1 FP16 ulp
+# on q/k (and the cached K) at prefill sizes; cached V and unwritten slots exact.
+T2_BITWISE_MAX_N = 17
+
+
+def _max_ulp(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Largest distance in FP16 ulps (monotone int16 ordering of the bits)."""
+
+    def order(x):
+        i = x.contiguous().view(torch.int16).to(torch.int32)
+        return torch.where(i < 0, -(i & 0x7FFF), i)
+
+    return int((order(a) - order(b)).abs().max()) if a.numel() else 0
+
+
+def test_max_ulp_helper():
+    one = torch.tensor([1.0], dtype=torch.half)
+    nxt = torch.nextafter(one.float(), torch.tensor([2.0])).half()  # rounds to 1
+    up = (one.view(torch.int16) + 1).view(torch.half)
+    assert _max_ulp(one, one) == 0 and _max_ulp(one, nxt) == 0
+    assert _max_ulp(one, up) == 1
+    z, nz = torch.tensor([0.0], dtype=torch.half), torch.tensor([-0.0], dtype=torch.half)
+    assert _max_ulp(z, nz) == 0
+    tiny = torch.tensor([0.0], dtype=torch.half).view(torch.int16) + 1
+    assert _max_ulp(tiny.view(torch.half), (-tiny.view(torch.half))) == 2
+
+
 @pytest.mark.gpu
 @one_gpu
 @pytest.mark.parametrize("rope", [True, False])
 @pytest.mark.parametrize("n", [1, 2, 17, 8192])
 def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
-    """T2 (1 GPU): the Triton kernel equals the torch oracle bitwise on q, k
-    and the UP-layout K/V cache, padded slots included."""
+    """T2 (1 GPU): the Triton kernel vs the torch oracle, under the fork's
+    contract for this kernel: "q and k within 1 FP16 ulp, KV cache layout
+    unchanged".
+
+    Decode sizes (n <= T2_BITWISE_MAX_N) must be bitwise equal on q, k and
+    the whole UP-layout K/V cache. At prefill sizes the oracle's CUDA
+    ``mean(-1)`` may reduce in a different order than the kernel's per-row
+    sum, so q, k and the cache's K half may differ by at most 1 ulp. The
+    cache's V half (a plain copy) and every slot not written (padded
+    tokens, unused slots) must still be bitwise equal."""
     g = torch.Generator().manual_seed(n)
     qkv = torch.randn(n, (HQ + 2 * HKV) * D, generator=g).half().cuda()
     qw = (torch.rand(D, generator=g) + 0.5).half().cuda()
@@ -726,8 +761,20 @@ def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
         k = torch.empty(n, HKV * D, dtype=torch.half, device="cuda")
         fn(qkv, q, k, qw, kw, pos, cs, 1e-6, *qk.triton_cache_views(kv, D), slots)
         res.append((q, k, kv))
-    for a, b in zip(*res):
-        assert torch.equal(a, b)
+    (tq, tk, tkv), (rq, rk, rkv) = res
+    if n <= T2_BITWISE_MAX_N:
+        for a, b in zip((tq, tk, tkv), (rq, rk, rkv)):
+            assert torch.equal(a, b)
+        return
+    assert _max_ulp(tq, rq) <= 1, "q differs by more than 1 FP16 ulp"
+    assert _max_ulp(tk, rk) <= 1, "k differs by more than 1 FP16 ulp"
+    assert _max_ulp(tkv[..., :D], rkv[..., :D]) <= 1, "cached K > 1 ulp"
+    assert torch.equal(tkv[..., D:], rkv[..., D:]), "cached V must be exact"
+    written = torch.zeros(blocks * PAGE, dtype=torch.bool, device="cuda")
+    written[slots[slots >= 0]] = True
+    untouched = ~written.view(blocks, PAGE)[:, None, :].expand(blocks, HKV, PAGE)
+    assert torch.equal(tkv[untouched], rkv[untouched]), "unwritten slots changed"
+    assert not tkv[untouched].any(), "kernel wrote to a padded/unused slot"
 
 
 @pytest.mark.gpu
