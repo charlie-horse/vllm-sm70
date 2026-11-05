@@ -19,7 +19,7 @@ Why: with ``is_monolithic`` False and ``moe_kernel`` None, UP
   run in the runner (NO_OVERLAP, :616-618).
 Kill-switch: none here; each method carries its own.
 
-Routing follows Kai's K03 contract (scratchpad sections/k03-contract-m4.md):
+Routing follows the K03 contract agreed with Kai (2026-11-05):
 metadata comes from UP ``_moe_C::moe_prepare_scatter`` (csrc/moe/
 torch_bindings.cpp:122-126) with the fork -> UP mapping
 inv_permuted_idx -> scatter_idx, permuted_idx -> sorted_rows,
