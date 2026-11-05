@@ -111,11 +111,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         name: _tuning(name)
         for name in (
             "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M",
+            "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2",
             "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY",
             "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS",
             "VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR",
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY",
+            "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE",
             "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE",
             "VLLM_SM70_AWQ_TP2_FAST_SELECTOR",
             "VLLM_SM70_AWQ_TP2_FAST_TARGETS",
@@ -130,7 +132,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR",
             "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
             "VLLM_SM70_FP8_GROUPED_BMM_DECODE",
+            "VLLM_SM70_FP8_MOE_PREPARE_VEC",
             "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH",
+            "VLLM_SM70_FP8_PREFILL_CUTLASS",
             "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR",
             "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS",
             "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY",
@@ -146,6 +150,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL",
             "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR",
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+            "VLLM_SM70_PROFILE_TRACE",
         )
     },
     "attention": {},
