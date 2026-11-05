@@ -10,6 +10,7 @@
   config,
   lib,
   pkgs,
+  utils,
   vllmSm70Packages,
   ...
 }:
@@ -203,7 +204,8 @@ in
               "lmcache"
               "lmcache/l2"
             ];
-            ExecStart = "${cfg.package}/bin/lmcache ${lib.escapeShellArgs lmcacheArgs}";
+            # systemd quoting (escapes `%` and `$` too), since extraArgs is free-form.
+            ExecStart = "${cfg.package}/bin/lmcache ${utils.escapeSystemdExecArgs lmcacheArgs}";
             Restart = "on-failure";
             RestartSec = 10;
             LimitMEMLOCK = "infinity";

@@ -1,5 +1,5 @@
 # Patches for the LMCache 0.5.6 sdist (docs/pins.md), in order. The LMCache
-# build in ./vllm.nix applies them:
+# build in ./vllm.nix is to apply them (wired in with the real build; the stub builds nothing):
 #   lmcache = prev.lmcache.overrideAttrs (old: {
 #     patches = (old.patches or [ ]) ++ import ./patches/lmcache;
 #     patchFlags = [ "-p1" "--fuzz=0" "--no-backup-if-mismatch" ];
