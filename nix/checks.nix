@@ -54,12 +54,10 @@ let
     in
     pkgs.writeText "vllm-sm70-units-${activeModel}" (builtins.unsafeDiscardStringContext text);
 
-  # The LMCache sdist the build uses (docs/pins.md) with our patches applied.
-  # Building this check fetches the sdist (~MBs); no compiling.
-  lmcacheSdist = pkgs.fetchurl {
-    url = "https://files.pythonhosted.org/packages/84/25/3ccd46844c94e08897aa8d72716a538c07e4583410d84dbc6cd12cb60dc1/lmcache-0.5.6.tar.gz";
-    sha256 = "d6951e60ce8818a76aa42d0866a4ba85f1c95cd919355fff30ff24dcc3243f1e";
-  };
+  # The LMCache sdist the build itself uses (nix/lmcache-build.nix), so the
+  # check tests exactly what ships. Building this check fetches the sdist
+  # (~MBs); no compiling.
+  lmcacheSdist = self.packages.${pkgs.stdenv.hostPlatform.system}.lmcache.sdist;
 in
 {
   lmcache-patches-apply = pkgs.runCommand "lmcache-patches-apply" { } ''

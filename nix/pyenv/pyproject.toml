@@ -86,6 +86,15 @@ dependencies = [
 # pulls it in, so uv.lock has 0.1.15.post2.
 
 [dependency-groups]
+# Runtime deps of LMCache 0.5.6 (built from the sdist, ../lmcache-build.nix) on
+# our paths (`lmcache server`, the MP connector, the UI) that vLLM's set lacks.
+# A group, not [project] dependencies, so buildVenv (and with it the vLLM tree
+# and sm70-ext) is unchanged; only the runtime venv adds them.
+lmcache = [
+  "sortedcontainers",                   # import time: lmcache/v1/memory_management.py:13
+  "cupy-cuda12x",                       # register_kv_caches: v1/platform/devices/cuda/cache_context.py:459
+  "opentelemetry-exporter-prometheus",  # default metrics: PrometheusMetricReader, otel_init.py:105
+]
 # setup.py build_ext (pyproject [build-system] + requirements/build/cuda.txt).
 # setuptools-rust also needs cargo/rustc from Nix for vLLM's _rust_* frontend.
 build = [

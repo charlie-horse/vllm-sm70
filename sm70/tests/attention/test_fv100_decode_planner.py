@@ -144,8 +144,9 @@ def _metadata(num_decodes, seq_lens, max_seq_len):
     return SimpleNamespace(
         num_decodes=num_decodes,
         num_decode_tokens=num_decodes,
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
-        block_table=torch.zeros((num_decodes, 8), dtype=torch.int32),
+        decode_rows=num_decodes,
+        decode_seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        decode_block_table=torch.zeros((num_decodes, 8), dtype=torch.int32),
         max_seq_len=max_seq_len,
         max_model_len=4096,
         cudagraph_capture=False,
@@ -165,6 +166,9 @@ class _Rec:
 
 @pytest.fixture
 def rec(fv100, monkeypatch):
+    # K06 routing on the two-launch ops whatever the build has; the K14
+    # fused route is tested in test_fv100_fused_decode_cpu.py.
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     r = _Rec()
     monkeypatch.setattr(fv100, "_op", r)
     return r
