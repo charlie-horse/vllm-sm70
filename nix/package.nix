@@ -72,7 +72,7 @@ let
       VLLM_TARGET_DEVICE = "cuda";
       VLLM_USE_PRECOMPILED = "0";
       # patches/0001: skip the external projects that build nothing for
-      # sm_70 (FA2/FA3 kernels, FlashMLA, DeepGEMM, ...). See nix/deps.nix.
+      # sm_70 (FA3, FlashMLA, DeepGEMM, ...; FA2 stays). See nix/deps.nix.
       VLLM_SM70_TRIM_EXTERNALS = "1";
       VLLM_USE_PRECOMPILED_RUST = "0";
       # No git metadata in a fetched source: skip setuptools-scm's git describe.
