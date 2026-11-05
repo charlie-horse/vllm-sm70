@@ -1,4 +1,4 @@
-# TurboMind SM70 GEMM core and ops: provenance (patches K02, K03)
+# TurboMind SM70 GEMM core and ops: provenance (patches K02, K03, K11)
 
 Source: charlie-horse/vLLM at **cf9492a01**. The lmdeploy upstream commit isn't recorded in the fork (see `lmdeploy/NOTICE`). Line counts are `wc -l`. "fork last-touch" is `git log -1 --format=%h -- <fork path>`. Re-verify against a fork checkout with:
 
@@ -401,6 +401,70 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `vllm/_sm70/moe.py` | 2408-2485 | `fp8_moe_single_token_sm70_out` | wrapper |
 | `vllm/_sm70/moe.py` | 2488-2529 | `fp8_moe_single_token_sm70_out` | fake |
 
+## K11: Flint NVFP4 M≤2 GEMV (`ops/nvfp4_tm_gemv_sm70.cu`)
+
+The source is fork `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu` (535 lines, last touch `0c9f3ee73`). Commit "import ... verbatim" copies it byte for byte, and the next commit adapts it (491 lines).
+
+### Kept (fork line → same name in the new file)
+| fork lines | definition |
+|---|---|
+| 36-41 | `nvfp4_gemm_sm70_out` declaration (K03 `tm_nvfp4_sm70.cu`; the `#ifndef VLLM_NVFP4_TM_GEMV_STANDALONE` guard is gone) |
+| 45-56 | `kTmGemvMaxRows`, `VLLM_TM_GEMV_TABLE` (launch table) |
+| 58-65 | `VLLM_SM70_TM_GEMV_MMA` |
+| 78-97 | `decode_e2m1x8` |
+| 100-104 | `TmGemvStage` |
+| 109-114 | `tm_gemv_d_row`, `tm_gemv_d_col` |
+| 118-127 | `tm_gemv_lanes_per_output` |
+| 130-135 | `tm_gemv_element_used` |
+| 142-296 | `nvfp4_tm_gemv_sm70_kernel` |
+| 298-304 | `TmGemvConfig` |
+| 306-316 | `launch_tm_gemv` |
+| 354-370 | `dispatch_tm_gemv_rows` |
+| 372-385 | `tm_gemv_config_valid` |
+| 387-413 | `tm_gemv_operands_ok` |
+| 415-431 | `TmGemvEntry`, `kTmGemvTable` |
+| 433-441 | `tm_gemv_config` |
+| 443-477 | `run_tm_gemv` |
+| 481-484 | `nvfp4_tm_gemv_sm70_supported` |
+| 486-506 | `nvfp4_tm_gemv_dispatch_sm70_out` (unchanged; its `#ifndef STANDALONE` guard at 486/508 is gone) |
+
+Function bodies are unchanged.
+
+### Dropped
+- The `VLLM_NVFP4_TM_GEMV_STANDALONE` launch list and its `#else` (fork 318-352, 27 untuned configurations) are gone. `VLLM_TM_GEMV_SHAPES` is now always the measured table, so only the measured configurations are compiled (4 distinct (G, warps, prefetch, pipelined, min blocks) tuples × M ∈ {1, 2}).
+- `nvfp4_tm_gemv_sm70_tune_out` and `TORCH_LIBRARY_FRAGMENT(_tm_gemv_dev)` (fork 510-535) are gone. They were a tuning-only extension.
+
+### Added
+- `#include <torch/library.h>`.
+- `TORCH_LIBRARY_FRAGMENT(_sm70_C)`: `nvfp4_tm_gemv_dispatch_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, int scale_shift=14) -> ()`. This is fork `csrc/torch_bindings.cpp:956-961` minus `str? native_policy`, with a CUDA impl.
+- `sources.cmake` lists the file with the K03 sources. It must be in the same `.so`, because it calls `nvfp4_gemm_sm70_out` directly.
+- Python, `vllm_sm70/ops/tm.py`:
+  - the wrapper and fake (fork `vllm/_sm70/linear.py:1805-1845`, minus `native_policy`);
+  - `NVFP4_TM_GEMV_SHAPES` and `nvfp4_tm_gemv_takes_gemv()`, a Python mirror of the op's shape gate.
+
+### Admitted shape set (audited for Flint TP2 on 2×V100)
+The GEMV runs only when all of these hold. Anything else runs K03's `nvfp4_gemm_sm70_out` inside the same op:
+- 1 ≤ M ≤ 2;
+- `group_size == 16`;
+- `k_ld == 32*K`;
+- `q_ld == N`;
+- (K, N) is in the launch table;
+- the operands pass `tm_gemv_operands_ok`: fp16 activations with unit column stride, row stride ≥ K and a multiple of 8 halves, 16-byte-aligned base; dense int32 weight [K, N/8] and fp16 scales [K/16, N].
+
+| layer (per rank, TP2) | K | N | groups | warps | prefetch | pipelined | min blocks | rounds |
+|---|---|---|---|---|---|---|---|---|
+| qkv | 2048 | 2560 | 2 | 8 | 2 | yes | 1 | 2 |
+| o | 2048 | 2048 | 2 | 8 | 2 | yes | 1 | 2 |
+| shared-expert gate/up | 2048 | 1024 | 2 | 8 | 2 | yes | 1 | 2 |
+| shared-expert down | 512 | 2048 | 1 | 8 | 2 | yes | 1 | 1 |
+| dense-MLP gate/up | 2048 | 6144 | 2 | 4 | 2 | no | 8 | 4 |
+| dense-MLP down | 3072 | 2048 | 2 | 8 | 2 | yes | 1 | 3 |
+
+- **Consistency with Flint's TP2 layout:** all six are per-rank TP2 shapes for hidden 2048. qkv 2560 is 16 q heads and 2 kv heads of 128 per rank. Dense intermediate is 3072 per rank; shared-expert intermediate is 512 per rank.
+- **Validity:** every entry passes `tm_gemv_config_valid` (N % 32 == 0, K % (32·G) == 0, (K / (32·G)) % (warps·prefetch) == 0). So no admitted Flint TP2 shape silently falls back to TurboMind. `tests/ops/test_k11_nvfp4_tm_gemv_cpu.py` checks this.
+- **Same set in three places:** the table, `tm.NVFP4_TM_GEMV_SHAPES` and M3's `MODELOPT_NVFP4_GEMV_SHAPES` are the same set, and the CPU test keeps them equal.
+- **Not GEMV:** Qwen TP2 (e.g. 5120×8704), transposed Flint and TP4 shapes all take TurboMind. The GPU test checks that those shapes give bit-identical TurboMind output.
+
 ## Files
 
 | new path | fork path | status | lines | fork lines | fork last-touch | sha256 | fork sha256 |
@@ -514,6 +578,7 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `sm70/csrc/turbomind/lmdeploy/src/turbomind/utils/string_utils.h` | `csrc/sm70_turbomind/lmdeploy/src/turbomind/utils/string_utils.h` | verbatim | 84 | 84 | ee0bc6a87 | `7caae49d69950416a3c227150d73490fc70abe77ea660f873f95275ec3b3befe` | `7caae49d69950416a3c227150d73490fc70abe77ea660f873f95275ec3b3befe` |
 | `sm70/csrc/turbomind/ops/gemm_runtime.cpp` | `csrc/sm70_turbomind/ops/gemm_runtime.cpp` | rewritten | 890 | 895 | 4db646d45 | `3f203e3b8d73167a3229076129871d56e7e73c60d17c4ded357f7e500d19881c` | `55d4e35e7c7f9cbb439d4c1126c3647da18d62a8d02dc2008c05d5d3ff8c7085` |
 | `sm70/csrc/turbomind/ops/gemm_runtime.h` | `csrc/sm70_turbomind/ops/gemm_runtime.h` | trimmed | 86 | 113 | 4db646d45 | `1082262db91911f54016bbdb4cd2626bb5b3c810154ef794eea840be33250021` | `305543af6e3e3850f62c82e245619894aee634ec02b53770ad459cf366ecbc6f` |
+| `sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu` | `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu` | rewritten | 491 | 535 | 0c9f3ee73 | `3847c5a005604379476599266e212ff74fc58f4ad96746f485705a5471895c6f` | `2c999c8def4d1391b09c68e52e16d0048422298a6ba238cd0d2bcbf4c865cae3` |
 | `sm70/csrc/turbomind/ops/packed_gemm.h` | `csrc/sm70_turbomind/ops/packed_gemm.h` | verbatim | 76 | 76 | 156ec4deb | `da56a140b05e0c21baa37400110871a0600236b536102997ef86f1ac155b5b1f` | `da56a140b05e0c21baa37400110871a0600236b536102997ef86f1ac155b5b1f` |
 | `sm70/csrc/turbomind/ops/qwen38_prefill_cutlass.cu` | `csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cu` | rewritten | 127 | 127 | 495fb442a | `c99a0a489487d381a9809dde7c1ce54a6f966c02f56eb94e3b6f3af41ba39e92` | `4934d496d3aa5da5e0ddb8f35f867cd1f79c30a604eff9bbca3fda3780a5dd2d` |
 | `sm70/csrc/turbomind/ops/qwen38_prefill_cutlass.cuh` | `csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cuh` | verbatim | 13 | 13 | 58beb3433 | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` |
@@ -526,5 +591,5 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `sm70/csrc/turbomind/ops/tm_nvfp4_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 288 | 10913 | 899e9ed33 | `98028afde445b8ecc1827be9ac32982bbbbf6afc6ae6cb3a269ba9423ec97c0f` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_ops_common_sm70.cuh` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 119 | 10913 | 899e9ed33 | `f00da8f4ef8450a75bbd8cae4d798fa12be683d0e406606410b4db97ccd96bb7` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_registry_sm70.cu` | `csrc/sm70_turbomind/ops/tm_registry_sm70.cu` | verbatim | 38 | 38 | 58beb3433 | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` |
-| `sm70/csrc/turbomind/sources.cmake` | `-` | new | 102 | - | - | `0e23a50120f954ac68368e8bdb36be37d5836e6b536078fd732f8404f90509ce` | `-` |
+| `sm70/csrc/turbomind/sources.cmake` | `-` | new | 104 | - | - | `035e38342ec48ecc036ccbd81d113ffffec11cd6a750ddb9738fe50594de1045` | `-` |
 | `sm70/csrc/sm70_tile_runtime_signal.cuh` | `csrc/sm70_tile_runtime_signal.cuh` | verbatim | 49 | 49 | 58beb3433 | `91f2977cbdd206c7bbf37f40330fcd99a1266f04da585b713f1c4e514982c350` | `91f2977cbdd206c7bbf37f40330fcd99a1266f04da585b713f1c4e514982c350` |

@@ -150,13 +150,30 @@ class Sm70CudaPlatform(CudaPlatform):
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
+        # K15: split the fused Flint q/k-norm + RoPE + KV-write op out of the
+        # compiled graph next to unified_kv_cache_update (FORK
+        # config/compilation.py:1172-1174). Off with VLLM_SM70_FLINT_QK_ROPE_KV=0.
+        from vllm_sm70.config import sm70_config
+        from vllm_sm70.flint import install_splitting_op
 
-    # U1 hooks (patches/0001): defaults keep upstream behaviour.
+        install_splitting_op(
+            vllm_config.compilation_config,
+            enabled=sm70_config(vllm_config).flint_qk_rope_kv,
+        )
+
+    # U1 hooks (patches/0001): None keeps upstream behaviour.
     @classmethod
     def get_unquantized_gemm(
         cls, linear_backend: str = "auto"
     ) -> Callable[..., Any] | None:
-        return None
+        # K18: DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
+        # other layer and M falls through to F.linear (UP
+        # default_unquantized_gemm). None (upstream dispatch) unless
+        # VLLM_SM70_DFLASH2_FP16=1 (opt-in) and the ops are built. Cached:
+        # UP calls this per forward for lm_head and the router gate.
+        from vllm_sm70.ops import dflash2
+
+        return dflash2.select_unquantized_gemm(linear_backend)
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:

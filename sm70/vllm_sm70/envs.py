@@ -4,6 +4,10 @@
 Rules:
 - Kill switches: only the value "0" acts, and it turns a feature off. The
   environment can never turn a feature on; defaults are decided in code.
+- Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
+  for fork compatibility: they add a check or a memset, never a kernel.
+  One reviewed exception selects a kernel: VLLM_SM70_DFLASH2_FP16 (K18),
+  off by default because the fork never ran it at TP2 (see its comment).
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -39,6 +43,22 @@ def _debug_flag(name: str) -> Callable[[], bool]:
 
     def getter() -> bool:
         return os.environ.get(name, "") not in ("", "0")
+
+    getter.__name__ = f"env_{name}"
+    return getter
+
+
+def opt_in(name: str) -> Callable[[], bool]:
+    """Getter that is True only when `name` == "1".
+
+    For the few fork switches that default off and keep their fork meaning
+    (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
+    memset). They add work or checks; they never select a different kernel,
+    except VLLM_SM70_DFLASH2_FP16 (K18, opt-in by review decision).
+    """
+
+    def getter() -> bool:
+        return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
     return getter
@@ -153,10 +173,36 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
+        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
+        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
+        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
+        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
+        # Off: get_unquantized_gemm returns None, nothing is marked or
+        # packed. Read once (selection cached) when layers are built/loaded.
+        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
         "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+        # K14 (C4): "0" -> Flint sink layers decode with the grouped
+        # partition kernel plus reducer (two launches) instead of the
+        # one-launch fused kernel. Read on every decode call
+        # (vllm_sm70/ops/fv100.py:fused_decode_enabled).
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE": kill_switch(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
+        ),
+        # K14 (C4), fork name and meaning, default off: "1" adds one memset
+        # of the arrival counters before every fused launch (captured into
+        # graphs too). Belt and braces; the kernel re-zeroes them itself.
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS": opt_in(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
+        ),
+        # K07: "0" -> verify rows take the causal paged prefill (K06) instead
+        # of the smallq -> XQA expansion; graphs then cover 1-token decode.
+        "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
     },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {
