@@ -96,9 +96,17 @@ jobs:
         run: scripts/regen-patches.sh --check "$VLLM_SRC"
 
   python-unit:
-    name: Python unit tests (CPU)
+    # wheel:   vLLM exactly as released (plugin must work without our patches).
+    # patched: the same, with patches/series applied to the BASE source and that
+    #          tree first on PYTHONPATH, so the U-hook tests (e.g. test_u1_hooks)
+    #          run instead of skipping.
+    name: Python unit tests (CPU, vLLM ${{ matrix.vllm }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm: [wheel, patched]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -151,11 +159,33 @@ jobs:
           fi
           python -c 'import torch, vllm; print("torch", torch.__version__, "vllm", vllm.__version__)'
 
+      - name: Apply patches/series to vLLM BASE source
+        if: steps.detect.outputs.run == 'true' && matrix.vllm == 'patched'
+        run: |
+          set -euo pipefail
+          base=$(cat patches/BASE)
+          src=$RUNNER_TEMP/vllm-patched
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/vllm-project/vllm.git
+          git -C "$src" fetch -q --depth 1 --no-tags origin "refs/tags/$base:refs/tags/$base"
+          git -C "$src" checkout -q --detach "refs/tags/$base"
+          n=0
+          while IFS= read -r p || [[ -n $p ]]; do
+            [[ -z ${p//[[:space:]]/} || $p == \#* ]] && continue
+            git -C "$src" -c user.name=ci -c user.email=ci@localhost am -q "$PWD/patches/$p"
+            echo "applied $p"; n=$((n+1))
+          done < patches/series
+          echo "$n patches applied on $base"
+          # Patched Python source shadows the installed wheel; compiled ops stay
+          # absent on CPU (the plugin tests stub what they need).
+          echo "PYTHONPATH=$src${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
       - name: pytest (not gpu)
         if: steps.detect.outputs.run == 'true'
         # Exit 5 means every collected test was GPU-only (deselected), which is fine on CPU.
         run: |
           set -uo pipefail
+          python -c 'import vllm; print("vllm from", vllm.__file__)'
           read -ra dirs <<<"${{ steps.detect.outputs.dirs }}"
           python -m pytest -q "${dirs[@]}" -m "not gpu"; rc=$?
           [[ $rc == 0 || $rc == 5 ]] || exit $rc
