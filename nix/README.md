@@ -22,8 +22,9 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 | `lmcache.nix` | integration | `services.lmcache-sm70` |
 | `packages-module.nix` | integration | `_module.args.vllmSm70Packages` |
 | `packages.nix` | integration | `{ vllm, lmcacheUi, flintCheckpoint }` |
-| `vllm.nix` | build | `{ vllm, lmcacheUi }` (stub until the sm_70 build lands; contract in the file) |
-| `patches/lmcache/` | integration | LMCache sdist patches (list in `default.nix`), to be applied by the LMCache build in `vllm.nix` (Felix wires it in with the LMCache sdist build) |
+| `vllm.nix` | build | `{ vllm, lmcacheUi }` (contract in the file) |
+| `lmcache-build.nix` | build | LMCache 0.5.6 from the sdist for sm_70, on the wrapper's PYTHONPATH (`packages.lmcache`) |
+| `patches/lmcache/` | integration | LMCache sdist patches (list in `default.nix`), applied by `lmcache-build.nix` |
 | `checkpoint.nix` | integration | `flintCheckpoint` FOD, recipe from input `vllm-legacy` |
 | `checks.nix` | integration | flake checks |
 
