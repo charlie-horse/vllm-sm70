@@ -8,7 +8,7 @@
 // See LICENSE.v100-skinny in this directory for the retained MIT notice.
 //
 // vllm-sm70 (K09): vendored from fork cf9492a, trimmed to prepare,
-// dequantize and the M<=8 GEMM, registered in the _sm70_C namespace.
+// dequantize and the M<=32 GEMM, registered in the _sm70_C namespace.
 // PROVENANCE.md lists every change.
 
 #include <torch/all.h>
@@ -770,8 +770,10 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
-  TORCH_CHECK(m <= 8 || channel_scales,
-              "fp8_qpn8_gemm_sm70_out: M=9..32 requires channel scales");
+  // K09: M=9..32 with block scales (block-FP8 checkpoints) runs the M<=16
+  // two-row-tile kernel, which reads the per-(K/128, 32-column) scale just
+  // like the M<=8 launch, in 16-row chunks. The fork admitted M>8 for
+  // channel scales only; those keep the fork's pair / two-phase kernels.
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
                   split_k == 32,
               "fp8_qpn8_gemm_sm70_out: unsupported split_k");
@@ -790,8 +792,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: split_k 12 requires the "
               "fast decoder, two accumulator chains, and no prefetch");
   TORCH_CHECK(
-      m <= 16 || ((split_k == 12 || split_k == 16) && accumulator_chains == 2 &&
-                  fast_decoder && !prefetch_codes),
+      m <= 16 || !channel_scales ||
+          ((split_k == 12 || split_k == 16) && accumulator_chains == 2 &&
+           fast_decoder && !prefetch_codes),
       "fp8_qpn8_gemm_sm70_out: M=17..32 requires split_k 12/16, "
       "the fast decoder, two accumulator chains, and no prefetch");
 
@@ -818,7 +821,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     }
   }
 
-  if (m > 16) {
+  if (m > 16 && channel_scales) {
     // Amortize the extra activation kernel only over large dense projections.
     // A full M32 tile also benefits on short-K/split-12 projections. Partial
     // row tiles retain their established unroll tradeoff.
@@ -873,18 +876,25 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 
 #define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                        \
   do {                                                                       \
-    if (m <= 8) {                                                            \
+    if (chunk_m <= 8) {                                                      \
       launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), channel_scales, stream); \
+          code_ptr, scale_ptr, chunk_in, chunk_out, static_cast<int>(n),     \
+          static_cast<int>(k), chunk_m, channel_scales, stream);             \
     } else if constexpr (SPLIT <= 16) {                                      \
       launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), true, stream);           \
+          code_ptr, scale_ptr, chunk_in, chunk_out, static_cast<int>(n),     \
+          static_cast<int>(k), chunk_m, channel_scales, stream);             \
     } else {                                                                 \
       TORCH_CHECK(false, "QPN8 M=9..16 does not support split_k ", SPLIT);   \
     }                                                                        \
   } while (0)
+
+  // K09: one pass for M<=16; block-scaled M=17..32 runs two 16-row chunks
+  // (each re-reads the weight codes).
+  for (int64_t row0 = 0; row0 < m; row0 += 16) {
+    const int chunk_m = static_cast<int>(std::min<int64_t>(16, m - row0));
+    const half* chunk_in = input_ptr + row0 * k;
+    half* chunk_out = output_ptr + row0 * n;
 
   if (prefetch_codes) {
     if (split_k == 4 && accumulator_chains == 1) {
@@ -940,6 +950,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     VLLM_LAUNCH_QPN8(32, 1, false, false);
   } else {
     VLLM_LAUNCH_QPN8(32, 2, false, false);
+  }
   }
 #undef VLLM_LAUNCH_QPN8
 
