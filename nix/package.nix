@@ -77,6 +77,9 @@ let
       CMAKE_CUDA_ARCHITECTURES = "70";
       VLLM_TARGET_DEVICE = "cuda";
       VLLM_USE_PRECOMPILED = "0";
+      # patches/0001: skip the external projects that build nothing for
+      # sm_70 (FA3, FlashMLA, DeepGEMM, ...; FA2 stays). See nix/deps.nix.
+      VLLM_SM70_TRIM_EXTERNALS = "1";
       VLLM_USE_PRECOMPILED_RUST = "0";
       # No git metadata in a fetched source: skip setuptools-scm's git describe.
       VLLM_VERSION_OVERRIDE = src.version;
@@ -168,6 +171,10 @@ let
         # sm70> (e.g. VLLM_PLUGINS=) turns both off and runs stock vLLM.
         # TRITON_PTXAS_PATH is only a default (12.6 ptxas): set it to Triton's
         # bundled ptxas (12.9) to compare.
+        # VLLM_USE_FLASHINFER_SAMPLER defaults to 1 upstream, and
+        # flashinfer_sampler_supported() imports flashinfer before checking
+        # the GPU (v1/sample/ops/topk_topp_sampler.py:117-124); flashinfer is
+        # not in the env (sm80+), so default it off.
         for exe in python vllm; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
@@ -176,6 +183,7 @@ let
             --set CUDA_HOME ${cuda.cudatoolkit} \
             --set CUDA_PATH ${cuda.cudatoolkit} \
             --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
+            --set-default VLLM_USE_FLASHINFER_SAMPLER 0 \
             --set TRITON_LIBCUDA_PATH /run/opengl-driver/lib \
             --set CC ${cuda.backendStdenv.cc}/bin/cc \
             --set CXX ${cuda.backendStdenv.cc}/bin/c++ \

@@ -85,9 +85,10 @@ class Sm70ModelOptNvFp4Config(ModelOptNvFp4Config):
     def get_min_capability(cls) -> int:
         return _min_capability(super().get_min_capability())
 
-    # HOOK(M3/M4): LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] (M3) and the
-    # FusedMoEMethodCls dispatch (M4) are installed next to this class, at
-    # import time, for the same unpickling reason as the registration.
+    # HOOK(M3/M4): LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] (M3, installed
+    # below by _install_m3) and the FusedMoEMethodCls dispatch (M4) are
+    # installed next to this class, at import time, for the same unpickling
+    # reason as the registration.
 
 
 # Registered name -> our class.
@@ -122,6 +123,23 @@ def _register_all() -> bool:
 REGISTERED = _register_all()
 
 
+def _install_m3() -> bool:
+    """M3: route ModelOpt W4A16_NVFP4 linears to the SM70 TurboMind method
+    (vllm_sm70/quant/nvfp4_linear.py). The builder re-checks is_sm70_ready()
+    for each layer and otherwise falls through to upstream's
+    ModelOptLinearMethod. Kill switch: VLLM_SM70_MODELOPT_NVFP4_GEMV=0 only
+    drops the M<=2 GEMV; VLLM_SM70_QUANT=0 skips this together with M2."""
+    if not (REGISTERED and sm70_platform.is_sm70_ready()):
+        return False
+    from vllm_sm70.quant.nvfp4_linear import install_linear_builder
+
+    install_linear_builder()
+    return True
+
+
+M3_INSTALLED = _install_m3()
+
+
 def register() -> None:
     """Plugin entry hook. Raises if the registration didn't take effect.
 
@@ -141,6 +159,14 @@ def register() -> None:
             )
         if "get_min_capability" not in cls.__dict__:
             raise RuntimeError(f"vllm_sm70: {cls.__qualname__} lost its gate.")
+    if M3_INSTALLED:
+        from vllm_sm70.quant.nvfp4_linear import builder_installed
+
+        if not builder_installed():
+            raise RuntimeError(
+                "vllm_sm70: LINEAR_METHOD_BUILDERS['W4A16_NVFP4'] was replaced "
+                "after M3 installed it."
+            )
     detected = Sm70ModelOptNvFp4Config.override_quantization_method(
         _FLINT_QUANT_CFG, None
     )

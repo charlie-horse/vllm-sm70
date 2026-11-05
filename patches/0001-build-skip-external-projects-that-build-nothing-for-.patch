@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vllm-sm70 <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 05:35:37 +0000
+Subject: [PATCH] build: skip external projects that build nothing for sm_70
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+What: with VLLM_SM70_TRIM_EXTERNALS=1, CMake skips DeepGEMM, DeepSelect,
+  MSA (fmha_sm100), FlashMLA, FlashKDA, qutlass and tml-fa4, and setup.py
+  drops their extensions plus vllm-flash-attn's FA3 target, so none of
+  them is built. FA2 is still built. Unset or any other value, the build
+  is unchanged.
+Why: on arch 7.0 none of these produce usable kernels, but FA3 alone
+  compiles ~250 Hopper .cu files at nvcc's default arch (FA3_ARCHS is
+  empty, yet vllm-flash-attn defines the target): most of the 46 min tree
+  build on r440 (2026-11-04). FA2 stays because vllm/vllm_flash_attn/
+  __init__.py raises ImportError unless _vllm_fa2_C or _vllm_fa3_C exists,
+  and vision encoders (qwen2_vl, qwen2_5_vl, glm4_1v, ...) reach
+  vllm_flash_attn.layers.rotary through ApplyRotaryEmb.forward_cuda
+  (rotary_embedding/common.py:223).
+Upstream-files: CMakeLists.txt, setup.py
+Kill-switch: unset or ≠1 (build-time) → upstream; nix/package.nix sets VLLM_SM70_TRIM_EXTERNALS=1
+Tests: nix build .#vllm on r440 (cuobjdump: sm_70 in _C_stable/_moe_C, no _vllm_fa3_C .so); import vllm.vllm_flash_attn.layers.rotary on c4130; c4130 TRITON_ATTN TP1/TP2 rerun
+Upstream-status: not-upstreamable
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7694e6f8bc46..2dde98fc1d5d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1701,6 +1701,8 @@ endif()
+ 
+ # For CUDA we also build and ship some external projects.
+ if (VLLM_GPU_LANG STREQUAL "CUDA")
++  # VLLM_SM70_TRIM_EXTERNALS=1: skip the projects that build nothing for sm_70.
++  if (NOT "$ENV{VLLM_SM70_TRIM_EXTERNALS}" STREQUAL "1")
+     include(cmake/external_projects/deepgemm.cmake)
+     include(cmake/external_projects/deepselect.cmake)
+     include(cmake/external_projects/fmha_sm100.cmake)
+@@ -1708,6 +1710,9 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
+     include(cmake/external_projects/flashkda.cmake)
+     include(cmake/external_projects/qutlass.cmake)
+     include(cmake/external_projects/tml_fa4.cmake)
++  else()
++    message(STATUS "vllm-sm70: VLLM_SM70_TRIM_EXTERNALS=1, skipping external projects that build nothing for sm_70")
++  endif()
+ 
+     # vllm-flash-attn should be last as it overwrites some CMake functions
+     include(cmake/external_projects/vllm_flash_attn.cmake)
+diff --git a/setup.py b/setup.py
+index cf99ec3aaaf4..4cff6cf5afda 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1619,6 +1619,23 @@ if _build_custom_ops():
+         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
+         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
+ 
++if _is_cuda() and os.environ.get("VLLM_SM70_TRIM_EXTERNALS") == "1":
++    # Don't build what has no sm_70 kernels. FA2 stays: vllm.vllm_flash_attn
++    # only imports with _vllm_fa2_C or _vllm_fa3_C present, and vision
++    # encoders use its Triton rotary (rotary_embedding/common.py:223).
++    _sm70_skip = {
++        "vllm.vllm_flash_attn._vllm_fa3_C",
++        "vllm._flashmla_C",
++        "vllm._flashmla_extension_C",
++        "vllm._deepselect_C",
++        "vllm._flashkda_C",
++        "vllm._deep_gemm_C",
++        "vllm._qutlass_C",
++        "vllm.fmha_sm100",
++        "vllm.tml_fa4",
++    }
++    ext_modules = [e for e in ext_modules if e.name not in _sm70_skip]
++
+ package_data = {
+     "vllm": [
+         "py.typed",
