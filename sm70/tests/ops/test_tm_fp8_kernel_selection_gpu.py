@@ -19,11 +19,12 @@ import sys
 
 import pytest
 
+torch = pytest.importorskip("torch")  # before _ref, which imports torch
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _ref import fp8_block_dequant, fp8_block_weight, max_abs_rel  # noqa: E402
 
 pytestmark = pytest.mark.gpu
-torch = pytest.importorskip("torch")
 
 
 def _prepared(tm, n, k, gated=False, seed=0):

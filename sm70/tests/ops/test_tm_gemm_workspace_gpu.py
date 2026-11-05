@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+torch = pytest.importorskip("torch")  # before _ref, which imports torch
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _ref import (  # noqa: E402
     fp8_block_dequant,
@@ -26,7 +28,6 @@ from _ref import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.gpu
-torch = pytest.importorskip("torch")
 
 MiB = 1024**2
 # Barriers + tensormaps + flags per stream workspace (fork test, same layout).
