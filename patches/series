@@ -2,4 +2,4 @@
 0001-build-skip-external-projects-that-build-nothing-for-.patch
 0002-platform-add-unquantized-GEMM-and-kernel-warmup-plat.patch
 0003-platform-pick-the-FLA-recurrent-decode-block-size-fo.patch
-0004-platform-add-a-fused-MoE-router-platform-hook.patch
+0004-platform-add-a-MoE-router-provider-hook-at-the-runne.patch

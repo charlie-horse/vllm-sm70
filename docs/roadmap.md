@@ -25,10 +25,10 @@ The whole carry against upstream is these patches:
 |---|---|---|
 | U1 | +12 | `layers/utils.py:682`, `platforms/interface.py`, `warmup/kernel_warmup.py:164` |
 | U2 | ~8 | `fla/ops/fused_sigmoid_gating.py:208-212`, `fla/ops/fused_recurrent.py:196-200` |
-| U3 | +9 | `fused_moe/router/router_factory.py:126`, `platforms/interface.py` |
+| U3 | +20 | `fused_moe/runner/moe_runner.py:630, :907`, `platforms/interface.py` |
 | U4 | ~60 | `v1/worker/gpu_model_runner.py` :3403, :4208 |
 | U5 | ~330 | `csrc/custom_all_reduce.cu`, `csrc/torch_bindings.cpp`, `custom_all_reduce.py`, `cuda_communicator.py` |
-| **total** | **~90 without U5; ~420 with it** | |
+| **total** | **~100 without U5; ~430 with it** | |
 
 ## Phase 1: unpatched build
 
