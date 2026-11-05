@@ -389,11 +389,69 @@ def test_3d_input_restored(nvl, mock_tm):
     assert method.apply(layer, torch.randn(2, 3, 256).half()).shape == (2, 3, 512)
 
 
-def test_bf16_activation_refused(nvl, mock_tm):
-    mock_tm()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_non_fp16_activation_raises_type_error(nvl, mock_tm, dtype):
+    """apply() declares a TypeError for non-FP16 activations and raises it
+    before any op runs (no silent cast, no kernel call)."""
+    tm = mock_tm()
     method, layer, _ = _prepared(nvl, 256, 512)
-    with pytest.raises(RuntimeError, match="float16"):
-        method.apply(layer, torch.randn(1, 256).bfloat16())
+    tm.calls.clear()
+    with pytest.raises(TypeError, match=r"needs float16 activations.*--dtype half"):
+        method.apply(layer, torch.randn(1, 256).to(dtype))
+    assert tm.calls == []
+    assert "TypeError" in nvl.apply_prepared_linear.__doc__
+    assert "TypeError" in nvl.ModelOptNvFp4Sm70LinearMethod.apply.__doc__
+
+
+def test_online_fp8_on_sm70_is_refused_by_upstream(
+    device, restore_registries, monkeypatch, tmp_path
+):
+    """Online ``--quantization fp8`` (checkpoint without a quant config) on
+    SM70, with M2 + M3 installed. Upstream rewrites it to
+    OnlineQuantizationConfig (UP 4ba787e weight_utils.py:355-363), whose min
+    capability is 75 (online/base.py:209-212). It therefore never reaches
+    Sm70Fp8Config's gate, and VllmConfig refuses cc 7.0 (config/vllm.py:926-936).
+    Nothing picks a kernel silently."""
+    from types import SimpleNamespace
+
+    from vllm.config.vllm import VllmConfig
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.model_loader.weight_utils import get_quant_config
+
+    monkeypatch.delenv("VLLM_SM70_FP8_TURBOMIND", raising=False)
+    device(7, 0)
+    configs = _reload_configs(monkeypatch)
+    assert configs.REGISTERED and configs.M3_INSTALLED
+    assert configs.Sm70Fp8Config.get_min_capability() == 70  # M2 gate is open
+    model_config = SimpleNamespace(
+        quantization="fp8",
+        quantization_config=None,
+        hf_config=SimpleNamespace(),  # unquantized checkpoint
+        hf_overrides={},
+        model=str(tmp_path),
+        revision=None,
+        dtype=torch.float16,
+    )
+    load_config = SimpleNamespace(download_dir=None)
+    built = get_quant_config(model_config, load_config)
+    assert type(built) is OnlineQuantizationConfig
+    assert not isinstance(built, configs.Sm70Fp8Config)
+    assert built.get_min_capability() == 75
+    with pytest.raises(
+        ValueError, match="Minimum capability: 75. Current capability: 70"
+    ):
+        VllmConfig._get_quantization_config(model_config, load_config)
+
+
+def test_fp8_config_refuses_online_construction():
+    """The other route, an Fp8Config built for a non-fp8 checkpoint, raises
+    in upstream's constructor (UP 4ba787e fp8.py:106-112)."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    with pytest.raises(ValueError, match="no longer supports online"):
+        Fp8Config(is_checkpoint_fp8_serialized=False)
 
 
 def test_missing_ops_raise(nvl, monkeypatch):
@@ -549,6 +607,25 @@ def test_gpu_gemv_equals_gemm(nvl, monkeypatch, k, n, m):
     m2, l2, _ = _gpu_prepared(nvl, k, n, 7, monkeypatch, gemv=False)
     y2 = m2.apply(l2, x)
     torch.testing.assert_close(y1, y2, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.gpu
+@needs_sm70
+@torch.inference_mode()
+def test_strided_activation_rows(nvl, monkeypatch):
+    """Port of FORK cf9492a tests/kernels/quantization/
+    test_sm70_nvfp4_tm_gemv.py:157-165. A row-strided (non-contiguous) M=2
+    activation on the Flint "o" shape, which takes the GEMV, must give exactly
+    the result of its contiguous copy. flatten_linear_input passes 2-D views
+    through unchanged, so the op sees the row stride."""
+    method, layer, _ = _gpu_prepared(nvl, 2048, 2048, 1, monkeypatch)
+    assert getattr(layer, nvl.STATE_ATTR).tm_gemv
+    k = 2048
+    wide = torch.randn(2, k + 64, device="cuda").half()
+    strided = wide[:, :k]
+    assert not strided.is_contiguous()
+    out = method.apply(layer, strided)
+    assert torch.equal(out, method.apply(layer, strided.clone()))
 
 
 @pytest.mark.gpu

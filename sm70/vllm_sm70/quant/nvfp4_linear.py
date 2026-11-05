@@ -46,8 +46,17 @@ tuple. No op takes a global scale: the caller folds weight_scale_2 into the
 fp16 scales once, before prepare (``format_nvfp4_scales``). The GEMV is
 feature-detected: without K11's op, the GEMM serves every M.
 
-Not M3: online ``--quantization fp8`` is admitted by M2's capability gate
-(Sm70Fp8Config) but has no SM70 linear path here. The M6 owner must refuse it.
+Not M3: online ``--quantization fp8``. It never reaches M2's Sm70Fp8Config
+gate. For a checkpoint without a quantization config, upstream's
+``get_quant_config`` rewrites "fp8" to ``OnlineQuantizationConfig``
+(fp8_per_tensor) (UP 4ba787e model_loader/weight_utils.py:355-363). That
+config's ``get_min_capability()`` is 75 (quantization/online/base.py:209-212),
+so ``VllmConfig._get_quantization_config`` refuses cc 7.0 with "Minimum
+capability: 75. Current capability: 70" (config/vllm.py:926-936). Building
+``Fp8Config`` directly with a non-fp8 checkpoint raises too (fp8.py:106-112).
+There is no SM70 online-FP8 linear, and nothing picks a kernel silently.
+tests/quant/test_m3_nvfp4_linear.py pins this; an SM70 online-FP8 path would
+be a new node with its own gate.
 """
 
 from __future__ import annotations
@@ -378,12 +387,18 @@ def apply_prepared_linear(
 
     ported from FORK sm70_turbomind.py:911-920 + sm70_provider.py:169-203
     (non-gated, non-interleaved branch)
+
+    Raises:
+        TypeError: ``x`` is not float16. The TurboMind W4A16 kernels on SM70
+            take FP16 activations only (V100 has no BF16; serve with
+            ``--dtype half``). The fork raised the same check as a
+            RuntimeError (FORK sm70_provider.py:175-181).
     """
     state: SM70TurboMindLinearState = getattr(layer, STATE_ATTR)
     if x.dtype != torch.float16:
-        # TurboMind W4A16 on SM70 is FP16-only (V100 has no BF16).
-        raise RuntimeError(
-            f"SM70 NVFP4 TurboMind needs float16 activations, got {x.dtype}"
+        raise TypeError(
+            f"SM70 NVFP4 TurboMind needs float16 activations, got {x.dtype}; "
+            "serve with --dtype half"
         )
     x_2d = flatten_linear_input(x)
     logical_n = state.output_size
@@ -487,6 +502,11 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the prepared TurboMind W4A16 linear (GEMV for M<=2 if admitted).
+
+        Raises:
+            TypeError: ``x`` is not float16 (SM70 TurboMind is FP16-only).
+        """
         return apply_prepared_linear(layer, x, bias)
 
 
