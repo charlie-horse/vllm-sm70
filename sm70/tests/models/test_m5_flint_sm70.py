@@ -181,13 +181,14 @@ def test_check_fp16_range_rejects_overflow():
     ],
 )
 def test_stream_scales(layer, expected):
-    """Fork model.py:402-408: residual /8 at 46, attention output /8 above."""
+    """Residual /8 at layer 46, attention output /8 above it
+    (FORK vllm/models/flint/model.py:402-408)."""
     assert fr.stream_scales(layer, True) == expected
     assert fr.stream_scales(layer, False) == (None, None)
 
 
 def test_lm_head_scale_folds_in_fp16_and_scales_logits_otherwise():
-    """Fork model.py:647-668."""
+    """FORK vllm/models/flint/model.py:647-668."""
     sc = fr.LmHeadScale()
     rest = list(
         sc.intercept(
@@ -255,9 +256,9 @@ def _inputs(n=5, seed=0):
 
 @pytest.mark.parametrize("rope", [True, False])
 def test_reference_matches_unfused_route(rope):
-    """The fused route's numerics (fork qk_norm_rope_kv.py:10-15) equal the
-    unfused route: per-head RMSNorm rounded to fp16, then NeoX RoPE on the
-    rounded values."""
+    """The fused route's numerics
+    (FORK vllm/models/flint/qk_norm_rope_kv.py:10-15) equal the unfused route:
+    per-head RMSNorm rounded to fp16, then NeoX RoPE on the rounded values."""
     qkv, qw, kw, pos = _inputs()
     n = qkv.shape[0]
     cs = _cos_sin() if rope else None
@@ -296,8 +297,9 @@ def _triton_impl():
 
 
 def test_cache_write_uses_upstream_triton_layout():
-    """kv_cache is [blocks, Hkv, page, 2*D] (UP triton_attn.py:598-599); K goes
-    to [..., :D] and V to [..., D:], at slot = block*page + offset. Padded
+    """kv_cache is [blocks, Hkv, page, 2*D]
+    (UP vllm/v1/attention/backends/triton_attn.py:598-599); K goes to
+    [..., :D] and V to [..., D:], at slot = block*page + offset. Padded
     slots (-1) are skipped."""
     qkv, qw, kw, pos = _inputs(n=4)
     kv_cache = torch.zeros(3, HKV, PAGE, 2 * D, dtype=torch.half)
@@ -323,6 +325,52 @@ def test_cache_write_uses_upstream_triton_layout():
         assert torch.equal(kv_cache[b, :, off, D:], vv[t])
         written[b, :, off] = True
     assert not kv_cache[~written].any()  # nothing else touched
+
+
+def _layer_cache(layout_name, blocks, layers=2, layer=1, device="cpu"):
+    """A per-layer [B, H, N, 2*D] KV view with UP's physical stride order.
+
+    UP allocates one buffer per KV-cache group in ``KVCacheLayout`` stride
+    order over logical [L, B, H, N, C] (UP vllm/v1/kv_cache_layout.py:15-28)
+    and hands each layer a logical [B, H, N, C] view
+    (vllm/v1/kv_cache_interface.py:418-427, create_kv_cache_views). TRITON_ATTN
+    accepts any layout: it doesn't override supported_kv_cache_layouts, so the
+    base returns None (vllm/v1/attention/backend.py:371-375). Permuted layouts
+    such as LBNHC reach do_kv_cache_update as non-contiguous views."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    order = KVCacheLayout[layout_name].stride_order
+    logical = (layers, blocks, HKV, PAGE, 2 * D)
+    physical = torch.zeros([logical[i] for i in order], dtype=torch.half, device=device)
+    inverse = [order.index(i) for i in range(5)]
+    return physical.permute(*inverse)[layer]
+
+
+LAYOUTS = ["LBHNC", "LBNHC", "BLHNC", "BLNHC"]
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_cache_write_honours_permuted_layouts(layout):
+    """The op takes block/page/head strides from the views and needs only a
+    unit inner stride (D), so a permuted (LBNHC-style) layer view gets the
+    same logical cache as the identity layout, -1 padding included."""
+    qkv, qw, kw, pos = _inputs(n=6, seed=3)
+    slots = torch.tensor([0, 19, -1, 47, 5, -1])
+    ref = _layer_cache("LBHNC", 3)
+    cache = _layer_cache(layout, 3)
+    if layout != "LBHNC":
+        assert not cache.is_contiguous()
+    layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
+    for kv in (ref, cache):
+        views = qk._direct_cache_views(layer, kv, slots, HKV)
+        assert views is not None  # admitted: the kernel honours the strides
+        q = torch.empty(6, HQ * D, dtype=torch.half)
+        k = torch.empty(6, HKV * D, dtype=torch.half)
+        qk.qk_norm_rope_kv_reference(
+            qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *views, slots
+        )
+    assert torch.equal(cache, ref)
+    assert ref.any()
 
 
 def test_direct_cache_views_refuses_other_layouts():
@@ -638,6 +686,53 @@ def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
         assert torch.equal(a, b)
 
 
+@pytest.mark.gpu
+@one_gpu
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("rope", [True, False])
+def test_t2b_permuted_cache_matches_upstream_writer(layout, rope):
+    """T2b (1 GPU): on a permuted UP layer view, our fused op's cache write is
+    byte-identical to UP's own TRITON_ATTN writer,
+    TritonAttentionImpl.do_kv_cache_update
+    (UP vllm/v1/attention/backends/triton_attn.py:798-843, which calls
+    triton_reshape_and_cache_flash,
+    vllm/v1/attention/ops/triton_reshape_and_cache_flash.py:377), fed the
+    same K and V, with -1 padded slots. UP's writer is a Triton kernel with no
+    CPU path, hence gpu."""
+    from vllm.v1.attention.backend import AttentionType
+
+    n = 37
+    g = torch.Generator().manual_seed(7)
+    qkv = torch.randn(n, (HQ + 2 * HKV) * D, generator=g).half().cuda()
+    qw = (torch.rand(D, generator=g) + 0.5).half().cuda()
+    kw = (torch.rand(D, generator=g) + 0.5).half().cuda()
+    pos = torch.randint(0, 64, (n,), generator=g).cuda()
+    cs = _cos_sin().cuda() if rope else None
+    blocks = 5
+    slots = torch.randperm(blocks * PAGE, generator=g)[:n].cuda()
+    slots[::4] = -1
+    ours = _layer_cache(layout, blocks, device="cuda")
+    q = torch.empty(n, HQ * D, dtype=torch.half, device="cuda")
+    k = torch.empty(n, HKV * D, dtype=torch.half, device="cuda")
+    qk.qk_norm_rope_kv(
+        qkv, q, k, qw, kw, pos, cs, 1e-6, *qk.triton_cache_views(ours, D), slots
+    )
+    impl = _triton_impl()
+    impl.attn_type = AttentionType.DECODER
+    impl.kv_cache_dtype = "auto"
+    one = torch.ones((), device="cuda")
+    upstream = _layer_cache(layout, blocks, device="cuda")
+    impl.do_kv_cache_update(
+        SimpleNamespace(_k_scale=one, _v_scale=one),
+        k.view(n, HKV, D),
+        qkv[:, (HQ + HKV) * D :].view(n, HKV, D),
+        upstream,
+        slots,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ours, upstream)
+
+
 def _tiny_flint_dir(tmp_path):
     """A tiny random-weight Flint config (load_format=dummy fills weights)."""
     from vllm.models.flint.configs import FlintConfig
@@ -757,8 +852,10 @@ def test_t5_golden_tokens_vs_fork():
             (i for i, (a, b) in enumerate(zip(ours, ref)) if a != b),
             min(len(ours), len(ref)),
         )
-        print(f"T5 prompt {g['prompt'][:40]!r}: common prefix {common}/64 "
-              f"(fork stable={g.get('stable_across_2_runs')})")
+        print(
+            f"T5 prompt {g['prompt'][:40]!r}: common prefix {common}/64 "
+            f"(fork stable={g.get('stable_across_2_runs')})"
+        )
         if common < GOLDEN_EXACT_TOKENS:
             failures.append((g["prompt"][:40], common))
     assert not failures, f"diverged before {GOLDEN_EXACT_TOKENS} tokens: {failures}"

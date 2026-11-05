@@ -28,27 +28,28 @@ from collections.abc import Iterable, Iterator
 import regex as re
 import torch
 
-# fork model.py:74
+# FORK vllm/models/flint/model.py:74
 FP16_MAX = torch.finfo(torch.float16).max
 
-# fork model.py:95-96
+# FORK vllm/models/flint/model.py:95-96
 MOE_INTERMEDIATE_SHIFT = 16
 _MOE_UP = (".mlp.experts.", ".mlp.shared_expert.")
 
-# fork model.py:105-107
+# FORK vllm/models/flint/model.py:105-107
 FP16_STREAM_SHIFT_LAYER = 46
 FP16_STREAM_SHIFT = 8
 _LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
-LM_HEAD_SCALE = "lm_head.weight_scale_2"  # fork model.py:85
+LM_HEAD_SCALE = "lm_head.weight_scale_2"  # FORK vllm/models/flint/model.py:85
 
 
 # ported from FORK vllm/models/flint/model.py:402-408, 443-447
 def stream_scales(layer_idx: int, enabled: bool) -> tuple[float | None, float | None]:
     """Return ``(residual_scale, attn_out_scale)`` for one decoder layer.
 
-    Port of fork model.py:402-408 (``FlintDecoderLayer.__init__``). The layer
-    applies ``attn_out_scale`` to the attention output before the
+    Port of FORK vllm/models/flint/model.py:402-408
+    (``FlintDecoderLayer.__init__``). The layer applies
+    ``attn_out_scale`` to the attention output before the
     post-attention norm, and ``residual_scale`` to the residual after it
     (fork :443-447).
     """
@@ -66,7 +67,7 @@ def rebalance_moe_intermediate(
     weights: Iterable[tuple[str, torch.Tensor]], shift: int = MOE_INTERMEDIATE_SHIFT
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Divide MoE up projections by ``shift`` and multiply the matching down
-    projections by it. Identical to fork model.py:696-715
+    projections by it. Identical to FORK vllm/models/flint/model.py:696-715
     (``_rebalance_moe_intermediate``).
 
     A power of two only moves exponents, so this is exact except where an
@@ -94,8 +95,9 @@ def rescale_fp16_stream(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Divide the MLP/MoE down projections of layers ``>= start_layer`` by
     ``shift``, so their outputs join the rescaled residual stream. Identical
-    to fork model.py:718-738 (``_rescale_fp16_stream``). NVFP4 tensors move
-    the FP32 global scale (``weight_scale_2``); unquantized tensors move the
+    to FORK vllm/models/flint/model.py:718-738 (``_rescale_fp16_stream``).
+    NVFP4 tensors move the FP32 global scale (``weight_scale_2``);
+    unquantized tensors move the
     weights.
     """
     for name, tensor in weights:
@@ -119,7 +121,7 @@ def check_fp16_range(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Reject BF16/FP32 tensors that would overflow when cast to FP16.
-    Identical to fork model.py:741-753 (``_check_fp16_range``)."""
+    Identical to FORK vllm/models/flint/model.py:741-753 (``_check_fp16_range``)."""
     for name, tensor in weights:
         if tensor.dtype in (torch.bfloat16, torch.float32) and tensor.numel():
             amax = tensor.detach().abs().amax()
@@ -135,7 +137,8 @@ def check_fp16_range(
 def fp16_weight_pipeline(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """The three FP16 filters, in fork order (model.py:623-628)."""
+    """The three FP16 filters, in fork order
+    (FORK vllm/models/flint/model.py:623-628)."""
     weights = rebalance_moe_intermediate(weights, MOE_INTERMEDIATE_SHIFT)
     weights = rescale_fp16_stream(weights, FP16_STREAM_SHIFT_LAYER, FP16_STREAM_SHIFT)
     return check_fp16_range(weights)
@@ -146,8 +149,9 @@ class LmHeadScale:
     """Captures ``lm_head.weight_scale_2`` from the weight stream and applies
     it after loading.
 
-    Port of fork model.py:620-621, 634-645 (``_intercept_lm_head_scale``) and
-    :647-668 (``_apply_lm_head_scale``). The NVFP4 checkpoint stores lm_head
+    Port of FORK vllm/models/flint/model.py:620-621, 634-645
+    (``_intercept_lm_head_scale``) and :647-668 (``_apply_lm_head_scale``).
+    The NVFP4 checkpoint stores lm_head
     dequantized without its global scale, which comes separately as a scalar.
     With BF16/FP32 weights the scale multiplies the logits, as upstream does
     (UP 4ba787e models/flint/model.py:690-691). FP16 can't hold the unscaled
@@ -162,7 +166,7 @@ class LmHeadScale:
     def intercept(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        # fork model.py:638-645
+        # FORK vllm/models/flint/model.py:638-645
         for name, tensor in weights:
             if name == LM_HEAD_SCALE:
                 self.scale = float(tensor)
@@ -171,8 +175,9 @@ class LmHeadScale:
 
     # ported from FORK vllm/models/flint/model.py:634-635, 647-668
     def apply(self, lm_head: torch.nn.Module | None, logits_processor) -> None:
-        # fork model.py:634-635 and :647-668. Pass lm_head=None on non-last PP
-        # ranks (the fork checks isinstance(PPMissingLayer)).
+        # FORK vllm/models/flint/model.py:634-635 and :647-668.
+        # Pass lm_head=None on non-last PP ranks (the fork checks
+        # isinstance(PPMissingLayer)).
         if self.scale is None or lm_head is None:
             return
         weight = lm_head.weight

@@ -4,28 +4,30 @@
 
 Port of charlie-horse/vLLM cf9492a ``vllm/models/flint/model.py`` (753 L). It
 reuses UP ``vllm.models.flint.configs.FlintConfig`` (identical to the fork's
-except one comment line, UP configs.py:88). Each fork-only core hook is
-replaced as follows:
+except one comment line, UP vllm/models/flint/configs.py:88). Each fork-only
+core hook is replaced as follows (UP paths under vllm/model_executor/layers/
+unless given in full):
 
 =====================================  =======================================
 fork (cf9492a)                         here (UP 4ba787e)
 =====================================  =======================================
 FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
                                        92). RoutedExperts.load_weights builds
-                                       its own mapping (UP routed_experts.py:
-                                       1004-1008)
+                                       its own mapping (UP fused_moe/
+                                       routed_experts.py:1004-1008)
 runner.router_provider :229            dropped in v1 (fused router deferred)
 Attention.forward(kv_cache_updated=)   op returns a dummy dep, then
   :386                                 torch.ops.vllm.unified_attention_with_
                                        output(kv_cache_dummy_dep=) (UP
-                                       attention.py:772-800)
+                                       attention/attention.py:772-800)
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
 layer_policy(...).value("flint_        dropped in v1 (sampler deferred)
   sampler") :570-577
 AutoWeightsLoader(skip_prefixes=)      filter lm_head.* when tied (UP
   :629-632                             AutoWeightsLoader has no skip_prefixes,
-                                       models/utils.py:242-248)
+                                       vllm/model_executor/models/
+                                       utils.py:242-248)
 FP16 rescale :87-107, :402-447, :623-  fp16_rescale.py
   628, :647-668, :696-753
 =====================================  =======================================
@@ -209,10 +211,13 @@ class FlintSm70SparseMoeBlock(nn.Module):
             reduce_results=False,
             prefix=f"{prefix}.shared_expert",
         )
-        # fork :211-226 -> UP FusedMoEFactory (UP layer.py:92-147). Dropped:
-        # expert_mapping= (UP routed_experts.py:1007 builds it from the default
-        # ckpt_names=("gate_proj","down_proj","up_proj"), UP layer.py:125), and
-        # the fork's runner.router_provider (:229, fused router deferred).
+        # FORK vllm/models/flint/model.py:211-226 -> UP FusedMoEFactory
+        # (UP vllm/model_executor/layers/fused_moe/layer.py:92-147). Dropped:
+        # expert_mapping=, since UP builds the mapping
+        # (vllm/model_executor/layers/fused_moe/routed_experts.py:1007) from the
+        # default ckpt_names=("gate_proj","down_proj","up_proj")
+        # (vllm/model_executor/layers/fused_moe/layer.py:125); and the fork's
+        # runner.router_provider (:229, fused router deferred).
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -365,10 +370,12 @@ class FlintSm70Attention(nn.Module):
 
         Our op writes the KV cache and returns a dummy. Then
         ``unified_attention_with_output`` runs with ``kv_cache_dummy_dep`` set,
-        exactly like UP ``Attention.forward`` (UP attention.py:560-583). UP
-        Flint calls the Python function (UP models/flint/model.py:365)
+        exactly like UP ``Attention.forward``
+        (UP vllm/model_executor/layers/attention/attention.py:560-583). UP
+        Flint calls the Python function (UP vllm/models/flint/model.py:365)
         because it isn't compiled; we are (@support_torch_compile), so we call
-        the registered op, which is in ``_attention_ops`` (UP compilation.py:769).
+        the registered op, which is in ``_attention_ops``
+        (UP vllm/config/compilation.py:769).
         """
         num_tokens = qkv.shape[0]
         q = torch.empty((num_tokens, self.q_size), dtype=qkv.dtype, device=qkv.device)

@@ -8,14 +8,16 @@ Three things differ from the fork, all for UP v0.33.0 (4ba787e):
 
 1. The op is ``torch.ops.vllm.sm70_flint_qk_norm_rope_kv_cache_update`` (fork
    name ``qk_norm_rope_kv_cache_update``, fork :27). Like UP
-   ``unified_kv_cache_update`` (UP attention/attention.py:729-767), it
+   ``unified_kv_cache_update``
+   (UP vllm/model_executor/layers/attention/attention.py:729-767), it
    **returns a 0-element dummy**, which the model passes to
    ``torch.ops.vllm.unified_attention_with_output(kv_cache_dummy_dep=...)``
    (UP :772-800). That data edge orders the cache write before attention under
    torch.compile, so the fork-only ``Attention.forward(kv_cache_updated=True)``
-   (fork attention.py:535) is not needed.
+   (FORK vllm/model_executor/layers/attention/attention.py:535) is not needed.
 2. Cache views follow UP's Triton layout: ``kv_cache.transpose(1, 2).split(D,
-   -1)`` (UP triton_attn.py:827-828), instead of the fork's ``unbind(1)`` of
+   -1)`` (UP vllm/v1/attention/backends/triton_attn.py:827-828), instead of
+   the fork's ``unbind(1)`` of
    ``[blocks, 2, page, Hkv, D]``.
 3. It isn't added to ``splitting_ops`` (the fork patched
    config/compilation.py:1174). On torch >= 2.11 the layer name is an opaque
@@ -80,7 +82,7 @@ def _qk_norm_rope_kv_kernel(
     HAS_ROPE: tl.constexpr,
     STORE_CACHE: tl.constexpr,
 ):
-    # Verbatim from fork qk_norm_rope_kv.py:65-125.
+    # Verbatim from FORK vllm/models/flint/qk_norm_rope_kv.py:65-125.
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     d = tl.arange(0, HEAD_DIM)
@@ -292,7 +294,8 @@ def fused_route_rejection(
 def triton_cache_views(
     kv_cache: torch.Tensor, head_dim: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[blocks, Hkv, page, 2*D]`` (UP triton_attn.py:598-599) -> K and V as
+    """``[blocks, Hkv, page, 2*D]``
+    (UP vllm/v1/attention/backends/triton_attn.py:598-599) -> K and V as
     ``[blocks, page, Hkv, D]`` views, exactly as
     ``TritonAttentionImpl.do_kv_cache_update`` builds them (UP :827-828).
     Not in the fork: its cache was ``[blocks, 2, page, Hkv, D]`` (fork :282-284)."""
@@ -457,7 +460,8 @@ def sm70_flint_qk_norm_rope_kv_cache_update_fake(
 
 
 # q_out/k_out are mutated. The returned dummy orders the cache write before
-# unified_attention_with_output (same pattern as UP attention.py:762-767).
+# unified_attention_with_output (same pattern as UP
+# vllm/model_executor/layers/attention/attention.py:762-767).
 # ported from FORK vllm/models/flint/qk_norm_rope_kv.py:362-369
 direct_register_custom_op(
     op_name=OP_NAME,

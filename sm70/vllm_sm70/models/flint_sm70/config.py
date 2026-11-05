@@ -15,8 +15,9 @@ v1 scope:
   FlashInfer (UP models/flint/model.py:318, 321); this class is the SM70
   variant.
 * Attention backend: TRITON_ATTN unless the user picked one. It supports sinks
-  (UP triton_attn.py:387) and every compute capability (:405), and needs an
-  FP16 KV cache on SM70 (fork :406-415). Kai's Flash-V100 sink route
+  (UP vllm/v1/attention/backends/triton_attn.py:387) and every compute
+  capability (:405), and needs an FP16 KV cache on SM70 (fork :406-415). Kai's
+  Flash-V100 sink route
   (fork :375-399, :276-305) arrives with his backend.
 * The fork's TP2 all-reduce + RMSNorm fusion (fork :308-372) is deferred. It
   needs the fork-only ``pass_config.fuse_allreduce_add_rms_tp2``.
