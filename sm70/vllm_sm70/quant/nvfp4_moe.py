@@ -45,6 +45,7 @@ buffers are allocated in process_weights_after_loading, never in forward.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Final
 
 import torch
@@ -64,6 +65,12 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# K12 decode switch and the one contract it serves (flint_moe.FLINT_TP2;
+# repeated here so the check works when vllm_sm70.ops.flint_moe is absent).
+_DECODE_SWITCH: Final = "VLLM_SM70_FLINT_MOE_QPN_DECODE"
+_FLINT_TP2_CONTRACT: Final = (256, 2048, 256, 6)
+_warned_decode_ops_absent = False
 
 NVFP4_GROUP_SIZE: Final = 16
 REQUIRED_OPS: Final = (
@@ -324,8 +331,29 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_decode_plan = None
         layer.sm70_nvfp4_decode_ws = None
         flint_moe = _flint_moe()
+        ops_present = flint_moe is not None and flint_moe.available()
+        if (
+            not ops_present
+            and self.decode_enabled
+            and contract == _FLINT_TP2_CONTRACT
+        ):
+            # fork nvfp4_sm70_moe.py:240-251: an explicit request for the
+            # decode with the ops missing is an error, not a silent fallback.
+            # "1" never enables anything here; it only makes absence fatal.
+            if os.environ.get(_DECODE_SWITCH) == "1":
+                raise RuntimeError(
+                    f"{_DECODE_SWITCH}=1 requires vllm_sm70._sm70_C built with "
+                    "the K12 ops nvfp4_moe_decode_w13_swiglu_sm70_out and "
+                    "nvfp4_moe_decode_w2_reduce_sm70_out."
+                )
+            global _warned_decode_ops_absent
+            if not _warned_decode_ops_absent:
+                _warned_decode_ops_absent = True
+                logger.warning(
+                    "The SM70 NVFP4 M<=2 decode ops are absent from the loaded "
+                    "_sm70_C; keeping the dense-stage route for M<=2."
+                )
         if flint_moe is None:
-            logger.debug("vllm_sm70.ops.flint_moe absent; dense stage serves M<=2.")
             return
         plan = flint_moe.admit_layer(
             contract,
