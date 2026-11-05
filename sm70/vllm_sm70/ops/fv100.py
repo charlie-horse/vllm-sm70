@@ -15,8 +15,13 @@ from the fork:
   grid follows the runtime length (VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS
   unset -> on). VLLM_FLASH_V100_DECODE_PARTITION_SIZE is gone; pass
   `partition_size_hint` instead.
-* No anchored SWA, FP8 KV, staged XQA, DFlash2 split or fused one-launch sink
-  decode (K14 adds the fused path).
+* No anchored SWA, FP8 KV, staged XQA or DFlash2 split.
+* K14 (C4): Flint sink layers (GQA 8, D128, fp16 KV) decode in one launch
+  through `fv100_decode_paged_sinks_fused` when the op is built and
+  VLLM_SM70_FLINT_ATTN_FUSED_DECODE is not "0". Its int32 arrival counters
+  are per device, allocated and zeroed only outside CUDA-graph capture (the
+  `--max-num-seqs 20` gibberish fix, fork 7f12d21b8); a capture without them
+  decodes in two launches. See "Fused one-launch sink decode" below.
 
 KV cache views: `k_cache`/`v_cache` are [num_blocks, block_size, H_kv, D]
 views with any strides in the first three dims and a contiguous last dim.
@@ -28,6 +33,8 @@ backend to that layout is K06.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -72,6 +79,9 @@ def available() -> bool:
     return all(has_op(name) for name in OPS)
 
 
+logger = logging.getLogger("vllm.sm70")
+
+
 OPS = (
     "fv100_decode_paged",
     "fv100_decode_paged_sinks",
@@ -86,6 +96,18 @@ VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 # Head sizes the lean build instantiates (decode: 128/256; XQA: 256).
 SUPPORTED_HEAD_SIZES = (128, 256)
 XQA_GQA_RATIOS = (4, 6, 8)
+
+# K14 (C4): optional sixth op, built unless VLLM_SM70_FV100_FUSED_DECODE=OFF.
+FUSED_DECODE_OP = "fv100_decode_paged_sinks_fused"
+FUSED_DECODE_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
+FUSED_DECODE_ZERO_COUNTERS_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
+# Shapes the fused kernel takes (flash_decode_paged.cu
+# gqa8_d128_decode_eligible): D128, 8 query heads per KV head, with sinks.
+FUSED_DECODE_HEAD_DIM = 128
+FUSED_DECODE_GQA = 8
+# fork flash_attn_interface.py:32-34: int32 arrival counters, one per
+# (row, KV head), 1024 rows x 16 KV heads (64 KiB) per device.
+FUSED_DECODE_COUNTER_CAPACITY = 1024 * 16
 
 _decode_plan_cache: dict = {}
 _decode_workspace_cache: dict = {}
@@ -472,9 +494,170 @@ def _get_decode_workspace_for_plan(
 
 
 def clear_workspaces() -> None:
-    """Drop cached decode plans and workspaces (tests, engine shutdown)."""
+    """Drop cached decode plans, workspaces and fused-decode counters
+    (tests, engine shutdown)."""
     _decode_plan_cache.clear()
     _decode_workspace_cache.clear()
+    _fused_decode_counter_cache.clear()
+    _fused_decode_warned.clear()
+    _fused_decode_capture_counts.update(fused=0, two_launch=0)
+
+
+# ---------------------------------------------------------------------------
+# Fused one-launch sink decode (K14, C4): fork flash_attn_interface.py:30-36,
+# 59-71, 141-275 and the counter fix 7f12d21b8 / 89f751847 / 7e1c8c089 /
+# 7b2bacefd. The policy object is gone: the switches are read from the
+# environment on each call, as the fork's legacy_policy.py:42-47 did.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FusedDecodeCounters:
+    """Zero-between-launches arrival counters of the one-launch sink decode.
+
+    Allocated (and zeroed) only outside CUDA-graph capture: a ``torch.zeros``
+    under capture only records a memset into that graph, so graphs captured
+    later would replay on whatever the buffer holds (the --max-num-seqs 20
+    gibberish). ``retired`` keeps smaller buffers alive that captured graphs
+    may still reference.
+    """
+
+    buffer: torch.Tensor
+    retired: list[torch.Tensor]
+
+
+# Keyed by device index (-1: no index), not by stream; see _fused_decode_counters.
+_fused_decode_counter_cache: dict[int, _FusedDecodeCounters] = {}
+# Grouped sink decodes recorded into CUDA graphs: one-launch vs two-launch.
+_fused_decode_capture_counts = {"fused": 0, "two_launch": 0}
+_fused_decode_warned: set[str] = set()
+_FUSED_DECODE_OFF = (
+    "Flash-V100 one-launch sink decode is off for CUDA graphs captured on "
+    "this device ({}); they decode with the partition kernel plus reducer. "
+    "To keep it, run an eager sink-layer forward or call "
+    "flash_attn_decode_paged_sinks_prepare on the device before capture; "
+    f"{FUSED_DECODE_ENV}=0 selects the two-launch route on purpose."
+)
+# Logging formats per fixed reason code; numbers stay lazy %-arguments.
+_FUSED_DECODE_OFF_FORMATS = {
+    "no_counters": _FUSED_DECODE_OFF.format(
+        "no counters were allocated before capture"
+    ),
+    "capacity": _FUSED_DECODE_OFF.format(
+        "capture needs %s counters, %s were allocated"
+    ),
+}
+
+
+def fused_decode_enabled() -> bool:
+    """Kill switch: VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 turns it off."""
+    return os.environ.get(FUSED_DECODE_ENV) != "0"
+
+
+def _fused_decode_zero_counters_enabled() -> bool:
+    """Opt-in (fork default off): one counter memset per fused launch."""
+    return os.environ.get(FUSED_DECODE_ZERO_COUNTERS_ENV) == "1"
+
+
+def fused_decode_available() -> bool:
+    """The fused op is built and not switched off (fork :236-240)."""
+    return has_op(FUSED_DECODE_OP) and fused_decode_enabled()
+
+
+def fused_decode_eligible(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    sinks: torch.Tensor | None,
+    kv_cache_dtype: str = "auto",
+) -> bool:
+    """Shapes the one-launch kernel takes (fork :1366-1377).
+
+    Flint per rank: TP1 32q/4kv and TP2 16q/2kv (and TP4 8q/1kv), D128,
+    sinks. The C++ side re-checks this and the 16-byte alignment of q, K, V,
+    out and tmp_out (gqa8_d128_decode_eligible) and falls back to two
+    launches for anything else, so a False here only saves the counters.
+    """
+    if sinks is None or kv_cache_dtype not in ("auto", "float16"):
+        return False
+    if q.dim() != 3 or k_cache.dim() != 4 or k_cache.shape[2] <= 0:
+        return False
+    return (
+        q.shape[2] == FUSED_DECODE_HEAD_DIM
+        and q.shape[1] == FUSED_DECODE_GQA * k_cache.shape[2]
+    )
+
+
+def _warn_fused_decode_once(code: str, *args) -> None:
+    """Warn once per fixed reason code, with its numbers as lazy args."""
+    if code in _fused_decode_warned:
+        return
+    _fused_decode_warned.add(code)
+    logger.warning(_FUSED_DECODE_OFF_FORMATS[code], *args)
+
+
+def _normalized_device(device: torch.device) -> torch.device:
+    """``cuda`` without an index is the current device, as kernels see it."""
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.accelerator.current_device_index())
+    return device
+
+
+def _fused_decode_counters(device: torch.device, required: int) -> torch.Tensor | None:
+    """The device's counters; None where they cannot be created.
+
+    Keyed by device, not stream: a capture finds them whichever stream ran
+    the eager call that created them (vLLM captures on a fresh stream). That
+    is safe because each launch leaves them at zero and sink decodes on one
+    device never run concurrently (one compute stream; captures run one
+    after another). Never creates zero-dependent state under capture: a
+    capture without a big-enough buffer gets None and takes two launches.
+    """
+    device = _normalized_device(device)
+    key = device.index if device.index is not None else -1
+    entry = _fused_decode_counter_cache.get(key)
+    if entry is not None and entry.buffer.numel() >= required:
+        return entry.buffer
+    if _cuda_graph_capture_active():
+        if entry is None:
+            _warn_fused_decode_once("no_counters")
+        else:
+            _warn_fused_decode_once("capacity", required, entry.buffer.numel())
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    buffer = torch.zeros(
+        max(FUSED_DECODE_COUNTER_CAPACITY, required),
+        dtype=torch.int32,
+        device=device,
+    )
+    retired = [] if entry is None else [*entry.retired, entry.buffer]
+    _fused_decode_counter_cache[key] = _FusedDecodeCounters(buffer, retired)
+    return buffer
+
+
+def flash_attn_decode_paged_sinks_prepare(device: torch.device | str | int) -> bool:
+    """Allocate the one-launch sink decode's counters for a device.
+
+    Counters are per device and must exist before capture; a graph captured
+    on any stream then finds them. The Flash-V100 impl calls this when a
+    sink layer is built and on its first eager forward. A no-op, returning
+    False, when the fused decode is switched off or not built, for a
+    non-CUDA device, or under capture.
+    """
+    if not fused_decode_available():
+        return False
+    device = torch.device(device)
+    if device.type != "cuda" or _cuda_graph_capture_active():
+        return False
+    return _fused_decode_counters(device, 0) is not None
+
+
+def flash_attn_decode_paged_sinks_capture_counts() -> tuple[int, int]:
+    """Grouped sink decodes captured so far: (one-launch, two-launch)."""
+    return (
+        _fused_decode_capture_counts["fused"],
+        _fused_decode_capture_counts["two_launch"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +736,9 @@ def flash_attn_decode_paged(
 
     `sinks` (fp32 [H], natural-log units) adds exp(sink) to each softmax
     denominator with no value row; None keeps the sink-free kernels. With
-    sinks, GQA-8 D128 layers (Flint) take the grouped two-launch kernel.
+    sinks, GQA-8 D128 layers (Flint) take the one-launch fused kernel when
+    it is built, switched on and has counters (K14), else the grouped
+    two-launch kernel.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -579,6 +764,19 @@ def flash_attn_decode_paged(
     _assert_decode_launch_covers_seq_lens(
         plan, seq_lens, workspace_seq_capacity_hint=workspace_seq_capacity_hint
     )
+    # K14 (fork :1366-1391): with the fused decode switched off or not built,
+    # nothing here touches counters or capture state.
+    fused_ok = (
+        fused_decode_eligible(q, k_cache, sinks, kv_cache_dtype)
+        and fused_decode_available()
+    )
+    counters = (
+        _fused_decode_counters(q.device, batch_capacity * k_cache.shape[2])
+        if fused_ok
+        else None
+    )
+    if fused_ok and _cuda_graph_capture_active():
+        _fused_decode_capture_counts["two_launch" if counters is None else "fused"] += 1
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -611,6 +809,11 @@ def flash_attn_decode_paged(
     )
     if sinks is None:
         _op("fv100_decode_paged")(*args)
+    elif counters is not None:
+        if _fused_decode_zero_counters_enabled():
+            # Optional belt and braces: one memset per call (captured too).
+            counters[: batch_capacity * k_cache.shape[2]].zero_()
+        _op(FUSED_DECODE_OP)(*args, sinks, counters)
     else:
         _op("fv100_decode_paged_sinks")(*args, sinks)
     return out
@@ -821,6 +1024,34 @@ if has_op("fv100_decode_paged_sinks"):
         window_size_left: int,
         window_size_right: int,
         sinks: torch.Tensor | None,
+    ) -> None:
+        return None
+
+
+if has_op("fv100_decode_paged_sinks_fused"):
+
+    @register_fake("_sm70_C::fv100_decode_paged_sinks_fused")
+    def _fv100_decode_paged_sinks_fused_fake(
+        out: torch.Tensor,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tmp_out: torch.Tensor,
+        max_logits: torch.Tensor,
+        exp_sums: torch.Tensor,
+        active_num_partitions: torch.Tensor,
+        softmax_scale: float,
+        partition_size: int,
+        launch_num_partitions: int,
+        kv_cache_dtype: str,
+        k_scale: float,
+        v_scale: float,
+        window_size_left: int,
+        window_size_right: int,
+        sinks: torch.Tensor,
+        counters: torch.Tensor,
     ) -> None:
         return None
 
