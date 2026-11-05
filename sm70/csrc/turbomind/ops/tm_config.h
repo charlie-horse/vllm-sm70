@@ -13,8 +13,9 @@
 // stay verbatim. They include this through the sm70_policy.h shim.
 //
 // Environment names are the fork's, so existing tuning notes still apply.
-// Only knobs read by the K02 file set are listed, plus batch_gemm_layouts
-// (shared with K03 Python). K03+ add their own.
+// Only knobs read by the vendored files are listed: the K02 set,
+// batch_gemm_layouts (shared with K03 Python), the K03 op files and the
+// K04 AWQ MoE code.
 #pragma once
 
 // Same std headers the fork's sm70_policy.h chain provided, so vendored
@@ -84,7 +85,16 @@ namespace vllm::sm70 {
   X(awq_moe_tune_max_tokens, "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS")            \
   X(nvfp4_moe_tune_max_tokens, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS")        \
   X(f16_dense_max_m, "VLLM_SM70_F16_DENSE_MAX_M")                            \
-  X(batch_gemm_layouts, "VLLM_SM70_BATCH_GEMM_LAYOUTS")
+  X(batch_gemm_layouts, "VLLM_SM70_BATCH_GEMM_LAYOUTS")                      \
+  /* K03 op files (tm_*_sm70.cu, qwen38_prefill_cutlass.cu) */               \
+  X(profile_trace, "VLLM_SM70_PROFILE_TRACE")                                \
+  X(fp8_prefill_cutlass, "VLLM_SM70_FP8_PREFILL_CUTLASS")                    \
+  X(fp8_moe_prepare_vec, "VLLM_SM70_FP8_MOE_PREPARE_VEC")                    \
+  /* K04 (AWQ MoE, under VLLM_SM70_TM_AWQ) */                                \
+  X(awq_moe_batched_active_exact_w2,                                         \
+    "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2")                             \
+  X(awq_qwen38_moe_compact_grouped_decode,                                   \
+    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE")
 
 // c4130 production defaults.
 //

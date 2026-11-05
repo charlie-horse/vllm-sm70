@@ -6,6 +6,8 @@
 // see ../PROVENANCE.md for the fork line range of every function.
 #include "tm_ops_common_sm70.cuh"
 
+#include <torch/library.h>
+
 namespace vllm::awq_sm70 {
 namespace {
 
@@ -256,4 +258,31 @@ void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
                                    int64_t q_ld, bool gated_silu) {
   vllm::awq_sm70::nvfp4_gemm_sm70_out(out, input, weight, scales, group_size,
                                       k_ld, q_ld, gated_silu, true);
+}
+
+// ---------------------------------------------------------------------------
+// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// ---------------------------------------------------------------------------
+
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  // fork csrc/torch_bindings.cpp:653
+  m.def(
+      "nvfp4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, int "
+      "group_size=16, bool interleave_gated_silu=False) -> Tensor[]");
+  // fork csrc/torch_bindings.cpp:947
+  m.def(
+      "nvfp4_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor "
+      "_kernel, Tensor _scaling_factors, int group_size, int k_ld, int "
+      "q_ld, bool gated_silu=False) -> ()");
+  // fork csrc/torch_bindings.cpp:963
+  m.def(
+      "nvfp4_gemm_sm70_prescaled_out(Tensor(a!) out, Tensor input, Tensor"
+      " weight, Tensor scales, int group_size, int k_ld, int q_ld, bool "
+      "gated_silu) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("nvfp4_sm70_prepare", &nvfp4_sm70_prepare);
+  m.impl("nvfp4_gemm_sm70_out", &nvfp4_gemm_sm70_out);
+  m.impl("nvfp4_gemm_sm70_prescaled_out", &nvfp4_gemm_sm70_prescaled_out);
 }

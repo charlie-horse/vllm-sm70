@@ -6,6 +6,13 @@
 // see ../PROVENANCE.md for the fork line range of every function.
 #include "tm_ops_common_sm70.cuh"
 
+#include <torch/library.h>
+
+// The fork defined this in the global namespace, next to a global
+// silu_and_mul() with the same name as upstream vLLM's op. Keep it in
+// vllm_sm70 so neither can collide with symbols from _C_stable_libtorch.
+namespace vllm_sm70 {
+
 void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input) {
   TORCH_CHECK(input.is_cuda() && out.is_cuda(),
               "silu_and_mul_interleaved SM70 op expects CUDA tensors.");
@@ -22,6 +29,8 @@ void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input) {
   sm70_silu_and_mul_interleaved_fp16_out(out, input);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+}  // namespace vllm_sm70
 
 namespace vllm::awq_sm70 {
 namespace {
@@ -331,4 +340,36 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
 void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
                            torch::Tensor _gate_weight) {
   vllm::awq_sm70::sm70_f16_gate_mul_out(out, _in_feats, _gate_weight);
+}
+
+// ---------------------------------------------------------------------------
+// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// ---------------------------------------------------------------------------
+
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  // fork csrc/torch_bindings.cpp:661
+  m.def(
+      "sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
+  // fork csrc/torch_bindings.cpp:682
+  m.def(
+      "sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
+  // fork csrc/torch_bindings.cpp:1005
+  m.def(
+      "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor "
+      "_kernel, int k_ld, bool gated_silu) -> ()");
+  // fork csrc/torch_bindings.cpp:1139
+  m.def(
+      "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, Tensor "
+      "_gate_weight) -> ()");
+  // fork csrc/torch_bindings.cpp:596
+  m.def(
+      "silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("sm70_f16_prepare", &sm70_f16_prepare);
+  m.impl("sm70_f16_gemm", &sm70_f16_gemm);
+  m.impl("sm70_f16_gemm_out", &sm70_f16_gemm_out);
+  m.impl("sm70_f16_gate_mul_out", &sm70_f16_gate_mul_out);
+  m.impl("silu_and_mul_interleaved", &vllm_sm70::silu_and_mul_interleaved);
 }

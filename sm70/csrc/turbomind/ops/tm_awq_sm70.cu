@@ -6,6 +6,8 @@
 // see ../PROVENANCE.md for the fork line range of every function.
 #include "tm_ops_common_sm70.cuh"
 
+#include <torch/library.h>
+
 #ifdef VLLM_SM70_TM_AWQ
 
 namespace turbomind {
@@ -695,4 +697,48 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                                     group_size, k_ld, q_ld, gated_silu);
 }
 
+#endif  // VLLM_SM70_TM_AWQ
+
+// ---------------------------------------------------------------------------
+// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// ---------------------------------------------------------------------------
+
+#ifdef VLLM_SM70_TM_AWQ
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  // fork csrc/torch_bindings.cpp:599
+  m.def(
+      "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor "
+      "_zeros, int group_size, bool interleave_gated_silu) -> Tensor[]");
+  // fork csrc/torch_bindings.cpp:608
+  m.def(
+      "awq_sm70_prepare_compact(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, int group_size, bool interleave_gated_silu) -> "
+      "Tensor[]");
+  // fork csrc/torch_bindings.cpp:616
+  m.def(
+      "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, Tensor "
+      "_scaling_factors, int group_size) -> ()");
+  // fork csrc/torch_bindings.cpp:623
+  m.def(
+      "uint4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor"
+      " _zeros, int group_size, bool interleave_gated_silu) -> Tensor[]");
+  // fork csrc/torch_bindings.cpp:675
+  m.def(
+      "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
+      "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
+  // fork csrc/torch_bindings.cpp:689
+  m.def(
+      "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor "
+      "_kernel, Tensor _scaling_factors, int group_size, int k_ld, int "
+      "q_ld, bool gated_silu) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("awq_sm70_prepare", &awq_sm70_prepare);
+  m.impl("awq_sm70_prepare_compact", &awq_sm70_prepare_compact);
+  m.impl("awq_sm70_dequantize_out", &awq_sm70_dequantize_out);
+  m.impl("uint4_sm70_prepare", &uint4_sm70_prepare);
+  m.impl("awq_gemm_sm70", &awq_gemm_sm70);
+  m.impl("awq_gemm_sm70_out", &awq_gemm_sm70_out);
+}
 #endif  // VLLM_SM70_TM_AWQ

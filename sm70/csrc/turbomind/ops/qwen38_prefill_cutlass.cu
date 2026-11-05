@@ -1,4 +1,4 @@
-#include "sm70_policy.h"
+#include "tm_config.h"
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 

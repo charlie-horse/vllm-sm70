@@ -6,8 +6,10 @@
 // see ../PROVENANCE.md for the fork line range of every function.
 #pragma once
 
-// fork awq_sm70_gemm.cu:1-37
-#include "sm70_policy.h"
+// fork awq_sm70_gemm.cu:1-37, adapted: tm_config.h replaces the fork's
+// sm70_policy.h; custom_all_reduce.cuh (only for the dropped
+// awq_gemm_sm70_out_tile_reduce) and <cutlass/half.h> (unused) are gone.
+#include "tm_config.h"
 #include "gemm_runtime.h"
 #include "packed_gemm.h"
 /*
@@ -23,7 +25,6 @@
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <cutlass/half.h>
 
 #include <atomic>
 #include <cfloat>
@@ -42,7 +43,6 @@
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
-#include "custom_all_reduce.cuh"
 #include "qwen38_prefill_cutlass.cuh"
 
 namespace {
