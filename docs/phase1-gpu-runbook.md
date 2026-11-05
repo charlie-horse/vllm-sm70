@@ -66,7 +66,10 @@ CUDA_VISIBLE_DEVICES=0  $OUT/bin/vllm serve /var/tmp/vsm70-test/models/Qwen3-0.6
   --host 127.0.0.1 --port 8001
 ```
 TP2: the same with `CUDA_VISIBLE_DEVICES=0,1 --tensor-parallel-size 2`.
-LMCache stays running (~328 MiB/GPU); 0.80 leaves room for it.
+LMCache stays running (~328 MiB/GPU at idle); 0.80 leaves room for it.
+After Flint stops, LMCache still holds ~16.4 GiB per GPU for about 120 s (seen
+2026-11-05) before it drops back. Wait until `nvidia-smi` shows it at idle
+(about 2 min) before starting the test unit, or restart `vllm-lmcache`.
 `TRITON_PTXAS_PATH` defaults to the CUDA 12.6 ptxas, which caps PTX ISA at 8.5. If
 TRITON_ATTN fails to compile (ptxas / PTX ISA errors), retry once with Triton's
 bundled ptxas (12.9) and record which one works:
@@ -103,10 +106,11 @@ exit evidence.
 | step | time |
 |---|---|
 | stop Flint (kill + stop) | ~1 min |
+| wait for LMCache to release GPU memory | ~2 min |
 | TP1: start (JIT/compile) + checks | ~5 min |
 | TP2: start + checks | ~6 min |
 | restore Flint to `/v1/models` OK (Bea's number) | 3–4.5 min |
-| **total** | **~15–17 min; ask for 25 min** |
+| **total** | **~17–19 min; ask for 25 min** |
 
 If a test start fails, collect `journalctl -u vsm70-test -n 300` and go
 straight to the restore; I debug offline on r440.
