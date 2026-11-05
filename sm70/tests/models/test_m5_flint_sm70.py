@@ -888,14 +888,52 @@ def test_t1_tiny_random_forward(tmp_path):
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
-def test_t3_checkpoint_loads(capfd):
+# The route line comes from init_logger("vllm_sm70.models.flint_sm70.model"),
+# which is not under vLLM's configured "vllm" logger, so with vLLM's default
+# logging config its INFO lines go nowhere. T3 gives the engine processes a
+# logging config (VLLM_LOGGING_CONFIG_PATH, inherited by the workers) that
+# also routes "vllm_sm70" to stdout.
+_T3_LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "%(levelname)s %(name)s: %(message)s"}},
+    "handlers": {
+        "out": {
+            "class": "logging.StreamHandler",
+            "formatter": "plain",
+            "level": "INFO",
+            "stream": "ext://sys.stdout",
+        }
+    },
+    "loggers": {
+        name: {"handlers": ["out"], "level": "INFO", "propagate": False}
+        for name in ("vllm", "vllm_sm70")
+    },
+}
+
+
+def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     """T3 (2 GPUs): the NVFP4 checkpoint loads at TP2 fp16 and every layer
     takes the fused route on TRITON_ATTN.
 
     The route line is logged in the TP worker processes, and the vllm logger
     does not propagate, so caplog never sees it. capfd reads the inherited
-    stdout/stderr file descriptors, which the workers write to."""
-    toks = _greedy_once(enforce_eager=True)
+    stdout/stderr file descriptors, which the workers write to, and
+    _T3_LOGGING_CONFIG makes the "vllm_sm70" logger write there."""
+    from vllm.config.logging import LoggingConfig
+
+    cfg = tmp_path / "logging.json"
+    cfg.write_text(json.dumps(_T3_LOGGING_CONFIG))
+    # Passed explicitly (EngineArgs.logging_config); the engine core and the
+    # TP workers apply it. The env vars cover anything built from defaults.
+    monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "1")
+    monkeypatch.setenv("VLLM_LOGGING_CONFIG_PATH", str(cfg))
+    toks = _greedy_once(
+        enforce_eager=True,
+        logging_config=LoggingConfig(
+            configure_logging=True, pylogging_config_file=str(cfg)
+        ),
+    )
     out, err = capfd.readouterr()
     logs = out + err
     sys.stdout.write(logs)  # keep the worker log in the pytest report
