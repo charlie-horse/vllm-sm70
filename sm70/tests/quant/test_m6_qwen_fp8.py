@@ -752,7 +752,14 @@ def _gpu_dense(n_parts, k):
     return method, layer, w, s
 
 
+# Boolean condition only (string skipif conditions break under inference_mode).
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a CUDA GPU"
+)
+
+
 @pytest.mark.gpu
+@needs_cuda
 @pytest.mark.parametrize(
     "parts, k",
     [([8704, 8704], 5120), ([5120], 8704), ([256], 2048), ([2048], 4096)],
@@ -767,6 +774,7 @@ def test_gpu_dense_parity(parts, k, m):
 
 
 @pytest.mark.gpu
+@needs_cuda
 @pytest.mark.parametrize("m", [1, 2, 8, 128])
 def test_gpu_moe_qwen36_tp2_parity_and_graph(m):
     import vllm_sm70.quant.fp8_moe as moe
