@@ -25,6 +25,7 @@
 // these 0.7-8 MB layers.
 
 #include <torch/all.h>
+#include <torch/library.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -33,12 +34,11 @@
 
 #include <cstdint>
 
-#ifndef VLLM_NVFP4_TM_GEMV_STANDALONE
+// K03, ops/tm_nvfp4_sm70.cu (global wrapper, same .so).
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                          torch::Tensor weight, torch::Tensor scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
                          bool gated_silu);
-#endif
 
 namespace {
 
@@ -315,41 +315,9 @@ void launch_tm_gemv(const uint4* codes, const half* scales, const half* input,
                                                 scale_mul, out_mul);
 }
 
-// Instantiated launch configurations (K, N, groups, warps, prefetch,
-// pipelined, min_blocks); K and N only label table rows. Production builds
-// only the measured table entries.
-#ifdef VLLM_NVFP4_TM_GEMV_STANDALONE
-  #define VLLM_TM_GEMV_SHAPES(X) \
-    X(0, 0, 1, 8, 2, true, 1)    \
-    X(0, 0, 1, 8, 4, true, 1)    \
-    X(0, 0, 1, 16, 2, true, 2)   \
-    X(0, 0, 1, 16, 4, false, 1)  \
-    X(0, 0, 1, 16, 2, false, 2)  \
-    X(0, 0, 2, 4, 4, true, 1)    \
-    X(0, 0, 2, 8, 2, true, 1)    \
-    X(0, 0, 2, 8, 2, true, 4)    \
-    X(0, 0, 2, 8, 4, false, 1)   \
-    X(0, 0, 2, 8, 2, false, 4)   \
-    X(0, 0, 2, 16, 2, false, 2)  \
-    X(0, 0, 2, 16, 1, false, 2)  \
-    X(0, 0, 2, 16, 3, false, 2)  \
-    X(0, 0, 2, 8, 3, false, 2)   \
-    X(0, 0, 4, 2, 2, false, 16)  \
-    X(0, 0, 4, 4, 1, false, 8)   \
-    X(0, 0, 4, 4, 2, false, 8)   \
-    X(0, 0, 4, 4, 4, false, 4)   \
-    X(0, 0, 4, 8, 1, false, 4)   \
-    X(0, 0, 4, 8, 2, false, 4)   \
-    X(0, 0, 4, 16, 1, false, 2)  \
-    X(0, 0, 4, 2, 2, true, 1)    \
-    X(0, 0, 4, 4, 2, true, 1)    \
-    X(0, 0, 4, 8, 3, false, 4)   \
-    X(0, 0, 2, 8, 1, false, 4)   \
-    X(0, 0, 2, 4, 2, false, 8)   \
-    X(0, 0, 1, 8, 2, false, 4)
-#else
-  #define VLLM_TM_GEMV_SHAPES(X) VLLM_TM_GEMV_TABLE(X)
-#endif
+// Instantiated launch configurations: only the measured table entries.
+// (The fork's VLLM_NVFP4_TM_GEMV_STANDALONE tuning list is not carried.)
+#define VLLM_TM_GEMV_SHAPES(X) VLLM_TM_GEMV_TABLE(X)
 
 template <int M>
 bool dispatch_tm_gemv_rows(const TmGemvConfig& c, const uint4* codes,
@@ -483,7 +451,6 @@ bool nvfp4_tm_gemv_sm70_supported(int64_t m, int64_t k, int64_t n) {
   return m >= 1 && m <= kTmGemvMaxRows && tm_gemv_config(k, n).groups > 0;
 }
 
-#ifndef VLLM_NVFP4_TM_GEMV_STANDALONE
 // M <= 2 runs the GEMV on the TurboMind operands; larger M, other shapes
 // and other activations run TurboMind's nvfp4_gemm_sm70_out unchanged. The
 // M branch lives here so torch.compile sees one opaque operator, and CUDA
@@ -505,31 +472,20 @@ void nvfp4_tm_gemv_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
   nvfp4_gemm_sm70_out(out, input, weight, scales, group_size, k_ld, q_ld,
                       false);
 }
-#endif
 
-#ifdef VLLM_NVFP4_TM_GEMV_STANDALONE
-// Tuning entries for a task-local extension (no vLLM rebuild).
-void nvfp4_tm_gemv_sm70_tune_out(torch::Tensor out, torch::Tensor input,
-                                 torch::Tensor weight, torch::Tensor scales,
-                                 int64_t groups, int64_t warps,
-                                 int64_t prefetch, bool pipelined,
-                                 int64_t min_blocks, int64_t scale_shift) {
-  TORCH_CHECK(tm_gemv_operands_ok(out, input, weight, scales),
-              "TM GEMV operand mismatch");
-  const TmGemvConfig config{static_cast<int>(groups), static_cast<int>(warps),
-                            static_cast<int>(prefetch), pipelined,
-                            static_cast<int>(min_blocks)};
-  TORCH_CHECK(tm_gemv_config_valid(config, input.size(1), out.size(1)),
-              "invalid TM GEMV tuning configuration");
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  run_tm_gemv(out, input, weight, scales, config, scale_shift);
+// ---------------------------------------------------------------------------
+// Op registration (K11). Schema: fork csrc/torch_bindings.cpp:956-961 minus
+// `str? native_policy`. The fork's standalone tuning entry (_tm_gemv_dev::
+// tune, VLLM_NVFP4_TM_GEMV_STANDALONE) is not carried.
+// ---------------------------------------------------------------------------
+
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def(
+      "nvfp4_tm_gemv_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
+      "int scale_shift=14) -> ()");
 }
 
-TORCH_LIBRARY_FRAGMENT(_tm_gemv_dev, ops) {
-  ops.def(
-      "tune(Tensor(a!) out, Tensor input, Tensor weight, Tensor scales, "
-      "int groups, int warps, int prefetch, bool pipelined, int min_blocks, "
-      "int scale_shift) -> ()");
-  ops.impl("tune", torch::kCUDA, &nvfp4_tm_gemv_sm70_tune_out);
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("nvfp4_tm_gemv_dispatch_sm70_out", &nvfp4_tm_gemv_dispatch_sm70_out);
 }
-#endif
