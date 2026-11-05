@@ -32,6 +32,26 @@ AREAS: tuple[str, ...] = (
 
 _registered = False
 
+# Outcome of each area's register(): "ok" or the error text. Read it through
+# registered_areas(); Sm70CudaPlatform turns failures into a startup error
+# on SM70 (fail-fast), since vLLM swallows exceptions raised here.
+_area_status: dict[str, str] = {}
+
+
+def registered_areas() -> dict[str, str]:
+    """Area name -> "ok" or the error text, for every area tried so far."""
+    return dict(_area_status)
+
+
+def failed_areas() -> dict[str, str]:
+    return {a: s for a, s in _area_status.items() if s != "ok"}
+
+
+def retry_failed_areas() -> None:
+    """Re-run register() for areas that failed (e.g. on import order)."""
+    for area in list(failed_areas()):
+        _register_area(area)
+
 
 def register() -> None:
     """vllm.general_plugins entry point. Idempotent, safe without _sm70_C.
@@ -55,12 +75,26 @@ def register() -> None:
 
     for area in AREAS:
         _register_area(area)
+    _log_summary()
 
 
 def _register_area(area: str) -> None:
     try:
         module = importlib.import_module(f"vllm_sm70.{area}")
         module.register()
-    except Exception:
-        # One broken area must not take the others (or vLLM) down.
+    except Exception as exc:
+        # One broken area must not take the others down here; on SM70 the
+        # platform raises later (Sm70CudaPlatform._enforce_strict).
+        _area_status[area] = f"{type(exc).__name__}: {exc}"
         logger.exception("vllm_sm70: register() failed for area %r", area)
+    else:
+        _area_status[area] = "ok"
+
+
+def _log_summary() -> None:
+    failed = failed_areas()
+    logger.info(
+        "vllm_sm70: areas registered: %s%s",
+        ", ".join(a for a, s in _area_status.items() if s == "ok") or "none",
+        f"; FAILED: {', '.join(failed)}" if failed else "",
+    )
