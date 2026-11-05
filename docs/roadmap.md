@@ -109,7 +109,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 
 ## Series order for `patches/`
 
-1. 0001–0099 build: none. FetchContent is fed by Nix.
+1. 0001–0099 build: 0001 skips the external projects that have no sm_70 kernels (FA2/FA3/FA4, FlashMLA, FlashKDA, DeepGEMM, DeepSelect, fmha_sm100, qutlass, tml-fa4, triton_kernels); only cutlass is still fetched. Build-time switch: `VLLM_SM70_TRIM_EXTERNALS=0`.
 2. 0100–0199 platform: U1, U2, U3, U4, then U5 last.
 3. 0500–0699 models: none, except U6 if the M7 subclass route fails.
 4. 0700–0799 kv: none.

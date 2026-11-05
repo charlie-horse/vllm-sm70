@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 01:33:39 +0000
+Subject: [PATCH] build: skip external projects that have no sm_70 kernels
+
+What: On CUDA builds, skip the FetchContent external projects
+  (triton_kernels, DeepGEMM, DeepSelect, fmha_sm100, FlashMLA, FlashKDA,
+  qutlass, tml-fa4, vllm-flash-attn FA2/FA3/FA4) in CMakeLists.txt, and
+  drop their extension targets from setup.py so the build does not ask
+  CMake for targets that no longer exist. Guard setup.py's unconditional
+  copy of build_lib/vllm/third_party/triton_kernels.
+Why: none of them builds kernels for sm_70 (their arch lists start at
+  8.0 or 9.0a, CMakeLists.txt:1686-1714 and cmake/external_projects/*),
+  but every build still fetches, configures and compiles them (~40 min
+  per build). At runtime vLLM already tolerates their absence
+  (vllm_flash_attn/flash_attn_interface.py try-imports _vllm_fa2_C/_fa3_C;
+  DeepGEMM, FlashMLA and triton_kernels are feature-detected); only
+  models we don't serve import vllm.vllm_flash_attn.cute at top level.
+Upstream-files: CMakeLists.txt, setup.py
+Kill-switch: VLLM_SM70_TRIM_EXTERNALS=0 at build time restores the upstream external projects and extension list
+Tests: CI --check and nix build .#source (patch applies at fuzz 0);
+  r440: nix build .#vllm completes without fetching the trimmed sources,
+  and on c4130 import vllm + the K01 plugin tests pass
+Upstream-status: not-upstreamable
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7694e6f8bc46..30c45d08bda0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1682,8 +1682,17 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
+   vllm_finalize_hipify_target()
+ endif()
+ 
++# vllm-sm70: none of the external projects below has kernels for sm_70, so a
++# Volta build skips fetching and configuring them. VLLM_SM70_TRIM_EXTERNALS=0
++# restores the upstream behaviour.
++if(VLLM_GPU_LANG STREQUAL "CUDA" AND NOT "$ENV{VLLM_SM70_TRIM_EXTERNALS}" STREQUAL "0")
++  set(VLLM_SM70_TRIM_EXTERNALS ON)
++  message(STATUS "vllm-sm70: skipping external projects (triton_kernels, DeepGEMM, "
++                 "DeepSelect, fmha_sm100, FlashMLA, FlashKDA, qutlass, tml-fa4, vllm-flash-attn)")
++endif()
++
+ # For CUDA and HIP builds also build the triton_kernels external package.
+-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
++if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND NOT VLLM_SM70_TRIM_EXTERNALS)
+     include(cmake/external_projects/triton_kernels.cmake)
+ endif()
+ 
+@@ -1700,7 +1709,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA"
+ endif()
+ 
+ # For CUDA we also build and ship some external projects.
+-if (VLLM_GPU_LANG STREQUAL "CUDA")
++if (VLLM_GPU_LANG STREQUAL "CUDA" AND NOT VLLM_SM70_TRIM_EXTERNALS)
+     include(cmake/external_projects/deepgemm.cmake)
+     include(cmake/external_projects/deepselect.cmake)
+     include(cmake/external_projects/fmha_sm100.cmake)
+diff --git a/setup.py b/setup.py
+index cf99ec3aaaf4..d4c112b65255 100644
+--- a/setup.py
++++ b/setup.py
+@@ -422,7 +422,9 @@ class cmake_build_ext(build_ext):
+             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+             self.copy_file(file, dst_file)
+ 
+-        if _is_cuda() or _is_hip():
++        if (_is_cuda() or _is_hip()) and os.path.isdir(
++            f"{self.build_lib}/vllm/third_party/triton_kernels"
++        ):
+             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
+             # to current directory so that they can be included in the editable
+             # build
+@@ -1548,11 +1550,16 @@ def get_rocm_device_requirements() -> list[str]:
+ 
+ ext_modules = []
+ 
++# vllm-sm70: must match the CMakeLists.txt switch that skips the external
++# projects; VLLM_SM70_TRIM_EXTERNALS=0 restores the upstream extension list.
++_sm70_trim_externals = _is_cuda() and os.environ.get("VLLM_SM70_TRIM_EXTERNALS") != "0"
++
+ if _is_cuda() or _is_hip():
+     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
+     # Optional since this doesn't get built (produce an .so file). This is just
+     # copying the relevant .py files from the source repository.
+-    ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
++    if not _sm70_trim_externals:
++        ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
+ 
+ if not _is_xpu():
+     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
+@@ -1561,7 +1568,7 @@ if not _is_xpu():
+ if _is_hip():
+     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
+ 
+-if _is_cuda():
++if _is_cuda() and not _sm70_trim_externals:
+     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+     if USE_PRECOMPILED_EXTENSIONS or (
+         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
