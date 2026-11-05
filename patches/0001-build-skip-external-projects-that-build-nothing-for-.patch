@@ -2,6 +2,9 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: vllm-sm70 <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 01:34:36 +0000
 Subject: [PATCH] build: skip external projects that build nothing for sm_70
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 What: with VLLM_SM70_TRIM_EXTERNALS=1, CMake skips DeepGEMM, DeepSelect,
   MSA (fmha_sm100), FlashMLA, FlashKDA, qutlass and tml-fa4, and replaces
@@ -15,7 +18,7 @@ Why: on arch 7.0 none of these produce usable kernels, but FA2/FA3
   vllm_flash_attn/layers/rotary.py is still needed
   (rotary_embedding/common.py:223), so FA's Python files stay.
 Upstream-files: CMakeLists.txt, cmake/external_projects/vllm_flash_attn.cmake, setup.py
-Kill-switch: VLLM_SM70_TRIM_EXTERNALS=0 (build-time; unset is the same)
+Kill-switch: unset or ≠1 (build-time) → upstream; nix/package.nix sets VLLM_SM70_TRIM_EXTERNALS=1
 Tests: nix build .#vllm on r440 (cuobjdump: sm_70 in _C_stable/_moe_C, no _vllm_fa2_C/_vllm_fa3_C .so); import vllm.vllm_flash_attn.layers.rotary; c4130 TRITON_ATTN TP1/TP2 rerun
 Upstream-status: not-upstreamable
 
