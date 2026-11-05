@@ -28,7 +28,7 @@ The whole carry against upstream is these patches:
 | U3 | ~30 | `fused_moe/runner/moe_runner.py` ~:630, :907 |
 | U4 | ~60 | `v1/worker/gpu_model_runner.py` :3403, :4208 |
 | U5 | 0 | none: K17's kernel is in `_sm70_C` and includes upstream's `csrc/custom_all_reduce.cuh` |
-| **total** | **~110 without U5; ~440 with it** | |
+| **total** | **~110** (U5 adds none) | |
 
 ## Phase 1: unpatched build
 
@@ -78,7 +78,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 
 ## Phase 4: Flint fast paths
 
-**D2:** the V1-vs-V2 sampler decision is deferred until V1 and V2 are measured, before K16. **D3:** U5 needs no upstream patch. K17 builds the fused kernel in `_sm70_C` against upstream's own `custom_all_reduce.cuh` and takes `ca_comm._ptr` as an int. R5 (the FULL-capture `cudaIpcGetMemHandle` crash under expandable segments) needs no upstream line either. The op copies its input into the communicator's eager buffer, which is IPC-registered at init, then publishes a fenced start flag (`staged_barrier_at_start`, fork 9f175fc6e), so it never registers graph buffers.
+**D2:** the V1-vs-V2 sampler decision is deferred until V1 and V2 are measured, before K16. **D3:** U5 needs no upstream patch. K17 builds the fused kernel in `_sm70_C` against upstream's own `custom_all_reduce.cuh` and takes `ca_comm._ptr` as an int. R5 (the FULL-capture `cudaIpcGetMemHandle` crash under expandable segments) needs no upstream line either. K17's op copies its input into the communicator's eager buffer, which is IPC-registered at init, then publishes a fenced start flag (`staged_barrier_at_start`, fork 9f175fc6e). So K17's op never registers graph buffers. Upstream's plain all-reduce still does, unchanged.
 
 **Upstream contract K17 depends on** (a rebase must keep it; the build fails loudly if the C++ side moves):
 - Python `CustomAllreduce` (`vllm/distributed/device_communicators/custom_all_reduce.py`): `_ptr`, `disabled`, `rank`, `world_size`, `buffer_ptrs`, `max_size`, `should_custom_ar`, `custom_all_reduce`.
