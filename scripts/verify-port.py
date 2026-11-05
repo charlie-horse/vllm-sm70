@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import ast
 import difflib
+import fnmatch
 import json
 import re
 import sys
@@ -62,6 +63,7 @@ class Rule:
     side: str
     regex: re.Pattern
     repl: str
+    exclude_paths: tuple = ()     # fnmatch globs on the file path; rule skipped there
 
 
 @dataclass
@@ -78,12 +80,13 @@ class Config:
         for r in data.get("rule", []):
             flags = re.MULTILINE | (re.DOTALL if r.get("dotall") else 0)
             rules.append(Rule(r["name"], r.get("lang", "all"), r.get("side", "fork"),
-                              re.compile(r["pattern"], flags), r.get("repl", "")))
+                              re.compile(r["pattern"], flags), r.get("repl", ""),
+                              tuple(r.get("exclude_paths", []))))
         pats = lambda k: [re.compile(p) for p in data.get(k, {}).get("patterns", [])]
         return cls(rules, pats("expected_dropped"), pats("expected_new"),
                    data.get("options", {}).get("ignore_docstrings", True))
 
-    def apply(self, text: str, lang: str, side: str) -> tuple[str, list[str]]:
+    def apply(self, text: str, lang: str, side: str, path: str = "") -> tuple[str, list[str]]:
         hits = []
         if lang == "cpp":
             # "a, str? " "native_policy=None" -> "a, str? native_policy=None", so
@@ -93,6 +96,9 @@ class Config:
                 text, n = _ADJ_STR.subn(lambda m: m.group(1) + m.group(2), text)
         for r in self.rules:
             if r.lang not in ("all", lang) or r.side not in ("both", side):
+                continue
+            if path and any(fnmatch.fnmatch(path, g) for g in r.exclude_paths):
+                hits.append(f"{r.name} SKIPPED (exclude_paths)")
                 continue
             text, n = r.regex.subn(r.repl, text)
             if n:
@@ -490,7 +496,7 @@ def collect(paths: list[Path], side: str, cfg: Config, keyed_by_file: bool) -> T
         except OSError as e:
             t.errors.append(f"{f}: {e}")
             continue
-        src, hits = cfg.apply(src, lang, side)
+        src, hits = cfg.apply(src, lang, side, Path(f).resolve().as_posix())
         if hits:
             t.rule_hits[str(f)] = hits
         try:
@@ -610,11 +616,12 @@ def compare(fork: Tree, port: Tree, cfg: Config, ctx: int) -> list[dict]:
         last = re.split(r"::|\.", _bare(e.key).split("#")[0])[-1]
         return re.sub(r"(?<![\w])" + re.escape(last) + r"(?![\w])", "<NAME>", e.body)
     by_body: dict[str, list[str]] = {}
+    movable = ("func", "kernel", "method", "class", "macro")   # consts/imports are too generic
     for k, e in drop.items():
-        if len(e.body) > 40:
+        if len(e.body) > 40 and e.kind in movable:
             by_body.setdefault(anon(e), []).append(k)
     for pk, pe in list(new.items()):
-        ks = by_body.get(anon(pe))
+        ks = by_body.get(anon(pe)) if pe.kind in movable else None
         if ks:
             fk = ks.pop(0)
             fe = drop.pop(fk)

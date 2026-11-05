@@ -1,9 +1,20 @@
 {
-  description = "vLLM for Volta (sm_70): upstream vLLM + a patch series, with NixOS modules";
+  description = "Upstream vLLM for V100 (sm_70): pinned tag + ordered patch series, built with Nix, with NixOS modules";
 
+  # nixpkgs is locked to nixos-26.05 @ 7dcdd87 (the Phase 1 pin sheet).
+  # Hosts should set `inputs.nixpkgs.follows = "nixpkgs"`.
   inputs = {
-    # docs/pins.md. Hosts should set `inputs.nixpkgs.follows = "nixpkgs"`.
-    nixpkgs.url = "github:NixOS/nixpkgs/7dcdd87373d72e7a2173e4db02e20d3d7f495cfd";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+
+    pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
+    pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
+    uv2nix.url = "github:pyproject-nix/uv2nix";
+    uv2nix.inputs.nixpkgs.follows = "nixpkgs";
+    uv2nix.inputs.pyproject-nix.follows = "pyproject-nix";
+    pyproject-build-systems.url = "github:pyproject-nix/build-system-pkgs";
+    pyproject-build-systems.inputs.nixpkgs.follows = "nixpkgs";
+    pyproject-build-systems.inputs.pyproject-nix.follows = "pyproject-nix";
+    pyproject-build-systems.inputs.uv2nix.follows = "uv2nix";
 
     # The former fork's flake, kept only for the Flint checkpoint recipe
     # (converter, GGUF and config pins; ./nix/checkpoint.nix). Its own lock
@@ -15,37 +26,33 @@
     inputs@{ self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
+      inherit (nixpkgs) lib;
       pkgs = import nixpkgs {
         inherit system;
         config.allowUnfree = true;
+        # Only the toolkit comes from nixpkgs (the CUDA libs ship in the
+        # wheels); target V100 only.
+        config.cudaCapabilities = [ "7.0" ];
       };
-      p = import ./nix/packages.nix {
-        inherit pkgs inputs;
-        inherit (nixpkgs) lib;
-      };
-      vllm = import ./nix/module.nix { inherit inputs; };
-      # Upstream vLLM at patches/BASE with patches/series applied (the same
-      # file as on phase1-spike).
-      source = import ./nix/source.nix {
-        inherit pkgs;
-        inherit (nixpkgs) lib;
-      };
+      src = import ./nix/source.nix { inherit pkgs lib; };
+      p = import ./nix/package.nix { inherit pkgs lib inputs src; };
+      checkpoint = import ./nix/checkpoint.nix { inherit inputs; };
+      vllmModule = import ./nix/module.nix { inherit inputs; };
     in
     {
       packages.${system} = {
         default = p.vllm;
-        vllm = p.vllm;
-        inherit (p) tree;
-        flint-checkpoint = p.flintCheckpoint;
-        inherit source;
+        inherit (p) vllm tree venv;
+        source = src;
+        flint-checkpoint = checkpoint.flintCheckpoint;
       };
 
       # `vllm` (services.vllm-sm70) imports `lmcache` (services.lmcache-sm70);
       # use `lmcache` alone to run only the cache server. Both build their
-      # packages with the host's `pkgs`.
+      # packages with the host's `pkgs` (./nix/packages-module.nix).
       nixosModules = {
-        default = vllm;
-        inherit vllm;
+        default = vllmModule;
+        vllm = vllmModule;
         lmcache = import ./nix/lmcache.nix { inherit inputs; };
       };
 

@@ -2,7 +2,7 @@
 
 A Nix flake that builds upstream [vLLM](https://github.com/vllm-project/vllm) for NVIDIA Volta GPUs (SM70, e.g. Tesla V100). It does this with two pieces on top of a pinned release tag: an out-of-tree plugin (`sm70/`: CUDA kernels plus the `vllm_sm70` package) and a small, ordered series of upstream-file patches (`patches/`) that add the hooks the plugin uses.
 
-Status: work in progress. Nothing here builds yet.
+Status: Phase 1 spike (branch `phase1-spike`): unpatched v0.33.0 for sm_70, TRITON_ATTN only. Not yet built.
 
 ## Pins
 
@@ -22,12 +22,12 @@ Full pins, hashes and evidence are in [docs/pins.md](docs/pins.md). Volta has no
 | path | contents |
 |---|---|
 | `flake.nix` | flake entry point |
-| `nix/` | derivations and NixOS modules |
+| `nix/` | `source.nix` (tag + `patches/series`), `deps.nix` (CMake FetchContent sources), `package.nix` (uv2nix wheel env, sm_70 build, wrapper), `pyenv/` (`pyproject.toml` + `uv.lock`, re-lock with `uv lock --python 3.13`) |
 | `sm70/` | the plugin: `csrc/` and CMake for the `vllm_sm70._sm70_C` extension, and the `vllm_sm70` Python package |
 | `patches/` | upstream-file edits only: `BASE` (upstream tag), `series` (apply order), `NNNN-*.patch` |
 | `scripts/regen-patches.sh` | regenerates `patches/` from a vLLM working branch, or checks that the series applies |
 | `tests/` | sm70 checks |
-| `docs/` | `pins.md` (locked pins), `patch-header.md` (change format), `roadmap.md` (ordered plan) |
+| `docs/` | `pins.md` (locked pins), `patch-header.md` (change format), `roadmap.md` (ordered plan), `phase1-gpu-runbook.md` (c4130 test) |
 | `.github/` | PR template and CI |
 
 ## Contributing
