@@ -274,7 +274,9 @@ __global__ void gdn_decode_mixed_qkv_global_state_kernel(
   const int hq = hv / (v_heads / q_heads);
   const int32_t slot = state_indices[t];
 
-  if (slot < 0 || slot >= slots) {
+  // K08: slot 0 is vLLM's NULL_BLOCK_ID (UP v1/attention/backends/utils.py:55)
+  // and upstream's packed decode skips state_idx <= 0; the fork skipped < 0.
+  if (slot <= 0 || slot >= slots) {
     if (lane == 0) {
       const int64_t out_base = (static_cast<int64_t>(t) * v_heads + hv) * V;
 #pragma unroll
