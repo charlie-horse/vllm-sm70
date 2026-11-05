@@ -64,7 +64,7 @@ Two hashes per dependency:
 - **without submodules:** `nix hash path` of a `git archive` export;
 - **with submodules:** `fetchSubmodules = true`, reproduced with `git submodule update --init --recursive`, `.git` stripped, then `nix hash path`. This matches `nix/deps.nix`.
 
-FetchContent's default recursively inits submodules. DeepSelect and qutlass have a cutlass submodule that we don't fetch: DeepSelect only uses it for 10.0f (nvcc ≥ 12.9), and qutlass prefers vLLM's cutlass. Since patch 0001 (`build`), only cutlass is fetched at all; the other rows document what `VLLM_SM70_TRIM_EXTERNALS=0` brings back.
+FetchContent's default recursively inits submodules. DeepSelect and qutlass have a cutlass submodule that we don't fetch: DeepSelect only uses it for 10.0f (nvcc ≥ 12.9), and qutlass prefers vLLM's cutlass. Once patch 0001 (`build`, PR #15) lands, only cutlass will be fetched; the other rows will then document what `VLLM_SM70_TRIM_EXTERNALS=0` brings back. Until then, all ten are fetched.
 | dep | rev | env override | subm. | Nix hash (no submodules) | Nix hash (with submodules) | sm_70? |
 |---|---|---|---|---|---|---|
 | cutlass | v4.7.1 = cb4247394dd82148787aed73e5dc7cef33cbf862 (CMakeLists.txt:512) | VLLM_CUTLASS_SRC_DIR | 0 | sha256-z/jASQGRj9fYwgyJKvzWgowG7j2zNKb3xeFUzYwwLQA= | same (no submodules) | Header-only; needed by core _C (scaled_mm/machete sources are arch-gated, but the include path is always used). Keep |
