@@ -16,6 +16,10 @@ import sys
 import types
 
 import pytest
+
+# Collected without vllm/torch installed (e.g. plain `pytest sm70/tests`): skip.
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
 import torch
 import vllm.model_executor.layers.quantization as me_quant
 import vllm.platforms
