@@ -2,7 +2,8 @@
 """M1 sm70-config: Sm70Config defaults, parsing, kill switches, hash.
 
 CPU only. Pure pydantic: vllm is never imported, except by the VLLM_SM70_QUANT
-path check, which is skipped when vLLM's Python source is not importable.
+path check (M2 registration is skipped), which is skipped when vLLM's Python
+source is not importable.
 
 The kill switches use K01's ``vllm_sm70.envs.kill_switch``: only "0" acts,
 and the environment can never turn a feature on.
@@ -50,7 +51,6 @@ OURS = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # name the patch that wires it, and the no-dead-switch test fails as soon
 # as the name is consumed, so that this entry gets removed.
 PENDING = {
-    "VLLM_SM70_QUANT": "M2",
     "VLLM_SM70_DFLASH2_EMULATION": "M7",
 }
 
@@ -172,6 +172,31 @@ def _fp8_refuses(name):
     assert sm70_config(_vc({})).quant_backend == "auto"  # no Marlin fallback
 
 
+def _quant_registration_skipped(name):
+    pytest.importorskip("vllm.envs")
+    import importlib
+
+    import vllm.model_executor.layers.quantization as me_quant
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+    )
+
+    saved = dict(me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+    try:
+        for slot in ("fp8", "modelopt_fp4"):
+            me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.pop(slot, None)
+        import vllm_sm70.quant.configs as configs
+
+        configs = importlib.reload(configs)
+        assert not configs.REGISTERED
+        assert me_quant.get_quantization_config("fp8") is Fp8Config
+        assert me_quant.get_quantization_config("modelopt_fp4") is ModelOptNvFp4Config
+    finally:
+        me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.clear()
+        me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.update(saved)
+
+
 def _getter_only(name):
     # TODO: replace with a path test in the patch named in PENDING.
     assert getattr(envs, name) is False
@@ -185,6 +210,8 @@ def _path_off(name):
             pass
     elif name == "VLLM_SM70_FP8_TURBOMIND":
         _fp8_refuses(name)
+    elif name == "VLLM_SM70_QUANT":
+        _quant_registration_skipped(name)
     elif name in PENDING:
         _getter_only(name)
     else:
