@@ -9,9 +9,11 @@
 #                                    and entry_points.txt (`lmcache` & co.)
 #
 # Patches: ./patches/lmcache (Theo's list), applied with --fuzz=0.
-# Runtime deps not in vLLM's set are the `lmcache` group in ./pyenv; the four
-# locked versions above LMCache's declared caps (numpy, protobuf,
-# opentelemetry-api, prometheus_client) are not import problems on our paths.
+# Runtime deps not in vLLM's set are the `lmcache` group in ./pyenv. Five
+# locked versions are above LMCache's declared caps (numpy, protobuf,
+# opentelemetry-api, prometheus_client, opentelemetry-exporter-prometheus;
+# docs/pins.md); none is an import problem on our paths, and no runtime-deps
+# check runs (lmcache is not a resolved lock entry; vLLM reads only the version).
 #
 # Not built:
 # - the gRPC stubs (`build_py` runs grpc_tools.protoc; grpcio-tools 1.78 needs
@@ -81,6 +83,8 @@ cuda.backendStdenv.mkDerivation {
     runHook postBuild
   '';
 
+  # compileall is only a start-up speedup, so a failure must not fail the
+  # build (`|| true`); lmcache/ 0.5.6 + patches compiles cleanly under 3.13.
   installPhase = ''
     runHook preInstall
     mkdir -p $out
