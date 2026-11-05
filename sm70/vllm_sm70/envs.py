@@ -249,12 +249,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         ),
         # "0": Sm70Config.fp8_qpn8=False.
         "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
+        # "0": Sm70Config.fp8_block_qpn8=False (M8 block QPN8 decode GEMV;
+        # the Qwen FP8 dense linears stay on M6 TurboMind).
+        "VLLM_SM70_FP8_BLOCK_QPN8": kill_switch("VLLM_SM70_FP8_BLOCK_QPN8"),
     },
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
-        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
-            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
-        ),
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".

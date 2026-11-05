@@ -110,3 +110,33 @@ def test_verdict_gates():
     bad = dict(phases, math={"correct": 8, "total": 10})
     assert probe.verdict({"phases": bad, "gated": True})[0] == "FAIL"
     assert probe.verdict({"phases": bad, "gated": False})[0] == "INFO"
+
+
+def _ab(rates, tokens=None, error=None):
+    res = {"speed": {"by_concurrency": {
+        str(c): {"decode_tok_s_median": t} for c, t in zip(probe.AB_CONCURRENCY, rates)
+    }}, "greedy": [
+        {"i": i, "text": f"out {i}", "tokens": (tokens or {}).get(i, [f"t{i}"])}
+        for i in range(len(probe.AB_GREEDY_PROMPTS))
+    ]}
+    if error:
+        res["error"] = error
+    return res
+
+
+def test_ab_compare_pass_and_noise_band():
+    res = probe.ab_compare(_ab([100, 180, 250, 300]), _ab([95, 183, 250, 301]))
+    assert res["status"] == "PASS", res
+    assert len(res["lines"]) == len(probe.AB_CONCURRENCY) + 1
+    assert res["lines"][0].startswith("c=1 qpn8 100.0 m6 95.0 tok/s ratio 1.053")
+    assert res["lines"][-1].endswith("5/5 match")
+
+
+def test_ab_compare_fails_on_regression_mismatch_or_missing():
+    slow = probe.ab_compare(_ab([100, 170, 250, 300]), _ab([100, 180, 250, 300]))
+    assert slow["status"] == "FAIL" and "c=2 ratio" in slow["fail_reasons"][0]
+    diff = probe.ab_compare(_ab([1, 1, 1, 1], {3: ["x"]}), _ab([1, 1, 1, 1]))
+    assert diff["status"] == "FAIL" and diff["greedy_mismatch"] == [3]
+    gone = probe.ab_compare(_ab([1, None, 1, 1]), {"error": "missing off/ab.json"})
+    assert gone["status"] == "FAIL"
+    assert "missing off/ab.json" in gone["fail_reasons"]

@@ -41,6 +41,8 @@ EFFECTIVE_DEFAULTS = {
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,
     "fp8_qpn8": None,
+    "fp8_block_qpn8": True,
+    "fp8_block_qpn8_turbomind_copy": None,
     "dflash2_verifier": "auto",
     "shared_moe_overlap": False,
 }
@@ -134,6 +136,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_FP8_MOE_DECODE",
         "VLLM_SM70_FP8_MOE_COMPACT_DECODE",
         "VLLM_SM70_FP8_QPN8",
+        "VLLM_SM70_FP8_BLOCK_QPN8",
     }
     assert set(envs._SECTIONS["models"]) == {
         "VLLM_SM70_FLINT_MOE_QPN_DECODE",
@@ -142,9 +145,11 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_DFLASH2_EMULATION",
         "VLLM_SM70_SHARED_MOE_OVERLAP",
     }
-    # one kill per field, except quant_backend (env-only refusal)
+    # one kill per field, except quant_backend (env-only refusal) and the
+    # TurboMind copy policy (a policy, not a feature)
     assert {f for f, _ in KILL_SWITCHES.values()} == set(Sm70Config.model_fields) - {
-        "quant_backend"
+        "quant_backend",
+        "fp8_block_qpn8_turbomind_copy",
     }
     assert set(KILL_SWITCHES) <= set(OURS)
     for name in (  # M10 and Kai own these; they must not be ours
@@ -355,6 +360,8 @@ def test_env_cannot_enable(monkeypatch, value):
         "fp8_moe_compact_decode": False,
         "flint_qk_rope_kv": False,
         "fp8_qpn8": False,
+        "fp8_block_qpn8": False,
+        "fp8_block_qpn8_turbomind_copy": False,
         "dflash2_verifier": "off",
         "shared_moe_overlap": False,
         "quant_backend": "turbomind",
@@ -405,6 +412,8 @@ def test_hash_changes_for_every_graph_field():
         "quant_backend": "turbomind",
         "flint_qk_rope_kv": False,
         "fp8_qpn8": True,
+        "fp8_block_qpn8": False,
+        "fp8_block_qpn8_turbomind_copy": True,
         "dflash2_verifier": "off",
         "flint_moe_qpn_decode": False,
         "fp8_moe_decode": False,
@@ -432,6 +441,7 @@ _ENABLED = {
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,
     "fp8_qpn8": True,
+    "fp8_block_qpn8": True,
     "dflash2_verifier": "on",
     "shared_moe_overlap": True,
 }
