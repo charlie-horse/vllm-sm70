@@ -3,45 +3,47 @@ From: vllm-sm70 <noreply@anthropic.com>
 Date: Thu, 5 Nov 2026 01:34:36 +0000
 Subject: [PATCH] build: skip external projects that build nothing for sm_70
 
-What: with VLLM_SM70_MINIMAL_EXTERNALS set, CMake skips DeepGEMM,
-  DeepSelect, MSA (fmha_sm100), FlashMLA, FlashKDA, qutlass and tml-fa4,
-  and replaces vllm-flash-attn's FA2/FA3 kernel build with empty targets
-  that still install its Python files; setup.py drops the matching
-  extensions. Unset, the build is unchanged.
+What: with VLLM_SM70_TRIM_EXTERNALS=1, CMake skips DeepGEMM, DeepSelect,
+  MSA (fmha_sm100), FlashMLA, FlashKDA, qutlass and tml-fa4, and replaces
+  vllm-flash-attn's FA2/FA3 kernel build with empty targets that still
+  install its Python files; setup.py drops the matching extensions.
+  Unset or 0, the build is unchanged.
 Why: on arch 7.0 none of these produce usable kernels, but FA2/FA3
   still compile ~250 .cu files at nvcc's default arch (FA2_ARCHS and
-  FA3_ARCHS are empty, CMakeLists.txt in vllm-flash-attn defines the
-  targets anyway): ~40 of the 46 min tree build on r440 (2026-11-04).
+  FA3_ARCHS are empty, yet vllm-flash-attn defines the targets): ~40 of
+  the 46 min tree build on r440 (2026-11-04).
   vllm_flash_attn/layers/rotary.py is still needed
   (rotary_embedding/common.py:223), so FA's Python files stay.
 Upstream-files: CMakeLists.txt, cmake/external_projects/vllm_flash_attn.cmake, setup.py
-Kill-switch: none (build-time): unset VLLM_SM70_MINIMAL_EXTERNALS to build upstream's full set
+Kill-switch: VLLM_SM70_TRIM_EXTERNALS=0 (build-time; unset is the same)
 Tests: nix build .#vllm on r440 (cuobjdump: sm_70 in _C_stable/_moe_C, no _vllm_fa2_C/_vllm_fa3_C .so); import vllm.vllm_flash_attn.layers.rotary; c4130 TRITON_ATTN TP1/TP2 rerun
 Upstream-status: not-upstreamable
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 7694e6f8bc46..2b0d955919c9 100644
+index 7694e6f8bc46..2dde98fc1d5d 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -1701,6 +1701,8 @@ endif()
  
  # For CUDA we also build and ship some external projects.
  if (VLLM_GPU_LANG STREQUAL "CUDA")
-+  # VLLM_SM70_MINIMAL_EXTERNALS: skip the projects that build nothing for sm_70.
-+  if (NOT DEFINED ENV{VLLM_SM70_MINIMAL_EXTERNALS})
++  # VLLM_SM70_TRIM_EXTERNALS=1: skip the projects that build nothing for sm_70.
++  if (NOT "$ENV{VLLM_SM70_TRIM_EXTERNALS}" STREQUAL "1")
      include(cmake/external_projects/deepgemm.cmake)
      include(cmake/external_projects/deepselect.cmake)
      include(cmake/external_projects/fmha_sm100.cmake)
-@@ -1708,6 +1710,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
+@@ -1708,6 +1710,9 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
      include(cmake/external_projects/flashkda.cmake)
      include(cmake/external_projects/qutlass.cmake)
      include(cmake/external_projects/tml_fa4.cmake)
++  else()
++    message(STATUS "vllm-sm70: VLLM_SM70_TRIM_EXTERNALS=1, skipping external projects that build nothing for sm_70")
 +  endif()
  
      # vllm-flash-attn should be last as it overwrites some CMake functions
      include(cmake/external_projects/vllm_flash_attn.cmake)
 diff --git a/cmake/external_projects/vllm_flash_attn.cmake b/cmake/external_projects/vllm_flash_attn.cmake
-index bac2afc828b3..ff88dffee0a1 100644
+index bac2afc828b3..cd8f43f0f75b 100644
 --- a/cmake/external_projects/vllm_flash_attn.cmake
 +++ b/cmake/external_projects/vllm_flash_attn.cmake
 @@ -29,7 +29,16 @@ if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
@@ -49,11 +51,11 @@ index bac2afc828b3..ff88dffee0a1 100644
  endif()
  
 -if(VLLM_FLASH_ATTN_SRC_DIR)
-+if(DEFINED ENV{VLLM_SM70_MINIMAL_EXTERNALS})
++if("$ENV{VLLM_SM70_TRIM_EXTERNALS}" STREQUAL "1")
 +  # Python files only: no FA2/FA3 kernels (sm80+). Empty targets keep the
 +  # setup.py --target/--component names valid.
 +  if(NOT VLLM_FLASH_ATTN_SRC_DIR)
-+    message(FATAL_ERROR "VLLM_SM70_MINIMAL_EXTERNALS needs VLLM_FLASH_ATTN_SRC_DIR")
++    message(FATAL_ERROR "VLLM_SM70_TRIM_EXTERNALS=1 needs VLLM_FLASH_ATTN_SRC_DIR")
 +  endif()
 +  set(vllm-flash-attn_SOURCE_DIR ${VLLM_FLASH_ATTN_SRC_DIR})
 +  add_custom_target(_vllm_fa2_C)
@@ -66,7 +68,7 @@ index bac2afc828b3..ff88dffee0a1 100644
    )
  endif()
  
-+if(NOT DEFINED ENV{VLLM_SM70_MINIMAL_EXTERNALS})
++if(NOT "$ENV{VLLM_SM70_TRIM_EXTERNALS}" STREQUAL "1")
  # Make sure vllm-flash-attn install rules are nested under vllm/
  # ALL_COMPONENTS ensures the save/modify/restore runs exactly once regardless
  # of how many components are being installed, avoiding double-append of /vllm/.
@@ -79,14 +81,14 @@ index bac2afc828b3..ff88dffee0a1 100644
  # Install shared Python files for both FA2 and FA3 components
  foreach(_FA_COMPONENT _vllm_fa2_C _vllm_fa3_C)
 diff --git a/setup.py b/setup.py
-index cf99ec3aaaf4..660ad5086528 100644
+index cf99ec3aaaf4..ae568bc797cc 100644
 --- a/setup.py
 +++ b/setup.py
 @@ -1619,6 +1619,25 @@ if _build_custom_ops():
          ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
          ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
  
-+if _is_cuda() and os.environ.get("VLLM_SM70_MINIMAL_EXTERNALS"):
++if _is_cuda() and os.environ.get("VLLM_SM70_TRIM_EXTERNALS") == "1":
 +    # Keep only what builds for sm_70; FA2's component still installs the
 +    # vllm_flash_attn Python files (e.g. layers/rotary.py).
 +    _sm70_skip = {
