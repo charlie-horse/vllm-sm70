@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 12:04:31 +0000
+Subject: [PATCH] platform: add a MoE router provider hook at the runner gate
+
+What: Adds Platform.get_moe_router_provider() (default None). When the
+  MoE runner holds the gate, it asks provider(runner) for a route; a
+  route's try_route(hidden_states) can return (topk_weights, topk_ids),
+  which skip the gate GEMM and select_experts. None keeps upstream.
+Why: Out-of-tree platforms (the vllm-sm70 plugin) need one Volta kernel
+  for gate GEMM + top-k (Flint fused router, K13); the gate runs at
+  vllm/model_executor/layers/fused_moe/runner/moe_runner.py:907 and
+  expert selection at :630, so both need the precomputed route.
+Upstream-files: vllm/platforms/interface.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+Kill-switch: hook returns None -> upstream (no plugin, or VLLM_SM70_FLINT_FUSED_ROUTER=0)
+Tests: sm70/tests/plugin/test_u3_router_hook.py
+Upstream-status: candidate
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmUQtD6qJskP867jP1x
+
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index dd42c8332ffd..f5f3b58826b0 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -602,6 +602,7 @@ class MoERunner(MoERunnerInterface):
+         shared_experts_input: torch.Tensor | None,
+         input_ids: torch.Tensor | None = None,
+         shared_experts_overlapping: bool = False,
++        precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
+     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
+         """Run expert routing and the fused MoE kernel via the quant method.
+ 
+@@ -619,6 +620,7 @@ class MoERunner(MoERunnerInterface):
+ 
+         if self.routed_experts.quant_method.is_monolithic:
+             # Monolithic kernels: pass router_logits to routed_experts
++            assert precomputed_topk is None, "platform route needs a modular kernel"
+             router_logits = self.router.prepare_monolithic_logits(router_logits)
+             fused_out = self.routed_experts.forward_monolithic(
+                 x=hidden_states,
+@@ -627,7 +629,7 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             # Modular kernels: select experts first, then call routed_experts
+-            topk_weights, topk_ids = self.router.select_experts(
++            topk_weights, topk_ids = precomputed_topk or self.router.select_experts(
+                 hidden_states=hidden_states,
+                 router_logits=router_logits,
+                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
+@@ -904,7 +906,12 @@ class MoERunner(MoERunnerInterface):
+         # If the Runner holds the gate, apply it after the stream sync,
+         # so it can run overlapped with the
+         # NOTE: in future PR, MoE runner will always hold the gate.
+-        if self.gate is not None:
++        provider = current_platform.get_moe_router_provider()
++        route = None
++        if provider is not None and self.gate is not None:
++            route = provider(self)
++        precomputed_topk = None if route is None else route.try_route(hidden_states)
++        if self.gate is not None and precomputed_topk is None:
+             if self._fse_fuse_gate:
+                 self._maybe_fuse_gate_weights()
+                 router_logits = dispatch_unquantized_gemm()(
+@@ -928,6 +935,7 @@ class MoERunner(MoERunnerInterface):
+                 shared_experts_input=shared_experts_input,
+                 input_ids=input_ids,
+                 shared_experts_overlapping=shared_experts_overlapping,
++                precomputed_topk=precomputed_topk,
+             )
+ 
+             return self._maybe_combine(
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 765a64441505..57792438b4c6 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1212,6 +1212,19 @@ class Platform:
+     def kernel_warmup(cls, worker: Any) -> None:
+         """Warm up platform kernels before CUDA graph capture."""
+ 
++    @classmethod
++    def get_moe_router_provider(cls) -> Any:
++        """Return provider(runner) -> route | None, or None for upstream.
++
++        route.try_route(hidden_states) returns (topk_weights, topk_ids) that
++        replace the runner's gate GEMM and router.select_experts, or None for
++        the upstream path. A precomputed route also skips the rest of
++        select_experts: capture_fn, the EPLB logical-to-physical mapping, the
++        topk_indices_dtype conversion and the routing-replay write. Return no
++        route when any of those is active, and for monolithic kernels, fused
++        shared expert gates, or EP/sequence-parallel dispatch."""
++        return None
++
+     @classmethod
+     def get_punica_wrapper(cls) -> str:
+         """Return the punica wrapper for current platform."""
