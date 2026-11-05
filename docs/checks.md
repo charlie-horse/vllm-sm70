@@ -1,5 +1,33 @@
 # Hardware regression checks
 
+## LMCache build check (CPU only, any time)
+
+Checks the LMCache that `nix/lmcache-build.nix` builds into `.#vllm`, on the
+serving host, without the GPUs (`CUDA_VISIBLE_DEVICES` is empty), sudo or
+services. Run it after realising a new `$OUT` and before any switch to it.
+
+Script: `scripts/check-lmcache-cpu.sh` (bash; needs only `$OUT` and `nix-store`).
+
+```sh
+nix-store --realise $OUT --add-root ~/vsm70/result-vllm --indirect
+scripts/check-lmcache-cpu.sh $OUT        # exit 0 = all PASS
+```
+
+| # | check | guards against |
+|---|---|---|
+| 1 | import `lmcache.cuda_ops`, `lmcache_native`, `lmcache_redis`, `lmcache_fs` | a missing extension (`import lmcache` only logs it) |
+| 2 | `ldd cuda_ops*.so`: `libcudart.so.12`, no `.so.13` | a CUDA 13 build |
+| 3 | `$OUT/bin/lmcache server --help` | the service entry point (a missing `.so` there prints "requires the full lmcache installation" and exits 1) |
+| 4 | import the MP connector from LMCache and from vLLM | a missing runtime dep on vLLM's path |
+| 5 | patch 0001's markers in the installed adapter | a silently dropped patch |
+| 6 | `importlib.metadata.version("lmcache") == "0.5.6"` | wrong metadata (vLLM reads the version) |
+| 7 | `lmcache_frontend/static/index.html`, import the dashboard app | missing package data for `vllm-lmcache-ui` |
+| 8 | cupy's CUDA runtime and NVRTC are 12.x | a CUDA 13 cupy (it runs in `register_kv_caches`) |
+| 9 | no `libcudart.so.13` in `$OUT`'s closure | a second, CUDA 13 runtime |
+
+The GPU half, in a window: `$OUT/bin/python -c "import cupy,torch; s=torch.cuda.Stream(); cupy.cuda.ExternalStream(s.cuda_stream).use(); print('ok')"`
+(torch's CUDA 12.6 runtime and cupy's static 12.9 runtime share a stream).
+
 ## Check 6: LMCache still stores and serves after 1 h of quiet
 
 Guards `nix/patches/lmcache/0001-mp-worker-heartbeat-from-registration.patch`
