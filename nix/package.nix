@@ -159,6 +159,10 @@ let
         # `vllm` is the venv python running vllm's CLI from the tree.
         # TRITON_PTXAS_PATH is only a default (12.6 ptxas): set it to Triton's
         # bundled ptxas (12.9) to compare.
+        # VLLM_USE_FLASHINFER_SAMPLER defaults to 1 upstream, and
+        # flashinfer_sampler_supported() imports flashinfer before checking
+        # the GPU (v1/sample/ops/topk_topp_sampler.py:117-124); flashinfer is
+        # not in the env (sm80+), so default it off.
         for exe in python vllm; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
@@ -167,6 +171,7 @@ let
             --set CUDA_HOME ${cuda.cudatoolkit} \
             --set CUDA_PATH ${cuda.cudatoolkit} \
             --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
+            --set-default VLLM_USE_FLASHINFER_SAMPLER 0 \
             --set TRITON_LIBCUDA_PATH /run/opengl-driver/lib \
             --set CC ${cuda.backendStdenv.cc}/bin/cc \
             --set CXX ${cuda.backendStdenv.cc}/bin/c++ \

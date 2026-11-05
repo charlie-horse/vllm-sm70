@@ -7,9 +7,12 @@ checks with their expected output.
 
 `$OUT` = outPath of `.#vllm` (r440, `~/vllm-sm70-work/felix/result-vllm`).
 Built 2026-11-04 on r440 (tree build 60 min, exit 0):
-`/nix/store/w22ph5z450cawvabknms35j5sp3hccfb-vllm-sm70-0.33.0` (closure 10.4 GiB;
+`/nix/store/1p3pm4768009z19cwzavykvcy7sjbg0i-vllm-sm70-0.33.0` (closure 10.4 GiB;
 tree `/nix/store/1xc5dp2nrh425sfphk52d2s7mv91is9l-vllm-sm70-0.33.0`).
 Already realised on c4130 and GC-rooted at `~charlie/vsm70/result-vllm`.
+The wrapper defaults `VLLM_USE_FLASHINFER_SAMPLER=0`: upstream defaults it to 1
+and imports flashinfer (not shipped, sm80+) before checking the GPU. The
+2026-11-05 test ran `w22ph5z4…` (same tree) with that variable set by hand.
 
 ## 1. Closure to c4130 (before the window, no service impact, no sudo)
 c4130 has the harmonia binary cache on r440 as a substituter and trusts
