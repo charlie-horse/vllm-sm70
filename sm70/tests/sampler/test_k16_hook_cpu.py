@@ -511,12 +511,18 @@ def test_kernel_warmup_prepares_the_runner_hook(platform_cls, monkeypatch):
     assert seen == [worker]
 
 
-def test_kernel_warmup_survives_prepare_failure(platform_cls, monkeypatch):
+def test_kernel_warmup_raises_on_prepare_failure(platform_cls, monkeypatch):
+    # A rank that silently fell back would desync TP collectives (hang), so
+    # a prepare failure must stop startup; the kill switch is the way out.
     def boom(worker):
-        raise RuntimeError("test")
+        raise ValueError("test")
 
     monkeypatch.setattr(sample_v1, "prepare_worker", boom)
     monkeypatch.delenv("VLLM_SM70_FLINT_SAMPLER", raising=False)
+    with pytest.raises(RuntimeError, match="VLLM_SM70_FLINT_SAMPLER=0") as ei:
+        platform_cls.kernel_warmup(object())
+    assert isinstance(ei.value.__cause__, ValueError)
+    monkeypatch.setenv("VLLM_SM70_FLINT_SAMPLER", "0")
     assert platform_cls.kernel_warmup(object()) is None
 
 

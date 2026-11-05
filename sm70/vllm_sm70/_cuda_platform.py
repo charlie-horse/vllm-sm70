@@ -163,14 +163,20 @@ class Sm70CudaPlatform(CudaPlatform):
         # Runs after model load and before CUDA graph capture (U1). K16:
         # bind the V1 hidden-state sampler and create its device counter
         # here, never lazily during capture (R4).
+        # A failure raises: if one TP rank silently fell back to upstream
+        # sampling while the other used K16, their collectives would no
+        # longer match and the engine would hang. VLLM_SM70_FLINT_SAMPLER=0
+        # is the way to run without it.
         if _flint_sampler_enabled():
-            try:
-                from vllm_sm70 import sample_v1
+            from vllm_sm70 import sample_v1
 
+            try:
                 sample_v1.prepare_worker(worker)
-            except Exception:
-                # Unprepared, the sampler returns None: upstream sampling.
-                logger.exception("vllm_sm70: preparing the K16 sampler failed")
+            except Exception as e:
+                raise RuntimeError(
+                    "vllm_sm70: preparing the K16 top-k sampler failed; set "
+                    "VLLM_SM70_FLINT_SAMPLER=0 to use upstream sampling"
+                ) from e
         return None
 
     # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
@@ -186,4 +192,6 @@ class Sm70CudaPlatform(CudaPlatform):
 
 
 def _flint_sampler_enabled() -> bool:
-    return os.environ.get("VLLM_SM70_FLINT_SAMPLER") != "0"
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_FLINT_SAMPLER)
