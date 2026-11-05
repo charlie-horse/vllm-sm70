@@ -33,6 +33,10 @@ import os
 from types import SimpleNamespace
 
 import pytest
+
+# Collected without vllm/torch installed (e.g. plain `pytest sm70/tests`): skip.
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
 import torch
 import torch.nn.functional as F
 from torch import nn
