@@ -157,6 +157,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
         "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+        # K07: "0" -> verify rows take the causal paged prefill (K06) instead
+        # of the smallq -> XQA expansion; graphs then cover 1-token decode.
+        "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
     },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {
