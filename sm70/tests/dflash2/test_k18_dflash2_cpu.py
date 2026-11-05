@@ -20,7 +20,11 @@ KILL = "VLLM_SM70_DFLASH2_FP16"
 
 @pytest.fixture(autouse=True)
 def _switch_on(monkeypatch):
-    monkeypatch.delenv(KILL, raising=False)
+    """Most tests run opted in (=1); default-off tests delenv explicitly."""
+    monkeypatch.setenv(KILL, "1")
+    dflash2.reset_selection_cache()
+    yield
+    dflash2.reset_selection_cache()
 
 
 # ------------------------------------------------------------------ schemas
@@ -53,14 +57,28 @@ def test_sources_cmake_lists_both_files():
 
 
 # ---------------------------------------------------------------- env / kill
-def test_kill_switch_registered_default_on(monkeypatch):
+def test_switch_registered_opt_in(monkeypatch):
     assert KILL in envs.environment_variables()
     assert KILL in envs._SECTIONS["ops"]
-    assert envs.VLLM_SM70_DFLASH2_FP16 is True
-    monkeypatch.setenv(KILL, "0")
-    assert envs.VLLM_SM70_DFLASH2_FP16 is False
+    monkeypatch.delenv(KILL)
+    assert envs.VLLM_SM70_DFLASH2_FP16 is False  # default OFF
+    for value in ("0", "", "true", "on", " 1"):
+        monkeypatch.setenv(KILL, value)
+        assert envs.VLLM_SM70_DFLASH2_FP16 is False, value
     monkeypatch.setenv(KILL, "1")
     assert envs.VLLM_SM70_DFLASH2_FP16 is True
+
+
+def test_default_off_selects_and_marks_nothing(monkeypatch):
+    monkeypatch.delenv(KILL)
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    assert dflash2.select_unquantized_gemm("auto") is None
+    assert not dflash2.enabled()
+    assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
+    layer = nn.Linear(2048, 512, bias=False).half()
+    monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
+    assert not dflash2.mark_and_prepare(layer)  # even a forced mark packs nothing
+    assert not hasattr(layer, dflash2.PACKED_ATTR)
 
 
 # ------------------------------------------------------------ shape guards
@@ -181,6 +199,57 @@ def test_select_kill_switch(monkeypatch):
     assert dflash2.select_unquantized_gemm("auto") is None
 
 
+def test_selection_is_cached(monkeypatch):
+    """UP calls dispatch_unquantized_gemm() per forward (lm_head, router gate):
+    the platform answer is computed once per linear_backend."""
+    pytest.importorskip("vllm")
+    calls = []
+
+    def counting():
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(dflash2, "gemm_available", counting)
+    for _ in range(100):
+        assert (
+            dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
+        )
+    assert len(calls) == 1
+    for _ in range(10):
+        dflash2.select_unquantized_gemm("flashinfer_cutedsl")
+    assert len(calls) == 2
+    dflash2.reset_selection_cache()
+    dflash2.select_unquantized_gemm("auto")
+    assert len(calls) == 3
+
+
+def test_per_layer_route_decided_once(monkeypatch):
+    """After packing, a GEMM call reads one cached route; no admission work."""
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
+    layer = nn.Linear(2048, 512, bias=False).half()
+    assert dflash2.mark_and_prepare(layer)
+    assert getattr(layer, dflash2.ROUTE_ATTR) == (512, 2048, 16, 16)
+    counts = {"enabled": 0, "sm70": 0, "valid": 0}
+
+    def count(key, ret):
+        def fn(*a, **k):
+            counts[key] += 1
+            return ret
+
+        return fn
+
+    monkeypatch.setattr(dflash2, "enabled", count("enabled", True))
+    monkeypatch.setattr(dflash2, "_is_sm70", count("sm70", True))
+    monkeypatch.setattr(dflash2, "geometry_valid", count("valid", True))
+    plain = nn.Linear(2048, 512, bias=False).half()
+    x = torch.randn(16, 2048).half()  # M > 8: F.linear on the CPU
+    for _ in range(20):
+        dflash2.dflash2_unquantized_gemm(layer, x, layer.weight, None)
+        dflash2.dflash2_unquantized_gemm(plain, x, plain.weight, None)
+    assert counts == {"enabled": 0, "sm70": 0, "valid": 0}
+
+
 def test_unmarked_layer_falls_through_to_f_linear():
     layer = nn.Linear(64, 32, bias=True)
     x = torch.randn(8, 64)
@@ -208,6 +277,7 @@ def _meta_layer(mod, n=1280, k=5120, tile=16, warps=16):
         persistent=False,
     )
     setattr(layer, mod.GEOMETRY_ATTR, (tile, warps))
+    setattr(layer, mod.ROUTE_ATTR, (n, k, tile, warps))
     return layer
 
 
@@ -297,6 +367,8 @@ def test_mark_skips_quantized_and_kill_switch(monkeypatch):
     assert dflash2.mark_draft_linears(_fake_decoder_layer(object())) == []
     monkeypatch.setenv(KILL, "0")
     assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
+    monkeypatch.delenv(KILL)
+    assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
 
 
 # ------------------------------------------------- reload / no autograd
@@ -347,9 +419,16 @@ def _m7_classes(monkeypatch):
 
     method = object.__new__(UnquantizedLinearMethod)
 
-    def proj():
+    shapes = dflash2.DRAFT_SHAPES_TP2["qwen3.6-35b-a3b-dflash2"]
+
+    def proj(kind=None):
         m = nn.Module()
         m.quant_method = method
+        if kind is not None and WEIGHTS["on"]:
+            n, k = shapes[kind]
+            m.weight = nn.Parameter(
+                torch.randn(n, k, dtype=torch.float16) * 0.01, requires_grad=False
+            )
         return m
 
     def fake_base_init(
@@ -364,15 +443,15 @@ def _m7_classes(monkeypatch):
     ):
         nn.Module.__init__(self)
         self.self_attn = nn.Module()
-        self.self_attn.qkv_proj = proj()
-        self.self_attn.o_proj = proj()
+        self.self_attn.qkv_proj = proj("qkv_proj")
+        self.self_attn.o_proj = proj("o_proj")
         self.mlp = nn.Module()
-        self.mlp.gate_up_proj = proj()
-        self.mlp.down_proj = proj()
+        self.mlp.gate_up_proj = proj("gate_up_proj")
+        self.mlp.down_proj = proj("down_proj")
         self.attention_conv = nn.Module()
-        self.attention_conv.kernel_projection = proj()
+        self.attention_conv.kernel_projection = proj("kernel_projection")
         self.mlp_conv = nn.Module()
-        self.mlp_conv.kernel_projection = proj()
+        self.mlp_conv.kernel_projection = proj("kernel_projection")
         # an unrelated linear must stay unmarked
         self.other = proj()
 
@@ -384,8 +463,13 @@ def _m7_classes(monkeypatch):
     return m7
 
 
-def _build_m7_layer(m7):
+WEIGHTS = {"on": False}
+
+
+def _build_m7_layer(m7, weights=False):
     from types import SimpleNamespace
+
+    WEIGHTS["on"] = weights
 
     cls = m7.DFlash2SM70Qwen3DecoderLayer
     vllm_config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16))
@@ -415,10 +499,30 @@ def test_m7_layer_marks_exactly_six_projections(monkeypatch):
     }
 
 
-def test_m7_layer_marks_nothing_when_killed(monkeypatch):
+@pytest.mark.parametrize("value", [None, "0"])
+def test_m7_default_marks_and_packs_nothing(monkeypatch, value):
     m7 = _m7_classes(monkeypatch)
-    monkeypatch.setenv(KILL, "0")
-    assert _marked(_build_m7_layer(m7)) == set()
+    if value is None:
+        monkeypatch.delenv(KILL)
+    else:
+        monkeypatch.setenv(KILL, value)
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
+    layer = _build_m7_layer(m7, weights=True)
+    assert _marked(layer) == set()
+    assert dflash2.prepare_marked(layer) == 0
+    assert not any(hasattr(m, dflash2.PACKED_ATTR) for m in layer.modules())
+
+
+def test_m7_opt_in_marks_and_packs_six(monkeypatch):
+    m7 = _m7_classes(monkeypatch)  # autouse fixture: KILL=1
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
+    layer = _build_m7_layer(m7, weights=True)
+    assert len(_marked(layer)) == 6
+    assert dflash2.prepare_marked(layer) == 6
+    packed = {n for n, m in layer.named_modules() if hasattr(m, dflash2.PACKED_ATTR)}
+    assert packed == _marked(layer)
 
 
 def test_m7_load_weights_calls_prepare_marked(monkeypatch):

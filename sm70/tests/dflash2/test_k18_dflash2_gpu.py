@@ -22,6 +22,17 @@ import torch.nn.functional as F  # noqa: E402
 pytestmark = pytest.mark.gpu
 
 
+@pytest.fixture(autouse=True)
+def _opt_in(monkeypatch):
+    """K18 is opt-in (VLLM_SM70_DFLASH2_FP16=1); these tests exercise it."""
+    from vllm_sm70.ops import dflash2
+
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FP16", "1")
+    dflash2.reset_selection_cache()
+    yield
+    dflash2.reset_selection_cache()
+
+
 def _input_scale(n: int, k: int) -> float:
     # The fork's per-shape scales (FORK test :17-25) by projection role: the
     # M7 emulation feeds gate_up x/32, o_proj attention/256, down a
@@ -136,7 +147,6 @@ def test_misaligned_input_keeps_matrix_product(dflash2_gpu):
 @torch.inference_mode()
 def test_u1_gemm_callable(dflash2_gpu, monkeypatch):
     mod = dflash2_gpu
-    monkeypatch.delenv(mod.KILL_SWITCH, raising=False)
     gemm = mod.select_unquantized_gemm("auto")
     assert gemm is mod.dflash2_unquantized_gemm
     layer = _layer(mod, 3072, 5120)
@@ -153,7 +163,8 @@ def test_u1_gemm_callable(dflash2_gpu, monkeypatch):
         assert torch.equal(
             gemm(plain, x, plain.weight, None), F.linear(x, plain.weight)
         )
-    monkeypatch.setenv(mod.KILL_SWITCH, "0")
+    monkeypatch.delenv(mod.KILL_SWITCH)  # default: off
+    mod.reset_selection_cache()
     assert mod.select_unquantized_gemm("auto") is None
     fresh = torch.nn.Linear(5120, 3072, bias=False, device="cuda", dtype=torch.float16)
     assert not mod.mark_and_prepare(fresh)

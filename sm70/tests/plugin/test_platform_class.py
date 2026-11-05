@@ -36,6 +36,7 @@ def test_u1_hooks_default_to_upstream(platform_cls, monkeypatch):
 
     # Without the K18 ops (CPU-only build) the GEMM hook keeps upstream.
     monkeypatch.setattr(dflash2, "gemm_available", lambda: False)
+    dflash2.reset_selection_cache()
     assert platform_cls.get_unquantized_gemm("auto") is None
     assert platform_cls.kernel_warmup(object()) is None
 
@@ -44,10 +45,18 @@ def test_u1_gemm_hook_k18(platform_cls, monkeypatch):
     from vllm_sm70.ops import dflash2
 
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
-    monkeypatch.delenv("VLLM_SM70_DFLASH2_FP16", raising=False)
-    assert platform_cls.get_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
-    monkeypatch.setenv("VLLM_SM70_DFLASH2_FP16", "0")
-    assert platform_cls.get_unquantized_gemm("auto") is None
+    for value, expected in ((None, None), ("0", None), ("1", True)):
+        if value is None:
+            monkeypatch.delenv("VLLM_SM70_DFLASH2_FP16", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_SM70_DFLASH2_FP16", value)
+        dflash2.reset_selection_cache()
+        got = platform_cls.get_unquantized_gemm("auto")
+        if expected is None:
+            assert got is None, value  # opt-in: default is upstream
+        else:
+            assert got is dflash2.dflash2_unquantized_gemm
+    dflash2.reset_selection_cache()
 
 
 def test_check_and_update_config_installs_pass(platform_cls, monkeypatch):

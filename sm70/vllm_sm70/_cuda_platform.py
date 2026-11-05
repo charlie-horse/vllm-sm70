@@ -168,8 +168,9 @@ class Sm70CudaPlatform(CudaPlatform):
     ) -> Callable[..., Any] | None:
         # K18: DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
         # other layer and M falls through to F.linear (UP
-        # default_unquantized_gemm). None (upstream dispatch) when
-        # VLLM_SM70_DFLASH2_FP16=0 or the ops are not built.
+        # default_unquantized_gemm). None (upstream dispatch) unless
+        # VLLM_SM70_DFLASH2_FP16=1 (opt-in) and the ops are built. Cached:
+        # UP calls this per forward for lm_head and the router gate.
         from vllm_sm70.ops import dflash2
 
         return dflash2.select_unquantized_gemm(linear_backend)

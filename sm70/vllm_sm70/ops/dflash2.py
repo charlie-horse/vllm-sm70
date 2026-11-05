@@ -13,8 +13,13 @@ How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
   :func:`prepare_dflash2_fp16_m8` packed, and calls ``F.linear`` (UP
   ``default_unquantized_gemm``) for everything else. M7's DFlash2 draft
   subclass marks the layers at construction and packs them in load_weights.
-Kill switch: ``VLLM_SM70_DFLASH2_FP16=0`` -> ``get_unquantized_gemm`` returns
-  None (upstream dispatch, untouched) and nothing is marked or packed.
+Switch: OPT-IN. Only ``VLLM_SM70_DFLASH2_FP16=1`` enables it (envs.py says
+  why). Unset or any other value: ``get_unquantized_gemm`` returns None
+  (upstream dispatch, untouched), nothing is marked or packed, F.linear runs.
+Selection is decided once: ``select_unquantized_gemm`` is cached per
+  linear_backend (UP calls ``dispatch_unquantized_gemm()`` on every forward of
+  lm_head and the MoE router gate), and each layer's route (N, K, tile, warps)
+  is fixed when it is packed (``ROUTE_ATTR``); a call only checks ``x``.
 
 Ported from fork cf9492a vllm/model_executor/layers/quantization/
 sm70_dflash2_fp16.py and vllm/model_executor/layers/sm70_compact_topk.py;
@@ -23,6 +28,7 @@ see sm70/csrc/dflash2/PROVENANCE.md for the line map and what changed.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -54,6 +60,8 @@ OPS = GEMM_OPS + TOPK_OPS
 MARK_ATTR = "_sm70_dflash2_fp16_m8"
 PACKED_ATTR = "_sm70_dflash2_fp16_packed"
 GEOMETRY_ATTR = "_sm70_dflash2_fp16_geometry"
+# (N, K, tile, warps), set only on a packed layer: the per-layer decision.
+ROUTE_ATTR = "_sm70_dflash2_fp16_route"
 
 # The kernel runs on exactly 8 rows; M 1..7 is zero-padded inside the op.
 MAX_M = 8
@@ -127,7 +135,7 @@ def gemm_available() -> bool:
 
 
 def enabled() -> bool:
-    """Kill switch on and the GEMM ops built."""
+    """Opted in (VLLM_SM70_DFLASH2_FP16=1) and the GEMM ops built."""
     return bool(envs.VLLM_SM70_DFLASH2_FP16) and gemm_available()
 
 
@@ -160,8 +168,20 @@ def dflash2_unquantized_gemm(
 def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] | None:
     """What Sm70CudaPlatform.get_unquantized_gemm returns (None -> upstream).
 
-    Read when each UnquantizedLinearMethod is built (UP linear.py:176).
+    Called when each UnquantizedLinearMethod is built (UP linear.py:176) and
+    on every forward of lm_head (UP vocab_parallel_embedding.py:83) and the
+    MoE router gate (UP moe_runner.py:910), so the answer is cached per
+    linear_backend for the process. reset_selection_cache() clears it.
     """
+    return _select_cached(linear_backend)
+
+
+def reset_selection_cache() -> None:
+    _select_cached.cache_clear()
+
+
+@functools.cache
+def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
     if not envs.VLLM_SM70_DFLASH2_FP16:
         return None
     if not gemm_available():
@@ -292,6 +312,7 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
     # Retain the original matrix for prefill, batched drafting, and context KV.
     layer.register_buffer(PACKED_ATTR, packed, persistent=False)
     setattr(layer, GEOMETRY_ATTR, geometry)
+    setattr(layer, ROUTE_ATTR, (n, k, tile, warps))
     logger.info(
         "vllm_sm70: DFlash2 FP16 M8 layout prepared: N%d/K%d, tile=%d, warps=%d.",
         n,
@@ -318,12 +339,14 @@ def apply_dflash2_fp16_m8(
 ) -> torch.Tensor | None:
     """The kernel's output, or None when this call keeps F.linear."""
     # ported from FORK sm70_dflash2_fp16.py:70-92
-    packed = getattr(layer, PACKED_ATTR, None)
+    route = getattr(layer, ROUTE_ATTR, None)  # decided once, at pack time
+    if route is None:
+        return None
+    n, k, tile, warps = route
     if (
-        packed is None
-        or bias is not None
+        bias is not None
         or x.ndim != 2
-        or x.shape[1] != layer.weight.shape[1]
+        or x.shape[1] != k
         or x.dtype != torch.float16
         or not x.is_contiguous()
     ):
@@ -332,10 +355,9 @@ def apply_dflash2_fp16_m8(
     # time (M 1..8: kernel, else mm), so a dynamic trace keeps the decode route.
     if not torch.compiler.is_compiling() and not 1 <= x.shape[0] <= MAX_M:
         return None
-    output = x.new_empty((x.shape[0], layer.weight.shape[0]))
-    tile, warps = getattr(layer, GEOMETRY_ATTR)
+    output = x.new_empty((x.shape[0], n))
     torch.ops._sm70_C.sm70_dflash2_fp16_dispatch_out(
-        output, x, packed, layer.weight, tile, warps
+        output, x, getattr(layer, PACKED_ATTR), layer.weight, tile, warps
     )
     return output
 
