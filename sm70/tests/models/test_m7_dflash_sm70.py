@@ -423,9 +423,11 @@ def test_attention_forward_copy_matches_upstream_source():
 # GPU (Bea, c4130)
 # --------------------------------------------------------------------------
 @pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 @pytest.mark.parametrize("rows, cols", [(1, 8704), (8, 8704), (32, 4352)])
 def test_triton_matches_reference_gpu(rows, cols):
-    assert torch.cuda.is_available() and m7.HAS_TRITON
+    # On a GPU host Triton must be there: fail, don't skip.
+    assert m7.HAS_TRITON
     g = torch.Generator(device="cuda").manual_seed(0)
     gate_up = (torch.randn(rows, 2 * cols, device="cuda", generator=g) * 20).half()
     out, s = m7.dflash_silu_and_mul_sm70(gate_up)

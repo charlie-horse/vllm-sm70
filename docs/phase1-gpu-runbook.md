@@ -49,9 +49,9 @@ v0.33.0 has no `vllm._C`: its kernels are `vllm._C_stable_libtorch` (imported by
 (No `-I` here: the wrapper puts the vLLM tree on PYTHONPATH, and `-I` would drop it.)
 
 ## 4. Test commands (inside the window, Flint stopped)
-Unit env on top of the vllm unit's env:
+Unit env on top of the vllm unit's env (v0.33.0 ignores `VLLM_ATTENTION_BACKEND`;
+pass `--attention-backend TRITON_ATTN` to `vllm serve`, or `attention_backend=` to `LLM`):
 ```
-VLLM_ATTENTION_BACKEND=TRITON_ATTN
 HF_HUB_OFFLINE=1
 VLLM_NO_USAGE_STATS=1
 HOME=/var/tmp/vsm70-test/home-vllm         # writable by vllm (create it 0700 owned by vllm)
@@ -63,8 +63,11 @@ TP1 (GPU0):
 CUDA_VISIBLE_DEVICES=0  $OUT/bin/vllm serve /var/tmp/vsm70-test/models/Qwen3-0.6B \
   --served-model-name t --dtype half --tensor-parallel-size 1 \
   --max-model-len 4096 --gpu-memory-utilization 0.80 \
+  --attention-backend TRITON_ATTN \
   --host 127.0.0.1 --port 8001
 ```
+The backend is the `--attention-backend` flag (vllm/engine/arg_utils.py:1114
+in v0.33.0); `vllm/` in v0.33.0 does not read `VLLM_ATTENTION_BACKEND`.
 TP2: the same with `CUDA_VISIBLE_DEVICES=0,1 --tensor-parallel-size 2`.
 LMCache stays running (~328 MiB/GPU at idle); 0.80 leaves room for it.
 After Flint stops, LMCache still holds ~16.4 GiB per GPU for about 120 s (seen
