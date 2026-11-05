@@ -9,8 +9,11 @@
 #                                         finds the plugins via importlib.metadata
 #
 # Inputs (agreed with Felix): buildVenv (torch: any change rebuilds this),
-# cuda, the CUTLASS source from deps.nix, and the sm70/ fileset. The kernels
-# include no vLLM csrc headers, so vLLM's `src` is not an input.
+# cuda, the CUTLASS source from deps.nix, the sm70/ fileset, and vLLM's
+# patched source (vllmSrc, ./source.nix: BASE + series) for its csrc headers.
+# sm70/csrc/custom_ar (K17) includes custom_all_reduce.cuh and
+# custom_collective_common.cuh from it, so the bytes match what vLLM's _C was
+# built from; any change to patches/ therefore rebuilds this too.
 {
   pkgs,
   lib,
@@ -18,6 +21,7 @@
   buildVenv,
   site,
   deps,
+  vllmSrc,
   version ? "0.1.0",
 }:
 let
@@ -59,6 +63,8 @@ cuda.backendStdenv.mkDerivation {
     NVCC_PREPEND_FLAGS = "-I${cuda.cudatoolkit}/include";
     # Headers only; CMake never writes into it, so the store path is fine.
     VLLM_SM70_CUTLASS_DIR = "${deps.VLLM_CUTLASS_SRC_DIR}";
+    # Headers only, read by sm70/CMakeLists for the custom_ar target.
+    VLLM_SM70_VLLM_CSRC_DIR = "${vllmSrc}/csrc";
   };
 
   buildPhase = ''

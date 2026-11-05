@@ -53,6 +53,7 @@ let
   # edit doesn't rebuild vLLM's tree. Owned by Kai (nix/sm70-ext.nix).
   sm70ext = import ./sm70-ext.nix {
     inherit pkgs lib cuda buildVenv site deps;
+    vllmSrc = src;
   };
 
   # LMCache 0.5.6 from the sdist for sm_70 (./lmcache-build.nix).

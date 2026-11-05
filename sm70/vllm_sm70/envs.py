@@ -109,6 +109,8 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_REQUIRE_CUDA",  # CMake option
             "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
             "VLLM_SM70_FV100_FUSED_DECODE",  # CMake option / C++ define (K05/K14)
+            # CMake $ENV (K17): vLLM's patched csrc/ for csrc/custom_ar
+            "VLLM_SM70_VLLM_CSRC_DIR",
         )
     },
     "core": {
@@ -259,6 +261,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
     },
     "passes": {},
+    # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
+    # first runs on a graph (fork name kept).
+    "passes": {
+        # "0": the TP2 all-reduce + fused_add_rms_norm pattern is not applied;
+        # graphs keep upstream's all_reduce and fused_add_rms_norm.
+        "VLLM_SM70_FLINT_AR_RMSNORM": kill_switch("VLLM_SM70_FLINT_AR_RMSNORM"),
+    },
 }
 
 

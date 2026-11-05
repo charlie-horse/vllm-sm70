@@ -1,0 +1,7 @@
+# sha256 of the upstream vLLM csrc headers sm70/csrc/custom_ar is built against:
+# v0.33.0 (patches/BASE) + patches/series. CMake (sources.cmake) and
+# sm70/tests/compile/test_k17_custom_ar_headers.py refuse any other bytes;
+# on a rebase re-check the static_asserts in tp2_ar_fused_add_rms_norm.cu.
+f1a564bebed668818bb7b423058d3308ae696154b74f292a4144c29cdfb94ff8  custom_all_reduce.cuh
+42ea189bad64b6e49fdf9c733d402bfea9f62bfd8ae2b3dee9fb437b3904adb9  custom_collective_common.cuh
+9274a7464c53de92976f6b5a19cc548b315f5d85e68b825515a6ff1fd73be4ca  type_convert.cuh
