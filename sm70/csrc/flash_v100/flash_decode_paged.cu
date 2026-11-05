@@ -1,4 +1,4 @@
-#include "flash_v100_policy.h"
+#include "fv100_config.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -2058,6 +2058,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+#ifdef VLLM_SM70_FV100_FUSED_DECODE  // K14: one-launch sink decode (C4)
 // Single-kernel grouped D128 decode with sinks: the partition kernel and the
 // cross-partition reducer above fused into one launch per layer.
 //
@@ -2468,6 +2469,7 @@ inline int gqa8_d128_fused_ctas_per_head(const int batch_size,
   const int ctas = (slots + rows - 1) / rows;
   return std::max(1, std::min({ctas, partial_slots, kGqaFusedMaxCtasPerHead}));
 }
+#endif  // VLLM_SM70_FV100_FUSED_DECODE
 
 // The grouped kernel loads q, K, V and the partials as aligned half8 vectors.
 inline bool gqa8_d128_decode_aligned(const at::Tensor& t) {
@@ -2559,6 +2561,7 @@ void launch_flash_attention_decode_paged(
   };
   bool grouped = false;
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+#ifdef VLLM_SM70_FV100_FUSED_DECODE
     if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE, PARTIAL_T>(
             q, k_cache, v_cache, tmp_out, use_anchored, sinks) &&
         fused_counters != nullptr && launch_reduce &&
@@ -2584,7 +2587,9 @@ void launch_flash_attention_decode_paged(
               v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
               softmax_scale, window_size_left);
       return;
-    } else if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE,
+    } else
+#endif  // VLLM_SM70_FV100_FUSED_DECODE
+    if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE,
                                          PARTIAL_T>(
                    q, k_cache, v_cache, tmp_out, use_anchored, sinks)) {
       grouped = true;
@@ -2916,6 +2921,9 @@ static at::Tensor decode_paged_sinks_impl(
               "anchor_lens and a positive anchored_window must be provided "
               "together");
   const bool use_anchored = anchor_lens.has_value();
+  // K05 lean build: the anchored-SWA kernels are not compiled.
+  TORCH_CHECK(!use_anchored,
+              "Flash-V100 (K05 lean build) has no anchored decode window");
   const int* anchor_lens_ptr = nullptr;
   if (use_anchored) {
     const at::Tensor& anchors = anchor_lens.value();
@@ -3049,6 +3057,7 @@ at::Tensor flash_attention_decode_paged_sinks(
       window_size_right, anchor_lens, anchored_window, sinks, std::nullopt);
 }
 
+#ifdef VLLM_SM70_FV100_FUSED_DECODE
 at::Tensor flash_attention_decode_paged_sinks_fused(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
@@ -3066,6 +3075,7 @@ at::Tensor flash_attention_decode_paged_sinks_fused(
       launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
       window_size_right, anchor_lens, anchored_window, sinks, fused_counters);
 }
+#endif  // VLLM_SM70_FV100_FUSED_DECODE
 
 // The sink-free ABI keeps its original arity for existing direct callers.
 at::Tensor flash_attention_decode_paged(
@@ -3110,6 +3120,9 @@ at::Tensor flash_attention_decode_paged_xqa(
                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
               "XQA decode supports fp16, fp8_e4m3, and fp8_e5m2 KV cache "
               "only");
+  // K05 lean build: only the fp16-KV XQA instantiations are compiled.
+  TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+              "Flash-V100 (K05 lean build) XQA decode supports fp16 KV only");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16 &&
                     v_cache.dtype() == torch::kFloat16,

@@ -1,4 +1,4 @@
-#include "flash_v100_policy.h"
+#include "fv100_config.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -2956,6 +2956,9 @@ static at::Tensor prefill_paged_forward(
               "anchor_lens and a positive anchored_window must be provided "
               "together");
   const bool use_anchored = anchor_lens.has_value();
+  // K05 lean build: the anchored-SWA kernels are not compiled.
+  TORCH_CHECK(!use_anchored,
+              "Flash-V100 (K05 lean build) has no anchored prefill window");
   const int* anchor_lens_ptr = nullptr;
   if (use_anchored) {
     const at::Tensor& anchors = anchor_lens.value();

@@ -91,6 +91,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_CUTLASS_DIR",  # setup.py -> CMake: CUTLASS headers
             "VLLM_SM70_REQUIRE_CUDA",  # CMake option
             "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
+            "VLLM_SM70_FV100_FUSED_DECODE",  # CMake option / C++ define (K05/K14)
         )
     },
     "core": {
