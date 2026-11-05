@@ -518,17 +518,18 @@ def test_composite_copies_int64_ids_into_the_workspace(flint_stub, monkeypatch):
     assert passed.tolist() == [5, 4, 3, 2, 1, 255]
 
 
-def test_m4_decode_constants_agree_with_k12(flint_stub):
-    """M4 (vllm_sm70/quant/nvfp4_moe.py) pre-wired the decode with its own
-    copy of the fork constants; they must match the compiled contract."""
+def test_m4_uses_k12_admission_not_a_private_copy(flint_stub):
+    """M4 (vllm_sm70/quant/nvfp4_moe.py) wires the decode through this module
+    (admit_layer, allocate_workspace, can_decode, flint_moe_decode_out); the
+    fork constants it pre-wired with are gone, so they cannot drift."""
     pytest.importorskip("vllm")
     try:
         from vllm_sm70.quant import nvfp4_moe as m4
     except ImportError as exc:  # pragma: no cover - vLLM without modelopt
         pytest.skip(f"vllm_sm70.quant.nvfp4_moe not importable: {exc}")
-    assert m4.DECODE_W13_OP == W13 and m4.DECODE_W2_OP == W2
-    assert m4.DECODE_QPN_CONTRACTS == flint_stub.CONTRACTS
-    assert m4.DECODE_QPN_MAX_TOKENS == flint_stub.MAX_TOKENS
-    assert m4.DECODE_QPN_PARTIALS == flint_stub.DECODE_PARTIALS
-    assert m4.DECODE_QPN_COUNTERS >= flint_stub.DECODE_COUNTERS
-    assert m4.DECODE_QPN_MAX_SHIFT == flint_stub.MAX_SCALE_SHIFT
+    assert m4._flint_moe() is flint_stub
+    for name in ("DECODE_QPN_CONTRACTS", "DECODE_QPN_COUNTERS", "DECODE_W13_OP"):
+        assert not hasattr(m4, name), name
+    src = pathlib.Path(m4.__file__).read_text()
+    for call in ("admit_layer(", "can_decode(", "flint_moe_decode_out("):
+        assert f"flint_moe.{call}" in src, call

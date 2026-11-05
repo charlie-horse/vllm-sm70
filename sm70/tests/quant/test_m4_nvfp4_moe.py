@@ -9,13 +9,16 @@ What: the CPU tests mock Kai's ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` / ``_C``
   [K, N] codes and [K/16, N] fp16 scales with the global folded in; apply
   against an independent ModelOpt-NVFP4 reference (dequant + top-k + SwiGLU
   + weighted sum) for M in {1, 2, 64}, top-k 8, always on the materialized W13 route
-  (never the Qwen3.8-only indexed op, even when present); that the decode fast path is off when the K12 ops
-  are absent or VLLM_SM70_FLINT_MOE_QPN_DECODE=0 (and on when present); that
-  workspaces are persistent (no allocation in apply); and get_quant_method
-  routing at cc 7.0 vs 8.0.
+  (never the Qwen3.8-only indexed op, even when present); the K12 decode
+  wiring against a fake ``vllm_sm70.ops.flint_moe`` (admit_layer args and
+  policy, kill switch, one shared workspace per device allocated at load,
+  can_decode gating with int32/int64 IDs, exact flint_moe_decode_out args,
+  dense route otherwise); that workspaces are persistent (no allocation in
+  apply); and get_quant_method routing at cc 7.0 vs 8.0.
   GPU (``-m gpu``, Bea on c4130, one V100, needs _sm70_C and vLLM's
   _C/_moe_C): parity on the real Flint TP2 expert shapes (E256, H2048,
-  I_local 256, top-6), and CUDA-graph capture == eager:
+  I_local 256, top-6), K12 decode == dense route for M in {1, 2} (int32
+  and int64 IDs), and CUDA-graph capture == eager:
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m4_nvfp4_moe.py -m gpu
 Why: Flint's routed experts are most of its FLOPs; M4 is their only SM70 path.
 Kill-switch: VLLM_SM70_FLINT_MOE_QPN_DECODE covered below; VLLM_SM70_QUANT in M2.
@@ -78,7 +81,7 @@ def _dequant_tm(w, s, group=16):
     return E2M1[_unpack_n8(w).cpu()] * s.float().cpu().repeat_interleave(group, dim=0)
 
 
-def make_mock_tm(indexed=True, decode=False):
+def make_mock_tm(indexed=True):
     tm = types.ModuleType("vllm_sm70.ops.tm")
     tm.calls = []
     tm.banks = {}
@@ -126,27 +129,72 @@ def make_mock_tm(indexed=True, decode=False):
         tm.nvfp4_moe_indexed_dense_stage_sm70_out = (
             nvfp4_moe_indexed_dense_stage_sm70_out
         )
-    if decode:
-
-        def w13(out, x, w, s, ids, partials, counters, shift):
-            tm.calls.append(("decode_w13", x.shape[0], shift))
-            for slot, e in enumerate(ids.tolist()):
-                gu = x[slot // tm.top_k].float() @ _dequant_tm(w[e], s[e])
-                g, u = gu.chunk(2)
-                out[slot] = (F.silu(g) * u).to(out.dtype)
-
-        def w2(out, inter, w, s, ids, weights, shift):
-            tm.calls.append(("decode_w2", out.shape[0], shift))
-            acc = torch.zeros(out.shape, dtype=torch.float32)
-            for slot, e in enumerate(ids.tolist()):
-                y = inter[slot].float() @ _dequant_tm(w[e], s[e])
-                acc[slot // tm.top_k] += weights.view(-1)[slot] * y
-            out.copy_(acc.to(out.dtype))
-
-        tm.nvfp4_moe_decode_w13_swiglu_sm70_out = w13
-        tm.nvfp4_moe_decode_w2_reduce_sm70_out = w2
     tm.has_op = lambda name: callable(getattr(tm, name, None))
     return tm
+
+
+def make_fake_flint_moe(admit=True):
+    """Fake vllm_sm70.ops.flint_moe (K12): records every call.
+
+    admit_layer admits iff the policy is on and ``admit``; can_decode takes
+    M in {1, 2}; flint_moe_decode_out computes the routed sum in torch (any
+    top-k), so the decode route is checked for numbers too.
+    """
+    fm = types.ModuleType("vllm_sm70.ops.flint_moe")
+    fm.calls = []
+    fm.allocations = []
+
+    class DecodePlan(SimpleNamespace):
+        pass
+
+    def enabled():
+        from vllm_sm70 import envs
+
+        return bool(envs.VLLM_SM70_FLINT_MOE_QPN_DECODE)
+
+    def admit_layer(contract, w13_w, w13_s, w2_w, w2_s, *, policy_enabled=None):
+        fm.calls.append(
+            ("admit", tuple(contract), policy_enabled, w13_w, w13_s, w2_w, w2_s)
+        )
+        if not (enabled() if policy_enabled is None else policy_enabled):
+            return None
+        return DecodePlan(w13_scale_shift=3, w2_scale_shift=5) if admit else None
+
+    def allocate_workspace(device):
+        fm.allocations.append(torch.device(device))
+        return SimpleNamespace(device=torch.device(device))
+
+    def can_decode(x, topk_weights, topk_ids):
+        fm.calls.append(("can_decode", x.shape[0], topk_ids.dtype))
+        return 0 < x.shape[0] <= 2
+
+    def flint_moe_decode_out(
+        out, inter, x, w13_w, w13_s, w2_w, w2_s, weights, ids, ws, plan
+    ):
+        fm.calls.append(
+            ("decode", out, inter, x, w13_w, w13_s, w2_w, w2_s, weights, ids, ws, plan)
+        )
+        acc = x.new_zeros(out.shape, dtype=torch.float32)  # not torch.zeros
+        for t in range(x.shape[0]):
+            for kk in range(ids.shape[1]):
+                e = int(ids[t, kk])
+                gu = x[t].float() @ _dequant_tm(w13_w[e], w13_s[e])
+                g, u = gu.chunk(2)
+                act = (F.silu(g) * u).half().float()
+                acc[t] += float(weights[t, kk]) * (act @ _dequant_tm(w2_w[e], w2_s[e]))
+        out.copy_(acc.to(out.dtype))  # fully overwrite, like the kernel
+        return out
+
+    for fn in (
+        enabled,
+        admit_layer,
+        allocate_workspace,
+        can_decode,
+        flint_moe_decode_out,
+    ):
+        setattr(fm, fn.__name__, fn)
+    fm.DecodePlan = DecodePlan
+    return fm
 
 
 class TorchMoeOps:
@@ -205,6 +253,9 @@ class TorchMoeOps:
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    from vllm_sm70.quant import nvfp4_moe
+
+    nvfp4_moe.clear_decode_workspaces()
     import vllm.model_executor.parameter as param_mod
 
     monkeypatch.setattr(param_mod, "get_tensor_model_parallel_rank", lambda: 0)
@@ -212,26 +263,32 @@ def _env(monkeypatch):
     moe_rt.Sm70MoEWorkspace.clear()
     yield
     moe_rt.Sm70MoEWorkspace.clear()
+    nvfp4_moe.clear_decode_workspaces()
 
 
 @pytest.fixture
 def mods(monkeypatch):
-    """mods(indexed=True, decode=False) -> (nvfp4_moe module, mock tm)."""
+    """mods(indexed=True, flint=None) -> (nvfp4_moe module, mock tm).
 
-    def _install(indexed=True, decode=False, small=True):
-        tm = make_mock_tm(indexed, decode)
+    ``flint`` is the vllm_sm70.ops.flint_moe to install (None: absent, the
+    import fails); the mock tm is ``mods.tm``.
+    """
+
+    def _install(indexed=True, small=True, flint=None):
+        tm = make_mock_tm(indexed)
         ops = types.ModuleType("vllm_sm70.ops")
         ops.tm = tm
         monkeypatch.setitem(sys.modules, "vllm_sm70.ops", ops)
         monkeypatch.setitem(sys.modules, "vllm_sm70.ops.tm", tm)
+        if flint is not None:
+            ops.flint_moe = flint
+            monkeypatch.setitem(sys.modules, "vllm_sm70.ops.flint_moe", flint)
         monkeypatch.setattr(moe_rt, "OPS", TorchMoeOps)
         monkeypatch.setattr(moe_rt, "max_batched_tokens", lambda: 64)
         import vllm_sm70.quant.nvfp4_moe as m4
 
         if small:
             monkeypatch.setattr(m4, "SUPPORTED_CONTRACTS", frozenset({SMALL}))
-            h, i, e, k = SMALL
-            monkeypatch.setattr(m4, "DECODE_QPN_CONTRACTS", frozenset({(e, h, i, k)}))
         return m4, tm
 
     return _install
@@ -493,45 +550,201 @@ def test_workspace_shared_and_bounded(mods):
         l1.sm70_moe_workspace.views(65)
 
 
-def test_decode_off_when_ops_absent(mods):
-    m4, _tm = mods(decode=False)
-    method, layer, _ = _build(m4)
-    assert method.decode_enabled and not layer.sm70_nvfp4_decode_qpn
+def _decode_calls(fm, kind):
+    return [c for c in fm.calls if c[0] == kind]
 
 
-def test_decode_on_and_used_for_m_le_2(mods):
-    m4, tm = mods(decode=True)
-    tm.top_k = SMALL[3]
+def test_decode_off_when_flint_moe_absent(mods):
+    m4, tm = mods(flint=None)
+    method, layer, _w = _build(m4)
+    assert method.decode_enabled and layer.sm70_nvfp4_decode_plan is None
+    assert layer.sm70_nvfp4_decode_ws is None
+    x = torch.randn(1, SMALL[0]).half()
+    weights, ids = _routing(1, SMALL[2], SMALL[3])
+    tm.calls.clear()
+    method.apply(layer, x, weights, ids, None, None)
+    assert [c[0] for c in tm.calls] == ["dense", "dense"]
+
+
+def test_admit_layer_gets_contract_banks_and_policy(mods):
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    _method, layer, _ = _build(m4)
+    (call,) = _decode_calls(fm, "admit")
+    h, gi, e, k = SMALL
+    assert call[1] == (e, h, gi, k)  # (experts, hidden, local I, top_k)
+    assert call[2] is True  # resolved Sm70Config policy, explicit
+    assert call[3] is layer.w13_tm_weight and call[4] is layer.w13_tm_scales
+    assert call[5] is layer.w2_tm_weight and call[6] is layer.w2_tm_scales
+    assert isinstance(layer.sm70_nvfp4_decode_plan, fm.DecodePlan)
+    assert layer.sm70_nvfp4_decode_ws.device == torch.device("cpu")
+    # the fork pre-wiring's per-layer partials/counters are gone
+    assert not hasattr(layer, "sm70_nvfp4_decode_counters")
+    assert not hasattr(layer, "sm70_nvfp4_decode_partials")
+
+
+def test_plan_none_keeps_dense_route(mods):
+    fm = make_fake_flint_moe(admit=False)
+    m4, tm = mods(flint=fm)
     method, layer, w = _build(m4)
-    assert layer.sm70_nvfp4_decode_qpn
-    for m in (1, 2, 3):
+    assert layer.sm70_nvfp4_decode_plan is None and not fm.allocations
+    for m in (1, 2):
         x = torch.randn(m, SMALL[0], generator=torch.Generator().manual_seed(m)).half()
         weights, ids = _routing(m, SMALL[2], SMALL[3])
         tm.calls.clear()
+        fm.calls.clear()
         out = method.apply(layer, x, weights, ids, None, None)
-        kinds = [c[0] for c in tm.calls]
-        assert kinds == (
-            ["decode_w13", "decode_w2"] if m <= 2 else ["dense", "dense"]
-        )
+        assert [c[0] for c in tm.calls] == ["dense", "dense"]
+        assert fm.calls == []  # can_decode is not even asked
         ref = _moe_reference(x, w, ids, weights, SMALL[1])
         torch.testing.assert_close(
             out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
         )
 
 
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+@pytest.mark.parametrize("m", [1, 2])
+def test_decode_route_exact_args_and_no_dense(mods, monkeypatch, m, ids_dtype):
+    fm = make_fake_flint_moe()
+    m4, tm = mods(flint=fm)
+    method, layer, w = _build(m4)
+    x = torch.randn(m, SMALL[0], generator=torch.Generator().manual_seed(m)).half()
+    weights, ids = _routing(m, SMALL[2], SMALL[3])
+    ids = ids.to(ids_dtype)
+    zeros = []
+    real_zeros = torch.zeros
+    tm.calls.clear()
+    fm.calls.clear()
+    TorchMoeOps.allocations = 0
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            torch, "zeros", lambda *a, **k: zeros.append(a) or real_zeros(*a, **k)
+        )
+        out = method.apply(layer, x, weights, ids, None, None)
+    assert tm.calls == [] and TorchMoeOps.allocations == 0  # no dense stage
+    assert zeros == []  # output is torch.empty, fully overwritten by K12
+    assert _decode_calls(fm, "can_decode") == [("can_decode", m, ids_dtype)]
+    (call,) = _decode_calls(fm, "decode")
+    _, d_out, inter, d_x, w13w, w13s, w2w, w2s, d_w, d_ids, ws, plan = call
+    assert d_out is out and d_out.shape == (m, SMALL[0])
+    assert d_out.dtype == torch.float16
+    buf = layer.sm70_moe_workspace.views(m)["intermediate"]
+    assert inter.data_ptr() == buf.data_ptr() and inter.shape == buf.shape
+    assert torch.equal(d_x, x)
+    assert w13w is layer.w13_tm_weight and w13s is layer.w13_tm_scales
+    assert w2w is layer.w2_tm_weight and w2s is layer.w2_tm_scales
+    assert d_w is weights and d_ids is ids  # int64 passed through, not cast
+    assert ws is layer.sm70_nvfp4_decode_ws and plan is layer.sm70_nvfp4_decode_plan
+    ref = _moe_reference(x, w, ids, weights, SMALL[1])
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
+def test_can_decode_false_takes_dense(mods):
+    fm = make_fake_flint_moe()
+    m4, tm = mods(flint=fm)
+    method, layer, w = _build(m4)
+    x = torch.randn(3, SMALL[0]).half()
+    weights, ids = _routing(3, SMALL[2], SMALL[3])
+    tm.calls.clear()
+    fm.calls.clear()
+    out = method.apply(layer, x, weights, ids.long(), None, None)
+    assert _decode_calls(fm, "can_decode") == [("can_decode", 3, torch.int64)]
+    assert _decode_calls(fm, "decode") == []
+    assert [c[0] for c in tm.calls] == ["dense", "dense"]
+    ref = _moe_reference(x, w, ids, weights, SMALL[1])
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
 def test_decode_kill_switch(mods, monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "0")
-    m4, _tm = mods(decode=True)
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
     method, layer, _ = _build(m4)
-    assert not method.decode_enabled and not layer.sm70_nvfp4_decode_qpn
-    assert not m4.decode_policy_enabled()
+    assert not method.decode_enabled and not m4.decode_policy_enabled()
+    ((_, _, policy, *_),) = _decode_calls(fm, "admit")
+    assert policy is False
+    assert layer.sm70_nvfp4_decode_plan is None and not fm.allocations
 
 
-def test_decode_off_outside_contract(mods, monkeypatch):
-    m4, _tm = mods(decode=True)
-    monkeypatch.setattr(m4, "DECODE_QPN_CONTRACTS", frozenset({(256, 2048, 256, 6)}))
-    _, layer, _ = _build(m4)
-    assert not layer.sm70_nvfp4_decode_qpn
+def test_kill_switch_applies_even_if_policy_resolved_on(mods, monkeypatch):
+    """admit_layer ignores the env when given a policy; M4 must apply it."""
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    method = m4.ModelOptNvFp4Sm70MoEMethod(_quant_config(), _moe_config(*SMALL))
+    assert method.decode_enabled
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "0")
+    cfg = _moe_config(*SMALL)
+    layer = _make_layer(method, cfg, _random_experts(SMALL[2], SMALL[0], SMALL[1]))
+    method.process_weights_after_loading(layer)
+    ((_, _, policy, *_),) = _decode_calls(fm, "admit")
+    assert policy is False and layer.sm70_nvfp4_decode_plan is None
+
+
+def test_config_policy_off_is_not_reenabled_by_env(mods, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1")
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    method = m4.ModelOptNvFp4Sm70MoEMethod(_quant_config(), _moe_config(*SMALL))
+    method.decode_enabled = False  # Sm70Config.flint_moe_qpn_decode=False
+    layer = _make_layer(
+        method, _moe_config(*SMALL), _random_experts(SMALL[2], SMALL[0], SMALL[1])
+    )
+    method.process_weights_after_loading(layer)
+    ((_, _, policy, *_),) = _decode_calls(fm, "admit")
+    assert policy is False and layer.sm70_nvfp4_decode_plan is None
+
+
+def test_decode_workspace_shared_per_device_and_not_in_apply(mods):
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    m1, l1, _ = _build(m4, seed=0)
+    _m2, l2, _ = _build(m4, seed=1)
+    assert fm.allocations == [torch.device("cpu")]  # once, at load
+    assert l1.sm70_nvfp4_decode_ws is l2.sm70_nvfp4_decode_ws
+    assert l1.sm70_nvfp4_decode_plan is not None
+    for m in (1, 2, 3):
+        weights, ids = _routing(m, SMALL[2], SMALL[3])
+        m1.apply(l1, torch.randn(m, SMALL[0]).half(), weights, ids, None, None)
+    assert len(fm.allocations) == 1  # never lazily in forward
+
+
+def test_decode_workspace_keyed_by_device(mods):
+    fm = make_fake_flint_moe()
+    m4, _tm = mods(flint=fm)
+    a = m4.decode_workspace(fm, torch.device("cpu"))
+    b = m4.decode_workspace(fm, torch.device("meta"))
+    assert a is not b and a is m4.decode_workspace(fm, torch.device("cpu"))
+    assert fm.allocations == [torch.device("cpu"), torch.device("meta")]
+
+
+def test_real_flint_moe_refuses_small_contract(mods):
+    """With Kai's real module, a non-Flint-TP2 layer is not admitted."""
+    from vllm_sm70.ops import flint_moe as real
+
+    m4, _tm = mods(flint=real)
+    _method, layer, _ = _build(m4)
+    assert layer.sm70_nvfp4_decode_plan is None
+    assert layer.sm70_nvfp4_decode_ws is None
+
+
+def test_no_private_k12_contract_copy():
+    """admit_layer owns the contract; M4 keeps no copy of the fork constants."""
+    import vllm_sm70.quant.nvfp4_moe as m4
+
+    for name in (
+        "DECODE_QPN_CONTRACTS",
+        "DECODE_QPN_COUNTERS",
+        "DECODE_QPN_PARTIALS",
+        "DECODE_W13_OP",
+        "decode_scale_shift",
+        "decode_ops_available",
+    ):
+        assert not hasattr(m4, name), name
+    assert not hasattr(m4.ModelOptNvFp4Sm70MoEMethod, "_use_decode")
 
 
 def test_missing_ops_fail_closed(mods, monkeypatch):
@@ -640,6 +853,40 @@ def test_gpu_flint_tp2_parity(m):
     torch.testing.assert_close(
         out.float().cpu(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+@pytest.mark.parametrize("m", [1, 2])
+def test_gpu_flint_tp2_decode_matches_dense(monkeypatch, m, ids_dtype):
+    """K12 decode route vs the dense-stage route on the same Flint TP2 layer."""
+    import vllm_sm70.quant.nvfp4_moe as m4
+    from vllm_sm70.ops import flint_moe
+
+    torch.cuda.set_device(0)
+    assert flint_moe.available(), "_sm70_C lacks the K12 decode ops"
+    method, layer, w = _gpu_layer(m4)
+    plan = layer.sm70_nvfp4_decode_plan
+    assert plan is not None, "Flint TP2 layer not admitted to the K12 decode"
+    used = []
+    real = flint_moe.flint_moe_decode_out
+    monkeypatch.setattr(
+        flint_moe, "flint_moe_decode_out", lambda *a: used.append(1) or real(*a)
+    )
+    g = torch.Generator().manual_seed(100 + m)
+    x = (torch.randn(m, 2048, generator=g) * 0.5).half().cuda()
+    weights, ids = _routing(m, 256, 6, seed=m)
+    dw, di = weights.cuda(), ids.to(ids_dtype).cuda()
+    decode = method.apply(layer, x, dw, di, None, None).clone()
+    assert used == [1]
+    layer.sm70_nvfp4_decode_plan = None
+    dense = method.apply(layer, x, dw, di, None, None)
+    layer.sm70_nvfp4_decode_plan = plan
+    assert used == [1]
+    ref = _moe_reference(x.cpu(), w, ids, weights, 256)
+    tol = 2e-2 * ref.abs().max().item()
+    torch.testing.assert_close(decode.float().cpu(), ref, rtol=2e-2, atol=tol)
+    torch.testing.assert_close(decode.float(), dense.float(), rtol=2e-2, atol=tol)
 
 
 @pytest.mark.gpu
