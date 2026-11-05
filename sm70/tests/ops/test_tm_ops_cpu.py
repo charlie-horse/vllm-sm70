@@ -26,9 +26,28 @@ PKG = pathlib.Path(__file__).resolve().parents[2] / "vllm_sm70"
 TM_PY = PKG / "ops" / "tm.py"
 
 
+def _has_tensor_arg(schema: str) -> bool:
+    args = schema[schema.index("(") + 1 : schema.rindex("->")]
+    return "Tensor" in args
+
+
+def _needs_fake() -> dict[str, str]:
+    """Ops that take a Tensor. Ops without one run eagerly (never traced),
+    and torch refuses a fake on them when the C++ impl is the default
+    CompositeImplicitAutograd from m.def(schema, fn) (seen on the real .so)."""
+    return {n: s for n, s in sm70_schemas().items() if _has_tensor_arg(s)}
+
+
+def test_no_fake_for_ops_without_tensor_args():
+    fakes = set(re.findall(r'register_fake\("_sm70_C::(\w+)"\)', TM_PY.read_text()))
+    no_tensor = set(sm70_schemas()) - set(_needs_fake())
+    assert no_tensor, "expected some ops without Tensor args"
+    assert not (fakes & no_tensor), sorted(fakes & no_tensor)
+
+
 def test_every_schema_has_a_fake():
     fakes = set(re.findall(r'register_fake\("_sm70_C::(\w+)"\)', TM_PY.read_text()))
-    schemas = sm70_schemas()
+    schemas = _needs_fake()
     assert schemas, "no _sm70_C schemas found"
     missing = sorted(set(schemas) - fakes)
     assert not missing, f"ops without a fake: {missing}"
@@ -218,7 +237,7 @@ def test_fake_signatures_match_schemas(tm):
     import inspect
 
     problems = []
-    for name, schema in sm70_schemas().items():
+    for name, schema in _needs_fake().items():
         fake = getattr(tm, f"_{name}_fake", None)
         if fake is None:
             problems.append(f"{name}: no _{name}_fake in tm.py")

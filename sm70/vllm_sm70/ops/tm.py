@@ -24,6 +24,13 @@ except ImportError:  # torch < 2.4
 
 NAMESPACE = "_sm70_C"
 
+# Load _sm70_C before any has_op() check below: the fakes are registered at
+# import, and an import that ran before the .so was loaded would silently
+# register none of them.
+from vllm_sm70 import _ext  # noqa: E402
+
+_ext.load()
+
 
 def has_op(name: str) -> bool:
     """True if torch.ops._sm70_C.<name> is registered."""
@@ -2352,22 +2359,15 @@ def tm_runtime_close() -> None:
     _op("tm_runtime_close")()
 
 
-if has_op("sm70_gemm_configure_workspace"):
-
-    @register_fake("_sm70_C::sm70_gemm_configure_workspace")
-    def _sm70_gemm_configure_workspace_fake(bytes: int) -> None:  # noqa: A002
-        return None
-
-
-if has_op("sm70_gemm_workspace_storage"):
-
-    @register_fake("_sm70_C::sm70_gemm_workspace_storage")
-    def _sm70_gemm_workspace_storage_fake() -> list[int]:
-        return [0, 0, 0]
-
-
-if has_op("tm_runtime_close"):
-
-    @register_fake("_sm70_C::tm_runtime_close")
-    def _tm_runtime_close_fake() -> None:
-        return None
+# No fakes for ops without Tensor arguments (sm70_gemm_configure_workspace,
+# sm70_gemm_workspace_storage, tm_runtime_close). They run eagerly at load,
+# warmup or shutdown and are never traced, and torch refuses a meta kernel on
+# an op whose C++ impl is CompositeImplicitAutograd (the default for
+# m.def(schema, fn)). tests/ops checks this rule.
+NO_FAKE_OPS = frozenset(
+    {
+        "sm70_gemm_configure_workspace",
+        "sm70_gemm_workspace_storage",
+        "tm_runtime_close",
+    }
+)
