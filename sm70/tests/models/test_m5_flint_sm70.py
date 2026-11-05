@@ -17,6 +17,9 @@ GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 from collections.abc import Iterable, Iterator
 from types import SimpleNamespace
 
@@ -659,6 +662,47 @@ def _greedy(llm, n=64, prompts=PROMPTS):
     return [list(o.outputs[0].token_ids) for o in outs]
 
 
+def _gpus_used_mib():
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def _shutdown(llm, settle_mib=2048, timeout_s=120):
+    """Release an LLM's GPUs before the next one starts (upstream's
+    VllmRunner.__exit__ recipe): stop the engine core, drop the object,
+    tear down the process groups, then wait for the memory to come back."""
+    import gc
+
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    finally:
+        del llm
+        gc.collect()
+        torch._dynamo.reset()
+        cleanup_dist_env_and_memory()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        used = _gpus_used_mib()
+        if not used or max(used) < settle_mib:
+            return
+        time.sleep(2)
+    raise RuntimeError(f"GPU memory not released after shutdown: {used} MiB")
+
+
+def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
+    """Build an LLM, run greedy decoding, always shut it down."""
+    llm = _llm(**llm_kw)
+    try:
+        return _greedy(llm, n, prompts)
+    finally:
+        _shutdown(llm)
+
+
 @pytest.mark.gpu
 @one_gpu
 @pytest.mark.parametrize("rope", [True, False])
@@ -788,7 +832,7 @@ def test_t1_tiny_random_forward(tmp_path):
             SamplingParams(temperature=0, max_tokens=16),
         )
         toks.append([list(o.outputs[0].token_ids) for o in outs])
-        del llm
+        _shutdown(llm)
     os.environ.pop("VLLM_SM70_FLINT_QK_ROPE_KV", None)
     assert all(len(t) == 16 for t in toks[0])
     assert toks[0] == toks[1]
@@ -797,13 +841,20 @@ def test_t1_tiny_random_forward(tmp_path):
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
-def test_t3_checkpoint_loads(caplog):
+def test_t3_checkpoint_loads(capfd):
     """T3 (2 GPUs): the NVFP4 checkpoint loads at TP2 fp16 and every layer
-    takes the fused route on TRITON_ATTN."""
-    with caplog.at_level("INFO"):
-        llm = _llm(enforce_eager=True)
-    assert "fused q/k norm, RoPE and KV-cache write" in caplog.text
-    assert all(len(t) == 64 for t in _greedy(llm))
+    takes the fused route on TRITON_ATTN.
+
+    The route line is logged in the TP worker processes, and the vllm logger
+    does not propagate, so caplog never sees it. capfd reads the inherited
+    stdout/stderr file descriptors, which the workers write to."""
+    toks = _greedy_once(enforce_eager=True)
+    out, err = capfd.readouterr()
+    logs = out + err
+    sys.stdout.write(logs)  # keep the worker log in the pytest report
+    assert "Flint SM70: fused q/k norm, RoPE and KV-cache write." in logs
+    assert "Flint SM70: unfused q/k norm/RoPE because" not in logs
+    assert all(len(t) == 64 for t in toks)
 
 
 @pytest.mark.gpu
@@ -812,8 +863,8 @@ def test_t3_checkpoint_loads(caplog):
 def test_t4_compiled_graphs_match_eager():
     """T4 (2 GPUs): eager vs compiled + FULL_AND_PIECEWISE CUDA graphs give
     identical greedy tokens (no splitting op needed for the fused op)."""
-    eager = _greedy(_llm(enforce_eager=True), 256)
-    graphs = _greedy(_llm(), 256)
+    eager = _greedy_once(256, enforce_eager=True)
+    graphs = _greedy_once(256)
     assert eager == graphs
 
 
@@ -884,6 +935,6 @@ def test_t6_fp16_headroom_8k():
 def test_t7_unfused_path_matches(monkeypatch):
     """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream Attention)
     gives the same greedy tokens as the fused route."""
-    fused = _greedy(_llm(enforce_eager=True))
+    fused = _greedy_once(enforce_eager=True)
     monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", "0")
-    assert _greedy(_llm(enforce_eager=True)) == fused
+    assert _greedy_once(enforce_eager=True) == fused
