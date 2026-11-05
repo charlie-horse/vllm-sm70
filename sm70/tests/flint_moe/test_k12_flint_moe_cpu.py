@@ -391,6 +391,16 @@ def test_admit_layer_reads_the_kill_switch_env(flint_stub, monkeypatch):
     assert _admit(flint_stub, monkeypatch) is not None
 
 
+def test_admit_layer_kill_switch_beats_policy_enabled(flint_stub, monkeypatch):
+    """VLLM_SM70_FLINT_MOE_QPN_DECODE=0 wins even when the caller passes
+    policy_enabled=True: no caller can bypass the kill."""
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "0")
+    assert _admit(flint_stub, monkeypatch, policy_enabled=True) is None
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1")  # only "0" acts
+    assert _admit(flint_stub, monkeypatch, policy_enabled=True) is not None
+    assert _admit(flint_stub, monkeypatch, policy_enabled=False) is None
+
+
 def test_allocate_workspace_sizes_and_zero_counters(flint_stub):
     ws = flint_stub.allocate_workspace("cpu")
     assert ws.partials.shape == (98304,) and ws.partials.dtype == torch.float32
@@ -521,12 +531,17 @@ def test_composite_copies_int64_ids_into_the_workspace(flint_stub, monkeypatch):
 def test_m4_uses_k12_admission_not_a_private_copy(flint_stub):
     """M4 (vllm_sm70/quant/nvfp4_moe.py) wires the decode through this module
     (admit_layer, allocate_workspace, can_decode, flint_moe_decode_out); the
-    fork constants it pre-wired with are gone, so they cannot drift."""
+    fork constants it pre-wired with are gone, so they cannot drift.
+
+    Taken over from Mara's PR #52 (models/m4-k12-wiring @ 3d2cc70). Skipped
+    while M4 (main before #52) still carries its private DECODE_* copy."""
     pytest.importorskip("vllm")
     try:
         from vllm_sm70.quant import nvfp4_moe as m4
     except ImportError as exc:  # pragma: no cover - vLLM without modelopt
         pytest.skip(f"vllm_sm70.quant.nvfp4_moe not importable: {exc}")
+    if hasattr(m4, "DECODE_QPN_CONTRACTS"):
+        pytest.skip("M4 still carries private DECODE_* constants (pre-#52)")
     assert m4._flint_moe() is flint_stub
     for name in ("DECODE_QPN_CONTRACTS", "DECODE_QPN_COUNTERS", "DECODE_W13_OP"):
         assert not hasattr(m4, name), name
