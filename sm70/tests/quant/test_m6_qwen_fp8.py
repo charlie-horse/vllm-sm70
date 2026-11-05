@@ -347,7 +347,14 @@ def test_dense_rejects_non_block_and_bf16(mods):
 # --------------------------------------------------------------------------
 # MoE
 # --------------------------------------------------------------------------
-def _moe_config(hidden=H, inter=I, experts=E, top_k=K, tp=1):
+def _moe_config(hidden=None, inter=None, experts=None, top_k=None, tp=1):
+    # Resolve defaults at call time. Default arguments bound to the module
+    # constants at definition time (H, I, E, K) are what made the GPU test
+    # build a 256-hidden layer while generating 2048-hidden weights.
+    hidden = H if hidden is None else hidden
+    inter = I if inter is None else inter
+    experts = E if experts is None else experts
+    top_k = K if top_k is None else top_k
     par = SimpleNamespace(use_all2all_kernels=False, use_ep=False)
     return SimpleNamespace(
         hidden_dim=hidden,
@@ -390,12 +397,15 @@ def _moe_layer(method, cfg, seed=0):
         torch.float16,
         weight_loader=_loader,
     )
+    # Shapes come from the layer's own config, the same values UP's
+    # Fp8MoEMethod.create_weights uses: w13 [E, 2*I_rank, H], w2 [E, H, I_rank].
+    h, i, e_n = cfg.hidden_dim, cfg.intermediate_size_per_partition, cfg.num_experts
     w = {}
-    for stage, n, k in (("w13", 2 * I, H), ("w2", H, I)):
+    for stage, n, k in (("w13", 2 * i, h), ("w2", h, i)):
         ws, ss = zip(
             *[
                 _random_block_fp8(n, k, seed * 100 + e + (stage == "w2") * 50)
-                for e in range(E)
+                for e in range(e_n)
             ]
         )
         w[stage] = (torch.stack(ws), torch.stack(ss))
@@ -405,25 +415,29 @@ def _moe_layer(method, cfg, seed=0):
 
 
 def _moe_reference(x, w, ids, weights):
+    inter = w["w2"][0].shape[2]  # w2 [E, H, I_rank]
     out = torch.zeros(x.shape, dtype=torch.float32)
     for t in range(x.shape[0]):
         for kk in range(ids.shape[1]):
             e = int(ids[t, kk])
             gu = x[t].float() @ _ref_dequant(w["w13"][0][e], w["w13"][1][e]).t()
-            act = (F.silu(gu[:I]) * gu[I:]).half().float()
+            act = (F.silu(gu[:inter]) * gu[inter:]).half().float()
             y = (act @ _ref_dequant(w["w2"][0][e], w["w2"][1][e]).t()).half().float()
             out[t] += float(weights[t, kk]) * y
     return out
 
 
-def _routing(m, seed=1):
+def _routing(m, seed=1, experts=None, top_k=None):
+    experts = E if experts is None else experts
+    top_k = K if top_k is None else top_k
     g = torch.Generator().manual_seed(seed)
-    w, ids = torch.topk(torch.softmax(torch.randn(m, E, generator=g), -1), K)
+    logits = torch.randn(m, experts, generator=g)
+    w, ids = torch.topk(torch.softmax(logits, -1), top_k)
     return (w / w.sum(-1, keepdim=True)).float(), ids.to(torch.int32)
 
 
-def _build_moe(moe):
-    cfg = _moe_config()
+def _build_moe(moe, cfg=None):
+    cfg = cfg or _moe_config()
     method = moe.Fp8Sm70MoEMethod(_cfg(), _routed(cfg))
     layer, w = _moe_layer(method, cfg)
     method.process_weights_after_loading(layer)
@@ -678,6 +692,50 @@ def test_fp8_weights_fit_v100_at_tp2(cfg):
     assert per_gpu < 0.7 * 32 * 2**30, f"{per_gpu / 2**30:.1f} GiB per GPU"
 
 
+QWEN36_TOP_K = 8  # num_experts_per_tok in the pinned config.json
+
+
+def _qwen36_tp2_moe_config():
+    """Qwen3.6-35B-A3B routed experts on one rank at TP2 (pinned config)."""
+    c = QWEN36_35B_A3B
+    return _moe_config(
+        hidden=c["hidden"],
+        inter=c["moe_inter"] // 2,
+        experts=c["experts"],
+        top_k=QWEN36_TOP_K,
+        tp=2,
+    )
+
+
+@pytest.mark.parametrize("route", ["compact", "batched"])
+def test_moe_qwen36_tp2_real_shapes_cpu(mods, monkeypatch, route):
+    """The GPU test's exact layer build at real Qwen3.6 TP2 shapes, with ops
+    mocked: catches a helper/create_weights layout mismatch on CPU."""
+    if route == "batched":
+        monkeypatch.setenv("VLLM_SM70_FP8_MOE_DECODE", "0")
+    _, moe, tm = mods()
+    cfg = _qwen36_tp2_moe_config()
+    assert (cfg.hidden_dim, cfg.intermediate_size_per_partition) == (2048, 256)
+    method = moe.Fp8Sm70MoEMethod(_cfg(), _routed(cfg))
+    layer, w = _moe_layer(method, cfg)
+    assert layer.w13_weight.shape == (256, 512, 2048)
+    assert layer.w2_weight.shape == (256, 2048, 256)
+    assert layer.w13_weight_scale_inv.shape == (256, 4, 16)
+    assert layer.w2_weight_scale_inv.shape == (256, 16, 2)
+    method.process_weights_after_loading(layer)
+    assert layer.w13_tm_weight.shape == (256, 2048, 512)
+    assert layer.w2_tm_weight.shape == (256, 256, 2048)
+    m = 1 if route == "compact" else 2
+    x = (torch.randn(m, 2048, generator=torch.Generator().manual_seed(3)) * 0.5).half()
+    weights, ids = _routing(m, experts=256, top_k=QWEN36_TOP_K)
+    tm.calls.clear()
+    out = method.apply(layer, x, weights, ids, None, None)
+    _close(out, _moe_reference(x, w, ids, weights))
+    assert [c[0] for c in tm.calls] == (
+        ["compact"] if route == "compact" else ["moe_gemm", "moe_gemm"]
+    )
+
+
 # --------------------------------------------------------------------------
 # GPU (Bea, c4130)
 # --------------------------------------------------------------------------
@@ -713,30 +771,24 @@ def test_gpu_dense_parity(parts, k, m):
 def test_gpu_moe_qwen36_tp2_parity_and_graph(m):
     import vllm_sm70.quant.fp8_moe as moe
 
-    global H, I, E
-    saved = (H, I, E)
-    H, I, E = 2048, 256, 256  # Qwen3.6-35B-A3B at TP2 (moe_inter 512 / 2)
-    try:
-        cfg = _moe_config()
-        method = moe.Fp8Sm70MoEMethod(_cfg(), _routed(cfg))
-        layer, w = _moe_layer(method, cfg)
-        layer.cuda()
-        method.process_weights_after_loading(layer)
-        x = (torch.randn(m, H) * 0.5).half().cuda()
-        weights, ids = _routing(m)
-        weights, ids = weights.cuda(), ids.cuda()
-        eager = method.apply(layer, x, weights, ids, None, None)
-        _close(eager.cpu(), _moe_reference(x.cpu(), w, ids.cpu(), weights.cpu()))
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            method.apply(layer, x, weights, ids, None, None)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = method.apply(layer, x, weights, ids, None, None)
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
-    finally:
-        H, I, E = saved
+    cfg = _qwen36_tp2_moe_config()
+    method = moe.Fp8Sm70MoEMethod(_cfg(), _routed(cfg))
+    layer, w = _moe_layer(method, cfg)
+    layer.cuda()
+    method.process_weights_after_loading(layer)
+    x = (torch.randn(m, cfg.hidden_dim) * 0.5).half().cuda()
+    weights, ids = _routing(m, experts=cfg.num_experts, top_k=cfg.experts_per_token)
+    weights, ids = weights.cuda(), ids.cuda()
+    eager = method.apply(layer, x, weights, ids, None, None)
+    _close(eager.cpu(), _moe_reference(x.cpu(), w, ids.cpu(), weights.cpu()))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        method.apply(layer, x, weights, ids, None, None)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = method.apply(layer, x, weights, ids, None, None)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
