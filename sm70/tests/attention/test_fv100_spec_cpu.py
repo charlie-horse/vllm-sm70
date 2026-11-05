@@ -365,8 +365,22 @@ def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
 
 
 @requires_vllm
-def test_flint_verify_takes_sink_decode(monkeypatch, cpu_ops):
+@pytest.mark.parametrize("fused", ["1", "0"])
+def test_flint_verify_takes_sink_decode(monkeypatch, cpu_ops, fused):
+    # K14: with its op built and its switch on, Flint's sink decode is the
+    # one-launch fused kernel; otherwise the two-launch one. Which ops exist
+    # depends on the build (a host with the real _sm70_C has the fused op).
+    from vllm_sm70.ops import fv100
+
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", fused)
+    decode_op = (
+        "fv100_decode_paged_sinks_fused"
+        if fv100.fused_decode_available()
+        else "fv100_decode_paged_sinks"
+    )
+    if fused == "0":
+        assert decode_op == "fv100_decode_paged_sinks"
     sinks = torch.linspace(-2, 6, 16)
     names = _run_case(
         monkeypatch,
@@ -378,7 +392,7 @@ def test_flint_verify_takes_sink_decode(monkeypatch, cpu_ops):
         query_lens=[L, L, 30],
         seq_lens=[900, 600, 700],
     )
-    assert names == ["fv100_decode_paged_sinks", "fv100_prefill_paged_sinks"]
+    assert names == [decode_op, "fv100_prefill_paged_sinks"]
 
 
 @requires_vllm
