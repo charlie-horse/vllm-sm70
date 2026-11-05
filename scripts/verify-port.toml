@@ -64,9 +64,9 @@ pattern = '''\bvllm\._C\b'''
 repl = "vllm_sm70._sm70_C"
 
 [[rule]]
-name = "ext: TORCH_LIBRARY(_C) -> _sm70_C"
+name = "ext: TORCH_LIBRARY*(_C) -> _sm70_C (incl. _FRAGMENT/_IMPL)"
 lang = "cpp"
-pattern = '''\bTORCH_LIBRARY(_EXPAND|_IMPL_EXPAND)?\(\s*(TORCH_EXTENSION_NAME|_C)\b'''
+pattern = '''\bTORCH_LIBRARY(\w*)\(\s*(TORCH_EXTENSION_NAME|_C)\b'''
 repl = "TORCH_LIBRARY\\1(_sm70_C"
 
 [[rule]]
@@ -74,12 +74,26 @@ name = "ns: namespace vllm -> namespace vllm_sm70"
 lang = "cpp"
 pattern = '''\bnamespace\s+vllm\b'''
 repl = "namespace vllm_sm70"
+# Exemption (PR #12, K02): the vendored TurboMind tree keeps the fork's C++
+# namespaces (vllm::sm70, vllm::awq_sm70) verbatim so 106 files stay
+# byte-identical to cf9492a. Safe: upstream v0.33.0 csrc/ defines no
+# vllm::sm70 / vllm::awq_sm70 / turbomind namespace, so no symbol in
+# _sm70_C can collide with upstream _C. Covers the whole tree (ops/ keeps
+# the namespaces too), not only lmdeploy/**.
+exclude_paths = ["*/sm70/csrc/turbomind/*", "*/csrc/sm70_turbomind/*", "*/csrc/sm70_policy.h"]  # fork sm70_policy.h -> turbomind/ops/tm_config.h
 
 [[rule]]
 name = "ns: vllm:: -> vllm_sm70::"
 lang = "cpp"
 pattern = '''(?<![\w:])vllm::'''
 repl = "vllm_sm70::"
+# Exemption (PR #12, K02): the vendored TurboMind tree keeps the fork's C++
+# namespaces (vllm::sm70, vllm::awq_sm70) verbatim so 106 files stay
+# byte-identical to cf9492a. Safe: upstream v0.33.0 csrc/ defines no
+# vllm::sm70 / vllm::awq_sm70 / turbomind namespace, so no symbol in
+# _sm70_C can collide with upstream _C. Covers the whole tree (ops/ keeps
+# the namespaces too), not only lmdeploy/**.
+exclude_paths = ["*/sm70/csrc/turbomind/*", "*/csrc/sm70_turbomind/*", "*/csrc/sm70_policy.h"]  # fork sm70_policy.h -> turbomind/ops/tm_config.h
 
 # --- native_policy argument removed ----------------------------------------
 
