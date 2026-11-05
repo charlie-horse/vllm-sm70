@@ -144,8 +144,9 @@ def _metadata(num_decodes, seq_lens, max_seq_len):
     return SimpleNamespace(
         num_decodes=num_decodes,
         num_decode_tokens=num_decodes,
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
-        block_table=torch.zeros((num_decodes, 8), dtype=torch.int32),
+        decode_rows=num_decodes,
+        decode_seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        decode_block_table=torch.zeros((num_decodes, 8), dtype=torch.int32),
         max_seq_len=max_seq_len,
         max_model_len=4096,
         cudagraph_capture=False,
