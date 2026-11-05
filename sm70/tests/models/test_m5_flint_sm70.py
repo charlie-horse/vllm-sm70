@@ -619,8 +619,8 @@ def _gpu_ok(n=1) -> bool:
     )
 
 
-one_gpu = pytest.mark.skipif("not _gpu_ok(1)", reason="needs a V100")
-two_gpus = pytest.mark.skipif("not _gpu_ok(2)", reason="needs 2 V100 (TP2)")
+one_gpu = pytest.mark.skipif(not _gpu_ok(1), reason="needs a V100")
+two_gpus = pytest.mark.skipif(not _gpu_ok(2), reason="needs 2 V100 (TP2)")
 CKPT = os.environ.get("FLINT_SM70_CHECKPOINT")
 needs_ckpt = pytest.mark.skipif(CKPT is None, reason="set FLINT_SM70_CHECKPOINT")
 ARCH_OVERRIDE = {"architectures": [flint_sm70.ARCH]}
