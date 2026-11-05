@@ -885,9 +885,6 @@ def test_t1_tiny_random_forward(tmp_path):
     assert toks[0] == toks[1]
 
 
-@pytest.mark.gpu
-@two_gpus
-@needs_ckpt
 # The route line comes from init_logger("vllm_sm70.models.flint_sm70.model"),
 # which is not under vLLM's configured "vllm" logger, so with vLLM's default
 # logging config its INFO lines go nowhere. T3 gives the engine processes a
@@ -912,6 +909,9 @@ _T3_LOGGING_CONFIG = {
 }
 
 
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
 def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     """T3 (2 GPUs): the NVFP4 checkpoint loads at TP2 fp16 and every layer
     takes the fused route on TRITON_ATTN.
