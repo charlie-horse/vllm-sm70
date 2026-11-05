@@ -123,6 +123,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
 endif()
 
+# Hook for K13 (Flint fused router). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
+endif()
+
 if(SM70_CUDA_SRCS AND NOT (SM70_HAS_CUDA AND SM70_ARCHS))
   message(FATAL_ERROR "vllm_sm70: CUDA sources listed but no CUDA/sm_70 toolchain")
 endif()
