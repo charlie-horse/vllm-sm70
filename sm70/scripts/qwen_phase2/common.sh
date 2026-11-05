@@ -11,7 +11,9 @@ OUT="${OUT:-$HOME/vllm-sm70-work/bea/qwen-phase2/$(date +%Y%m%dT%H%M)}"
 QP2_GPU_IDLE_MIB="${QP2_GPU_IDLE_MIB:-1024}"   # >1 GiB used => prod still up
 
 # Env defaults from docs/phase1-gpu-runbook.md section 4 (only if unset).
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+# v0.33.0 no longer reads VLLM_ATTENTION_BACKEND; the backend goes on the
+# serve command line as --attention-backend.
+QP2_ATTN_BACKEND="${QP2_ATTN_BACKEND:-TRITON_ATTN}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"

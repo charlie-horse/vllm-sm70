@@ -84,13 +84,13 @@ run_row() {  # ROW  (runs in a subshell: its EXIT trap stops this row's server)
   fi
   local cmd=("$VLLM_BIN" serve "$QWEN_STAGE/$tgt" --served-model-name "$SERVED_NAME"
     --tensor-parallel-size 2 --dtype half --gpu-memory-utilization "$GPU_MEM_UTIL"
-    --max-model-len "$MAX_MODEL_LEN" --host 127.0.0.1 --port "$PORT" "${spec[@]}")
+    --max-model-len "$MAX_MODEL_LEN" --attention-backend "$QP2_ATTN_BACKEND"
+    --host 127.0.0.1 --port "$PORT" "${spec[@]}")
   local kill_env=()
   [[ "$nokill" == 1 ]] && kill_env=(VLLM_SM70_DFLASH2_EMULATION=0)
   {
     printf 'row=%s gated=%s\n' "$row" "$gated"
-    printf 'env: CUDA_VISIBLE_DEVICES=0,1 VLLM_ATTENTION_BACKEND=%s %s\n' \
-      "$VLLM_ATTENTION_BACKEND" "${kill_env[*]:-}"
+    printf 'env: CUDA_VISIBLE_DEVICES=0,1 %s\n' "${kill_env[*]:-}"
     printf '%q ' "${cmd[@]}"; echo
   } >"$dir/cmd.txt" || { qp2_log "row $row: cannot write $dir/cmd.txt"; return 1; }
 
