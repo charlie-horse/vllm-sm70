@@ -735,6 +735,23 @@ def _near_tie(a, b, lp_a, lp_b, tol=T4_NEAR_TIE):
     return f"near-tie (gaps {gaps[0]:.4f} / {gaps[1]:.4f} nats)"
 
 
+def _assert_identical_until_near_tie(label, runs_a, runs_b, n):
+    """Per prompt: tokens identical, or identical up to a first flip that
+    _near_tie classifies as a near-tie. Prints each prompt's verdict."""
+    bad = []
+    for i, ((ta, lpa), (tb, lpb)) in enumerate(zip(runs_a, runs_b)):
+        pos = next((j for j, (a, b) in enumerate(zip(ta, tb)) if a != b), None)
+        if pos is None:
+            assert len(ta) == len(tb) == n, (label, i, len(ta), len(tb))
+            print(f"{label} prompt {i}: identical for {len(ta)} tokens")
+            continue
+        verdict = _near_tie(ta[pos], tb[pos], lpa[pos], lpb[pos])
+        print(f"{label} prompt {i}: first divergence at {pos}: {verdict}")
+        if not verdict.startswith("near-tie"):
+            bad.append((i, pos, verdict))
+    assert not bad, f"{label}: confident disagreement {bad}"
+
+
 def test_near_tie_classifier():
     assert _near_tie(1, 2, {1: -0.69, 2: -0.70}, {2: -0.69, 1: -0.70}).startswith(
         "near-tie"
@@ -1008,18 +1025,7 @@ def test_t4_compiled_graphs_match_eager():
     first-divergence position and gap is printed."""
     eager = _greedy_lp_once(256, enforce_eager=True)
     graphs = _greedy_lp_once(256)
-    bad = []
-    for i, ((et, elp), (gt, glp)) in enumerate(zip(eager, graphs)):
-        pos = next((j for j, (a, b) in enumerate(zip(et, gt)) if a != b), None)
-        if pos is None:
-            assert len(et) == len(gt) == 256
-            print(f"T4 prompt {i}: identical for {len(et)} tokens")
-            continue
-        verdict = _near_tie(et[pos], gt[pos], elp[pos], glp[pos])
-        print(f"T4 prompt {i}: first divergence at {pos}: {verdict}")
-        if not verdict.startswith("near-tie"):
-            bad.append((i, pos, verdict))
-    assert not bad, f"eager vs graphs: confident disagreement {bad}"
+    _assert_identical_until_near_tie("T4 eager vs graphs", eager, graphs, 256)
 
 
 # Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
@@ -1109,7 +1115,15 @@ def test_t6_fp16_headroom_8k():
 @needs_ckpt
 def test_t7_unfused_path_matches(monkeypatch):
     """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream Attention)
-    gives the same greedy tokens as the fused route."""
-    fused = _greedy_once(enforce_eager=True)
+    agrees with the fused route up to the first near-tie.
+
+    Both routes use FP32 math with the same rounding points, but upstream's
+    unfused RMSNorm sums the squares with a CUDA block reduction
+    (csrc/layernorm_kernels.cu) while the fused Triton kernel uses tl.sum,
+    and FMA contraction can differ. So q/k can differ by an FP16 ulp (the
+    fork's contract for this kernel) and a greedy near-tie can flip; a
+    confident disagreement is a bug (same rule and threshold as T4)."""
+    fused = _greedy_lp_once(enforce_eager=True)
     monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", "0")
-    assert _greedy_once(enforce_eager=True) == fused
+    unfused = _greedy_lp_once(enforce_eager=True)
+    _assert_identical_until_near_tie("T7 fused vs unfused", fused, unfused, 64)
