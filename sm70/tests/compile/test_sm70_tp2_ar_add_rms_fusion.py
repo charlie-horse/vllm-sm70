@@ -272,7 +272,8 @@ def test_op_schema_and_fake(fusion):
 # ---------------------------------------------------------------------------
 
 
-FLINT = "FlintForCausalLM"
+FLINT = "FlintSm70ForCausalLM"  # production arch (M5)
+FLINT_UPSTREAM = "FlintForCausalLM"
 QWEN36_LIKE = "Qwen3_5MoeForConditionalGeneration"  # hidden 2048, GemmaRMSNorm
 
 
@@ -509,11 +510,12 @@ def test_op_falls_back_to_the_unfused_ops(fusion, monkeypatch, sum2, scale):
 
 
 def test_fork_keys_on_the_flint_architecture(fusion):
-    assert fusion[0].FLINT_ARCHITECTURE == FLINT
+    # Production serves M5's FlintSm70ForCausalLM; upstream's class too.
+    assert set(fusion[0].FLINT_ARCHITECTURES) == {FLINT, FLINT_UPSTREAM}
     assert "Flint-only" in fusion[0].rejection(SimpleNamespace(model_config=None), 2)
 
 
-@pytest.mark.parametrize("arch, expect_patterns", [(QWEN36_LIKE, False), (FLINT, True)])
+@pytest.mark.parametrize("arch, expect_patterns", [(QWEN36_LIKE, False), (FLINT, True), (FLINT_UPSTREAM, True)])
 def test_apply_builds_patterns_only_for_flint(
     tp_group, fusion, monkeypatch, arch, expect_patterns
 ):

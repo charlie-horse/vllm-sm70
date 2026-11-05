@@ -25,7 +25,7 @@ Interface (fixed; tests pin it):
       normalized_out (a!), residual_out (b!), reg_buffer: int,
       reg_buffer_sz_bytes: int, epsilon: float, scale: float) -> ()
 
-Admitted models: Flint only (architecture FlintForCausalLM), as in the
+Admitted models: Flint only (FlintSm70ForCausalLM or FlintForCausalLM), as in the
 fork, where only FlintModelConfig requested the pass (fork models/config.py:
 341-372, MODELS_CONFIG_MAP["FlintForCausalLM"] :1052). Other hidden-2048
 models (e.g. GemmaRMSNorm-style fp32 weight + 1) are never matched.
@@ -66,8 +66,10 @@ KILL_SWITCH = "VLLM_SM70_FLINT_AR_RMSNORM"
 HIDDEN_SIZE = 2048
 MAX_ROWS = 16
 
-# The fork keyed the request on this architecture (MODELS_CONFIG_MAP).
-FLINT_ARCHITECTURE = "FlintForCausalLM"
+# The fork keyed the request on the Flint architecture (MODELS_CONFIG_MAP).
+# Production serves M5's FlintSm70ForCausalLM (via --hf-overrides), which
+# model_config.architecture then reports; upstream's class is kept too.
+FLINT_ARCHITECTURES = ("FlintSm70ForCausalLM", "FlintForCausalLM")
 
 # Attributes of upstream's CustomAllreduce the fused path reads.
 _CA_ATTRS = ("_ptr", "disabled", "rank", "world_size", "buffer_ptrs", "max_size")
@@ -464,8 +466,8 @@ def rejection(config: Any, tp_size: int) -> str | None:
     """Why the fusion is off for this engine config, or None."""
     model_config = config.model_config
     architecture = getattr(model_config, "architecture", None)
-    if architecture != FLINT_ARCHITECTURE:
-        return f"it is Flint-only ({FLINT_ARCHITECTURE}), not {architecture}"
+    if architecture not in FLINT_ARCHITECTURES:
+        return f"it is Flint-only ({'/'.join(FLINT_ARCHITECTURES)}), not {architecture}"
     parallel = config.parallel_config
     if tp_size != 2 or parallel.pipeline_parallel_size != 1:
         return "it needs TP2 without pipeline parallelism"
