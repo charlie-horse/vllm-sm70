@@ -26,10 +26,6 @@ let
     "--http-host" "127.0.0.1"
     # Already the default, but vllm-lmcache-ui points at this port.
     "--http-port" (toString cfg.httpPort)
-    # Metrics are on (Prometheus pull); the port is LMCache's default, made
-    # explicit here. --prometheus-host comes from patch 0002.
-    "--prometheus-port" "9090"
-    "--prometheus-host" cfg.metricsHost
     # One object group per attention type, required for hybrid GDN models.
     "--separate-object-groups"
     # Must be a multiple of the served model's vLLM block size.
@@ -132,18 +128,6 @@ in
       type = lib.types.port;
       default = 8080;
       description = "Admin API port (loopback only; no authentication).";
-    };
-
-    metricsHost = lib.mkOption {
-      type = lib.types.str;
-      default = "127.0.0.1";
-      example = "0.0.0.0";
-      description = ''
-        Address LMCache's Prometheus /metrics endpoint (port 9090, in
-        lmcacheArgs) binds to. Loopback by
-        default; set it only if a scraper on another host needs it, and open
-        the port on that interface yourself.
-      '';
     };
 
     # Lower both to run LMCache alongside something else that wants the RAM or
