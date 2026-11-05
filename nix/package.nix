@@ -45,6 +45,12 @@ let
 
   site = "${buildVenv}/${python.sitePackages}";
 
+  # The sm70/ plugin (vllm_sm70 + _sm70_C), built separately so a kernel
+  # edit doesn't rebuild vLLM's tree. Owned by Kai (nix/sm70-ext.nix).
+  sm70ext = import ./sm70-ext.nix {
+    inherit pkgs lib cuda buildVenv site deps;
+  };
+
   tree = cuda.backendStdenv.mkDerivation {
     pname = "vllm-sm70";
     inherit (src) version;
@@ -152,7 +158,7 @@ let
     pkgs.runCommand "vllm-sm70-${src.version}"
       {
         nativeBuildInputs = [ pkgs.makeWrapper ];
-        passthru = { inherit venv tree python pythonSet; };
+        passthru = { inherit venv tree sm70ext python pythonSet; };
       }
       ''
         site=${venv}/${python.sitePackages}
@@ -160,6 +166,9 @@ let
           -name '*.so*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd:)
         mkdir -p $out/bin
         # `vllm` is the venv python running vllm's CLI from the tree.
+        # sm70ext follows the tree on PYTHONPATH; vLLM loads its general and
+        # platform plugins through entry points. VLLM_PLUGINS=<list without
+        # sm70> (e.g. VLLM_PLUGINS=) turns both off and runs stock vLLM.
         # TRITON_PTXAS_PATH is only a default (12.6 ptxas): set it to Triton's
         # bundled ptxas (12.9) to compare.
         # VLLM_USE_FLASHINFER_SAMPLER defaults to 1 upstream, and
@@ -170,7 +179,7 @@ let
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")
           makeWrapper ${venv}/bin/python $out/bin/$exe "''${args[@]}" \
-            --prefix PYTHONPATH : ${tree} \
+            --prefix PYTHONPATH : ${tree}:${sm70ext} \
             --set CUDA_HOME ${cuda.cudatoolkit} \
             --set CUDA_PATH ${cuda.cudatoolkit} \
             --set-default TRITON_PTXAS_PATH ${cuda.cudatoolkit}/bin/ptxas \
@@ -184,5 +193,5 @@ let
       '';
 in
 {
-  inherit vllm tree venv buildVenv;
+  inherit vllm tree venv buildVenv sm70ext;
 }

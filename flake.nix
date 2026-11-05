@@ -43,6 +43,7 @@
       packages.${system} = {
         default = p.vllm;
         inherit (p) vllm tree venv;
+        sm70-ext = p.sm70ext;
         source = src;
         flint-checkpoint = checkpoint.flintCheckpoint;
       };

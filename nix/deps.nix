@@ -4,6 +4,11 @@
 # CUTLASS is compiled against; triton_kernels is Python files copied into the
 # tree; vllm-flash-attn builds FA2 (vllm.vllm_flash_attn needs it to import)
 # and installs its Python files. FA3 is configured but not built.
+# Building with VLLM_SM70_TRIM_EXTERNALS off (the 0001 kill switch) also needs
+# the 7 skipped sources back here: DeepGEMM, DeepSelect, MSA, FlashMLA,
+# FlashKDA, qutlass and tml-fa4 (the list in git history before #20), and
+# flash-attention with all submodules. Otherwise CMake tries FetchContent in
+# the offline sandbox.
 # Revisions are the ones pinned in v0.33.0's CMakeLists.txt / cmake/external_projects.
 { pkgs }:
 let
