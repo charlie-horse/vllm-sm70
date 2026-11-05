@@ -197,9 +197,10 @@ def admit_layer(
     Returns the plan, or None (logged) when the layer must keep the dense
     stage: kill switch off, ops absent, shape outside the compiled contract,
     or scales with no FP16 headroom. ``policy_enabled`` is the caller's
-    resolved switch (Sm70Config.flint_moe_qpn_decode); None reads the env.
+    resolved switch (Sm70Config.flint_moe_qpn_decode). It is always ANDed
+    with VLLM_SM70_FLINT_MOE_QPN_DECODE, so no caller can bypass the kill.
     """
-    if not (enabled() if policy_enabled is None else policy_enabled):
+    if not (enabled() and (policy_enabled is None or policy_enabled)):
         logger.debug("SM70 Flint MoE decode off (%s=0).", KILL_SWITCH)
         return None
     if not available():

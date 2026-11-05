@@ -136,7 +136,7 @@ The guards refuse Flint TP1 (I=512), TP4 (I=128), Qwen3.6 top-8, M=3 and misalig
 
 ## Callable contract for the M4 wiring (`vllm_sm70/quant/nvfp4_moe.py`)
 
-M4 already detects the ops by name with `tm.has_op` (true once `_sm70_C` has K12, because the ops share the `_sm70_C` namespace). Its `decode_ops_available()` then requires `callable(getattr(tm, name))`. The wrappers live in `vllm_sm70.ops.flint_moe`, not in `tm`, so the fast path stays off until M4 switches to the following. Everything comes from `from vllm_sm70.ops import flint_moe`.
+M4 detects the decode through `vllm_sm70.ops.flint_moe` (its `_flint_moe()` import; `admit_layer` checks `flint_moe.available()`), not through `tm.has_op`. It keeps no private copy of the contract or workspace sizes; `test_m4_uses_k12_admission_not_a_private_copy` pins that. Everything comes from `from vllm_sm70.ops import flint_moe`.
 
 At load (`_prepare_decode`, after the banks are stacked):
 ```python
@@ -166,8 +166,9 @@ if plan is not None and flint_moe.can_decode(x, topk_weights, topk_ids):
 - The return value is the local, un-reduced [M, 2048] sum, as the dense route returns it.
 - Raw ops, if M4 prefers them: `flint_moe.nvfp4_moe_decode_w13_swiglu_sm70_out(out[6M,256], x, w13_w, w13_s, ids_i32[6M], partials, counters, w13_shift)`, then `flint_moe.nvfp4_moe_decode_w2_reduce_sm70_out(out[M,2048], act, w2_w, w2_s, ids_i32, topk_weights[M,6], w2_shift)`.
 
-Differences from M4's current pre-wiring:
-- **Counters:** 96 are needed (M4 allocates 128; still accepted).
-- **int64 IDs:** M4's `_use_decode` refuses them and sends them to the dense route; `can_decode` accepts them.
+Notes for the wiring:
+- **Kill switch:** `admit_layer` ANDs `policy_enabled` with `VLLM_SM70_FLINT_MOE_QPN_DECODE`; `=0` always wins.
+- **int64 IDs:** `can_decode` accepts them; `flint_moe_decode_out` copies them into the workspace.
 - **Output buffer:** the output needs no `torch.zeros`.
-- **Sharing the workspace:** one workspace can serve every layer on the device, since they run in sequence on one stream (saves 384 KiB per MoE layer). Per-layer workspaces are also correct.
+- **Sharing the workspace:** one workspace per device, allocated at load, serves every layer as long as the layers run in sequence on one stream. Per-layer workspaces are also correct. Why sharing is safe: `partials` slots are written before they are read within each W13 launch; the last CTA of each (route, tile) resets its counter to 0 inside the same launch; W2 uses no workspace; and stream order serializes launches across layers. Not safe across concurrently running streams.
+- **Determinism:** no floating-point atomics. Warp partials are joined in fixed order. The split-K partials are summed by the last-arriving CTA in slice order 0..15; the integer `atomicAdd` only elects that CTA. W2 sums slots in fixed order. Results are bit-identical run to run and between eager and graph replay.
