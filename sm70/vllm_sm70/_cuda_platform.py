@@ -161,12 +161,18 @@ class Sm70CudaPlatform(CudaPlatform):
             enabled=sm70_config(vllm_config).flint_qk_rope_kv,
         )
 
-    # U1 hooks (patches/0001): defaults keep upstream behaviour.
+    # U1 hooks (patches/0001): None keeps upstream behaviour.
     @classmethod
     def get_unquantized_gemm(
         cls, linear_backend: str = "auto"
     ) -> Callable[..., Any] | None:
-        return None
+        # K18: DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
+        # other layer and M falls through to F.linear (UP
+        # default_unquantized_gemm). None (upstream dispatch) when
+        # VLLM_SM70_DFLASH2_FP16=0 or the ops are not built.
+        from vllm_sm70.ops import dflash2
+
+        return dflash2.select_unquantized_gemm(linear_backend)
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
