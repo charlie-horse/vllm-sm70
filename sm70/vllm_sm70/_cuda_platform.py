@@ -179,6 +179,25 @@ class Sm70CudaPlatform(CudaPlatform):
         import dataclasses
 
         priority = super().get_default_ir_op_priority(vllm_config)
+        # Flint only (K17 admission): there the fused AR kernel keeps the
+        # residual in fp16, so the unfused path (switch off) must too. Other
+        # models keep upstream's priority (fork parity).
+        if not _k17_admits(vllm_config):
+            return priority
         return dataclasses.replace(
             priority, fused_add_rms_norm=list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
         )
+
+
+def _k17_admits(vllm_config: Any) -> bool:
+    """True when K17's rejection() is None for this engine config."""
+    if getattr(vllm_config, "model_config", None) is None:
+        return False
+    try:
+        from vllm_sm70 import ar_rms_fusion
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        return ar_rms_fusion.rejection(vllm_config, tp) is None
+    except Exception:
+        logger.debug("vllm_sm70: K17 admission check failed", exc_info=True)
+        return False
