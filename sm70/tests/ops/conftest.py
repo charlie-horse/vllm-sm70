@@ -20,10 +20,16 @@ def tm_gpu():
         pytest.skip("requires an SM70 GPU")
     from vllm_sm70 import _ext
 
+    # On a real SM70 GPU a missing extension is a broken build or a wrong
+    # PYTHONPATH (e.g. the source tree shadowing the built package), not a
+    # reason to skip: fail so the nightly run cannot pass on stubs.
     if not _ext.is_loaded():
-        pytest.skip("vllm_sm70._sm70_C is not built")
+        pytest.fail(
+            "SM70 GPU present but vllm_sm70._sm70_C is not loaded: "
+            f"vllm_sm70 imported from {_ext.__file__}"
+        )
     from vllm_sm70.ops import tm
 
     if not tm.has_op("nvfp4_gemm_sm70_out"):
-        pytest.skip("_sm70_C has no TurboMind ops (built without K03)")
+        pytest.fail("_sm70_C is loaded but has no TurboMind ops (built without K03)")
     return tm
