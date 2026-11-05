@@ -26,8 +26,9 @@ Kill-switch: ``Sm70Config.flint_moe_qpn_decode`` /
   disables the whole route.
 
 Ops: Kai's, only through ``vllm_sm70.ops.tm`` (K03): nvfp4_sm70_prepare,
-awq_moe_build_strided_ptrs, nvfp4_moe_dense_stage_sm70_out,
-nvfp4_moe_indexed_dense_stage_sm70_out (optional, avoids the permuted copy).
+awq_moe_build_strided_ptrs, nvfp4_moe_dense_stage_sm70_out (W13 always runs on
+the permuted input: the indexed W13 op is a Qwen3.8-only contract, hidden 2560,
+FORK nvfp4_sm70_moe.py:336-359, and its CUDA guard rejects Flint shapes).
 The K12 decode ops (nvfp4_moe_decode_w13_swiglu_sm70_out,
 nvfp4_moe_decode_w2_reduce_sm70_out) are detected with ``tm.has_op``; they
 are absent today. Dtypes per the K03 contract: topk_weights float32, topk_ids
@@ -64,7 +65,6 @@ REQUIRED_OPS: Final = (
     "awq_moe_build_strided_ptrs",
     "nvfp4_moe_dense_stage_sm70_out",
 )
-INDEXED_W13_OP: Final = "nvfp4_moe_indexed_dense_stage_sm70_out"
 DECODE_W13_OP: Final = "nvfp4_moe_decode_w13_swiglu_sm70_out"
 DECODE_W2_OP: Final = "nvfp4_moe_decode_w2_reduce_sm70_out"
 
@@ -281,7 +281,6 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_hidden_size = hidden
         layer.sm70_nvfp4_intermediate_size = intermediate
         layer.sm70_nvfp4_top_k = top_k
-        layer.sm70_nvfp4_indexed_w13 = has_tm_op(INDEXED_W13_OP)
 
         self._prepare_decode(layer, (num_experts, hidden, intermediate, top_k))
         layer.sm70_moe_workspace = Sm70MoEWorkspace.get(
@@ -415,35 +414,19 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
             )
             return output
 
-        if layer.sm70_nvfp4_indexed_w13:
-            moe_rt.route_indexed(buffers, topk_ids, experts, top_k)
-            tm.nvfp4_moe_indexed_dense_stage_sm70_out(
-                buffers["gate_up"],
-                x,
-                buffers["input_row_indices"],
-                buffers["expert_offsets"],
-                buffers["dense_expert_ids"],
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                experts,
-                hidden,
-                2 * inter,
-                NVFP4_GROUP_SIZE,
-            )
-        else:
-            moe_rt.route_materialized(buffers, x, topk_ids, experts, top_k)
-            tm.nvfp4_moe_dense_stage_sm70_out(
-                buffers["gate_up"],
-                buffers["permuted_input"],
-                buffers["expert_offsets"],
-                buffers["dense_expert_ids"],
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                experts,
-                hidden,
-                2 * inter,
-                NVFP4_GROUP_SIZE,
-            )
+        moe_rt.route_materialized(buffers, x, topk_ids, experts, top_k)
+        tm.nvfp4_moe_dense_stage_sm70_out(
+            buffers["gate_up"],
+            buffers["permuted_input"],
+            buffers["expert_offsets"],
+            buffers["dense_expert_ids"],
+            layer.w13_strided_ptrs_w,
+            layer.w13_strided_ptrs_s,
+            experts,
+            hidden,
+            2 * inter,
+            NVFP4_GROUP_SIZE,
+        )
         moe_rt.OPS.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
         tm.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
