@@ -21,8 +21,11 @@ Ported from fork cf9492a:
 - vllm/model_executor/kernels/linear/qpn/fp8.py:55-63, 208-211, the
   split-K table `_SM70_FP8_QPN8_CONFIGS` and its generic fallback.
 
-Contract for the FP8 linear method (Mara, M8). This module has no runtime
-switch; M8 reads VLLM_SM70_FP8_QPN8 and decides whether to call it.
+Contract for the FP8 linear method (Mara, M8). This module has no on/off
+switch of its own: M8 decides whether to call it from its Sm70Config field
+`fp8_block_qpn8` (FORK config/kernel.py:386 `kernel_config.sm70_fp8.block_qpn8`),
+and keeps the TurboMind copy per `fp8_block_qpn8_turbomind_copy`
+(FORK :388). VLLM_SM70_FP8_QPN8_M32 (below) is this module's only switch.
 
 M cap: `qpn8_max_m(block_scaled=True)` is the M up to which the QPN8 GEMV
 runs. It is 8 for block-scaled weights (the block-FP8 checkpoints) unless
