@@ -10,7 +10,8 @@ GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
   and the ``vllm`` service stopped; they run in the 00:00-06:00 window.
   Paths come from env:
     FLINT_SM70_CHECKPOINT  the ModelOpt NVFP4 Flint checkpoint dir
-    FLINT_SM70_GOLDEN      JSON of fork cf9492a greedy token ids (T5)
+    FLINT_SM70_GOLDEN      JSON of fork cf9492a greedy records (T5); c4130:
+                           ~/vllm-sm70-work/bea/golden/flint_cf9492a_greedy64.json
 """
 
 import json
@@ -721,6 +722,10 @@ def test_t4_compiled_graphs_match_eager():
     assert eager == graphs
 
 
+# Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
+GOLDEN_EXACT_TOKENS = 32
+
+
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
@@ -728,11 +733,35 @@ def test_t4_compiled_graphs_match_eager():
     os.environ.get("FLINT_SM70_GOLDEN") is None, reason="set FLINT_SM70_GOLDEN"
 )
 def test_t5_golden_tokens_vs_fork():
-    """T5 (2 GPUs): the first 64 greedy tokens equal the fork cf9492a run
-    (fork sampler and fused router off) for PROMPTS."""
+    """T5 (2 GPUs): greedy tokens match the fork cf9492a golden.
+
+    Golden file (Bea, captured from live fork Flint, raw /v1/completions,
+    temperature 0, max_tokens 64): a JSON list of {"prompt",
+    "prompt_token_ids", "token_ids", "stable_across_2_runs", ...}. The fork
+    itself is not bit-stable past ~40 tokens across two runs (prefix-cache
+    path), so we require an exact match of the first GOLDEN_EXACT_TOKENS
+    tokens for every prompt, and report the full common prefix."""
+    from vllm import SamplingParams
+
     with open(os.environ["FLINT_SM70_GOLDEN"]) as f:
         golden = json.load(f)
-    assert _greedy(_llm()) == [g[:64] for g in golden]
+    llm = _llm()
+    outs = llm.generate(
+        [{"prompt_token_ids": g["prompt_token_ids"]} for g in golden],
+        SamplingParams(temperature=0, max_tokens=64),
+    )
+    failures = []
+    for g, o in zip(golden, outs):
+        ours, ref = list(o.outputs[0].token_ids), g["token_ids"]
+        common = next(
+            (i for i, (a, b) in enumerate(zip(ours, ref)) if a != b),
+            min(len(ours), len(ref)),
+        )
+        print(f"T5 prompt {g['prompt'][:40]!r}: common prefix {common}/64 "
+              f"(fork stable={g.get('stable_across_2_runs')})")
+        if common < GOLDEN_EXACT_TOKENS:
+            failures.append((g["prompt"][:40], common))
+    assert not failures, f"diverged before {GOLDEN_EXACT_TOKENS} tokens: {failures}"
 
 
 @pytest.mark.gpu
