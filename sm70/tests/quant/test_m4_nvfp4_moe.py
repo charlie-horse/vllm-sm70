@@ -838,7 +838,14 @@ def _gpu_layer(m4):
     return method, layer, w
 
 
+# Boolean condition only (string skipif conditions break under inference_mode).
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a CUDA GPU"
+)
+
+
 @pytest.mark.gpu
+@needs_cuda
 @pytest.mark.parametrize("m", [1, 2, 7, 64, 512])
 def test_gpu_flint_tp2_parity(m):
     import vllm_sm70.quant.nvfp4_moe as m4
@@ -856,6 +863,7 @@ def test_gpu_flint_tp2_parity(m):
 
 
 @pytest.mark.gpu
+@needs_cuda
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
 @pytest.mark.parametrize("m", [1, 2])
 def test_gpu_flint_tp2_decode_matches_dense(monkeypatch, m, ids_dtype):
@@ -890,6 +898,7 @@ def test_gpu_flint_tp2_decode_matches_dense(monkeypatch, m, ids_dtype):
 
 
 @pytest.mark.gpu
+@needs_cuda
 @pytest.mark.parametrize("m", [1, 2, 8])
 def test_gpu_cuda_graph_matches_eager(m):
     import vllm_sm70.quant.nvfp4_moe as m4
