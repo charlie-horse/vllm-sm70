@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U3 (patches/0003): fused-MoE router platform hook in upstream vLLM."""
+"""U3 (patches/0004): fused-MoE router platform hook in upstream vLLM."""
 
 import pytest
 from conftest import requires_vllm

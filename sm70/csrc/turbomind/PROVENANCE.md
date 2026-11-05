@@ -185,7 +185,7 @@ Fork `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` at cf9492a (10,913 lines, last t
 | 7763-7946 | `awq_moe_gemm_sm70_out_impl` |
 | 7948-7957 | `awq_moe_gemm_sm70_out` |
 | 7959-7967 | `awq_moe_gemm_sm70_per_expert_dispatch_out` |
-| 7969-8013 | `awq_moe_indexed_dense_w13_sm70_out` |
+| 7969-8013 | `awq_moe_indexed_dense_w13_sm70_out` | DROPPED (TP4-only; cleanup PR) |
 | 8030-8078 | `awq_moe_dense_stage_sm70_out` |
 | 8224-8254 | `awq_moe_build_active_expert_segments_kernel` |
 | 8335-8411 | `awq_moe_active_dense_stage_sm70_out` |
@@ -205,9 +205,9 @@ Fork `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` at cf9492a (10,913 lines, last t
 | 9284-9293 | `fp8_moe_gemm_sm70_per_expert_dispatch_out` |
 | 9295-9345 | `fp8_moe_dense_stage_sm70_out` |
 | 9570-9709 | `nvfp4_moe_gemm_sm70_out_impl` |
-| 9711-9756 | `nvfp4_moe_indexed_dense_stage_sm70_out_impl` |
-| 9758-9766 | `nvfp4_moe_indexed_dense_stage_sm70_out` |
-| 9768-9776 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` |
+| 9711-9756 | `nvfp4_moe_indexed_dense_stage_sm70_out_impl` | DROPPED (TP4-only; cleanup PR) |
+| 9758-9766 | `nvfp4_moe_indexed_dense_stage_sm70_out` | DROPPED (TP4-only; cleanup PR) |
+| 9768-9776 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | DROPPED (TP4-only; cleanup PR) |
 | 9778-9858 | `nvfp4_moe_dense_stage_sm70_out` |
 | 9979-10024 | `fp8_moe_single_token_dense_stage_sm70_out` |
 | 10026-10069 | `fp8_moe_single_token_indexed_dense_stage_sm70_out` |
@@ -348,10 +348,10 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `vllm/_sm70/linear.py` | 2109-2112 | `sm70_gemm_export_cache` | wrapper |
 | `vllm/_sm70/moe.py` | 837-863 | `nvfp4_moe_dense_stage_sm70_out` | wrapper |
 | `vllm/_sm70/moe.py` | 866-882 | `nvfp4_moe_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 885-913 | `nvfp4_moe_indexed_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 916-933 | `nvfp4_moe_indexed_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 936-964 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 967-984 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | fake |
+| `vllm/_sm70/moe.py` | 885-913 | `nvfp4_moe_indexed_dense_stage_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
+| `vllm/_sm70/moe.py` | 916-933 | `nvfp4_moe_indexed_dense_stage_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
+| `vllm/_sm70/moe.py` | 936-964 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
+| `vllm/_sm70/moe.py` | 967-984 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
 | `vllm/_sm70/moe.py` | 1083-1099 | `awq_moe_build_strided_ptrs` | wrapper |
 | `vllm/_sm70/moe.py` | 1102-1116 | `awq_moe_build_strided_ptrs` | fake |
 | `vllm/_sm70/moe.py` | 1119-1145 | `awq_moe_gemm_sm70_out` | wrapper |
@@ -360,8 +360,8 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `vllm/_sm70/moe.py` | 1196-1212 | `awq_moe_gemm_sm70_per_expert_dispatch_out` | fake |
 | `vllm/_sm70/moe.py` | 1215-1242 | `awq_moe_dense_stage_sm70_out` | wrapper |
 | `vllm/_sm70/moe.py` | 1245-1261 | `awq_moe_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1264-1293 | `awq_moe_indexed_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1296-1313 | `awq_moe_indexed_dense_w13_sm70_out` | fake |
+| `vllm/_sm70/moe.py` | 1264-1293 | `awq_moe_indexed_dense_w13_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
+| `vllm/_sm70/moe.py` | 1296-1313 | `awq_moe_indexed_dense_w13_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
 | `vllm/_sm70/moe.py` | 1316-1345 | `awq_moe_active_dense_stage_sm70_out` | wrapper |
 | `vllm/_sm70/moe.py` | 1348-1365 | `awq_moe_active_dense_stage_sm70_out` | fake |
 | `vllm/_sm70/moe.py` | 1368-1417 | `awq_moe_chunked_w2_sm70_out` | wrapper |
@@ -522,7 +522,7 @@ Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `#
 | `sm70/csrc/turbomind/ops/tm_config.h` | `csrc/sm70_policy.h` | rewritten | 267 | 315 | c43f5d78c | `a5fb816fb7d5ba9485e7839d85d7e8e0662ea8f7e47cacc665192b3cf63f760a` | `b2c935891ef32cc8c70367fb109c65f574beaff64b193b08565164b0a9e53981` |
 | `sm70/csrc/turbomind/ops/tm_f16_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 375 | 10913 | 899e9ed33 | `39219d6437ea5ebd06a5468731caa7e6a5e16496a1e1342de3fa336244c74da5` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_fp8_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 615 | 10913 | 899e9ed33 | `493ed6e2d7c920bb8f6c82d8c8046feb0fb566c4318c6f0b5e9cd5fa1daf790b` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3549 | 10913 | 899e9ed33 | `794b33738da06b5a507d539085226a803b8bab6a2df889763d9ff9b508a14eaf` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3415 | 10913 | 899e9ed33 | `4517ca77811962b1d332cfabe8681b6d31a1627022ca63bb91a6c29427ca2f63` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_nvfp4_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 288 | 10913 | 899e9ed33 | `98028afde445b8ecc1827be9ac32982bbbbf6afc6ae6cb3a269ba9423ec97c0f` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_ops_common_sm70.cuh` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 119 | 10913 | 899e9ed33 | `f00da8f4ef8450a75bbd8cae4d798fa12be683d0e406606410b4db97ccd96bb7` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_registry_sm70.cu` | `csrc/sm70_turbomind/ops/tm_registry_sm70.cu` | verbatim | 38 | 38 | 58beb3433 | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` |
