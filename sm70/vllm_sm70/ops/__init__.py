@@ -1,12 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM70 custom ops: Python wrappers and fake impls over torch.ops._sm70_C (K02+)."""
 
+import logging
+
+logger = logging.getLogger("vllm.sm70")
+
 _registered = False
 
 
+def _sm70_c_loaded() -> bool:
+    # `hasattr(torch.ops, "_sm70_C")` alone is always True: torch.ops creates
+    # a namespace object for any attribute name. The namespace only has ops
+    # once vllm_sm70._sm70_C is imported, which _ext.load() does.
+    import torch
+
+    from vllm_sm70 import _ext
+
+    return hasattr(torch.ops, "_sm70_C") and _ext.is_loaded()
+
+
 def register() -> None:
-    """Area hook, called by vllm_sm70.register(). Idempotent."""
+    """Area hook, called by vllm_sm70.register(). Idempotent.
+
+    Without _sm70_C (CPU-only build, VLLM_SM70_SKIP_EXT=1) nothing is
+    imported, so the upstream paths stay in use.
+    """
     global _registered
     if _registered:
         return
     _registered = True
+    if not _sm70_c_loaded():
+        logger.debug("vllm_sm70.ops: _sm70_C not loaded; TurboMind ops skipped")
+        return
+    from vllm_sm70.ops import tm  # noqa: F401  (registers the fakes)
