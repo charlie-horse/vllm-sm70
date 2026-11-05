@@ -124,7 +124,13 @@ class Sm70Config(BaseModel):
     only on this flag, fp16 in/out, static 128x128 block weights, rank 2,
     N,K % 128 and the native ops. So it is on for both Qwen3.6-35B-A3B and
     Qwen3.8-27B (docs/models/sm70-effective-defaults.md). No override
-    applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0."""
+    applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0.
+
+    The flag alone does not admit a layer; fp8_block_qpn8_turbomind_copy
+    does. At the c4130 prod settings (max_num_seqs 4, DFlash2 k=7, so 32
+    rows) the default copy policy admits neither Qwen model while K09's
+    block-scaled max M is 8: both stay on M6 TurboMind (signed-off
+    deviation, PR #65)."""
 
     fp8_block_qpn8_turbomind_copy: bool | None = None
     """Block QPN8 vs a second, TurboMind-packed weight copy. rows =
