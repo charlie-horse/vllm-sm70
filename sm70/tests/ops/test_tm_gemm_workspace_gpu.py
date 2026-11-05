@@ -121,6 +121,8 @@ def test_runtime_close_is_idempotent_and_ops_recover(tm_gpu):
     assert max_abs_rel(out, reference(x)) < 1e-2
 
 
+# close() raises before anything is captured, so torch warns the graph is empty.
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
 def test_runtime_close_refuses_capture(tm_gpu):
     tm = tm_gpu
     run, _ = _nvfp4(tm, 1024, 2048)
