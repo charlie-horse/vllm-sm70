@@ -11,11 +11,10 @@
 #              lmcache.lmcache_frontend.app (kept off the system PATH).
 #   tree       the sm_70-built vLLM tree.
 #
-# vllm/python/tree come from ./package.nix (Phase 1 build). LMCache is not in
-# the venv yet, so bin/lmcache and lmcacheUi are still stubs that fail at
-# start; the LMCache sdist build replaces them, applying
-# `import ./patches/lmcache` (a list of patch files, in order) with
-# patchFlags = [ "-p1" "--fuzz=0" "--no-backup-if-mismatch" ].
+# vllm/python/lmcache/tree come from ./package.nix. LMCache 0.5.6 is built
+# from the sdist for sm_70 (./lmcache-build.nix, with ./patches/lmcache) and
+# sits on the wrapper's PYTHONPATH, so bin/lmcache and lmcacheUi's bin/python
+# are the same wrapper as bin/vllm.
 {
   pkgs,
   lib,
@@ -25,20 +24,6 @@
 let
   src = import ./source.nix { inherit pkgs lib; };
   build = import ./package.nix { inherit pkgs lib inputs src; };
-
-  stub =
-    name: exes:
-    pkgs.runCommand name { } ''
-      mkdir -p $out/bin
-      for exe in ${lib.escapeShellArgs exes}; do
-        cat > $out/bin/$exe <<SH
-      #!${pkgs.runtimeShell}
-      echo "vllm-sm70: '$exe' is a stub; LMCache is not built into this flake yet" >&2
-      exit 1
-      SH
-        chmod +x $out/bin/$exe
-      done
-    '';
 
   # `hf` from the venv (huggingface-hub[hf-xet]); it needs no CUDA setup.
   hf = pkgs.runCommand "vllm-sm70-hf" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
@@ -52,10 +37,14 @@ in
     paths = [
       build.vllm
       hf
-      (stub "lmcache-sm70-stub" [ "lmcache" ])
     ];
-    passthru = { inherit (build) venv tree; };
+    passthru = { inherit (build) venv tree lmcacheBuild; };
   };
-  lmcacheUi = stub "lmcache-ui-sm70-stub" [ "python" ];
+  # Only bin/python (kept off the system PATH); it imports
+  # lmcache.lmcache_frontend.app like the vllm wrapper does.
+  lmcacheUi = pkgs.runCommand "lmcache-ui-sm70-${src.version}" { } ''
+    mkdir -p $out/bin
+    ln -s ${build.vllm}/bin/python $out/bin/python
+  '';
   inherit (build) tree;
 }

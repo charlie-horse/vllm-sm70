@@ -18,9 +18,14 @@
 # (the -U flags undo torch's -D__CUDA_NO_HALF*__; upstream vLLM does the same
 # in cmake/utils.cmake).
 #
-# The one-launch fused sink decode (C4, patch K14) is compiled only with
-# -DVLLM_SM70_FV100_FUSED_DECODE (set VLLM_SM70_FV100_FUSED_DECODE=ON before
-# this include). K05 leaves it off.
+# The one-launch fused sink decode (C4, patch K14) is compiled with
+# -DVLLM_SM70_FV100_FUSED_DECODE: the kernel, its launch branch and the
+# `fv100_decode_paged_sinks_fused` op. K14 turns it on by default; configure
+# with -DVLLM_SM70_FV100_FUSED_DECODE=OFF to build the K05 two-launch-only set
+# (the Python side then finds no fused op and keeps two launches). At runtime
+# VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 selects the two-launch route instead.
+option(VLLM_SM70_FV100_FUSED_DECODE
+       "Flash-V100 one-launch sink decode (K14)" ON)
 
 set(_VLLM_SM70_FV100_ROOT "${CMAKE_CURRENT_LIST_DIR}")
 
@@ -50,7 +55,7 @@ if(SM70_HAS_CUDA AND SM70_ARCHS)
     set_property(SOURCE ${VLLM_SM70_FV100_CUDA_SRCS} ${VLLM_SM70_FV100_CXX_SRCS}
       APPEND PROPERTY COMPILE_DEFINITIONS VLLM_SM70_FV100_FUSED_DECODE=1)
   endif()
-  message(STATUS "vllm_sm70: Flash-V100 lean attention (K05)"
+  message(STATUS "vllm_sm70: Flash-V100 lean attention (K05/K14)"
                  " fused_decode=${VLLM_SM70_FV100_FUSED_DECODE}")
 endif()
 

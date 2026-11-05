@@ -47,6 +47,7 @@ class CpuOps:
             wl,
             wr,
             extra=None,
+            counters=None,
         ):
             assert launch * partition >= int(lens.max()), (launch, partition)
             sinks = None if name == "fv100_decode_paged_xqa" else extra
@@ -59,6 +60,7 @@ class CpuOps:
                         sinks=sinks,
                         launch=launch,
                         partition=partition,
+                        counters=counters,
                     ),
                 )
             )
