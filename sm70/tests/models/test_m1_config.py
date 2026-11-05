@@ -202,6 +202,20 @@ def _fp8_refuses(name):
     with pytest.raises(RuntimeError, match="VLLM_SM70_FP8_TURBOMIND=0"):
         require_fp8_turbomind()
     assert sm70_config(_vc({})).quant_backend == "auto"  # no Marlin fallback
+    _fp8_not_routed()
+
+
+def _fp8_not_routed():
+    """M6 path: even on a ready SM70 host, no SM70 FP8 method is routed."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    import vllm_sm70.platform as sm70_platform
+    from vllm_sm70.quant import configs
+
+    with mock.patch.object(sm70_platform, "is_sm70_ready", lambda: True):
+        assert not configs.fp8_route_enabled()
+        assert configs.Sm70Fp8Config.get_min_capability() == 75
 
 
 def _quant_registration_skipped(name):
@@ -251,6 +265,15 @@ def _dflash2_emulation_off(name):
     assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
 
 
+def _fp8_moe_decode_off():
+    """M6: the Qwen FP8 single-token MoE route is off (batched only)."""
+    pytest.importorskip("vllm.envs")
+    from vllm_sm70.quant import fp8_moe
+
+    assert not fp8_moe.decode_policy_enabled(_vc({}))
+    assert not fp8_moe.decode_policy_enabled(_vc({"fp8_moe_decode": True}))
+
+
 def _flint_moe_decode_off():
     """M4: the M<=2 decode fast path is not admitted (dense stage only)."""
     pytest.importorskip("vllm.envs")
@@ -272,6 +295,8 @@ def _path_off(name):
             _nvfp4_gemv_not_selected()
         if name == "VLLM_SM70_FLINT_MOE_QPN_DECODE":
             _flint_moe_decode_off()
+        if name == "VLLM_SM70_FP8_MOE_DECODE":
+            _fp8_moe_decode_off()
     elif name == "VLLM_SM70_FP8_TURBOMIND":
         _fp8_refuses(name)
     elif name == "VLLM_SM70_QUANT":
