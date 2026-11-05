@@ -6,6 +6,10 @@
 // dispatch is restricted to accepted SM70 tensor/layout contracts and can be
 // disabled with VLLM_SM70_FP8_QPN8=0.
 // See LICENSE.v100-skinny in this directory for the retained MIT notice.
+//
+// vllm-sm70 (K09): vendored from fork cf9492a, trimmed to prepare,
+// dequantize and the M<=8 GEMM, registered in the _sm70_C namespace.
+// PROVENANCE.md lists every change.
 
 #include <torch/all.h>
 #include <torch/library.h>
@@ -553,8 +557,10 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = out.size(1);
-  TORCH_CHECK(m >= 1 && m <= 32,
-              "fp8_qpn8_gemm_sm70_out: M must be in [1, 32]");
+  // K09: M<=8 only (one 8-row tile). Larger M goes to TurboMind FP8 or a
+  // dequantize + mm (vllm_sm70/ops/qpn8.py qpn8_linear).
+  TORCH_CHECK(m >= 1 && m <= 8,
+              "fp8_qpn8_gemm_sm70_out: M must be in [1, 8]");
   TORCH_CHECK(out.size(0) == m, "fp8_qpn8_gemm_sm70_out: output M mismatch");
   TORCH_CHECK(n > 0 && n % 32 == 0,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
@@ -569,15 +575,11 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
-  TORCH_CHECK(m <= 8 || channel_scales,
-              "fp8_qpn8_gemm_sm70_out: M=9..32 requires channel scales");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
                   split_k == 32,
               "fp8_qpn8_gemm_sm70_out: unsupported split_k");
   TORCH_CHECK((k / 16) % split_k == 0,
               "fp8_qpn8_gemm_sm70_out: K/16 must be divisible by split_k");
-  TORCH_CHECK(m <= 8 || split_k <= 16,
-              "fp8_qpn8_gemm_sm70_out: M=9..32 does not support split_k 32");
   TORCH_CHECK(accumulator_chains == 1 || accumulator_chains == 2,
               "fp8_qpn8_gemm_sm70_out: accumulator_chains must be 1 or 2");
   TORCH_CHECK(!prefetch_codes || fast_decoder,
@@ -588,11 +590,6 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                   (accumulator_chains == 2 && fast_decoder && !prefetch_codes),
               "fp8_qpn8_gemm_sm70_out: split_k 12 requires the "
               "fast decoder, two accumulator chains, and no prefetch");
-  TORCH_CHECK(
-      m <= 16 || ((split_k == 12 || split_k == 16) && accumulator_chains == 2 &&
-                  fast_decoder && !prefetch_codes),
-      "fp8_qpn8_gemm_sm70_out: M=17..32 requires split_k 12/16, "
-      "the fast decoder, two accumulator chains, and no prefetch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -623,17 +620,9 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 
 #define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                        \
   do {                                                                       \
-    if (m <= 8) {                                                            \
-      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), channel_scales, stream); \
-    } else if constexpr (SPLIT <= 16) {                                      \
-      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), true, stream);           \
-    } else {                                                                 \
-      TORCH_CHECK(false, "QPN8 M=9..16 does not support split_k ", SPLIT);   \
-    }                                                                        \
+    launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(             \
+        code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),     \
+        static_cast<int>(k), static_cast<int>(m), channel_scales, stream);   \
   } while (0)
 
   if (prefetch_codes) {
@@ -694,4 +683,24 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 #undef VLLM_LAUNCH_QPN8
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// K09: registration in the _sm70_C namespace (the fork registered these in
+// csrc/torch_bindings.cpp:723-758 under _C with a native_policy argument).
+// Fakes live in vllm_sm70/ops/qpn8.py.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
+  m.def(
+      "fp8_qpn8_dequantize_sm70_out(Tensor(a!) out, Tensor codes, "
+      "Tensor group_scales) -> ()");
+  m.def(
+      "fp8_qpn8_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor group_scales, int split_k, int accumulator_chains, "
+      "bool fast_decoder, bool prefetch_codes) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("fp8_qpn8_prepare_sm70", &fp8_qpn8_prepare_sm70);
+  m.impl("fp8_qpn8_dequantize_sm70_out", &fp8_qpn8_dequantize_sm70_out);
+  m.impl("fp8_qpn8_gemm_sm70_out", &fp8_qpn8_gemm_sm70_out);
 }
