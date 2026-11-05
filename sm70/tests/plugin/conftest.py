@@ -50,6 +50,11 @@ def fake_nvml(monkeypatch):
     """Returns install(caps) -> FakeNvml; clears the platform caches."""
     from vllm_sm70 import platform
 
+    # The fake GPUs are the visible set: an inherited CUDA_VISIBLE_DEVICES
+    # (e.g. "" on a GPU host running CPU-only tests) must not hide them.
+    # Tests that exercise visibility set it after this.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
     def install(caps, uuids=None):
         nvml = FakeNvml(caps, uuids)
         monkeypatch.setattr(platform, "_import_pynvml", lambda: nvml)
