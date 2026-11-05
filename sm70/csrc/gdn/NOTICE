@@ -1,0 +1,24 @@
+FlashQLA SM70 gated-delta-net kernels, vendored from the Qwen FlashQLA port
+==========================================================================
+
+Origin
+- Code: FlashQLA by the Qwen team, Alibaba Group. MIT License, Copyright (c)
+  2026 Qwen, Alibaba (see LICENSE in this directory; it applies to
+  gdn_forward.cu).
+- Immediate source: charlie-horse/vLLM (a fork of 1CatAI/1Cat-vLLM),
+  commit cf9492a01, file
+  flash_qla/ops/gated_delta_rule/chunk/sm70/csrc/gdn_forward.cu
+  (last touched in ec1484d7e). The fork's flash_qla/LICENSE (last touched in
+  25733d9cf) is copied unchanged as LICENSE.
+- The upstream FlashQLA commit the fork started from is not recorded in
+  the fork.
+
+What is here
+- gdn_forward.cu: the CUDA (non-TileLang) SM70 GDN kernels. vLLM-sm70
+  keeps the varlen chunked prefill against the [N, Hv, V, K] state layout
+  and the fused mixed-QKV decode against vLLM's global state slots. The
+  DDTree decode, the fixed-batch forward and the pybind11 module were
+  removed, and the ops are registered with TORCH_LIBRARY_FRAGMENT in the
+  _sm70_C namespace. PROVENANCE.md lists every change.
+- Modifications are licensed under the same MIT terms; the vllm-sm70
+  build glue around them (sources.cmake) is Apache-2.0.

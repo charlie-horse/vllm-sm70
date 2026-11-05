@@ -91,6 +91,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_CUTLASS_DIR",  # setup.py -> CMake: CUTLASS headers
             "VLLM_SM70_REQUIRE_CUDA",  # CMake option
             "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
+            "VLLM_SM70_FV100_FUSED_DECODE",  # CMake option / C++ define (K05/K14)
         )
     },
     "core": {
@@ -153,8 +154,25 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_PROFILE_TRACE",
         )
     },
-    "attention": {},
-    "gdn": {},
+    "attention": {
+        # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
+        "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+    },
+    # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
+    "gdn": {
+        # "0": GDN chunked prefill stays on upstream Triton/FLA (read when
+        # ChunkGatedDeltaRule is built, vllm_sm70/gdn/kernels.py).
+        "VLLM_SM70_GDN_FLASHQLA_PREFILL": kill_switch(
+            "VLLM_SM70_GDN_FLASHQLA_PREFILL"
+        ),
+        # "0": non-spec GDN decode stays on upstream's packed Triton decode
+        # (read on each flashqla_decode() call). Fork name kept.
+        "VLLM_SM70_GDN_DECODE_FLASHQLA": kill_switch("VLLM_SM70_GDN_DECODE_FLASHQLA"),
+        # "0": patch U2 off; the FLA recurrent kernels keep upstream's BV on
+        # sm_70 (read by vllm/third_party/flash_linear_attention/ops/
+        # fused_recurrent.py, which only checks for "0").
+        "VLLM_SM70_FLA_RECURRENT_SCHED": kill_switch("VLLM_SM70_FLA_RECURRENT_SCHED"),
+    },
     "fused_moe": {},
     # Mara (M1 sm70-config, M2 sm70-quant-gates). Kill switches only.
     "quant": {
@@ -168,6 +186,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_MODELOPT_NVFP4_GEMV": kill_switch("VLLM_SM70_MODELOPT_NVFP4_GEMV"),
         # "0": Sm70Config.fp8_moe_decode=False (Qwen FP8 MoE single-token route).
         "VLLM_SM70_FP8_MOE_DECODE": kill_switch("VLLM_SM70_FP8_MOE_DECODE"),
+        # "0": Sm70Config.fp8_moe_compact_decode=False (M==1 decomposed plan
+        # instead of the fused legacy compact op).
+        "VLLM_SM70_FP8_MOE_COMPACT_DECODE": kill_switch(
+            "VLLM_SM70_FP8_MOE_COMPACT_DECODE"
+        ),
         # "0": Sm70Config.fp8_qpn8=False.
         "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
     },

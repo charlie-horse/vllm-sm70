@@ -1143,52 +1143,6 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
                              gated_silu, torch::Tensor(), true);
 }
 
-void awq_moe_indexed_dense_w13_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
-    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
-    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size) {
-  constexpr int kQwen38TopK = 10;
-  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
-                  input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
-                  input.is_contiguous(),
-              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 CUDA FP16 "
-              "[tokens, 2560] input is required.");
-  TORCH_CHECK(num_experts == 512 && k == 2560 && n == 320 && group_size == 32,
-              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 TP4 W13 "
-              "g32 contract is required.");
-  TORCH_CHECK(input_row_indices.is_cuda() &&
-                  input_row_indices.scalar_type() == torch::kInt32 &&
-                  input_row_indices.is_contiguous() &&
-                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
-              "awq_moe_indexed_dense_w13_sm70_out: input row indices must "
-              "contain exactly tokens*10 contiguous CUDA int32 entries.");
-  TORCH_CHECK(expert_offsets.is_cuda() &&
-                  expert_offsets.scalar_type() == torch::kInt32 &&
-                  expert_offsets.is_contiguous() &&
-                  expert_offsets.numel() >= num_experts + 1,
-              "awq_moe_indexed_dense_w13_sm70_out: expert offsets must be "
-              "contiguous CUDA int32 with num_experts+1 entries.");
-  TORCH_CHECK(dense_expert_ids.is_cuda() &&
-                  dense_expert_ids.scalar_type() == torch::kInt32 &&
-                  dense_expert_ids.is_contiguous() &&
-                  dense_expert_ids.numel() >= num_experts,
-              "awq_moe_indexed_dense_w13_sm70_out: dense expert IDs must be "
-              "contiguous CUDA int32.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
-                  out.size(1) == n && out.stride(1) == 1,
-              "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
-
-  maybe_log_sm70_moe_route_once(
-      "logged_awq_indexed_prefill",
-      "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
-      input, input_row_indices.numel(), num_experts);
-  awq_moe_gemm_sm70_out_impl(
-      out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
-      false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
-      input_row_indices.numel(), input_row_indices);
-}
-
 void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor expert_offsets,
                                   torch::Tensor dense_expert_ids,
@@ -2434,73 +2388,6 @@ void nvfp4_moe_gemm_sm70_out_impl(
               ").");
 }
 
-void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
-    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
-    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
-    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size, bool fused_swiglu) {
-  constexpr int kQwen38TopK = 10;
-
-  const bool split_w13_candidate =
-      (vllm::sm70::policy_atoi(
-           vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) != 0) &&
-      fused_swiglu && (n == 256 || n == 64);
-  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
-                  input.scalar_type() == torch::kFloat16 && input.is_cuda(),
-              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 CUDA "
-              "FP16 [tokens, 2560] input is required.");
-  TORCH_CHECK(num_experts == 512 && k == 2560 &&
-                  (n == 320 || split_w13_candidate) && group_size == 16,
-              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 TP4 W13 "
-              "contract is required.");
-  TORCH_CHECK(input_row_indices.is_cuda() &&
-                  input_row_indices.scalar_type() == torch::kInt32 &&
-                  input_row_indices.is_contiguous() &&
-                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
-              "nvfp4_moe_indexed_dense_stage_sm70_out: input row indices must "
-              "contain exactly tokens*10 contiguous CUDA int32 entries.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
-                  out.size(1) == (fused_swiglu ? n / 2 : n),
-              "nvfp4_moe_indexed_dense_stage_sm70_out: output shape mismatch.");
-  TORCH_CHECK(vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled(),
-              "nvfp4_moe_indexed_dense_stage_sm70_out requires grouped "
-              "prefill dispatch.");
-
-  maybe_log_sm70_moe_route_once(
-      fused_swiglu ? "logged_nvfp4_indexed_fused_prefill"
-                   : "logged_nvfp4_indexed_prefill",
-      fused_swiglu
-          ? "SM70 Qwen3.8 NVFP4 MoE indexed-A fused-SwiGLU W13 prefill "
-            "path enabled C++ op reached"
-          : "SM70 Qwen3.8 NVFP4 MoE indexed-A W13 prefill path enabled C++ "
-            "op reached",
-      input, input_row_indices.numel(), num_experts);
-  nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
-                               num_experts, k, n, group_size, dense_expert_ids,
-                               false, input_row_indices.numel(),
-                               input_row_indices, fused_swiglu);
-}
-
-void nvfp4_moe_indexed_dense_stage_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
-    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
-    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size) {
-  nvfp4_moe_indexed_dense_stage_sm70_out_impl(
-      out, input, input_row_indices, expert_offsets, dense_expert_ids, ptrs_w,
-      ptrs_s, num_experts, k, n, group_size, false);
-}
-
-void nvfp4_moe_indexed_fused_swiglu_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
-    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
-    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size) {
-  nvfp4_moe_indexed_dense_stage_sm70_out_impl(
-      out, input, input_row_indices, expert_offsets, dense_expert_ids, ptrs_w,
-      ptrs_s, num_experts, k, n, group_size, true);
-}
-
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,
                                     torch::Tensor dense_expert_ids,
@@ -3419,18 +3306,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
       "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> "
       "()");
-  // fork csrc/torch_bindings.cpp:1501
-  m.def(
-      "nvfp4_moe_indexed_dense_stage_sm70_out(Tensor(a!) out, Tensor "
-      "input, Tensor input_row_indices, Tensor expert_offsets, Tensor "
-      "dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int num_experts, "
-      "int k, int n, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1510
-  m.def(
-      "nvfp4_moe_indexed_fused_swiglu_sm70_out(Tensor(a!) out, Tensor "
-      "input, Tensor input_row_indices, Tensor expert_offsets, Tensor "
-      "dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int num_experts, "
-      "int k, int n, int group_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
@@ -3448,8 +3323,6 @@ TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
   m.impl("fp8_moe_single_token_compact_dense_w13_sm70_out", &fp8_moe_single_token_compact_dense_w13_sm70_out);
   m.impl("fp8_moe_single_token_sm70_out", &fp8_moe_single_token_sm70_out);
   m.impl("nvfp4_moe_dense_stage_sm70_out", &nvfp4_moe_dense_stage_sm70_out);
-  m.impl("nvfp4_moe_indexed_dense_stage_sm70_out", &nvfp4_moe_indexed_dense_stage_sm70_out);
-  m.impl("nvfp4_moe_indexed_fused_swiglu_sm70_out", &nvfp4_moe_indexed_fused_swiglu_sm70_out);
 }
 
 #ifdef VLLM_SM70_TM_AWQ
@@ -3470,12 +3343,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "awq_moe_dense_stage_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, Tensor "
       "ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1202
-  m.def(
-      "awq_moe_indexed_dense_w13_sm70_out(Tensor(a!) out, Tensor input, "
-      "Tensor input_row_indices, Tensor expert_offsets, Tensor "
-      "dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int num_experts, "
-      "int k, int n, int group_size) -> ()");
   // fork csrc/torch_bindings.cpp:1211
   m.def(
       "awq_moe_active_dense_stage_sm70_out(Tensor(a!) out, Tensor input, "
@@ -3537,7 +3404,6 @@ TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
   m.impl("awq_moe_gemm_sm70_out", &awq_moe_gemm_sm70_out);
   m.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", &awq_moe_gemm_sm70_per_expert_dispatch_out);
   m.impl("awq_moe_dense_stage_sm70_out", &awq_moe_dense_stage_sm70_out);
-  m.impl("awq_moe_indexed_dense_w13_sm70_out", &awq_moe_indexed_dense_w13_sm70_out);
   m.impl("awq_moe_active_dense_stage_sm70_out", &awq_moe_active_dense_stage_sm70_out);
   m.impl("awq_moe_single_token_dense_stage_sm70_out", &awq_moe_single_token_dense_stage_sm70_out);
   m.impl("awq_moe_single_token_indexed_dense_stage_sm70_out", &awq_moe_single_token_indexed_dense_stage_sm70_out);

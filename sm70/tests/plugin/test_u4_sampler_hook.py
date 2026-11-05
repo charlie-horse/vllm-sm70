@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U4 (patches/0004): V1 sampler platform hook in upstream vLLM."""
+"""U4 (patches/0005): V1 sampler platform hook in upstream vLLM."""
 
 import inspect
 

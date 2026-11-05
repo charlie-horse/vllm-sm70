@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """M1 sm70-config: the typed SM70 policy for the plugin.
 
-What: ``Sm70Config``, a frozen pydantic model with 8 fields (extra keys are
+What: ``Sm70Config``, a frozen pydantic model with 9 fields (extra keys are
   rejected), and ``sm70_config(vllm_config)``. The helper reads
   ``additional_config["sm70"]`` (or ``kernel_config.sm70``), applies the
   kill-only env switches from ``vllm_sm70.envs``, and caches the result per
@@ -84,6 +84,16 @@ class Sm70Config(BaseModel):
     in sm70_moe.py:16-71. No override applies.
     Kill: VLLM_SM70_FP8_MOE_DECODE=0."""
 
+    fp8_moe_compact_decode: bool = True
+    """Within the fp8_moe_decode route (M==1): the fork's legacy compact op,
+    one fused ``fp8_moe_single_token_sm70_out`` launch with exact_layout
+    (FORK fp8_sm70_moe.py:547-554; frozen as CONSTANTS FP8_MOE_LEGACY_COMPACT,
+    FP8_MOE_COMPACT_EXACT_LAYOUT, FP8_MOE_COMPACT_NATIVE_UNPERMUTE and
+    FP8_MOE_COMPACT_DECOMPOSED below). Off: the decomposed single-token plan
+    (active-expert W13, SiLU*up, indexed W2, unpermute). It has no effect
+    when fp8_moe_decode is off (batched only).
+    Kill: VLLM_SM70_FP8_MOE_COMPACT_DECODE=0."""
+
     flint_qk_rope_kv: bool = True
     """Flint fused q/k RMSNorm + RoPE + FP16 paged KV-cache write (one kernel).
     Gates: SM70, FP16 default dtype, FP16 KV (kv_cache_dtype auto), and the
@@ -126,6 +136,7 @@ GRAPH_FIELDS: tuple[str, ...] = (
     "dflash2_verifier",
     "flint_moe_qpn_decode",
     "fp8_moe_decode",
+    "fp8_moe_compact_decode",
     "nvfp4_gemv",
     "shared_moe_overlap",
 )
@@ -140,6 +151,7 @@ KILL_SWITCHES: dict[str, tuple[str, Any]] = {
     "VLLM_SM70_MODELOPT_NVFP4_GEMV": ("nvfp4_gemv", False),
     "VLLM_SM70_FLINT_MOE_QPN_DECODE": ("flint_moe_qpn_decode", False),
     "VLLM_SM70_FP8_MOE_DECODE": ("fp8_moe_decode", False),
+    "VLLM_SM70_FP8_MOE_COMPACT_DECODE": ("fp8_moe_compact_decode", False),
     "VLLM_SM70_FLINT_QK_ROPE_KV": ("flint_qk_rope_kv", False),
     "VLLM_SM70_FP8_QPN8": ("fp8_qpn8", False),
     "VLLM_SM70_DFLASH2_VERIFIER": ("dflash2_verifier", "off"),

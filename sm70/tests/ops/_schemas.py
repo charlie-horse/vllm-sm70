@@ -26,13 +26,15 @@ def _block_end(text: str, start: int) -> int:
     raise ValueError("unbalanced registration block")
 
 
-def sm70_schemas(awq: bool = True) -> dict[str, str]:
+def sm70_schemas(awq: bool = True, area: str | None = None) -> dict[str, str]:
     """{op name: schema} for every m.def in a TORCH_LIBRARY*(_sm70_C) block.
 
     With awq=False, defs inside `#ifdef VLLM_SM70_TM_AWQ` are left out.
+    With area="turbomind" (or "gdn", ...), only csrc/<area>/ is read.
     """
     out: dict[str, str] = {}
-    for path in sorted(CSRC.rglob("*")):
+    root = CSRC if area is None else CSRC / area
+    for path in sorted(root.rglob("*")):
         if path.suffix not in (".cu", ".cpp", ".cc") or path.name in SKIP_FILES:
             continue
         text = path.read_text()

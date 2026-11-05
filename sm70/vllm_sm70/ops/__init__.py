@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 custom ops: Python wrappers and fake impls over torch.ops._sm70_C (K02+)."""
+"""SM70 custom ops: Python wrappers and fake impls over torch.ops._sm70_C.
+
+K02/K03: TurboMind (tm.py). K05: Flash-V100 attention (fv100.py).
+"""
 
 import logging
 
@@ -33,3 +36,4 @@ def register() -> None:
         logger.debug("vllm_sm70.ops: _sm70_C not loaded; TurboMind ops skipped")
         return
     from vllm_sm70.ops import tm  # noqa: F401  (registers the fakes)
+    from vllm_sm70.ops import fv100  # noqa: F401  (K05: Flash-V100 fakes)

@@ -361,6 +361,42 @@ def test_non_flint_shape_uses_gemm(nvl, mock_tm):
     assert tm.calls == [("gemm", 1)]
 
 
+@pytest.mark.parametrize("has_gemv", [False, True])
+def test_gemv_decision_with_real_c4130_meta(nvl, monkeypatch, has_gemv):
+    """Reproduces the c4130 f31b6aa decision for the Flint TP2 "o" shape
+    (K=N=2048, in MODELOPT_NVFP4_GEMV_SHAPES, FORK sm70_turbomind.py:569-579)
+    with the meta Kai's real nvfp4_sm70_prepare returned there: k_ld=65536
+    (=32*K) and q_ld=2048 (=N), with fp16 scales and the default config. Every
+    admission check passes except the op probe, so the GEMV is selected only
+    when K11's nvfp4_tm_gemv_dispatch_sm70_out is registered."""
+    monkeypatch.delenv("VLLM_SM70_MODELOPT_NVFP4_GEMV", raising=False)
+    k = n = 2048
+    state = nvl.SM70TurboMindLinearState(
+        weight=torch.zeros((k, n // 8), dtype=torch.int32),
+        scales=torch.full((k // 16, n), 2.0**-10, dtype=torch.float16),
+        group_size=16,
+        k_ld=65536,
+        q_ld=2048,
+        output_size=n,
+        padded_output_size=n,
+    )
+    method = nvl.ModelOptNvFp4Sm70LinearMethod(_quant_config(), "o_proj")
+    assert method.gemv_enabled is True  # the sm70_config gate is open
+    assert (k, n) in nvl.MODELOPT_NVFP4_GEMV_SHAPES
+    probed = []
+
+    def has_tm_op(op):
+        probed.append(op)
+        return has_gemv or op != nvl.GEMV_OP
+
+    monkeypatch.setattr(nvl, "has_tm_op", has_tm_op)
+    admitted = nvl.admit_modelopt_nvfp4_gemv(state, enabled=method.gemv_enabled)
+    assert probed == [nvl.GEMV_OP]  # reached the last check: only the op decides
+    assert admitted is has_gemv and state.tm_gemv is has_gemv
+    assert state.provider == (nvl.GEMV_OP if has_gemv else nvl.GEMM_OP)
+    assert state.tm_gemv_scale_shift == 14
+
+
 def test_scale_shift(nvl):
     assert nvl._tm_gemv_scale_shift(torch.tensor([1.0]).half()) == 14
     assert nvl._tm_gemv_scale_shift(torch.tensor([8.0]).half()) == 12
@@ -548,9 +584,29 @@ def _gpu_ready() -> bool:
     return True
 
 
+# Boolean, not a string: a string condition is evaluated in the decorated
+# function's globals, which are torch's when @torch.inference_mode() wraps it.
 needs_sm70 = pytest.mark.skipif(
-    "not _gpu_ready()", reason="needs an SM70 GPU and vllm_sm70.ops"
+    not _gpu_ready(), reason="needs an SM70 GPU and vllm_sm70.ops"
 )
+
+
+def _has_k11_gemv() -> bool:
+    try:
+        from vllm_sm70.ops import tm
+    except ImportError:
+        return False
+    return tm.has_op("nvfp4_tm_gemv_dispatch_sm70_out")
+
+
+# K11 (Phase 4) ships the GEMV op; main's K03 build does not
+# (sm70/csrc/turbomind/PROVENANCE.md:258). Without it, admission refuses the
+# layer and the GEMM serves every M, which is correct behaviour.
+needs_k11_gemv = pytest.mark.skipif(
+    not _has_k11_gemv(),
+    reason="needs _sm70_C::nvfp4_tm_gemv_dispatch_sm70_out (K11, not in K03)",
+)
+
 
 # Flint TP2 per-rank (K, N), FORK sm70_turbomind.py:567-579
 FLINT_SHAPES = [
@@ -597,6 +653,7 @@ def test_gpu_matches_reference(nvl, monkeypatch, k, n, m, gemv):
 
 @pytest.mark.gpu
 @needs_sm70
+@needs_k11_gemv
 @pytest.mark.parametrize("k, n", FLINT_SHAPES)
 @pytest.mark.parametrize("m", [1, 2])
 def test_gpu_gemv_equals_gemm(nvl, monkeypatch, k, n, m):
@@ -609,23 +666,40 @@ def test_gpu_gemv_equals_gemm(nvl, monkeypatch, k, n, m):
     torch.testing.assert_close(y1, y2, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.gpu
-@needs_sm70
-@torch.inference_mode()
-def test_strided_activation_rows(nvl, monkeypatch):
+def _check_strided_rows(nvl, monkeypatch, gemv: bool) -> None:
     """Port of FORK cf9492a tests/kernels/quantization/
     test_sm70_nvfp4_tm_gemv.py:157-165. A row-strided (non-contiguous) M=2
-    activation on the Flint "o" shape, which takes the GEMV, must give exactly
-    the result of its contiguous copy. flatten_linear_input passes 2-D views
-    through unchanged, so the op sees the row stride."""
-    method, layer, _ = _gpu_prepared(nvl, 2048, 2048, 1, monkeypatch)
-    assert getattr(layer, nvl.STATE_ATTR).tm_gemv
+    activation on the Flint "o" shape (K=N=2048, one of the six admitted
+    shapes, FORK sm70_turbomind.py:569-579) must give exactly the result of
+    its contiguous copy. flatten_linear_input passes 2-D views through
+    unchanged, so the op sees the row stride."""
+    method, layer, _ = _gpu_prepared(nvl, 2048, 2048, 1, monkeypatch, gemv=gemv)
+    assert (2048, 2048) in nvl.MODELOPT_NVFP4_GEMV_SHAPES
+    assert getattr(layer, nvl.STATE_ATTR).tm_gemv is gemv
     k = 2048
     wide = torch.randn(2, k + 64, device="cuda").half()
     strided = wide[:, :k]
     assert not strided.is_contiguous()
     out = method.apply(layer, strided)
     assert torch.equal(out, method.apply(layer, strided.clone()))
+
+
+@pytest.mark.gpu
+@needs_sm70
+@torch.inference_mode()
+def test_strided_activation_rows_gemm(nvl, monkeypatch):
+    """Strided rows on the TurboMind GEMM path (GEMV killed). Always runs."""
+    _check_strided_rows(nvl, monkeypatch, gemv=False)
+
+
+@pytest.mark.gpu
+@needs_sm70
+@needs_k11_gemv
+@torch.inference_mode()
+def test_strided_activation_rows(nvl, monkeypatch):
+    """Strided rows on the M<=2 GEMV. Skips without K11's op, as the fork's
+    test did (FORK test_sm70_nvfp4_tm_gemv.py:29-37, ``_requires_gemv``)."""
+    _check_strided_rows(nvl, monkeypatch, gemv=True)
 
 
 @pytest.mark.gpu
