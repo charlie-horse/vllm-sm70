@@ -28,7 +28,6 @@ The whole carry against upstream is these patches:
 | U3 | ~30 | `fused_moe/runner/moe_runner.py` ~:630, :907 |
 | U4 | ~60 | `v1/worker/gpu_model_runner.py` :3403, :4208 |
 | U5 | ~330 | `csrc/custom_all_reduce.cu`, `csrc/torch_bindings.cpp`, `custom_all_reduce.py`, `cuda_communicator.py` |
-| U6 (opt) | ~10 | `models/qwen3_dflash2.py` `get_layer_cls` hook, only if the M7 subclass route fails |
 | **total** | **~110 without U5; ~440 with it** | |
 
 ## Phase 1: unpatched build
@@ -51,7 +50,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 | U2 | 0 | Volta launch schedule for FLA recurrent GDN | Kai | – | `VLLM_SM70_FLA_RECURRENT_SCHED=0` | GPU: upstream GDN tests pass on sm70 |
 | K02 | 1 | Vendored TurboMind GEMM core (lean lmdeploy, ~20K) | Kai | K01 | required | builds for sm_70 only; PROVENANCE sha256 matches the fork (cf9492a) |
 | M2 | 1 | `Sm70Fp8Config` / `Sm70ModelOptNvFp4Config` registered over `"fp8"` / `"modelopt_fp4"` (PR #9) | Mara | K01 | `VLLM_SM70_QUANT=0` (upstream classes, which refuse on sm70) | CPU, mocked cc: gate is 70 at cc 7.0 with `_sm70_C`, 75 without; identical to upstream at cc 8.0; registry identity asserted in `register()`; real Flint (nested ModelOpt W4A16_NVFP4) and Qwen fp8 block-128 configs pass the upstream capability check (`config/vllm.py:926-936`) |
-| M7 | 1 | DFlash2 draft: BF16-range emulation in fp16, as a `DFlash2DraftModel` subclass registered by the plugin (U6 is the fallback) | Mara | M1 | `VLLM_SM70_DFLASH2_EMULATION=0` | GPU: draft forward in fp16 has no inf/NaN (plain cuBLAS fp16). Acceptance-rate e2e runs after M6 |
+| M7 | 1 | DFlash2 draft: BF16-range emulation in fp16, as a `DFlash2DraftModel` subclass re-registered by the plugin, using upstream's `model_cls` / `decoder_layer_cls` factory hooks (`qwen3_dflash.py:737`, `:388`); no upstream edit | Mara | M1 | `VLLM_SM70_DFLASH2_EMULATION=0` | GPU: draft forward in fp16 has no inf/NaN (plain cuBLAS fp16). Acceptance-rate e2e runs after M6 |
 | K03 | 2 | TurboMind fp16/FP8/NVFP4 dense + MoE ops (~5.8K), `vllm_sm70/ops.py` | Kai | K02, U1 | `VLLM_SM70_TURBOMIND=0` (fp16 path only) | GPU: TM fp16/FP8-block/NVFP4 GEMM vs `torch.matmul` on dequantized weights, max-abs-rel < 1e-2 at M ∈ {1,2,8,64,512}, N/K from the Flint and Qwen shapes; MoE vs a reference loop; the fork tests in the carry map pass |
 | M3 | 3 | NVFP4 dense linear → TurboMind GEMM, via the plugin's `LINEAR_METHOD_BUILDERS` entry; the M≤2 GEMV is wired only if K11's op is present. Must handle or refuse online `--quantization fp8`, which M2's lowered gate admits on sm70 | Mara | M2, K03 | `VLLM_SM70_MODELOPT_NVFP4_GEMV=0` (GEMM only) | GPU: layer output vs dequantized fp16 reference |
 | M4 | 4 | NVFP4 MoE → TurboMind MoE via `FusedMoEMethodCls`; the decode fast path is wired only if K12's op is present | Mara | M3, K03 | `VLLM_SM70_FLINT_MOE_QPN_DECODE=0` | GPU: MoE block vs reference |
@@ -111,7 +110,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 
 1. 0001–0099 build: none. FetchContent is fed by Nix.
 2. 0100–0199 platform: U1, U2, U3, U4, then U5 last.
-3. 0500–0699 models: none, except U6 if the M7 subclass route fails.
+3. 0500–0699 models: none. The M7 subclass route works without a patch.
 4. 0700–0799 kv: none.
 
 ## Settled
