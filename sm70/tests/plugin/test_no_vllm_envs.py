@@ -14,6 +14,7 @@ def test_names_and_sections():
     assert "VLLM_SM70_PLUGIN_DEBUG" in names
     assert all(n.startswith("VLLM_SM70_") for n in names)
     assert list(envs._SECTIONS) == [
+        "build",
         "core",
         "ops",
         "attention",
@@ -64,3 +65,28 @@ def test_import_pulls_in_no_vllm():
         "assert not bad, bad"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_every_referenced_var_is_registered():
+    """Every VLLM_SM70_* name used by the build or the package is registered.
+
+    vLLM's validate_environ rejects unregistered VLLM_* vars that are set at
+    runtime, so a var read only by setup.py or CMake must still be registered
+    (as an inert build-time entry).
+    """
+    import pathlib
+    import re
+
+    from vllm_sm70 import envs
+
+    root = pathlib.Path(__file__).resolve().parents[2]  # sm70/
+    sources = [root / "setup.py", root / "CMakeLists.txt"]
+    sources += sorted((root / "vllm_sm70").rglob("*.py"))
+    sources += sorted((root / "csrc").rglob("*.cmake"))
+    pattern = re.compile(r"VLLM_SM70_[A-Z0-9_]+")
+    referenced = set()
+    for path in sources:
+        if path.is_file():
+            referenced |= set(pattern.findall(path.read_text()))
+    missing = sorted(referenced - set(envs.environment_variables()))
+    assert not missing, f"unregistered VLLM_SM70_* vars: {missing}"

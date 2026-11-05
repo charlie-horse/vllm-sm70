@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """register(): idempotent, works without _sm70_C, merges env vars into vllm."""
 
+import os
+
 import pytest
 from conftest import requires_vllm
 
@@ -56,6 +58,10 @@ def test_env_merge_and_validate_environ(fresh_plugin, no_ext, monkeypatch):
     import vllm_sm70
     from vllm_sm70 import envs
 
+    # Hermetic: CI and dev shells export build-time VLLM_SM70_* vars
+    # (e.g. VLLM_SM70_SKIP_EXT=1). Clear them so the only unknown var is ours.
+    for key in [k for k in os.environ if k.startswith("VLLM_SM70_")]:
+        monkeypatch.delenv(key)
     monkeypatch.setenv("VLLM_SM70_PLUGIN_DEBUG", "1")
     for name in envs.environment_variables():
         monkeypatch.delitem(vllm_envs.environment_variables, name, raising=False)
