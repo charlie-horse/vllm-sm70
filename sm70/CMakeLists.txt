@@ -113,6 +113,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
 endif()
 
+# Hook for K17 (TP2 all-reduce + RMSNorm). Same contract; needs
+# $ENV{VLLM_SM70_VLLM_CSRC_DIR} (vLLM's csrc headers) for its one source.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+endif()
+
 if(SM70_CUDA_SRCS AND NOT (SM70_HAS_CUDA AND SM70_ARCHS))
   message(FATAL_ERROR "vllm_sm70: CUDA sources listed but no CUDA/sm_70 toolchain")
 endif()
