@@ -97,6 +97,11 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_DFLASH2_VERIFIER` | new |
 | `VLLM_SM70_SHARED_MOE_OVERLAP` | new |
 
+To turn the whole plugin off, set `VLLM_PLUGINS` to a comma-separated list
+that leaves out `sm70`. vLLM then loads neither entry point
+(`vllm.general_plugins` and `vllm.platform_plugins`, both named `sm70`), and
+none of the switches above apply. Unset, vLLM loads every installed plugin.
+
 ## Host use
 
 ```nix
