@@ -86,10 +86,13 @@ def all_visible_gpus_are_sm70() -> bool:
     return bool(caps) and all(c == SM70_CAPABILITY for c in caps)
 
 
+
 def activate() -> str | None:
     """vllm.platform_plugins entry point."""
     if all_visible_gpus_are_sm70():
+        logger.info("vllm_sm70: platform plugin active -> %s", PLATFORM_QUALNAME)
         return PLATFORM_QUALNAME
+    logger.info("vllm_sm70: platform plugin inactive (not every visible GPU is cc 7.0)")
     return None
 
 

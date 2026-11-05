@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+torch = pytest.importorskip("torch")  # before _ref, which imports torch
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _ref import (  # noqa: E402
     fp8_block_dequant,
@@ -26,7 +28,6 @@ from _ref import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.gpu
-torch = pytest.importorskip("torch")
 
 MiB = 1024**2
 # Barriers + tensormaps + flags per stream workspace (fork test, same layout).
@@ -121,6 +122,8 @@ def test_runtime_close_is_idempotent_and_ops_recover(tm_gpu):
     assert max_abs_rel(out, reference(x)) < 1e-2
 
 
+# close() raises before anything is captured, so torch warns the graph is empty.
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
 def test_runtime_close_refuses_capture(tm_gpu):
     tm = tm_gpu
     run, _ = _nvfp4(tm, 1024, 2048)
