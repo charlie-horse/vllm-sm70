@@ -7,24 +7,31 @@ What: ``Fp8Sm70MoEMethod``, a direct-apply MoE method on M4's shared base
   :530-668: w13/w2 e4m3, w13/w2_weight_scale_inv fp32 [E, N/128, K/128]).
   ``process_weights_after_loading`` repacks every expert with
   ``tm.fp8_sm70_prepare`` and builds the strided pointer tables.
-  ``apply`` has two routes:
+  ``apply`` has three routes:
   - batched (any M): UP moe_permute_with_scratch, then TurboMind
     ``fp8_moe_gemm_sm70_out`` for W13, UP silu_and_mul, the W2 batched GEMM,
     and UP moe_unpermute;
-  - single-token decode (M == 1, ``Sm70Config.fp8_moe_decode``): the
-    active-expert W13 op (``fp8_moe_single_token_dense_w13_sm70_out``, which
-    builds its own routing), SiLU*up, the indexed W2 stage and moe_unpermute.
+  - compact decode (M == 1, the default): the fork's legacy compact route,
+    one fused ``fp8_moe_single_token_sm70_out`` launch with exact_layout
+    (FORK fp8_sm70_moe.py:547-554, fork defaults envs.py:8858/9138 and
+    sm70_moe.py:344-347, frozen in M1's CONSTANTS);
+  - decomposed decode (M == 1, compact killed): the active-expert W13 op
+    (``fp8_moe_single_token_dense_w13_sm70_out``, which builds its own slot
+    order), SiLU*up, the indexed W2 stage and moe_unpermute.
   The output is the local, un-reduced [M, H] fp16; the runner all-reduces.
   ``Sm70Fp8Config.get_quant_method`` (quant/configs.py) returns it for routed
   experts when ``is_sm70_ready()``.
 Why: UP's FP8 MoE oracle has no cc 7.0 backend. Ported from FORK cf9492a
   quantization/fp8_sm70_moe.py:100-649 (Fp8SM70MoEMethod) with
   fused_moe/sm70/stages.py:18-196 and single_token.py:19-151. Dropped: the
-  compact-compare diagnostics (:348-398), the legacy single-token compact
-  route (:399-520), the per-expert-dispatch and chunked W2 variants, the
+  compact-compare diagnostics (:348-398), the compact route's decomposed
+  and top-k-descriptor variants (:420-444; CONSTANTS FP8_MOE_COMPACT_
+  DECOMPOSED is False and exact layout is True), the per-expert-dispatch and chunked W2 variants, the
   non-block (per-tensor) checkpoints, and the dequant-to-FP16 fallback.
 Kill-switch: ``VLLM_SM70_FP8_MOE_DECODE=0`` (``Sm70Config.fp8_moe_decode``)
-  turns off the single-token route; the batched route then serves M == 1.
+  turns off both single-token routes; the batched route then serves M == 1.
+  ``VLLM_SM70_FP8_MOE_COMPACT_DECODE=0`` (``Sm70Config.fp8_moe_compact_
+  decode``) swaps the compact op for the decomposed plan.
   ``VLLM_SM70_FP8_TURBOMIND=0`` refuses FP8 on SM70 altogether (M2 gate),
   and get_quant_method then never builds this class.
 """
@@ -42,7 +49,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_sm70.config import sm70_config
+from vllm_sm70.config import CONSTANTS, sm70_config
 from vllm_sm70.fused_moe import method as moe_rt
 from vllm_sm70.fused_moe.method import (
     Sm70MoEMethodBase,
@@ -67,6 +74,12 @@ REQUIRED_OPS: Final = (
 )
 DECODE_W13_OP: Final = "fp8_moe_single_token_dense_w13_sm70_out"
 DECODE_W2_OP: Final = "fp8_moe_single_token_indexed_dense_stage_sm70_out"
+COMPACT_OP: Final = "fp8_moe_single_token_sm70_out"
+# Frozen fork values (M1 CONSTANTS; FORK config/sm70_moe.py:344-349).
+COMPACT_EXACT_LAYOUT: Final = bool(CONSTANTS["FP8_MOE_COMPACT_EXACT_LAYOUT"])
+COMPACT_NATIVE_UNPERMUTE: Final = bool(CONSTANTS["FP8_MOE_COMPACT_NATIVE_UNPERMUTE"])
+if not CONSTANTS["FP8_MOE_LEGACY_COMPACT"] or CONSTANTS["FP8_MOE_COMPACT_DECOMPOSED"]:
+    raise AssertionError("M6 ports only the legacy compact op (not decomposed).")
 
 
 def decode_policy_enabled(vllm_config: Any = None) -> bool:
@@ -76,6 +89,15 @@ def decode_policy_enabled(vllm_config: Any = None) -> bool:
 
         vllm_config = get_current_vllm_config_or_none()
     return bool(sm70_config(vllm_config).fp8_moe_decode)
+
+
+def compact_policy_enabled(vllm_config: Any = None) -> bool:
+    """Sm70Config.fp8_moe_compact_decode after VLLM_SM70_FP8_MOE_COMPACT_DECODE=0."""
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+    return bool(sm70_config(vllm_config).fp8_moe_compact_decode)
 
 
 class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
@@ -98,6 +120,7 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         self.block_quant = True
         self.weight_scale_name = "weight_scale_inv"
         self.decode_enabled = decode_policy_enabled()
+        self.compact_enabled = compact_policy_enabled()
 
     def create_weights(
         self,
@@ -226,9 +249,16 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         layer.sm70_hidden_size = hidden
         layer.sm70_intermediate_size = intermediate
         layer.sm70_top_k = top_k
+        # Precedence: fp8_moe_decode off -> batched only; else compact (if
+        # its switch and op are on), else the decomposed plan (if its ops are).
+        layer.sm70_fp8_moe_compact = bool(
+            self.decode_enabled and self.compact_enabled and has_tm_op(COMPACT_OP)
+        )
         layer.sm70_fp8_moe_decode = bool(
             self.decode_enabled and has_tm_op(DECODE_W13_OP) and has_tm_op(DECODE_W2_OP)
         )
+        if layer.sm70_fp8_moe_compact:
+            self._allocate_compact_buffers(layer, top_k)
         layer.sm70_moe_workspace = Sm70MoEWorkspace.get(
             WorkspaceKey(
                 device=str(layer.w13_tm_weight.device),
@@ -284,6 +314,10 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         buffers = layer.sm70_moe_workspace.views(num_tokens)
         output = torch.zeros((num_tokens, hidden), dtype=x.dtype, device=x.device)
 
+        if num_tokens == 1 and layer.sm70_fp8_moe_compact:
+            return self._apply_compact(
+                layer, x, topk_weights, topk_ids, buffers, output
+            )
         if num_tokens == 1 and layer.sm70_fp8_moe_decode:
             return self._apply_single_token(
                 layer, x, topk_weights, topk_ids, buffers, output
@@ -318,11 +352,112 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         return moe_rt.unpermute(buffers, topk_weights, output)
 
     @staticmethod
+    def _allocate_compact_buffers(layer: Any, top_k: int) -> None:
+        """Per-layer scratch of the compact op (top_k rows of pointer descriptors).
+
+        ported from FORK fused_moe/sm70/workspace.py:75-126 (single-token part)
+        and fp8_sm70_moe.py:274-289 (pointer rows).
+        """
+        dev = layer.w13_tm_weight.device
+        row = int(layer.w13_strided_ptrs_w.numel() // layer.sm70_num_experts)
+        layer.sm70_fp8_ptr_rows = {
+            name: getattr(layer, name).view(layer.sm70_num_experts, row)
+            for name in (
+                "w13_strided_ptrs_w",
+                "w13_strided_ptrs_s",
+                "w2_strided_ptrs_w",
+                "w2_strided_ptrs_s",
+            )
+        }
+        ptr_dtype = layer.w13_strided_ptrs_w.dtype
+        layer.sm70_fp8_compact = {
+            "sorted_weights": torch.empty(top_k, dtype=torch.float32, device=dev),
+            "broadcast_input_indices": torch.empty(
+                top_k, dtype=torch.int32, device=dev
+            ),
+            **{
+                f"legacy_{s}_ptrs_{t}": torch.empty(
+                    top_k, row, dtype=ptr_dtype, device=dev
+                )
+                for s in ("w13", "w2")
+                for t in ("w", "s")
+            },
+            "empty_weight": torch.empty(0, dtype=torch.float8_e4m3fn, device=dev),
+            "empty_scale": torch.empty(0, dtype=torch.float32, device=dev),
+        }
+
+    @staticmethod
+    def _apply_compact(layer, x, topk_weights, topk_ids, buffers, output):
+        """M == 1 default: one fused legacy compact launch, exact layout.
+
+        ported from FORK fp8_sm70_moe.py:399-410 and :447-490 (exact layout,
+        no fused SiLU/reduce/broadcast/direct-reduce/indexed pointers), with
+        the optional native unpermute at :491-500 (off per CONSTANTS).
+        """
+        top_k = int(layer.sm70_top_k)
+        rows = layer.sm70_fp8_ptr_rows
+        c = layer.sm70_fp8_compact
+        ids = moe_rt.int32_topk_ids(buffers, topk_ids)
+        _tm().fp8_moe_single_token_sm70_out(
+            output,
+            x,
+            topk_weights,
+            ids,
+            rows["w13_strided_ptrs_w"],
+            rows["w13_strided_ptrs_s"],
+            rows["w2_strided_ptrs_w"],
+            rows["w2_strided_ptrs_s"],
+            buffers["permuted_input"],
+            buffers["gate_up"],
+            buffers["intermediate"],
+            buffers["sorted_output"],
+            c["sorted_weights"],
+            c["legacy_w13_ptrs_w"],
+            c["legacy_w13_ptrs_s"],
+            c["legacy_w2_ptrs_w"],
+            c["legacy_w2_ptrs_s"],
+            buffers["expert_offsets"],
+            buffers["scatter_idx"],
+            buffers["sorted_experts"].view(-1)[:top_k],
+            c["broadcast_input_indices"],
+            c["empty_weight"],
+            c["empty_scale"],
+            int(layer.sm70_hidden_size),
+            2 * int(layer.sm70_intermediate_size),
+            int(layer.sm70_intermediate_size),
+            int(layer.sm70_hidden_size),
+            FP8_BLOCK,
+            int(layer.sm70_hidden_size),
+            False,  # fused_gated_silu
+            False,  # fused_weighted_reduce
+            False,  # broadcast_input
+            False,  # w2_direct_reduce
+            False,  # indexed_expert_ptrs
+            COMPACT_EXACT_LAYOUT,  # exact_per_route
+        )
+        if COMPACT_NATIVE_UNPERMUTE:
+            output.zero_()
+            moe_rt.OPS.unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["scatter_idx"],
+                None,
+                top_k,
+                output,
+            )
+        return output
+
+    @staticmethod
     def _apply_single_token(layer, x, topk_weights, topk_ids, buffers, output):
-        """M == 1: active-expert W13 (builds its own routing), indexed W2.
+        """M == 1 decomposed plan: active-expert W13 (builds its own slot
+        order), SiLU*up, indexed W2, moe_unpermute.
 
         ported from FORK single_token.py:19-151 with plan w13="active_dense",
-        w2="indexed", reduce="unpermute" (the cf9492a effective defaults).
+        w2="indexed". The fork's effective single-token reduce was the native
+        weighted reduce (M1 CONSTANTS MOE_SINGLE_TOKEN_REDUCE="weighted",
+        awq_moe_single_token_weighted_reduce_out); this fallback uses UP
+        moe_unpermute for the same weighted sum. It only runs with
+        VLLM_SM70_FP8_MOE_COMPACT_DECODE=0; the compact op is the default.
         """
         tm = _tm()
         top_k = int(layer.sm70_top_k)

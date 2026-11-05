@@ -61,7 +61,7 @@ def _tm_dequant(w, s):
     ).float().cpu() * s.float().cpu().repeat_interleave(B, dim=0)
 
 
-def make_mock_tm(single_token=True):
+def make_mock_tm(single_token=True, compact=True):
     tm = types.ModuleType("vllm_sm70.ops.tm")
     tm.calls = []
     tm.banks = {}
@@ -121,6 +121,28 @@ def make_mock_tm(single_token=True):
     if single_token:
         tm.fp8_moe_single_token_dense_w13_sm70_out = single_w13
         tm.fp8_moe_single_token_indexed_dense_stage_sm70_out = single_w2
+    if compact:
+
+        def single_compact(out, x, weights, ids, w13w, w13s, w2w, w2s, *rest):
+            # rest: compact_input, gate_up, intermediate, sorted_output,
+            # sorted_weights, 4 dst ptr rows, expert_offsets, inv, sorted ids,
+            # broadcast idx, w2 raw weight/scale, w13_k, w13_n, w2_k, w2_n,
+            # group, hidden, 5 flags, exact_per_route (K03 tm.py signature).
+            assert len(rest) == 27
+            dims, flags = rest[15:21], rest[21:]
+            tm.calls.append(("compact", dims, flags))
+            assert ids.dtype == torch.int32 and weights.dtype == torch.float32
+            assert w13w.dim() == 2 and w13w.shape[0] == w2w.shape[0]  # ptr rows
+            inter = dims[2]
+            acc = torch.zeros(out.shape[1])
+            for kk, e in enumerate(ids[0].tolist()):
+                gu = x[0].float() @ _w(w13w.view(-1), e)
+                act = (F.silu(gu[:inter]) * gu[inter:]).half().float()
+                y = (act @ _w(w2w.view(-1), e)).half().float()
+                acc += float(weights[0, kk]) * y
+            out[0] = acc.to(out.dtype)
+
+        tm.fp8_moe_single_token_sm70_out = single_compact
     tm.has_op = lambda name: callable(getattr(tm, name, None))
     return tm
 
@@ -164,7 +186,11 @@ class TorchMoeOps:
 # --------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    for name in ("VLLM_SM70_FP8_TURBOMIND", "VLLM_SM70_FP8_MOE_DECODE"):
+    for name in (
+        "VLLM_SM70_FP8_TURBOMIND",
+        "VLLM_SM70_FP8_MOE_DECODE",
+        "VLLM_SM70_FP8_MOE_COMPACT_DECODE",
+    ):
         monkeypatch.delenv(name, raising=False)
     import vllm.model_executor.parameter as param_mod
 
@@ -182,8 +208,8 @@ def _env(monkeypatch):
 
 @pytest.fixture
 def mods(monkeypatch):
-    def _install(single_token=True):
-        tm = make_mock_tm(single_token)
+    def _install(single_token=True, compact=True):
+        tm = make_mock_tm(single_token, compact)
         ops = types.ModuleType("vllm_sm70.ops")
         ops.tm = tm
         monkeypatch.setitem(sys.modules, "vllm_sm70.ops", ops)
@@ -441,11 +467,14 @@ def test_moe_prepare_args(mods):
     )
 
 
-@pytest.mark.parametrize("decode", [True, False])
+@pytest.mark.parametrize("route", ["compact", "decomposed", "batched"])
 @pytest.mark.parametrize("m", [1, 2, 64])
-def test_moe_apply_matches_reference(mods, monkeypatch, m, decode):
-    if not decode:
+def test_moe_apply_matches_reference(mods, monkeypatch, m, route):
+    if route == "decomposed":
+        monkeypatch.setenv("VLLM_SM70_FP8_MOE_COMPACT_DECODE", "0")
+    if route == "batched":
         monkeypatch.setenv("VLLM_SM70_FP8_MOE_DECODE", "0")
+        monkeypatch.setenv("VLLM_SM70_FP8_MOE_COMPACT_DECODE", "1")  # decode=0 wins
     _, moe, tm = mods()
     method, layer, w = _build_moe(moe)
     x = (torch.randn(m, H, generator=torch.Generator().manual_seed(m)) * 0.5).half()
@@ -454,7 +483,12 @@ def test_moe_apply_matches_reference(mods, monkeypatch, m, decode):
     out = method.apply(layer, x, weights, ids, None, None)
     _close(out, _moe_reference(x, w, ids, weights))
     kinds = [c[0] for c in tm.calls]
-    if m == 1 and decode:
+    if m == 1 and route == "compact":
+        assert kinds == ["compact"]  # exactly one launch
+        _, dims, flags = tm.calls[0]
+        assert dims == (H, 2 * I, I, H, B, H)
+        assert flags == (False, False, False, False, False, True)  # exact_layout
+    elif m == 1 and route == "decomposed":
         assert kinds == ["st_w13", "st_w2"]
     else:
         assert kinds == ["moe_gemm", "moe_gemm"]
@@ -466,11 +500,31 @@ def test_moe_decode_off_without_ops(mods):
     assert not layer.sm70_fp8_moe_decode
 
 
+def test_moe_compact_off_without_op(mods):
+    _, moe, tm = mods(compact=False)
+    method, layer, w = _build_moe(moe)
+    assert not layer.sm70_fp8_moe_compact and layer.sm70_fp8_moe_decode
+    weights, ids = _routing(1)
+    x = torch.randn(1, H).half()
+    tm.calls.clear()
+    method.apply(layer, x, weights, ids, None, None)
+    assert [c[0] for c in tm.calls] == ["st_w13", "st_w2"]
+
+
+def test_moe_compact_kill_switch(mods, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FP8_MOE_COMPACT_DECODE", "0")
+    _, moe, _ = mods()
+    _, layer, _ = _build_moe(moe)
+    assert not layer.sm70_fp8_moe_compact and layer.sm70_fp8_moe_decode
+    assert not moe.compact_policy_enabled() and moe.decode_policy_enabled()
+
+
 def test_moe_decode_kill_switch(mods, monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_MOE_DECODE", "0")
     _, moe, _ = mods()
     _, layer, _ = _build_moe(moe)
     assert not layer.sm70_fp8_moe_decode and not moe.decode_policy_enabled()
+    assert not layer.sm70_fp8_moe_compact  # decode=0 also disables compact
 
 
 # --------------------------------------------------------------------------
