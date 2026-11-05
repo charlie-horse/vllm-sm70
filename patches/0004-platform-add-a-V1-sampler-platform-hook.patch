@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 11:53:34 +0000
+Subject: [PATCH] platform: add a V1 sampler platform hook
+
+What: Adds Platform.get_sampler(logprobs_mode, use_fp64_gumbel) (default
+  None); GPUModelRunner uses the returned sampler and falls back to the
+  upstream Sampler when it is None.
+Why: Out-of-tree platforms (the vllm-sm70 plugin) need to swap in a
+  Volta top-k candidate sampler (Flint sampler, K16) for the V1 runner;
+  the sampler is built only at vllm/v1/worker/gpu_model_runner.py:563.
+Upstream-files: vllm/platforms/interface.py, vllm/v1/worker/gpu_model_runner.py
+Kill-switch: hook returns None -> upstream (no plugin, or VLLM_SM70_FLINT_SAMPLER=0)
+Tests: sm70/tests/plugin/test_u4_sampler_hook.py
+Upstream-status: candidate
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmUQtD6qJskP867jP1x
+
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 31b35de88f45..24a3088ddf38 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1218,6 +1218,11 @@ class Platform:
+         for upstream."""
+         return None
+ 
++    @classmethod
++    def get_sampler(cls, logprobs_mode: str, use_fp64_gumbel: bool) -> Any:
++        """Return a platform V1 Sampler, or None for upstream."""
++        return None
++
+     @classmethod
+     def get_punica_wrapper(cls) -> str:
+         """Return the punica wrapper for current platform."""
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index ac3ff3b65865..556481724e36 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -560,7 +560,10 @@ class GPUModelRunner(
+         self._pp_recv_work: torch.distributed.Work | None = None
+ 
+         # Sampler
+-        self.sampler = Sampler(
++        self.sampler = current_platform.get_sampler(
++            logprobs_mode=self.model_config.logprobs_mode,
++            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
++        ) or Sampler(
+             logprobs_mode=self.model_config.logprobs_mode,
+             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+         )
