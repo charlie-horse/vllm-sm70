@@ -4,6 +4,7 @@
 K02/K03: TurboMind (tm.py). K05: Flash-V100 attention (fv100.py).
 K12: Flint NVFP4 MoE M<=2 QPN decode (flint_moe.py).
 K18: DFlash2 draft FP16 M<=8 GEMM + compact FP16 top-64 (dflash2.py).
+K16: top-k candidate sampler (sampler.py).
 """
 
 import logging
@@ -42,3 +43,4 @@ def register() -> None:
     from vllm_sm70.ops import qpn8  # noqa: F401  (K09: QPN8 fakes + linear op)
     from vllm_sm70.ops import flint_moe  # noqa: F401  (K12: decode fakes)
     from vllm_sm70.ops import dflash2  # noqa: F401  (K18: DFlash2 fakes)
+    from vllm_sm70.ops import sampler  # noqa: F401  (K16: sampler fakes)
