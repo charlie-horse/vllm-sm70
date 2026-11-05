@@ -480,8 +480,12 @@ def verdict(res: dict) -> tuple[str, list[str]]:
             why.append(f"{k} {p.get(k, {}).get('correct')}<{need}")
     if p.get("gibberish", {}).get("flagged", 1) != 0:
         why.append(f"gibberish {p.get('gibberish', {}).get('flagged')} flagged")
-    if res.get("spec") and not (res.get("spec_decode", {}).get("overall", {}).get("drafts")):
-        why.append("no spec-decode drafts in /metrics")
+    if res.get("spec"):
+        overall = res.get("spec_decode", {}).get("overall", {})
+        if not overall.get("drafts"):
+            why.append("no spec-decode drafts in /metrics")
+        elif not overall.get("accepted_tokens"):
+            why.append("spec-decode drafts but 0 accepted tokens in /metrics")
     if res.get("error"):
         why.append(res["error"])
     if not res.get("gated", True):

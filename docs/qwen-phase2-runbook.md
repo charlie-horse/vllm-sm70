@@ -82,7 +82,7 @@ The probe sends greedy requests (temperature 0) with
 | needle | passphrase in ~31K tokens of filler (max-model-len − 768), depths 10/50/90 % | 3/3 |
 | gibberish | 20 parallel requests; flags empty output, U+FFFD, > 15 % non-ASCII, repeated 4-grams, long word/char runs | 0 flagged |
 | speed | single stream, ~4K-token prompt, 512 tokens (`ignore_eos`), median of 3 decode tok/s and TTFT | recorded only |
-| spec (rows 2/4) | deltas of `vllm:spec_decode_*` in `/metrics` per phase and overall: mean acceptance length (1 + accepted/drafts), acceptance rate, per-position rate | must show > 0 drafts; numbers recorded |
+| spec (rows 2/4) | deltas of `vllm:spec_decode_*` in `/metrics` per phase and overall: mean acceptance length (1 + accepted/drafts), acceptance rate, per-position rate | must show > 0 drafts and > 0 accepted tokens; numbers recorded |
 
 A row PASSes when every gate holds. `-noemu` rows are always INFO.
 

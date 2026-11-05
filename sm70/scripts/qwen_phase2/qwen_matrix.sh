@@ -77,8 +77,8 @@ run_row() {  # ROW  (runs in a subshell: its EXIT trap stops this row's server)
   local row="$1" tgt drf gated nokill
   read -r tgt drf gated nokill <<<"$(row_def "$row")"
   local dir="$OUT/row$row" spec=()
-  mkdir -p "$dir"
-  rm -f "$dir/results.json"
+  mkdir -p "$dir" || { qp2_log "row $row: cannot create $dir"; return 1; }
+  rm -f "$dir/results.json" || { qp2_log "row $row: cannot clear $dir/results.json"; return 1; }
   if [[ "$drf" != - ]]; then
     spec=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$QWEN_STAGE/$drf\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}")
   fi
@@ -92,7 +92,7 @@ run_row() {  # ROW  (runs in a subshell: its EXIT trap stops this row's server)
     printf 'env: CUDA_VISIBLE_DEVICES=0,1 VLLM_ATTENTION_BACKEND=%s %s\n' \
       "$VLLM_ATTENTION_BACKEND" "${kill_env[*]:-}"
     printf '%q ' "${cmd[@]}"; echo
-  } >"$dir/cmd.txt"
+  } >"$dir/cmd.txt" || { qp2_log "row $row: cannot write $dir/cmd.txt"; return 1; }
 
   local label="$tgt"
   [[ "$drf" != - ]] && label+=" + $drf"
@@ -119,7 +119,8 @@ run_row() {  # ROW  (runs in a subshell: its EXIT trap stops this row's server)
     sleep 5
   done
   qp2_log "row $row: healthy after $((SECONDS - t0))s; probing"
-  echo "startup_seconds=$((SECONDS - t0))" >>"$dir/cmd.txt"
+  echo "startup_seconds=$((SECONDS - t0))" >>"$dir/cmd.txt" \
+    || { qp2_log "row $row: cannot write $dir/cmd.txt"; return 1; }
   nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv >"$dir/nvidia-smi.csv" || true
 
   local probe=("$VLLM_PY" "$QP2_DIR/probe.py" run --url "$url" --model "$SERVED_NAME"
@@ -127,7 +128,9 @@ run_row() {  # ROW  (runs in a subshell: its EXIT trap stops this row's server)
   [[ "$drf" != - ]] && probe+=(--spec)
   [[ "$gated" == 0 ]] && probe+=(--no-gate)
   "${probe[@]}" 2>&1 | tee "$dir/probe.log"
-  return "${PIPESTATUS[0]}"
+  local st=("${PIPESTATUS[@]}")
+  (( st[1] == 0 )) || { qp2_log "row $row: cannot write $dir/probe.log"; return 1; }
+  return "${st[0]}"
 }
 
 # shellcheck disable=SC2329  # invoked via trap

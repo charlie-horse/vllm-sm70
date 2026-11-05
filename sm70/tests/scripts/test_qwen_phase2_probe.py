@@ -102,6 +102,11 @@ def test_verdict_gates():
     assert probe.verdict({"phases": phases, "gated": True})[0] == "PASS"
     spec = {"phases": phases, "gated": True, "spec": True, "spec_decode": {}}
     assert probe.verdict(spec)[0] == "FAIL"  # spec row with no drafts
+    zero_acc = dict(spec, spec_decode={"overall": {"drafts": 50, "accepted_tokens": 0}})
+    verdict, why = probe.verdict(zero_acc)
+    assert verdict == "FAIL" and any("0 accepted" in w for w in why)
+    ok_acc = dict(spec, spec_decode={"overall": {"drafts": 50, "accepted_tokens": 120}})
+    assert probe.verdict(ok_acc)[0] == "PASS"
     bad = dict(phases, math={"correct": 8, "total": 10})
     assert probe.verdict({"phases": bad, "gated": True})[0] == "FAIL"
     assert probe.verdict({"phases": bad, "gated": False})[0] == "INFO"
