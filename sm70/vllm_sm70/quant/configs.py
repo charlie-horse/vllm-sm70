@@ -59,6 +59,11 @@ def _min_capability(upstream: int) -> int:
     return SM70_MIN_CAPABILITY if sm70_platform.is_sm70_ready() else upstream
 
 
+def fp8_route_enabled() -> bool:
+    """M6 routing gate: SM70 ready and VLLM_SM70_FP8_TURBOMIND not "0"."""
+    return fp8_turbomind_enabled() and sm70_platform.is_sm70_ready()
+
+
 class Sm70Fp8Config(Fp8Config):
     """Upstream ``Fp8Config`` with the SM70 capability gate (Qwen FP8).
 
@@ -74,8 +79,40 @@ class Sm70Fp8Config(Fp8Config):
             return upstream
         return _min_capability(upstream)
 
-    # HOOK(M3/M4): get_quant_method override routing LinearBase/RoutedExperts
-    # to the SM70 FP8 linear and MoE methods goes here.
+    def get_quant_method(self, layer, prefix: str):
+        """M6: Qwen block-FP8 linears and routed experts -> SM70 TurboMind.
+
+        Only when is_sm70_ready() (K01) and VLLM_SM70_FP8_TURBOMIND is not 0.
+        Skipped layers (UP fp8.py:180-197, is_layer_skipped) and everything
+        else, including KV-cache methods, go to upstream. At TP outside
+        (1, 2) the MoE method raises instead of falling back.
+        """
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts,
+        )
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            is_layer_skipped,
+        )
+
+        if (
+            isinstance(layer, (LinearBase, RoutedExperts))
+            and fp8_route_enabled()
+            and not is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+                match_mode=self.ignored_layers_match_mode,
+            )
+        ):
+            if isinstance(layer, LinearBase):
+                from vllm_sm70.quant.fp8_linear import Fp8Sm70LinearMethod
+
+                return Fp8Sm70LinearMethod(self)
+            from vllm_sm70.quant.fp8_moe import Fp8Sm70MoEMethod
+
+            return Fp8Sm70MoEMethod(self, layer)
+        return super().get_quant_method(layer, prefix)
 
 
 class Sm70ModelOptNvFp4Config(ModelOptNvFp4Config):
@@ -188,6 +225,9 @@ def register() -> None:
                 "vllm_sm70: LINEAR_METHOD_BUILDERS['W4A16_NVFP4'] was replaced "
                 "after M3 installed it."
             )
+    for cls in (Sm70Fp8Config, Sm70ModelOptNvFp4Config):
+        if "get_quant_method" not in cls.__dict__:
+            raise RuntimeError(f"vllm_sm70: {cls.__qualname__} lost its MoE hook.")
     if "get_quant_method" not in Sm70ModelOptNvFp4Config.__dict__:
         raise RuntimeError("vllm_sm70: Sm70ModelOptNvFp4Config lost its M4 MoE hook.")
     detected = Sm70ModelOptNvFp4Config.override_quantization_method(

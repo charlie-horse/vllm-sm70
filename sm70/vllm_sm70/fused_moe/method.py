@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Validated topologies. TP4+ is out of scope and untested: refuse, never fall
+# back to upstream (which has no cc 7.0 MoE kernel either).
+SUPPORTED_TP_SIZES = (1, 2)
 DEFAULT_MAX_TOKENS = 8192  # FORK nix/module.nix serves --max-num-batched-tokens 8192
 
 
@@ -315,10 +318,15 @@ class Sm70MoEMethodBase(FusedMoEMethodBase):
 
     @staticmethod
     def validate_topology(moe: FusedMoEConfig) -> None:
-        """TP only: no DP/EP/all2all/sequence parallel.
+        """TP 1 or 2 only: no TP4+, DP/EP/all2all or sequence parallel.
 
         ported from FORK nvfp4_sm70_moe.py:752-756.
         """
+        if moe.tp_size not in SUPPORTED_TP_SIZES:
+            raise NotImplementedError(
+                f"SM70 MoE supports tensor_parallel_size in {SUPPORTED_TP_SIZES} "
+                f"(validated on 2x V100); got {moe.tp_size}. TP4+ is untested."
+            )
         par = moe.moe_parallel_config
         if par.use_all2all_kernels or par.use_ep or moe.dp_size > 1:
             raise NotImplementedError("SM70 MoE supports tensor parallel only.")

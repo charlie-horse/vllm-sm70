@@ -168,6 +168,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_MODELOPT_NVFP4_GEMV": kill_switch("VLLM_SM70_MODELOPT_NVFP4_GEMV"),
         # "0": Sm70Config.fp8_moe_decode=False (Qwen FP8 MoE single-token route).
         "VLLM_SM70_FP8_MOE_DECODE": kill_switch("VLLM_SM70_FP8_MOE_DECODE"),
+        # "0": Sm70Config.fp8_moe_compact_decode=False (M==1 decomposed plan
+        # instead of the fused legacy compact op).
+        "VLLM_SM70_FP8_MOE_COMPACT_DECODE": kill_switch(
+            "VLLM_SM70_FP8_MOE_COMPACT_DECODE"
+        ),
         # "0": Sm70Config.fp8_qpn8=False.
         "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
     },

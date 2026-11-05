@@ -543,7 +543,7 @@ def test_missing_ops_fail_closed(mods, monkeypatch):
 
 @pytest.mark.parametrize(
     "field, value",
-    [("tp_size", 8), ("num_experts", 32)],
+    [("tp_size", 4), ("tp_size", 8), ("num_experts", 32)],
 )
 def test_contract_rejects(mods, field, value):
     m4, _ = mods()
@@ -664,3 +664,25 @@ def test_gpu_cuda_graph_matches_eager(m):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_get_quant_method_tp_gate(mods, device, monkeypatch, tp):
+    """SM70 MoE is validated at TP1/TP2 only; TP4+ refuses, never falls back."""
+    m4, _ = mods()
+    device(7, 0, ops=True)
+
+    class UpstreamSentinel:
+        def __init__(self, quant_config, moe_config):
+            raise AssertionError("must not fall back to upstream")
+
+    monkeypatch.setattr(
+        up_modelopt.ModelOptNvFp4Config, "FusedMoEMethodCls", UpstreamSentinel
+    )
+    layer = _routed_layer(_moe_config(*SMALL, tp=tp))
+    if tp in (1, 2):
+        method = _quant_config().get_quant_method(layer, "model.layers.0.mlp.experts")
+        assert isinstance(method, m4.ModelOptNvFp4Sm70MoEMethod)
+    else:
+        with pytest.raises(NotImplementedError, match="tensor_parallel_size"):
+            _quant_config().get_quant_method(layer, "model.layers.0.mlp.experts")
