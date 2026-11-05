@@ -238,6 +238,10 @@ def test_fake_signatures_match_schemas(tm):
 
     problems = []
     for name, schema in _needs_fake().items():
+        if not tm.has_op(name):
+            # Not in this build (e.g. AWQ ops when the real .so is built
+            # without VLLM_SM70_TM_AWQ): tm.py defines no fake for it.
+            continue
         fake = getattr(tm, f"_{name}_fake", None)
         if fake is None:
             problems.append(f"{name}: no _{name}_fake in tm.py")
