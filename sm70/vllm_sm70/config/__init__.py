@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import weakref
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -264,6 +265,59 @@ def dflash2_verifier_enabled(cfg: Sm70Config, *, verifier_qualified: bool) -> bo
     return cfg.dflash2_verifier == "on"
 
 
+def dflash2_verifier_qualified(
+    model_config: Any, speculative_config: Any, parallel_config: Any
+) -> bool:
+    """The fork's DFlash2 verifier contract (FORK models/config.py:1087-1134,
+    sm70_dflash2_verifier_qualified): Qwen3_5 arch, fp16, hidden 5120, 24/4
+    heads x 256, method dflash with k=7, draft selector_top_k 16, PP1, no
+    DBO/ubatching. Target quantization and TP are not part of it (fork
+    docstring). Only getattr on the three configs, so no vllm import."""
+    if model_config is None or speculative_config is None or parallel_config is None:
+        return False
+    import torch
+
+    draft = getattr(speculative_config, "draft_model_config", None)
+    dflash_config = getattr(getattr(draft, "hf_config", None), "dflash_config", None)
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
+    text = getattr(model_config, "hf_text_config", None)
+    archs = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        archs & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(text, "hidden_size", None) == 5120
+        and getattr(text, "num_attention_heads", None) == 24
+        and getattr(text, "num_key_value_heads", None) == 4
+        and getattr(text, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "dflash"
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
+def resolved_fp8_qpn8(vllm_config: Any) -> bool:
+    """Sm70Config.fp8_qpn8 for this engine, after VLLM_SM70_FP8_QPN8=0, with
+    None (auto) resolved through the DFlash2 verifier contract (FORK
+    platforms/runtime_defaults.py:497-513). No vllm_config: False."""
+    if vllm_config is None:
+        return False
+    return fp8_qpn8_enabled(
+        sm70_config(vllm_config),
+        verifier_qualified=dflash2_verifier_qualified(
+            getattr(vllm_config, "model_config", None),
+            getattr(vllm_config, "speculative_config", None),
+            getattr(vllm_config, "parallel_config", None),
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # Frozen constants: the effective cf9492a values of the knobs that are no
 # longer configurable. "override" marks values the cc=7.0 platform defaults
@@ -351,9 +405,11 @@ __all__ = [
     "clear_cache",
     "compute_hash",
     "dflash2_verifier_enabled",
+    "dflash2_verifier_qualified",
     "fp8_qpn8_enabled",
     "fp8_turbomind_enabled",
     "require_fp8_turbomind",
     "parse_sm70_config",
+    "resolved_fp8_qpn8",
     "sm70_config",
 ]

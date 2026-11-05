@@ -20,14 +20,32 @@ Why: V100 has no FP8 tensor cores and UP refuses FP8 below cc 7.5. Ported
 Kill-switch: ``VLLM_SM70_FP8_TURBOMIND=0``. M2's gate then returns
   upstream's capability 75, so UP refuses FP8 on SM70, and get_quant_method
   never builds this class.
+
+M8 (QPN8 decode): when the resolved ``Sm70Config.fp8_qpn8`` is True (auto:
+  the DFlash2 verifier contract, so Qwen3.8-27B yes, Qwen3.6-35B-A3B no),
+  VLLM_SM70_FP8_QPN8 is not "0", TP is 1 or 2, K09's ops are present
+  (vllm_sm70.ops.qpn8) and ``qpn8_rejection(N, K)`` is None, the layer is
+  repacked at load with ``qpn8_prepare`` instead of TurboMind and served by
+  ``qpn8_linear``: M<=8 runs the QPN8 GEMV, M>8 dequantizes into one shared
+  per-device fp16 scratch (allocated at load) and runs torch.mm. The M choice
+  is inside K09's opaque op, so a graph traced at small M stays correct.
+  Memory-neutral, as the fork's c4130 route was (FORK qpn/fp8.py:686-787:
+  QPN8 codes replace the weight, exact-dense prefill workspace for M>8): no
+  second TurboMind copy, whatever K09's ``needs_turbomind_fallback`` says,
+  because that copy doubles Qwen3.8-27B's FP8 weights per V100 at TP2. The
+  fork's PP2/TP4 QPN8 variant and its TP4 meaning of the switch are not
+  carried. Every other case is the M6 TurboMind path unchanged.
+  Kill-switch: ``VLLM_SM70_FP8_QPN8=0``.
 """
 
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -39,6 +57,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_sm70.config import resolved_fp8_qpn8
 from vllm_sm70.quant.nvfp4_linear import (
     _tm,
     flatten_linear_input,
@@ -51,6 +70,18 @@ logger = logging.getLogger(__name__)
 FP8_BLOCK = 128
 PREPARE_OP = "fp8_sm70_prepare"
 GEMM_OP = "fp8_gemm_sm70_out"
+
+# M8: K09 ops the QPN8 route needs (no TurboMind copy, so no K03 op).
+QPN8_OPS = (
+    "fp8_qpn8_prepare_sm70",
+    "fp8_qpn8_gemm_sm70_out",
+    "fp8_qpn8_dequantize_sm70_out",
+)
+QPN8_API = ("qpn8_prepare", "qpn8_linear", "qpn8_rejection", "Qpn8Prepared")
+# TP2 is the target, TP1 is in K09's shape-only admission. The fork's TP4
+# QPN8 meaning (PP2/TP4 tables) is not carried.
+QPN8_TP_SIZES = (1, 2)
+QPN8_SCRATCH = "sm70_qpn8_dense_scratch"
 
 
 def check_fp8_sm70_config(quant_config: Any) -> None:
@@ -70,13 +101,82 @@ def check_fp8_sm70_config(quant_config: Any) -> None:
         raise NotImplementedError("SM70 FP8 does not support UE8M0 block scales.")
 
 
+def qpn8_module():
+    """K09's vllm_sm70.ops.qpn8 when its API and ops are present, else None.
+
+    Missing module, wrapper or op means the plain M6 path, never an error.
+    """
+    try:
+        from vllm_sm70.ops import qpn8
+    except (ImportError, OSError, RuntimeError):  # unbuilt, or a stub ops pkg
+        return None
+    if not all(callable(getattr(qpn8, name, None)) for name in QPN8_API):
+        return None
+    has_op = getattr(qpn8, "has_op", None)
+    if not callable(has_op) or not all(has_op(name) for name in QPN8_OPS):
+        return None
+    return qpn8
+
+
+def qpn8_route_enabled(vllm_config: Any = None) -> bool:
+    """M8 engine gate: resolved Sm70Config.fp8_qpn8 (after the
+    VLLM_SM70_FP8_QPN8 kill) and TP in QPN8_TP_SIZES. Layer admission and op
+    presence are checked at load."""
+    if vllm_config is None:
+        vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or not resolved_fp8_qpn8(vllm_config):
+        return False
+    parallel = getattr(vllm_config, "parallel_config", None)
+    tp = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+    return tp in QPN8_TP_SIZES
+
+
+class _Qpn8ScratchPool:
+    """One fp16 dense scratch per device, shared by every QPN8 layer there.
+
+    Grown at load to the largest K*N; layers already bound are re-pointed, so
+    nothing is allocated after loading. Layers run one at a time on the model
+    stream, as the fork's shared exact-dense workspace assumed (FORK
+    qpn/fp8.py:318-352).
+    """
+
+    def __init__(self) -> None:
+        self.tensor: torch.Tensor | None = None
+        self.layers: weakref.WeakSet[torch.nn.Module] = weakref.WeakSet()
+
+    def bind(self, layer: torch.nn.Module, numel: int, device: torch.device) -> None:
+        if self.tensor is None or self.tensor.numel() < numel:
+            self.tensor = torch.empty((numel,), dtype=torch.float16, device=device)
+            for other in self.layers:
+                other._buffers[QPN8_SCRATCH] = self.tensor
+        layer.register_buffer(QPN8_SCRATCH, self.tensor, persistent=False)
+        self.layers.add(layer)
+
+
+_QPN8_SCRATCH_POOLS: dict[str, _Qpn8ScratchPool] = {}
+_LOGGED: set[str] = set()
+
+
+def _log_once(msg: str) -> None:
+    if msg not in _LOGGED:
+        _LOGGED.add(msg)
+        logger.info(msg)
+
+
+def clear_qpn8_scratch() -> None:
+    _QPN8_SCRATCH_POOLS.clear()
+
+
 @register_weight_loader_v2_supported_method
 class Fp8Sm70LinearMethod(Fp8LinearMethod):
-    """TurboMind W8A16 block-FP8 linear (FP16 activations)."""
+    """TurboMind W8A16 block-FP8 linear (FP16 activations); QPN8 for decode
+    on admitted layers when M8 is on."""
 
     def __init__(self, quant_config: Any) -> None:
         check_fp8_sm70_config(quant_config)
         super().__init__(quant_config)  # UP fp8.py:241-280 (keys only)
+        self.qpn8_enabled = qpn8_route_enabled()
+        self._qpn8: Any = None
 
     def create_weights(
         self,
@@ -138,6 +238,9 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             layer.weight, layer.weight_scale_inv
         )
         scale = scale.to(torch.float32)
+        layer.sm70_fp8_qpn8 = False
+        if self.qpn8_enabled and self._prepare_qpn8(layer, weight, scale):
+            return
         tm_weight, tm_scales, meta = _tm().fp8_sm70_prepare(
             weight.contiguous(), scale.contiguous(), FP8_BLOCK, False
         )
@@ -149,6 +252,87 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         layer.sm70_fp8_q_ld = q_ld
         layer.sm70_fp8_turbomind = True
 
+    def _prepare_qpn8(
+        self, layer: torch.nn.Module, weight: torch.Tensor, scale: torch.Tensor
+    ) -> bool:
+        """M8: repack into QPN8 at load (K09 contract), or False for M6.
+
+        ported from FORK qpn/fp8.py:686-787 (generic, non-PP2/TP4 branch) with
+        K09's shape-only admission (qpn8_rejection) instead of the fork's
+        layer-suffix list.
+        """
+        qpn8 = qpn8_module()
+        if qpn8 is None:
+            _log_once(
+                "SM70 FP8 QPN8 requested, but vllm_sm70.ops.qpn8 or its ops are "
+                "missing; using TurboMind FP8."
+            )
+            return False
+        if weight.dim() != 2:
+            return False
+        n, k = (int(d) for d in weight.shape)
+        if qpn8.qpn8_rejection(n, k) is not None:
+            return False
+        if tuple(scale.shape) != (n // FP8_BLOCK, k // FP8_BLOCK):
+            return False  # e.g. a merged layer with an unaligned partition
+        prepared = qpn8.qpn8_prepare(
+            weight.contiguous(), scale.contiguous(), turbomind_fallback=False
+        )
+        layer.register_buffer("sm70_qpn8_codes", prepared.codes, persistent=False)
+        layer.register_buffer(
+            "sm70_qpn8_group_scales", prepared.group_scales, persistent=False
+        )
+        layer.sm70_qpn8_meta = (
+            prepared.n,
+            prepared.k,
+            prepared.split_k,
+            prepared.accumulator_chains,
+            prepared.prefetch_codes,
+        )
+        device = prepared.codes.device
+        key = str(device)
+        pool = _QPN8_SCRATCH_POOLS.get(key)
+        if pool is None:
+            pool = _QPN8_SCRATCH_POOLS[key] = _Qpn8ScratchPool()
+        pool.bind(layer, n * k, device)
+        # Free the checkpoint layout (K09: "the caller frees the checkpoint
+        # weight afterwards"); the parameters stay for weight reloading.
+        replace_parameter(
+            layer, "weight", torch.empty(0, dtype=torch.uint8, device=device)
+        )
+        replace_parameter(
+            layer,
+            "weight_scale_inv",
+            torch.empty(0, dtype=torch.float32, device=device),
+        )
+        layer.input_scale = None
+        layer.sm70_fp8_qpn8 = True
+        layer.sm70_fp8_turbomind = False
+        self._qpn8 = qpn8
+        _log_once(
+            "SM70 FP8 QPN8 decode (M<=8) enabled for block-FP8 linears; "
+            "M>8 dequantizes into a shared FP16 scratch."
+        )
+        return True
+
+    def _apply_qpn8(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        qpn8 = self._qpn8
+        n, k, split_k, chains, prefetch = layer.sm70_qpn8_meta
+        prepared = qpn8.Qpn8Prepared(
+            layer.sm70_qpn8_codes,
+            layer.sm70_qpn8_group_scales,
+            n,
+            k,
+            split_k,
+            chains,
+            prefetch,
+        )
+        return qpn8.qpn8_linear(
+            x, prepared, bias, dense_scratch=getattr(layer, QPN8_SCRATCH)
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -158,6 +342,8 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         # ported from FORK qpn/fp8.py:1045-1052, 1121-1141
         if x.dtype != torch.float16:
             raise TypeError(f"SM70 FP8 linear needs FP16 activations, got {x.dtype}.")
+        if getattr(layer, "sm70_fp8_qpn8", False):
+            return self._apply_qpn8(layer, x, bias)
         n = layer.output_size_per_partition
         x_2d = flatten_linear_input(x)
         if x_2d.stride(-1) != 1:
