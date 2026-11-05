@@ -13,7 +13,8 @@ def register() -> None:
     global _registered
     if _registered:
         return
-    from vllm_sm70.models import qwen
+    from vllm_sm70.models import flint_sm70, qwen
 
+    flint_sm70.register()
     qwen.register()
     _registered = True
