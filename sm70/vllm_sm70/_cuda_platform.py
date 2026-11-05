@@ -176,25 +176,15 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        # K13 (risk R4): admit the fused router and allocate its per-layer
-        # workspace before CUDA graph capture.
+        # Runs after model load and before CUDA graph capture (U1). Both
+        # steps allocate here, never lazily during capture (R4).
+        # K13: admit the fused router and allocate its per-layer workspace.
         get_model = getattr(worker, "get_model", None)
-        if get_model is None:
-            return
-        from vllm_sm70 import router
+        if get_model is not None:
+            from vllm_sm70 import router
 
-        router.prepare_model(get_model())
-
-    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
-    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
-    @classmethod
-    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
-        from vllm_sm70 import router
-
-        return router.provider()
-        # Runs after model load and before CUDA graph capture (U1). K16:
-        # bind the V1 hidden-state sampler and create its device counter
-        # here, never lazily during capture (R4).
+            router.prepare_model(get_model())
+        # K16: bind the V1 hidden-state sampler and create its device counter.
         if _flint_sampler_enabled():
             try:
                 from vllm_sm70 import sample_v1
@@ -204,6 +194,14 @@ class Sm70CudaPlatform(CudaPlatform):
                 # Unprepared, the sampler returns None: upstream sampling.
                 logger.exception("vllm_sm70: preparing the K16 sampler failed")
         return None
+
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()
 
     # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
     @classmethod

@@ -260,7 +260,6 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
         "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
     },
-    "passes": {},
     # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
     # first runs on a graph (fork name kept).
     "passes": {
