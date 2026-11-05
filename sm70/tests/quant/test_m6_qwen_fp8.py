@@ -549,11 +549,13 @@ def test_moe_tp_gate(mods, device, monkeypatch, tp):
 # --------------------------------------------------------------------------
 # Memory budget (TP2, per GPU)
 # --------------------------------------------------------------------------
-# config.json values for the R11 pins (Qwen/Qwen3.6-35B-A3B-FP8 @95a723d0,
-# Qwen/Qwen3.8-27B-FP8 @017b9c7a). R11 only pins architectures, dtype and
-# quant; these dims are the Qwen3.5-family values (FORK sm70_gguf.py:35 shows
-# 5120 x 17408 for the 27B MLP). Unverified until checked against the pinned
-# config.json; the test keeps > 30% headroom so a small error cannot flip it.
+# Dims verified against config.json at the pinned revisions (2026-11-05):
+# Qwen/Qwen3.6-35B-A3B-FP8 @95a723d0 (text_config: hidden 2048, 40 layers,
+# 256 experts x moe_inter 512, shared 512, heads 16/2, head_dim 256, linear
+# heads k16/v32 x 128, vocab 248320) and Qwen/Qwen3.8-27B-FP8 @017b9c7a
+# (hidden 5120, inter 17408, 64 layers, heads 24/4, linear k16/v48).
+# Both pin in_proj_a/in_proj_b as not-converted, so the 48-row TP2 shards
+# never hit validate_fp8_block_shape.
 QWEN36_35B_A3B = dict(
     hidden=2048,
     layers=40,
