@@ -76,7 +76,7 @@ SUPPORTED_CONTRACTS: Final = frozenset(
         (2048, 512, 256, 8),  # Qwen3.6-35B-A3B shape (NVFP4 variant)
     }
 )
-SUPPORTED_TP_SIZES: Final = (1, 2, 4)
+SUPPORTED_TP_SIZES: Final = moe_rt.SUPPORTED_TP_SIZES  # (1, 2)
 # ported from FORK nvfp4_sm70_moe.py:120-129
 DECODE_QPN_CONTRACTS: Final = frozenset({(256, 2048, 256, 6)})  # Flint TP2
 DECODE_QPN_MAX_TOKENS: Final = 2
