@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 12:04:55 +0000
+Subject: [PATCH] platform: add a V1 hidden-state sampler hook before
+ compute_logits
+
+What: Adds Platform.get_hidden_state_sampler() (default None). Before
+  compute_logits, GPUModelRunner asks its try_sample(...) for a
+  SamplerOutput; if one comes back, logits are skipped and sample_tokens
+  uses it. None keeps compute_logits and the upstream Sampler.
+Why: Out-of-tree platforms (the vllm-sm70 plugin) need to sample from TP-
+  local top-k candidates without a full-vocab lm_head (Flint sampler,
+  K16); logits are built at vllm/v1/worker/gpu_model_runner.py:4208 and
+  consumed by _sample at :4306.
+Upstream-files: vllm/platforms/interface.py, vllm/v1/worker/gpu_model_runner.py
+Kill-switch: hook returns None -> upstream (no plugin, or VLLM_SM70_FLINT_SAMPLER=0)
+Tests: sm70/tests/plugin/test_u4_sampler_hook.py
+Upstream-status: candidate
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmUQtD6qJskP867jP1x
+
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index e64bd77f9cfd..73c82098cdd0 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1222,6 +1222,16 @@ class Platform:
+         expert gates, or EP/sequence-parallel dispatch."""
+         return None
+ 
++    @classmethod
++    def get_hidden_state_sampler(cls) -> Any:
++        """Return a V1 sampler that can skip compute_logits, or None.
++
++        Its try_sample(model, sample_hidden_states, sampling_metadata,
++        scheduler_output, spec_decode_metadata) returns a SamplerOutput, or
++        None for compute_logits + the upstream Sampler. Return None for
++        batches with structured output, which needs the logits."""
++        return None
++
+     @classmethod
+     def get_punica_wrapper(cls) -> str:
+         """Return the punica wrapper for current platform."""
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index ac3ff3b65865..df4f2db5d6b2 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -564,6 +564,8 @@ class GPUModelRunner(
+             logprobs_mode=self.model_config.logprobs_mode,
+             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+         )
++        self._hidden_state_sampler = current_platform.get_hidden_state_sampler()
++        self._platform_sampler_output: SamplerOutput | None = None
+ 
+         self.eplb_state: EplbState | None = None
+         self._moe_model: MixtureOfExperts | None = None
+@@ -4205,7 +4207,20 @@ class GPUModelRunner(
+                     )
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                if self._hidden_state_sampler is not None:
++                    self._platform_sampler_output = (
++                        self._hidden_state_sampler.try_sample(
++                            self.model,
++                            sample_hidden_states,
++                            self.input_batch.sampling_metadata,
++                            scheduler_output,
++                            spec_decode_metadata,
++                        )
++                    )
++                if self._platform_sampler_output is None:
++                    logits = self.model.compute_logits(sample_hidden_states)
++                else:
++                    logits = None
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -4303,7 +4318,10 @@ class GPUModelRunner(
+             )
+ 
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+-            sampler_output = self._sample(logits, spec_decode_metadata)
++            sampler_output = self._platform_sampler_output or self._sample(
++                logits, spec_decode_metadata
++            )
++            self._platform_sampler_output = None
+ 
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
