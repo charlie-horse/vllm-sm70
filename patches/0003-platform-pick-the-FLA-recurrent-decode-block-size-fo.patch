@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 07:17:52 +0000
+Subject: [PATCH] platform: pick the FLA recurrent decode block size for sm_70
+
+What: fused_recurrent_gated_delta_rule_fwd and the packed decode ask
+  sm70_recurrent_bv() for BV. On compute capability 7.0 it returns the
+  largest BV in (32, 16, 8) that launches at least two waves of CTAs
+  (cdiv(V, BV) * N * HV >= 2 * SMs); elsewhere it returns the caller's BV
+  unchanged.
+Why: V100 (80 SMs) at TP2 runs few sequences with Hv=16/24 GDN heads, so
+  upstream's fixed BV=32 launches 64-96 CTAs, under one wave. The fork
+  (cf9492a fla/ops/fused_recurrent.py:29-95) uses this schedule; its
+  fused_sigmoid_gating default on sm_70 equals upstream's (BV=32, 4
+  warps), so that file is left alone.
+Upstream-files: vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+Kill-switch: VLLM_SM70_FLA_RECURRENT_SCHED=0 -> upstream BV
+Tests: sm70/tests/gdn/test_u2_recurrent_schedule.py (CPU)
+Upstream-status: candidate
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmTunjuSkk6L8stBVhg
+
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index 2f3997e995fe..571ba3d8a77a 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -8,6 +8,8 @@
+ # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+ # ruff: noqa: E501
+ 
++import os
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+@@ -16,6 +18,20 @@ from vllm.triton_utils import tl, triton
+ from .op import exp, log
+ 
+ 
++def sm70_recurrent_bv(BV: int, V: int, NHV: int, device: torch.device) -> int:
++    # sm_70 only: the largest BV in (32, 16, 8) giving >= 2 waves of CTAs.
++    if os.environ.get("VLLM_SM70_FLA_RECURRENT_SCHED") == "0" or not (
++        current_platform.is_device_capability(70, device_id=device.index or 0)
++    ):
++        return BV
++    sms = torch.cuda.get_device_properties(device).multi_processor_count
++    for bv in (32, 16, 8):
++        bv = min(bv, triton.next_power_of_2(V))
++        if triton.cdiv(V, bv) * NHV >= 2 * sms:
++            return bv
++    return bv
++
++
+ @triton.heuristics(
+     {
+         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+@@ -194,6 +210,7 @@ def fused_recurrent_gated_delta_rule_fwd(
+     HV = v.shape[2]
+     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
++    BV = sm70_recurrent_bv(BV, V, N * HV, q.device)
+     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+     assert NK == 1, "NK > 1 is not supported yet"
+     num_stages = 3
+@@ -451,6 +468,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+             BV = 4
+         elif initial_state.dtype == torch.float32:
+             BV = 8
++    BV = sm70_recurrent_bv(BV, V, B * HV, dev)
+     num_stages = 3
+     num_warps = 1
+ 

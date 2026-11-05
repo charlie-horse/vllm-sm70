@@ -103,11 +103,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/turbomind/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/turbomind/sources.cmake")
 endif()
 
+# Hook for K08 (FlashQLA GDN prefill/decode). Same contract as above.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gdn/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/gdn/sources.cmake")
+endif()
+
+# Hook for K05 (Flash-V100 attention, lean subset). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
+endif()
+
 if(SM70_CUDA_SRCS AND NOT (SM70_HAS_CUDA AND SM70_ARCHS))
   message(FATAL_ERROR "vllm_sm70: CUDA sources listed but no CUDA/sm_70 toolchain")
 endif()
+# APPEND (K05): area files may set their own per-file nvcc options first.
 foreach(_src IN LISTS SM70_CUDA_SRCS)
-  set_source_files_properties("${_src}" PROPERTIES COMPILE_OPTIONS "${SM70_CUDA_GENCODE}")
+  set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "${SM70_CUDA_GENCODE}")
 endforeach()
 
 Python_add_library(_sm70_C MODULE WITH_SOABI ${SM70_CXX_SRCS} ${SM70_CUDA_SRCS})
