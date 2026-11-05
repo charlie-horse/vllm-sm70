@@ -26,9 +26,9 @@ The whole carry against upstream is these patches:
 | U1 | +12 | `layers/utils.py:682`, `platforms/interface.py`, `warmup/kernel_warmup.py:164` |
 | U2 | ~8 | `fla/ops/fused_sigmoid_gating.py:208-212`, `fla/ops/fused_recurrent.py:196-200` |
 | U3 | +20 | `fused_moe/runner/moe_runner.py:630, :907`, `platforms/interface.py` |
-| U4 | ~60 | `v1/worker/gpu_model_runner.py` :3403, :4208 |
+| U4 | +35 | `v1/worker/gpu_model_runner.py:563, :4208, :4306`, `platforms/interface.py` |
 | U5 | 0 | none: K17's kernel is in `_sm70_C` and includes upstream's `csrc/custom_all_reduce.cuh` |
-| **total** | **~100** (U5 adds none) | |
+| **total** | **~75** (U5 adds none) | |
 
 ## Phase 1: unpatched build
 
