@@ -5,7 +5,8 @@
 1. Every `#include "..."` in a kept file resolves inside the tree. Lookup
    order: the includer's directory, then VLLM_SM70_TM_INCLUDE_DIRS
    (lmdeploy/, ops/), the same order nvcc uses for quoted includes.
-2. Every `#include <...>` is a C++ standard, CUDA toolkit or torch header.
+2. Every `#include <...>` is a C++ standard, CUDA toolkit, torch or CUTLASS
+   header.
 3. No kept file names a dropped symbol (gguf, Lattice, MXF4/MXFP4,
    U8_Affine, U2_Affine, Lut4, BitPlane) outside an allowlist of files known to keep such references
    verbatim. Every hit is printed with the reason it is allowed.
@@ -27,7 +28,7 @@ INCLUDE_DIRS = [TREE / "lmdeploy", TREE / "ops"]
 EXTS = {".h", ".cuh", ".cu", ".cc", ".cpp", ".inc"}
 
 STD = set(
-    "algorithm array atomic cassert climits cmath cstddef cstdint cstdio "
+    "algorithm array atomic cassert cfloat climits cmath cstddef cstdint cstdio "
     "cstdlib cstring filesystem fstream functional initializer_list iomanip "
     "iostream iterator limits map memory mutex numeric optional ostream random "
     "regex set sstream stack stdexcept string string_view thread tuple "
@@ -38,7 +39,8 @@ CUDA = set(
     "cuda_fp8.h cuda_pipeline_primitives.h cublas_v2.h cublasLt.h "
     "cusparseLt.h".split()
 )
-PREFIXES = ("cub/", "torch/", "ATen/", "c10/")
+# cutlass/: headers from VLLM_SM70_CUTLASS_DIR (K03 qwen38_prefill_cutlass.cu).
+PREFIXES = ("cub/", "torch/", "ATen/", "c10/", "cutlass/")
 
 # Dropped-format names (Kai's list plus U2_Affine/Lut4/BitPlane) that remain (R7: headers kept verbatim;
 # no kernels for these formats are registered any more).

@@ -4,9 +4,11 @@
 #include "tm_config.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/library.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <fstream>
@@ -149,6 +151,9 @@ struct TurboMindRuntime {
   std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
                      Sm70F16WeightCacheKeyHash>
       sm70_f16_weight_cache;
+  // Bumped by release(). get_workspace()/get_gemm() keep raw pointers in
+  // thread-local fast-path caches and drop them when this changes.
+  std::atomic<uint64_t> generation{1};
 
   void close() {
     // Engine shutdown drains graphs before releasing owners. Also wait for
@@ -162,6 +167,62 @@ struct TurboMindRuntime {
       c10::cuda::CUDAGuard guard(device);
       AT_CUDA_CHECK(cudaDeviceSynchronize());
     }
+  }
+
+  // _sm70_C::tm_runtime_close (K03). Waits for every device that owns
+  // TurboMind state, then frees it all: stream workspaces (barriers,
+  // partials, tensormaps, flags), the per-device Gemm objects with their
+  // dispatch caches and tuning results, the prepared fp16 weight cache, and
+  // the tuned/imported-shape sets. The configured scratch size is kept. The
+  // next TurboMind call starts from scratch (it allocates and re-tunes
+  // lazily). Call it only after every CUDA graph that replays TurboMind
+  // kernels has been destroyed and no other thread is running a TurboMind
+  // op: graphs capture raw workspace pointers.
+  void release() {
+    std::set<int> devices;
+    {
+      std::lock_guard<std::mutex> lock(workspace_mutex);
+      for (const auto& [key, holder] : workspace_cache)
+        devices.insert(key.device);
+    }
+    {
+      std::lock_guard<std::mutex> lock(gemm_mutex);
+      for (const auto& [device, holder] : gemm_cache) devices.insert(device);
+    }
+    {
+      std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
+      for (const auto& [key, entry] : sm70_f16_weight_cache)
+        devices.insert(key.device);
+    }
+    for (int device : devices) {
+      c10::cuda::CUDAGuard guard(device);
+      cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+      AT_CUDA_CHECK(cudaStreamIsCapturing(
+          at::cuda::getCurrentCUDAStream(device), &status));
+      TORCH_CHECK(status == cudaStreamCaptureStatusNone,
+                  "tm_runtime_close: called during CUDA graph capture.");
+      AT_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    {
+      std::lock_guard<std::mutex> lock(workspace_mutex);
+      workspace_cache.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(gemm_mutex);
+      gemm_cache.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
+      sm70_f16_weight_cache.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(tune_mutex);
+      dense_tuned_shapes.clear();
+      moe_tuned_shapes.clear();
+      prefill_tuned_families.clear();
+      imported_cache_devices.clear();
+    }
+    generation.fetch_add(1, std::memory_order_acq_rel);
   }
 };
 
@@ -557,8 +618,11 @@ static WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
   thread_local int cached_device = -1;
   thread_local cudaStream_t cached_stream = nullptr;
   thread_local WorkspaceHolder* cached_holder = nullptr;
+  thread_local uint64_t cached_generation = 0;
+  const uint64_t generation =
+      runtime().generation.load(std::memory_order_acquire);
   if (cached_holder != nullptr && cached_device == device &&
-      cached_stream == stream) {
+      cached_stream == stream && cached_generation == generation) {
     return *cached_holder;
   }
 
@@ -571,6 +635,7 @@ static WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
     if (it != runtime().workspace_cache.end()) {
       cached_device = device;
       cached_stream = stream;
+      cached_generation = generation;
       cached_holder = &it->second;
       return it->second;
     }
@@ -606,6 +671,7 @@ static WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
       runtime().workspace_cache.emplace(key, std::move(holder));
   cached_device = device;
   cached_stream = stream;
+  cached_generation = generation;
   cached_holder = &insert_it->second;
   return insert_it->second;
 }
@@ -613,7 +679,11 @@ static WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
 turbomind::gemm::Gemm& get_gemm(int device) {
   thread_local int cached_device = -1;
   thread_local turbomind::gemm::Gemm* cached_gemm = nullptr;
-  if (cached_gemm != nullptr && cached_device == device) {
+  thread_local uint64_t cached_generation = 0;
+  const uint64_t generation =
+      runtime().generation.load(std::memory_order_acquire);
+  if (cached_gemm != nullptr && cached_device == device &&
+      cached_generation == generation) {
     return *cached_gemm;
   }
 
@@ -621,6 +691,7 @@ turbomind::gemm::Gemm& get_gemm(int device) {
   auto it = runtime().gemm_cache.find(device);
   if (it != runtime().gemm_cache.end()) {
     cached_device = device;
+    cached_generation = generation;
     cached_gemm = it->second.gemm.get();
     return *it->second.gemm;
   }
@@ -629,6 +700,7 @@ turbomind::gemm::Gemm& get_gemm(int device) {
   auto [insert_it, _] =
       runtime().gemm_cache.emplace(device, std::move(holder));
   cached_device = device;
+  cached_generation = generation;
   cached_gemm = insert_it->second.gemm.get();
   return *insert_it->second.gemm;
 }
@@ -703,6 +775,8 @@ void configure_gemm_workspace(int64_t bytes) {
       "TurboMind scratch cannot change after a stream workspace exists");
   state.partials_size = bytes;
 }
+
+void tm_runtime_close() { runtime().release(); }
 
 std::vector<int64_t> gemm_workspace_storage() {
   auto& state = runtime();
@@ -794,4 +868,23 @@ int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
 
   auto& gemm = vllm::awq_sm70::get_gemm(device);
   return gemm.Export(ofs);
+}
+
+// K03: cache import/export (fork csrc/torch_bindings.cpp:1155,1161, minus
+// `str? native_policy`) and the runtime shutdown op.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
+  m.def("sm70_gemm_export_cache(Tensor device_hint, str path) -> int");
+  m.def("tm_runtime_close() -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("sm70_gemm_import_cache", &sm70_gemm_import_cache);
+  m.impl("sm70_gemm_export_cache", &sm70_gemm_export_cache);
+}
+
+// No tensor arguments: an empty dispatch key set, so it needs this key (see
+// csrc/torch_bindings_sm70.cpp).
+TORCH_LIBRARY_IMPL(_sm70_C, CompositeExplicitAutograd, m) {
+  m.impl("tm_runtime_close", &vllm::awq_sm70::tm_runtime_close);
 }
