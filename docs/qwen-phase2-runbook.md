@@ -123,8 +123,21 @@ settings and teardown as `qwen_matrix.sh`:
 
 | arm | env | expected M8 route |
 |---|---|---|
-| `on` | default | QPN8: 4 × (7 + 1) = 32 ≤ K09 `QPN8_MAX_M` (32) |
-| `off` | `VLLM_SM70_FP8_QPN8=0` | M6 TurboMind |
+| `on` | default | block QPN8 (`Sm70Config.fp8_block_qpn8`, default True) for M ≤ K09 `QPN8_MAX_M` |
+| `off` | `VLLM_SM70_FP8_BLOCK_QPN8=0` | M6 TurboMind |
+
+`VLLM_SM70_FP8_QPN8` / `fp8_qpn8` is the fork's separate sm70_native selector,
+and M8 does not read it.
+
+**TurboMind copy.** `QP2_QPN8_COPY=auto|true|false` (default `auto`) passes
+`--additional-config '{"sm70": {"fp8_block_qpn8_turbomind_copy": ...}}'` to
+both arms. `auto` follows the fork rule: it keeps a second, TurboMind-packed
+copy of each weight when 4 × (7 + 1) = 32 > `QPN8_MAX_M`. That copy is about
+2× the dense FP8 bytes per GPU, about +12 GiB on Qwen3.8-27B at TP2. If K09
+exposes `QPN8_MAX_M` 32, auto keeps no copy. If it exposes 8 (M9–32 still
+opt-in), auto keeps one. If the `on` arm fails at startup with OOM or "estimated maximum model
+length", rerun with `QP2_QPN8_COPY=false`. Rows above `QPN8_MAX_M` (prefill)
+then dequantize to fp16 and run torch.mm. Record which setting the PASS used.
 
 `probe.py ab-run` sends a fixed ~1K-token prompt at concurrency 1, 2, 3 and 4.
 Each stream decodes 256 tokens (`ignore_eos`, temperature 0), and each
@@ -136,10 +149,10 @@ records the greedy first 32 tokens of 5 fixed prompts.
 **PASS** = ratio ≥ 0.98 (noise band) at every concurrency, and all 5 greedy outputs match.
 
 The script also greps `server.log` for `SM70 FP8 QPN8` into
-`$OUT/m8/<arm>/m8_log.txt`. Expected lines: `on` has
-"SM70 FP8 QPN8 decode (M<=32) enabled ..."; `off` has no line, because the
-kill switch stops M8 before it logs. A "not used: decode/verify can reach M=..."
-line in `on` means the gate refused, so the A/B compared M6 with M6.
+`$OUT/m8/<arm>/m8_log.txt`. In `on`, expect
+"SM70 FP8 QPN8 decode (M<=N) enabled ...: rows=32, max_m=N, keep_copy=...",
+and, with a copy, "TurboMind copy on cuda:X: G GiB so far" lines (one per GiB).
+`off` has no line, because the kill switch stops M8 before it logs.
 
 Results: `$OUT/m8/{on,off}/` hold `ab.json`, `server.log`, `probe.log`,
 `cmd.txt`, `nvidia-smi.csv` and `m8_log.txt`. `$OUT/m8/summary.txt` and

@@ -21,24 +21,25 @@ Kill-switch: ``VLLM_SM70_FP8_TURBOMIND=0``. M2's gate then returns
   upstream's capability 75, so UP refuses FP8 on SM70, and get_quant_method
   never builds this class.
 
-M8 (QPN8 decode): when the resolved ``Sm70Config.fp8_qpn8`` is True (auto:
-  the DFlash2 verifier contract, so Qwen3.8-27B yes, Qwen3.6-35B-A3B no),
-  VLLM_SM70_FP8_QPN8 is not "0", TP is 1 or 2, K09's ops are present
-  (vllm_sm70.ops.qpn8) and ``qpn8_rejection(N, K)`` is None, the layer is
-  repacked at load with ``qpn8_prepare`` instead of TurboMind and served by
-  ``qpn8_linear``. Also only when max_num_seqs * (num_speculative_tokens
-  + 1) <= K09's QPN8_MAX_M (32 since K09 restored M9..32), so
-  decode and DFlash2 verify always fit the GEMV. M<=QPN8_MAX_M runs the
-  QPN8 GEMV; larger M (prefill) dequantizes into one shared per-device fp16
-  scratch (allocated at load) and runs torch.mm. The M choice
-  is inside K09's opaque op, so a graph traced at small M stays correct.
-  Memory-neutral, as the fork's c4130 route was (FORK qpn/fp8.py:686-787:
-  QPN8 codes replace the weight, exact-dense prefill workspace for M>8): no
-  second TurboMind copy, whatever K09's ``needs_turbomind_fallback`` says,
-  because that copy doubles Qwen3.8-27B's FP8 weights per V100 at TP2. The
-  fork's PP2/TP4 QPN8 variant and its TP4 meaning of the switch are not
-  carried. Every other case is the M6 TurboMind path unchanged.
-  Kill-switch: ``VLLM_SM70_FP8_QPN8=0``.
+M8 (block QPN8 decode): when ``Sm70Config.fp8_block_qpn8`` is True (the
+  default, as the fork's kernel_config.sm70_fp8.block_qpn8, FORK
+  config/kernel.py:386; on for Qwen3.6 and Qwen3.8 alike),
+  VLLM_SM70_FP8_BLOCK_QPN8 is not "0", TP is 1 or 2, K09's ops are present
+  (vllm_sm70.ops.qpn8), ``qpn8_rejection(N, K)`` is None and the scale
+  raster is [N/128, K/128] (FORK kernels/linear/qpn/fp8_block.py:160-195),
+  the layer is repacked at load with ``qpn8_prepare`` instead of TurboMind
+  and served by ``qpn8_linear``. M<=QPN8_MAX_M (read from K09) runs the
+  QPN8 GEMV. Larger M uses the TurboMind copy when one is kept, else a
+  dequantize into one shared per-device fp16 scratch (allocated at load)
+  and torch.mm. The copy follows ``fp8_block_qpn8_turbomind_copy``: None
+  (auto, FORK fp8_block.py:204-213) keeps it iff max_num_seqs *
+  (num_speculative_tokens + 1) > QPN8_MAX_M; it roughly doubles the dense
+  FP8 weight bytes per GPU. The M choice is inside K09's opaque op, so a
+  graph traced at small M stays correct. ``Sm70Config.fp8_qpn8`` (the
+  fork's sm70_native qpn8 selector) does not gate this. The fork's PP2/TP4
+  QPN8 variant is not carried. Every other case is the M6 TurboMind path
+  unchanged.
+  Kill-switch: ``VLLM_SM70_FP8_BLOCK_QPN8=0``.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_sm70.config import resolved_fp8_qpn8
+from vllm_sm70.config import sm70_config
 from vllm_sm70.quant.nvfp4_linear import (
     _tm,
     flatten_linear_input,
@@ -126,12 +127,12 @@ def qpn8_module():
 
 
 def qpn8_route_enabled(vllm_config: Any = None) -> bool:
-    """M8 engine gate: resolved Sm70Config.fp8_qpn8 (after the
-    VLLM_SM70_FP8_QPN8 kill) and TP in QPN8_TP_SIZES. Layer admission and op
-    presence are checked at load."""
+    """M8 engine gate: Sm70Config.fp8_block_qpn8 (after the
+    VLLM_SM70_FP8_BLOCK_QPN8 kill) and TP in QPN8_TP_SIZES. Layer admission
+    and op presence are checked at load. No vllm_config: False."""
     if vllm_config is None:
         vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None or not resolved_fp8_qpn8(vllm_config):
+    if vllm_config is None or not sm70_config(vllm_config).fp8_block_qpn8:
         return False
     parallel = getattr(vllm_config, "parallel_config", None)
     tp = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
@@ -141,7 +142,8 @@ def qpn8_route_enabled(vllm_config: Any = None) -> bool:
 def qpn8_max_rows(vllm_config: Any = None) -> int | None:
     """Largest decode/verify M: max_num_seqs * (num_speculative_tokens + 1).
 
-    None when the scheduler config is not reachable (QPN8 is then refused).
+    None when the scheduler config is not reachable (auto then keeps the
+    TurboMind copy, as the fork did without an engine config).
     """
     if vllm_config is None:
         vllm_config = get_current_vllm_config_or_none()
@@ -157,6 +159,15 @@ def qpn8_max_rows(vllm_config: Any = None) -> int | None:
 def qpn8_max_m(qpn8: Any) -> int:
     """K09's largest QPN8 GEMV M (QPN8_MAX_M), 8 if the module names none."""
     return int(getattr(qpn8, "QPN8_MAX_M", QPN8_DEFAULT_MAX_M))
+
+
+def qpn8_keep_turbomind_copy(policy: bool | None, rows: int | None, max_m: int) -> bool:
+    """fp8_block_qpn8_turbomind_copy resolved (FORK fp8_block.py:204-213):
+    explicit True/False wins; None keeps the copy iff rows > max_m, or when
+    rows is unknown."""
+    if policy is not None:
+        return bool(policy)
+    return rows is None or rows > max_m
 
 
 class _Qpn8DenseScratch:
@@ -186,7 +197,7 @@ class _Qpn8DenseScratch:
     @staticmethod
     def linear(qpn8, layer, x, prepared, bias):
         return qpn8.qpn8_linear(
-            x, prepared, bias, dense_scratch=getattr(layer, QPN8_SCRATCH)
+            x, prepared, bias, dense_scratch=getattr(layer, QPN8_SCRATCH, None)
         )
 
     def clear(self) -> None:
@@ -203,8 +214,26 @@ def _log_once(msg: str) -> None:
         m8_logger.info(msg)
 
 
+_COPY_BYTES: dict[str, int] = {}
+
+
+def _count_copy_bytes(device: torch.device, nbytes: int) -> None:
+    """Running total of the TurboMind copy per GPU, logged once per GiB."""
+    if not nbytes:
+        return
+    key = str(device)
+    before = _COPY_BYTES.get(key, 0)
+    _COPY_BYTES[key] = after = before + nbytes
+    if after >> 30 > before >> 30 or before == 0:
+        _log_once(
+            f"SM70 FP8 QPN8 TurboMind copy on {key}: {after / 2**30:.2f} GiB so far "
+            "(logged at each GiB crossed)"
+        )
+
+
 def clear_qpn8_scratch() -> None:
     _QPN8_DENSE_SCRATCH.clear()
+    _COPY_BYTES.clear()
 
 
 @register_weight_loader_v2_supported_method
@@ -217,6 +246,11 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         super().__init__(quant_config)  # UP fp8.py:241-280 (keys only)
         self.qpn8_enabled = qpn8_route_enabled()
         self.qpn8_max_rows = qpn8_max_rows() if self.qpn8_enabled else None
+        self.qpn8_copy_policy = (
+            sm70_config(get_current_vllm_config_or_none()).fp8_block_qpn8_turbomind_copy
+            if self.qpn8_enabled
+            else None
+        )
         self._qpn8: Any = None
 
     def create_weights(
@@ -311,14 +345,7 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             return False
         max_m = qpn8_max_m(qpn8)
         rows = self.qpn8_max_rows
-        if rows is None or rows > max_m:
-            _log_once(
-                "SM70 FP8 QPN8 not used: decode/verify can reach M="
-                f"{rows if rows is not None else 'unknown'} (max_num_seqs x "
-                f"(num_speculative_tokens + 1)) and the QPN8 GEMV covers M<="
-                f"{max_m}; using TurboMind FP8."
-            )
-            return False
+        keep_copy = qpn8_keep_turbomind_copy(self.qpn8_copy_policy, rows, max_m)
         if weight.dim() != 2:
             return False
         n, k = (int(d) for d in weight.shape)
@@ -327,21 +354,36 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         if tuple(scale.shape) != (n // FP8_BLOCK, k // FP8_BLOCK):
             return False  # e.g. a merged layer with an unaligned partition
         prepared = qpn8.qpn8_prepare(
-            weight.contiguous(), scale.contiguous(), turbomind_fallback=False
+            weight.contiguous(), scale.contiguous(), turbomind_fallback=keep_copy
         )
         layer.register_buffer("sm70_qpn8_codes", prepared.codes, persistent=False)
         layer.register_buffer(
             "sm70_qpn8_group_scales", prepared.group_scales, persistent=False
         )
+        copy_bytes = 0
+        if prepared.tm_weight is not None:
+            layer.register_buffer(
+                "sm70_qpn8_tm_weight", prepared.tm_weight, persistent=False
+            )
+            layer.register_buffer(
+                "sm70_qpn8_tm_scales", prepared.tm_scales, persistent=False
+            )
+            copy_bytes = sum(
+                t.numel() * t.element_size()
+                for t in (prepared.tm_weight, prepared.tm_scales)
+            )
         layer.sm70_qpn8_meta = (
             prepared.n,
             prepared.k,
             prepared.split_k,
             prepared.accumulator_chains,
             prepared.prefetch_codes,
+            prepared.tm_k_ld,
+            prepared.tm_q_ld,
         )
         device = prepared.codes.device
-        _QPN8_DENSE_SCRATCH.bind(layer, n * k, device)
+        if prepared.tm_weight is None:
+            _QPN8_DENSE_SCRATCH.bind(layer, n * k, device)
         # Free the checkpoint layout (K09: "the caller frees the checkpoint
         # weight afterwards"); the parameters stay for weight reloading.
         replace_parameter(
@@ -357,17 +399,24 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         layer.sm70_fp8_turbomind = False
         self._qpn8 = qpn8
         _log_once(
-            f"SM70 FP8 QPN8 decode (M<={max_m}) enabled for block-FP8 linears "
-            f"(max decode/verify M={rows}); larger M dequantizes into a shared "
-            "FP16 scratch."
+            f"SM70 FP8 QPN8 decode (M<={max_m}) enabled for block-FP8 linears: "
+            f"rows={rows} (max_num_seqs x (num_speculative_tokens + 1)), "
+            f"max_m={max_m}, keep_copy={keep_copy} (policy "
+            f"{self.qpn8_copy_policy}); larger M "
+            + (
+                "runs a second, TurboMind-packed copy of each weight."
+                if keep_copy
+                else "dequantizes into a shared FP16 scratch."
+            )
         )
+        _count_copy_bytes(device, copy_bytes)
         return True
 
     def _apply_qpn8(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         qpn8 = self._qpn8
-        n, k, split_k, chains, prefetch = layer.sm70_qpn8_meta
+        n, k, split_k, chains, prefetch, k_ld, q_ld = layer.sm70_qpn8_meta
         prepared = qpn8.Qpn8Prepared(
             layer.sm70_qpn8_codes,
             layer.sm70_qpn8_group_scales,
@@ -376,6 +425,10 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             split_k,
             chains,
             prefetch,
+            getattr(layer, "sm70_qpn8_tm_weight", None),
+            getattr(layer, "sm70_qpn8_tm_scales", None),
+            k_ld,
+            q_ld,
         )
         return _QPN8_DENSE_SCRATCH.linear(qpn8, layer, x, prepared, bias)
 

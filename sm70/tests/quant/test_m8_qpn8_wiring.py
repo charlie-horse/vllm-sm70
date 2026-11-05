@@ -5,17 +5,20 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
   (qpn8_prepare, qpn8_linear, the opaque qpn8_native_linear op and its M
   choice) over pure-torch fakes of the three _sm70_C QPN8 ops, and a mock of
   the K03 TurboMind FP8 ops for the M6 route. They check:
-  - routing per resolved Sm70Config.fp8_qpn8 (True / False / auto through the
-    DFlash2 verifier contract), the VLLM_SM70_FP8_QPN8=0 kill (and "1" never
-    enabling), the TP gate (1 and 2 only);
+  - routing per Sm70Config.fp8_block_qpn8 (default on, Qwen3.6- and
+    Qwen3.8-shaped alike), the VLLM_SM70_FP8_BLOCK_QPN8=0 kill (and "1"
+    never enabling), fp8_qpn8 / VLLM_SM70_FP8_QPN8 not affecting it, the TP
+    gate (1 and 2 only);
+  - the TurboMind copy policy (fp8_block_qpn8_turbomind_copy auto / True /
+    False across rows = max_num_seqs * (k + 1) vs QPN8_MAX_M);
   - the M boundary inside K09's op (QPN8_MAX_M read from the module): up to
     it the QPN8 GEMV, above it the dequantize into the layer's load-time
     scratch, never the GEMV;
-  - the max-rows gate: max_num_seqs * (k + 1) <= QPN8_MAX_M;
   - missing K09 module / ops / rejected shape -> the plain M6 path;
   - prepare runs once at load, apply allocates no weight-sized tensor and
     changes no buffer; the scratch is shared per device and grown at load;
-  - compute_hash differs with fp8_qpn8 on/off.
+  - compute_hash changes with fp8_qpn8, fp8_block_qpn8 and
+    fp8_block_qpn8_turbomind_copy.
   GPU (``-m gpu``, one V100 with _sm70_C built with K03 and K09), for Bea:
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m8_qpn8_wiring.py -m gpu
   QPN8 route vs M6 route at the Qwen3.8-27B TP2 dense shapes, M in {1, 2, 8}
@@ -23,7 +26,7 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
   reference), M=QPN8_MAX_M+1 falls back off the GEMV, and an M=1 CUDA
   graph replay.
 Why: a wrong route or scale layout is silent garbage, not a crash.
-Kill-switch: VLLM_SM70_FP8_QPN8=0.
+Kill-switch: VLLM_SM70_FP8_BLOCK_QPN8=0.
 """
 
 import sys
@@ -146,7 +149,11 @@ def _vllm_config(sm70=None, tp=2, qualified=False, max_num_seqs=1, spec_k=7):
 # --------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    for name in ("VLLM_SM70_FP8_TURBOMIND", "VLLM_SM70_FP8_QPN8"):
+    for name in (
+        "VLLM_SM70_FP8_TURBOMIND",
+        "VLLM_SM70_FP8_QPN8",
+        "VLLM_SM70_FP8_BLOCK_QPN8",
+    ):
         monkeypatch.delenv(name, raising=False)
     import vllm.distributed as dist
     import vllm.model_executor.parameter as param_mod
@@ -257,15 +264,15 @@ def _x(m, k, seed=1, device="cpu"):
 @pytest.mark.parametrize(
     "sm70, qualified, routed",
     [
-        ({"fp8_qpn8": True}, False, True),
-        ({"fp8_qpn8": False}, True, False),
-        ({}, True, True),  # auto, Qwen3.8 DFlash2 contract
-        ({}, False, False),  # auto, Qwen3.6-35B-A3B
-        ({"dflash2_verifier": "off"}, True, False),  # auto follows the verifier
+        ({}, False, True),  # default, Qwen3.6-35B-A3B shaped engine
+        ({}, True, True),  # default, Qwen3.8-27B + DFlash2
+        ({"fp8_block_qpn8": False}, False, False),
+        ({"fp8_qpn8": False}, False, True),  # the sm70_native selector: no effect
+        ({"fp8_qpn8": False, "dflash2_verifier": "off"}, True, True),
     ],
-    ids=["on", "off", "auto-3.8", "auto-3.6", "auto-verifier-off"],
+    ids=["default-3.6", "default-3.8", "block-off", "qpn8-off", "verifier-off"],
 )
-def test_route_follows_resolved_config(mods, engine, sm70, qualified, routed):
+def test_route_follows_fp8_block_qpn8(mods, engine, sm70, qualified, routed):
     lin, _, calls = mods()
     engine(_vllm_config(sm70, qualified=qualified))
     method, layer, w, s = _layer(lin, 256, [256, 128])
@@ -283,75 +290,120 @@ def test_route_follows_resolved_config(mods, engine, sm70, qualified, routed):
         assert not any(c[0] == "qpn8" for c in calls.qpn8)
 
 
+@pytest.mark.parametrize(
+    "name, part",
+    [("qwen3.6-qkv_proj", [4096, 256, 256]), ("qwen3.6-shared_gate_up", [256, 256])],
+)
+def test_qwen36_shapes_admitted_by_default(mods, engine, name, part):
+    """Qwen3.6-35B-A3B-shaped dense layers (hidden 2048, TP2) take block QPN8
+    with the default config, as in the fork (block_qpn8=True, verifier off)."""
+    lin, _, calls = mods()
+    engine(_vllm_config({}, qualified=False, max_num_seqs=1, spec_k=None))
+    _, layer, _, _ = _layer(lin, 2048, part)
+    assert layer.sm70_fp8_qpn8 is True and calls.tm == []
+
+
 def test_env_kill_and_never_enable(mods, engine, monkeypatch):
     lin, _, calls = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
+    engine(_vllm_config({}))
+    monkeypatch.setenv("VLLM_SM70_FP8_BLOCK_QPN8", "0")
     _, layer, _, _ = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is False and calls.tm[0][0] == "tm_prepare"
     sm70_cfg.clear_cache()
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
-    engine(_vllm_config({"fp8_qpn8": False}))
+    monkeypatch.setenv("VLLM_SM70_FP8_BLOCK_QPN8", "1")
+    engine(_vllm_config({"fp8_block_qpn8": False}))
     _, layer, _, _ = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is False
+
+
+def test_fp8_qpn8_kill_does_not_disable_block_qpn8(mods, engine, monkeypatch):
+    lin, _, _ = mods()
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
+    engine(_vllm_config({}, qualified=True))
+    assert _layer(lin, 256, [256])[1].sm70_fp8_qpn8 is True
 
 
 @pytest.mark.parametrize("tp, routed", [(1, True), (2, True), (4, False), (8, False)])
 def test_tp_gate(mods, engine, tp, routed):
     lin, _, _ = mods()
-    engine(_vllm_config({"fp8_qpn8": True}, tp=tp))
+    engine(_vllm_config({}, tp=tp))
     _, layer, _, _ = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is routed
 
 
+# --------------------------------------------------------------------------
+# CPU: TurboMind copy policy (FORK fp8_block.py:204-213)
+# --------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "max_num_seqs, spec_k, max_m",
+    "policy, max_num_seqs, spec_k, max_m, keep",
     [
-        (1, 7, 8),  # M = 8: admitted
-        (2, 7, 8),  # M = 16: M6
-        (8, None, 8),  # no spec, M = 8: admitted
-        (9, None, 8),  # M6
-        (4, 7, 32),  # K09 with M<=32: M = 32, admitted
-        (5, 7, 32),  # M = 40: M6
-        (4, 7, None),  # the real K09 constant
-        (5, 7, None),
-        (1, 7, None),
+        (None, 1, 7, 8, False),  # rows 8 <= 8
+        (None, 2, 7, 8, True),  # rows 16 > 8
+        (None, 8, None, 8, False),
+        (None, 9, None, 8, True),
+        (None, 4, 7, 32, False),  # rows 32 <= 32
+        (None, 5, 7, 32, True),
+        (True, 1, 7, 32, True),  # explicit: always
+        (False, 5, 7, 32, False),  # explicit: never
+        (None, 4, 7, None, None),  # K09's real constant
+        (None, 5, 7, None, None),
     ],
     ids=[
-        "1x8-max8",
-        "2x8-max8",
-        "8x1-max8",
-        "9x1-max8",
-        "4x8-max32",
-        "5x8-max32",
-        "4x8-real",
-        "5x8-real",
-        "1x8-real",
+        "auto-1x8-max8",
+        "auto-2x8-max8",
+        "auto-8x1-max8",
+        "auto-9x1-max8",
+        "auto-4x8-max32",
+        "auto-5x8-max32",
+        "true-1x8",
+        "false-5x8",
+        "auto-4x8-real",
+        "auto-5x8-real",
     ],
 )
-def test_max_rows_gate(mods, engine, monkeypatch, max_num_seqs, spec_k, max_m):
+def test_turbomind_copy_policy(
+    mods, engine, monkeypatch, policy, max_num_seqs, spec_k, max_m, keep
+):
     lin, qpn8, calls = mods()
     if max_m is not None:
         monkeypatch.setattr(qpn8, "QPN8_MAX_M", max_m)
-    routed = max_num_seqs * ((spec_k or 0) + 1) <= qpn8.QPN8_MAX_M
-    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=max_num_seqs, spec_k=spec_k))
+    rows = max_num_seqs * ((spec_k or 0) + 1)
+    if keep is None:
+        keep = rows > qpn8.QPN8_MAX_M
+    sm70 = {} if policy is None else {"fp8_block_qpn8_turbomind_copy": policy}
+    engine(_vllm_config(sm70, max_num_seqs=max_num_seqs, spec_k=spec_k))
     method, layer, w, s = _layer(lin, 256, [256])
-    assert layer.sm70_fp8_qpn8 is routed
-    assert [c[0] for c in calls.tm] == ([] if routed else ["tm_prepare"])
-    x = _x(2, 256)
+    assert layer.sm70_fp8_qpn8 is True  # QPN8 either way; only the copy changes
+    names = {n for n, _ in layer.named_buffers()}
+    assert ("sm70_qpn8_tm_weight" in names) is keep
+    assert (lin.QPN8_SCRATCH in names) is (not keep)
+    assert [c[0] for c in calls.tm] == (["tm_prepare"] if keep else [])
+    big = qpn8.QPN8_MAX_M + 1
+    calls.qpn8.clear()
+    x = _x(big, 256)
     _close(method.apply(layer, x), x.float() @ _ref_dequant(w, s).t())
+    if keep:
+        assert calls.tm[-1] == ("tm_gemm", big) and calls.qpn8 == []
+    else:
+        assert [c[0] for c in calls.qpn8] == ["dequant"]
+    calls.qpn8.clear()
+    method.apply(layer, _x(qpn8.QPN8_MAX_M, 256))
+    assert [c[0] for c in calls.qpn8] == ["qpn8"]
+
+
+def test_keep_copy_resolution():
+    k = lambda p, r, m: __import__(  # noqa: E731
+        "vllm_sm70.quant.fp8_linear", fromlist=["x"]
+    ).qpn8_keep_turbomind_copy(p, r, m)
+    assert k(None, 8, 8) is False and k(None, 9, 8) is True
+    assert k(None, None, 32) is True  # unknown rows: keep (fork, no engine)
+    assert k(True, 1, 32) is True and k(False, 99, 32) is False
 
 
 def test_missing_max_m_constant_is_8(mods, engine, monkeypatch):
     lin, qpn8, _ = mods()
     monkeypatch.delattr(qpn8, "QPN8_MAX_M")
     assert lin.qpn8_max_m(qpn8) == 8
-    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=8, spec_k=None))
-    assert _layer(lin, 256, [256])[1].sm70_fp8_qpn8 is True
-    lin.clear_qpn8_scratch()
-    sm70_cfg.clear_cache()
-    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=9, spec_k=None))
-    assert _layer(lin, 256, [256])[1].sm70_fp8_qpn8 is False
 
 
 def test_no_vllm_config_is_m6(mods, engine):
@@ -366,7 +418,7 @@ def test_no_vllm_config_is_m6(mods, engine):
 @pytest.mark.parametrize("m", [0, 1, 2, 8, 9, 32, 33, 64])
 def test_m_boundary(mods, engine, m):
     lin, qpn8, calls = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     method, layer, w, s = _layer(lin, 512, [384])
     calls.qpn8.clear()
     x = _x(m, 512)
@@ -392,7 +444,7 @@ def test_m_boundary(mods, engine, m):
 # --------------------------------------------------------------------------
 def test_missing_qpn8_module_is_m6(mods, engine):
     lin, _, calls = mods(with_qpn8=False)
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     assert lin.qpn8_module() is None
     method, layer, w, s = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is False
@@ -404,7 +456,7 @@ def test_missing_qpn8_module_is_m6(mods, engine):
 @pytest.mark.parametrize("missing", ["has_op", "qpn8_prepare", "qpn8_rejection"])
 def test_missing_op_or_api_is_m6(mods, engine, monkeypatch, missing):
     lin, qpn8, calls = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     if missing == "has_op":
         monkeypatch.setattr(qpn8, "has_op", lambda n: n != "fp8_qpn8_gemm_sm70_out")
     else:
@@ -415,7 +467,7 @@ def test_missing_op_or_api_is_m6(mods, engine, monkeypatch, missing):
 
 def test_rejected_shape_is_m6(mods, engine, monkeypatch):
     lin, qpn8, calls = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     seen = []
 
     def reject(n, k):
@@ -433,7 +485,7 @@ def test_rejected_shape_is_m6(mods, engine, monkeypatch):
 # --------------------------------------------------------------------------
 def test_prepare_once_at_load_no_alloc_in_apply(mods, engine, monkeypatch):
     lin, _, calls = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     method, layer, _, _ = _layer(lin, 512, [256])
     assert [c[0] for c in calls.qpn8] == ["prepare"]
     before = {n: (b.data_ptr(), tuple(b.shape)) for n, b in layer.named_buffers()}
@@ -466,7 +518,7 @@ def test_prepare_once_at_load_no_alloc_in_apply(mods, engine, monkeypatch):
 
 def test_scratch_shared_and_grown_at_load(mods, engine):
     lin, _, _ = mods()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({}))
     _, small, _, _ = _layer(lin, 256, [128])
     _, big, _, _ = _layer(lin, 512, [384], seed=1)
     _, mid, _, _ = _layer(lin, 256, [256], seed=2)
@@ -478,17 +530,27 @@ def test_scratch_shared_and_grown_at_load(mods, engine):
 # --------------------------------------------------------------------------
 # CPU: config plumbing
 # --------------------------------------------------------------------------
-def test_compute_hash_differs_with_fp8_qpn8(monkeypatch):
-    assert "fp8_qpn8" in sm70_cfg.GRAPH_FIELDS
-    on = sm70_cfg.compute_hash(sm70_cfg.Sm70Config(fp8_qpn8=True))
-    off = sm70_cfg.compute_hash(sm70_cfg.Sm70Config(fp8_qpn8=False))
-    auto = sm70_cfg.compute_hash(sm70_cfg.Sm70Config())
-    assert len({on, off, auto}) == 3
-    vc = _vllm_config({"fp8_qpn8": True})
-    assert sm70_cfg.compute_hash(vc) == on
+@pytest.mark.parametrize(
+    "field, values",
+    [
+        ("fp8_qpn8", (None, True, False)),
+        ("fp8_block_qpn8", (True, False)),
+        ("fp8_block_qpn8_turbomind_copy", (None, True, False)),
+    ],
+)
+def test_compute_hash_changes_with_qpn8_fields(field, values):
+    assert field in sm70_cfg.GRAPH_FIELDS
+    hashes = {sm70_cfg.compute_hash(sm70_cfg.Sm70Config(**{field: v})) for v in values}
+    assert len(hashes) == len(values)
+
+
+def test_block_qpn8_kill_changes_hash(monkeypatch):
+    on = sm70_cfg.compute_hash(_vllm_config({}))
     sm70_cfg.clear_cache()
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
-    assert sm70_cfg.compute_hash(_vllm_config({"fp8_qpn8": True})) == off
+    monkeypatch.setenv("VLLM_SM70_FP8_BLOCK_QPN8", "0")
+    off = sm70_cfg.compute_hash(_vllm_config({}))
+    assert off != on
+    assert off == sm70_cfg.compute_hash(sm70_cfg.Sm70Config(fp8_block_qpn8=False))
 
 
 def test_verifier_contract_fields():
@@ -543,13 +605,14 @@ def gpu_ops():
     return lin, qpn8
 
 
-def _gpu_pair(lin, engine, parts, k):
-    engine(_vllm_config({"fp8_qpn8": False}))
+def _gpu_pair(lin, engine, parts, k, copy=False):
+    engine(_vllm_config({"fp8_block_qpn8": False}))
     m6, l6, w, s = _layer(lin, k, parts, device="cuda")
     sm70_cfg.clear_cache()
-    engine(_vllm_config({"fp8_qpn8": True}))
+    engine(_vllm_config({"fp8_block_qpn8_turbomind_copy": copy}))
     q8, lq, _, _ = _layer(lin, k, parts, device="cuda")
     assert l6.sm70_fp8_qpn8 is False and lq.sm70_fp8_qpn8 is True
+    assert hasattr(lq, "sm70_qpn8_tm_weight") is copy
     ref = _ref_dequant(w, s).cuda()  # fp32 [N, K]
     return (m6, l6), (q8, lq), ref
 
@@ -580,11 +643,14 @@ def test_gpu_qpn8_matches_m6(gpu_ops, engine, name, m):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not HAS_SM70_GPU, reason="requires an SM70 GPU")
+@pytest.mark.parametrize("copy", [False, True], ids=["dense", "tm-copy"])
 @pytest.mark.parametrize("name", ["mlp.gate_up_proj", "mlp.down_proj"])
-def test_gpu_above_max_m_falls_back_off_the_gemv(gpu_ops, engine, monkeypatch, name):
+def test_gpu_above_max_m_falls_back_off_the_gemv(
+    gpu_ops, engine, monkeypatch, name, copy
+):
     lin, qpn8 = gpu_ops
     parts, k = QWEN38_TP2[name]
-    (m6, l6), (q8, lq), ref_w = _gpu_pair(lin, engine, parts, k)
+    (m6, l6), (q8, lq), ref_w = _gpu_pair(lin, engine, parts, k, copy=copy)
     gemv = []
     real = qpn8.fp8_qpn8_gemm_sm70_out
     monkeypatch.setattr(

@@ -10,7 +10,7 @@ Refs: FORK `cf9492a` unless HOST. eff = effective, dflt = plain envs.py/field de
   - `model_executor/models/runtime_defaults.py:194` is **GLM-5.3 DFlash2 TP8/PP1 only** (`:165-180` requires model_type glm5_next, modelopt_fp4, TP8). It does not apply. The same holds for `:125` (GLM5 TP4 push AR), `:217` (GLM5 TP4/PP2) and `:70-121` (Qwen4Exp FP16 lane, arch Qwen4Exp*). The graph_cache rule (`:43-67`) needs NVFP4, TP4 and fp8_e4m3 KV, so it doesn't apply either.
   - `sm70_profiles/acceleration.py:752` is **report-only**: `build_report` and `log_and_validate` (`:1010-1039`) only warn, and raise only if `require_profile_acceleration`. The release profile JSON (`sm70_profiles/profile.py`) only generates argv. Neither changes any knob.
 
-## (a) The 8 Sm70Config fields
+## (a) The Sm70Config fields (8 at M1, + 2 at M8)
 
 | Field | Flint (NVFP4 W4A16, TP2) | Qwen3.6-35B-A3B FP8 | Qwen3.8-27B FP8 | Evidence chain |
 |---|---|---|---|---|
@@ -20,6 +20,8 @@ Refs: FORK `cf9492a` unless HOST. eff = effective, dflt = plain envs.py/field de
 | fp8_moe_decode | n/a | **True** (M==1: dense W13 (compact exact layout) + indexed W2 + **weighted** native reduce) | n/a (dense, unverified) | sm70_moe.py:16-71; FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=1, FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH=1, MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH=1 (envs.py:9262) → `single_token_reduce="weighted"` (sm70_moe.py:393-397; consumer fp8_sm70_moe.py:54). No override |
 | flint_qk_rope_kv | **True** (fp16, FP16 KV) | n/a | n/a | envs.py:8622 → kernel.py:774-781 (resolved at vllm.py:1188) → flint/model.py:312-330. No override |
 | fp8_qpn8 (auto) | n/a | **False** (not qualified) | **True** ⚠ | dflt 0 envs.py:3880. Override: platforms/runtime_defaults.py:497-513 sets `sm70_fp8.qpn8 = target_fp8_qpn8` when the verifier contract qualifies and quantization=="fp8"; VERIFIER_DEFAULTS sm70_dflash2.py:27 = "1" |
+| fp8_block_qpn8 (M8) | n/a | **True** | **True** | `kernel_config.sm70_fp8.block_qpn8 = True` kernel.py:386; QPN8Fp8BlockScaledMMLinearKernel first in `_POSSIBLE_FP8_BLOCK_KERNELS` (kernels/linear/__init__.py:344); can_implement fp8_block.py:160-195 gates only on the flag, fp16, static 128×128 block, rank 2, N,K%128, native ops. Not the `qpn8` selector above |
+| fp8_block_qpn8_turbomind_copy (M8, auto) | n/a | auto | auto | `block_qpn8_volta_turbomind_prefill = None` kernel.py:388 → `_keep_volta_turbomind_copy` fp8_block.py:204-213: keep iff max_num_seqs × (1 + k) > max M (fork 8; ours = K09 QPN8_MAX_M) |
 | dflash2_verifier (auto) | n/a (no spec) | **off** | **on** ⚠ | Qualification is in models/config.py:1087-1134: arch Qwen3_5ForConditionalGeneration/CausalLM (Qwen3.6-35B-A3B is `Qwen3_5Moe*`, so it fails), fp16, hidden 5120, heads 24/4, head_dim 256, dflash, k=7, draft selector_top_k=16, PP1. Applied in sm70_dflash2.py:264-305 |
 | shared_moe_overlap | n/a | **False** | n/a | VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP=0 envs.py:13347 → qwen3_next.py:245-249 disables the stream. It is forced to 1 only for Qwen4Exp (models/runtime_defaults.py:110-111). **This corrects my earlier proposal of True.** |
 
