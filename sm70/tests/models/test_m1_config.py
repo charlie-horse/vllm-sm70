@@ -50,9 +50,7 @@ OURS = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # Switches that are registered but whose path has not landed yet. Each must
 # name the patch that wires it, and the no-dead-switch test fails as soon
 # as the name is consumed, so that this entry gets removed.
-PENDING = {
-    "VLLM_SM70_DFLASH2_EMULATION": "M7",
-}
+PENDING: dict[str, str] = {}
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +195,24 @@ def _quant_registration_skipped(name):
         me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.update(saved)
 
 
+def _dflash2_emulation_off(name):
+    pytest.importorskip("vllm.envs")
+    from unittest import mock
+
+    import torch
+    from vllm.model_executor.models import ModelRegistry
+
+    import vllm_sm70.platform as sm70_platform
+    from vllm_sm70.models.qwen import dflash_sm70
+
+    bf16_draft = SimpleNamespace(dtype=torch.bfloat16)
+    assert not dflash_sm70.emulation_enabled(bf16_draft, torch.float16, capability=70)
+    before = ModelRegistry.models[dflash_sm70.DRAFT_ARCH]
+    with mock.patch.object(sm70_platform, "is_sm70_ready", lambda: True):
+        assert dflash_sm70.register() is False
+    assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
+
+
 def _getter_only(name):
     # TODO: replace with a path test in the patch named in PENDING.
     assert getattr(envs, name) is False
@@ -212,6 +228,8 @@ def _path_off(name):
         _fp8_refuses(name)
     elif name == "VLLM_SM70_QUANT":
         _quant_registration_skipped(name)
+    elif name == "VLLM_SM70_DFLASH2_EMULATION":
+        _dflash2_emulation_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
