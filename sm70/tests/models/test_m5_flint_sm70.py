@@ -694,6 +694,55 @@ def _shutdown(llm, settle_mib=2048, timeout_s=120):
     raise RuntimeError(f"GPU memory not released after shutdown: {used} MiB")
 
 
+# T4: a flip counts as a near-tie when both runs rank the two tokens as their
+# top-2 and their logprobs are within this many nats in both runs.
+T4_NEAR_TIE = 0.1
+
+
+def _greedy_lp(llm, n=64, prompts=PROMPTS):
+    """Greedy tokens plus each step's top-2 {token: logprob}."""
+    from vllm import SamplingParams
+
+    sp = SamplingParams(temperature=0, max_tokens=n, logprobs=2)
+    outs = llm.generate(prompts, sp)
+    res = []
+    for o in outs:
+        c = o.outputs[0]
+        steps = [{t: lp.logprob for t, lp in step.items()} for step in c.logprobs]
+        res.append((list(c.token_ids), steps))
+    return res
+
+
+def _greedy_lp_once(n=64, prompts=PROMPTS, **llm_kw):
+    llm = _llm(**llm_kw)
+    try:
+        return _greedy_lp(llm, n, prompts)
+    finally:
+        _shutdown(llm)
+
+
+def _near_tie(a, b, lp_a, lp_b, tol=T4_NEAR_TIE):
+    """Classify the first greedy flip between two runs (a chosen by run A
+    with step logprobs lp_a, b by run B with lp_b)."""
+    for name, lp in (("A", lp_a), ("B", lp_b)):
+        top2 = sorted(lp, key=lp.get, reverse=True)[:2]
+        if {a, b} != set(top2):
+            return f"run {name} top-2 {top2} does not hold both {a} and {b}"
+        gap = abs(lp[a] - lp[b])
+        if gap > tol:
+            return f"run {name} gap {gap:.4f} > {tol} nats"
+    gaps = (abs(lp_a[a] - lp_a[b]), abs(lp_b[a] - lp_b[b]))
+    return f"near-tie (gaps {gaps[0]:.4f} / {gaps[1]:.4f} nats)"
+
+
+def test_near_tie_classifier():
+    assert _near_tie(1, 2, {1: -0.69, 2: -0.70}, {2: -0.69, 1: -0.70}).startswith(
+        "near-tie"
+    )
+    assert "gap" in _near_tie(1, 2, {1: -0.1, 2: -2.5}, {2: -0.6, 1: -0.8})
+    assert "top-2" in _near_tie(1, 2, {1: -0.1, 3: -0.2}, {2: -0.1, 1: -0.12})
+
+
 def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
     """Build an LLM, run greedy decoding, always shut it down."""
     llm = _llm(**llm_kw)
@@ -946,11 +995,31 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
 @two_gpus
 @needs_ckpt
 def test_t4_compiled_graphs_match_eager():
-    """T4 (2 GPUs): eager vs compiled + FULL_AND_PIECEWISE CUDA graphs give
-    identical greedy tokens (no splitting op needed for the fused op)."""
-    eager = _greedy_once(256, enforce_eager=True)
-    graphs = _greedy_once(256)
-    assert eager == graphs
+    """T4 (2 GPUs): eager vs compiled + FULL_AND_PIECEWISE CUDA graphs agree
+    on greedy tokens up to the first near-tie.
+
+    Under compile, Inductor lowers upstream's native fused_add_rms_norm IR
+    (fp32 residual) where eager runs the vllm_c custom op, so logits differ
+    in the last bits and a greedy near-tie can flip, after which the two
+    continuations legitimately diverge. The fork's standard: identical until
+    the first near-tie. At the first differing position both runs must
+    rank the two tokens as their top-2 and put them within T4_NEAR_TIE nats;
+    anything else (a confident disagreement) is a real bug. Every prompt's
+    first-divergence position and gap is printed."""
+    eager = _greedy_lp_once(256, enforce_eager=True)
+    graphs = _greedy_lp_once(256)
+    bad = []
+    for i, ((et, elp), (gt, glp)) in enumerate(zip(eager, graphs)):
+        pos = next((j for j, (a, b) in enumerate(zip(et, gt)) if a != b), None)
+        if pos is None:
+            assert len(et) == len(gt) == 256
+            print(f"T4 prompt {i}: identical for {len(et)} tokens")
+            continue
+        verdict = _near_tie(et[pos], gt[pos], elp[pos], glp[pos])
+        print(f"T4 prompt {i}: first divergence at {pos}: {verdict}")
+        if not verdict.startswith("near-tie"):
+            bad.append((i, pos, verdict))
+    assert not bad, f"eager vs graphs: confident disagreement {bad}"
 
 
 # Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
