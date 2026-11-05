@@ -6,8 +6,9 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  One reviewed exception selects a kernel: VLLM_SM70_DFLASH2_FP16 (K18),
-  off by default because the fork never ran it at TP2 (see its comment).
+  Two reviewed exceptions select a kernel, both off by default until
+  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -54,7 +55,8 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_DFLASH2_FP16 (K18, opt-in by review decision).
+    except VLLM_SM70_DFLASH2_FP16 (K18) and VLLM_SM70_FP8_QPN8_M32 (K09),
+    opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -175,6 +177,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         )
     }
     | {
+        # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
+        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
+        # the other opt_in switches this one selects a kernel.
+        "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
         # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
         # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
         # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),

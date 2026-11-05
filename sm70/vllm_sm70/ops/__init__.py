@@ -39,5 +39,6 @@ def register() -> None:
         return
     from vllm_sm70.ops import tm  # noqa: F401  (registers the fakes)
     from vllm_sm70.ops import fv100  # noqa: F401  (K05: Flash-V100 fakes)
+    from vllm_sm70.ops import qpn8  # noqa: F401  (K09: QPN8 fakes + linear op)
     from vllm_sm70.ops import dflash2  # noqa: F401  (K18: DFlash2 fakes)
     from vllm_sm70.ops import flint_moe  # noqa: F401  (K12: decode fakes)
