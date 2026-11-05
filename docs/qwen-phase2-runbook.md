@@ -114,7 +114,7 @@ Run this after the M8 GPU tests pass, in this order:
 ```sh
 cd <repo checkout>   # PR #65 head
 $VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/qpn8 -v                      # K09 ops
-$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/quant/test_m8_qpn8_wiring.py -v  # M8 wiring (21)
+$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/quant/test_m8_qpn8_wiring.py -v  # M8 wiring (23)
 sm70/scripts/qwen_phase2/m8_qpn8_ab.sh
 ```
 `m8_qpn8_ab.sh` serves row 4 (Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2, `dflash`
