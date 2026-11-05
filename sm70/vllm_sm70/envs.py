@@ -154,7 +154,21 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         )
     },
     "attention": {},
-    "gdn": {},
+    # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
+    "gdn": {
+        # "0": GDN chunked prefill stays on upstream Triton/FLA (read when
+        # ChunkGatedDeltaRule is built, vllm_sm70/gdn/kernels.py).
+        "VLLM_SM70_GDN_FLASHQLA_PREFILL": kill_switch(
+            "VLLM_SM70_GDN_FLASHQLA_PREFILL"
+        ),
+        # "0": non-spec GDN decode stays on upstream's packed Triton decode
+        # (read on each flashqla_decode() call). Fork name kept.
+        "VLLM_SM70_GDN_DECODE_FLASHQLA": kill_switch("VLLM_SM70_GDN_DECODE_FLASHQLA"),
+        # "0": patch U2 off; the FLA recurrent kernels keep upstream's BV on
+        # sm_70 (read by vllm/third_party/flash_linear_attention/ops/
+        # fused_recurrent.py, which only checks for "0").
+        "VLLM_SM70_FLA_RECURRENT_SCHED": kill_switch("VLLM_SM70_FLA_RECURRENT_SCHED"),
+    },
     "fused_moe": {},
     # Mara (M1 sm70-config, M2 sm70-quant-gates). Kill switches only.
     "quant": {

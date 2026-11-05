@@ -35,12 +35,14 @@ def _needs_fake() -> dict[str, str]:
     """Ops that take a Tensor. Ops without one run eagerly (never traced),
     and torch refuses a fake on them when the C++ impl is the default
     CompositeImplicitAutograd from m.def(schema, fn) (seen on the real .so)."""
-    return {n: s for n, s in sm70_schemas().items() if _has_tensor_arg(s)}
+    return {
+        n: s for n, s in sm70_schemas(area="turbomind").items() if _has_tensor_arg(s)
+    }
 
 
 def test_no_fake_for_ops_without_tensor_args():
     fakes = set(re.findall(r'register_fake\("_sm70_C::(\w+)"\)', TM_PY.read_text()))
-    no_tensor = set(sm70_schemas()) - set(_needs_fake())
+    no_tensor = set(sm70_schemas(area="turbomind")) - set(_needs_fake())
     assert no_tensor, "expected some ops without Tensor args"
     assert not (fakes & no_tensor), sorted(fakes & no_tensor)
 
