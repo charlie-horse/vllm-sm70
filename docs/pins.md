@@ -57,7 +57,17 @@ Full URLs are in the PyPI JSON (`/pypi/<name>/<ver>/json`).
   - sdist: https://files.pythonhosted.org/packages/84/25/3ccd46844c94e08897aa8d72716a538c07e4583410d84dbc6cd12cb60dc1/lmcache-0.5.6.tar.gz
   - sha256: `d6951e60ce8818a76aa42d0866a4ba85f1c95cd919355fff30ff24dcc3243f1e`
 - **Build settings:** `LMCACHE_CUDA_MAJOR=12`, `TORCH_CUDA_ARCH_LIST=7.0`, `--no-build-isolation`, against torch 2.14.0+cu126.
-- **Constraints:** requires-python <3.14 and `numpy<=2.2.6`.
+- **Build:** `nix/lmcache-build.nix` (`packages.lmcache`): `BUILD_WITH_CUDA=1`, `setup.py build_ext --inplace`, patches from `nix/patches/lmcache`. Not built: the gRPC stubs (`build_py` needs grpcio-tools 1.78, which needs protobuf<7; only `--transport grpc` uses them), `rust/raw_block`, NIXL/Mooncake/Aerospike/HF3FS.
+- **Runtime deps:** vLLM's lock plus the `lmcache` group in `nix/pyenv`: sortedcontainers 2.4.0, cupy-cuda12x 14.2.0, opentelemetry-exporter-prometheus 0.66b2. Not added (unused on our paths): aiofile(s), awscrt, redis, google-*, cufile-python, grpcio-observability, cuda-python (cuda-bindings 12.9 is already locked).
+- **Constraints:** requires-python <3.14. Five locked versions are above LMCache's declared caps; none breaks an import on our paths, and no runtime-deps check runs (LMCache isn't a resolved lock entry; vLLM reads only its version):
+
+  | package | LMCache's cap | locked |
+  |---|---|---|
+  | numpy | `<=2.2.6` | 2.3.5 |
+  | protobuf | `<7` | 7.36.2 |
+  | opentelemetry-api | `<=1.40.0` | 1.45.2 |
+  | prometheus_client | `<=0.24.1` | 0.26.0 |
+  | opentelemetry-exporter-prometheus | `<=0.61b0` | 0.66b2 |
 
 ## Build-time fetches (all FetchContent, all fetched unconditionally for CUDA builds; the arch gate only skips compiling. The Nix sandbox has no network, so feed every one via its env var or patch out the include)
 Two hashes per dependency:

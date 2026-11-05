@@ -103,7 +103,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 |---|---|---|---|---|
 | C1 | Side-by-side bench and quality run vs the fork (cf9492a) on c4130: `verify_vllm.py`, `bench_vllm.py`, `kvtier_test.py`, and the SWE-bench slice (fork ≈37/50) | Astro + Mara | phase 2–4 exits | report attached to the cutover PR |
 | C2 | LMCache 0.5.6 from sdist (cu12, sm_70) in the flake, loaded via `kv_connector_module_path`, no vLLM patch | Theo + Felix | N2 | `kvtier_test.py` passes |
-| C3 | Switch `hosts/c4130/vllm` in charlie-horse/flake to this flake (after the GC of old generations c4130 needs first) | Felix + Charlie | C1, C2 | `nixos-rebuild switch` succeeds; etcd health OK; service serves |
+| C3 | Switch `hosts/c4130/vllm` in charlie-horse/flake to this flake's `latest` branch (gated per `docs/release.md`; after the GC of old generations c4130 needs first) | Felix + Charlie | C1, C2 | `nixos-rebuild switch` succeeds; etcd health OK; service serves |
 | C4 | Archive the fork (charlie-horse/vLLM) as reference only | Charlie | C3 | – |
 
 ## Series order for `patches/`
