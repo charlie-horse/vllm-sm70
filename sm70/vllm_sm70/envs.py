@@ -94,8 +94,35 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "attention": {},
     "gdn": {},
     "fused_moe": {},
-    "quant": {},
-    "models": {},
+    # Mara (M1 sm70-config, M2 sm70-quant-gates). Kill switches only.
+    "quant": {
+        # M2: "0" skips registering the SM70 "fp8"/"modelopt_fp4" configs;
+        # upstream's then refuse SM70 (min capability 75).
+        "VLLM_SM70_QUANT": kill_switch("VLLM_SM70_QUANT"),
+        # "0": the SM70 FP8 TurboMind path refuses with a clear error (no
+        # Marlin route in v1; upstream FP8 refuses SM70).
+        "VLLM_SM70_FP8_TURBOMIND": kill_switch("VLLM_SM70_FP8_TURBOMIND"),
+        # "0": Sm70Config.nvfp4_gemv=False (Flint NVFP4 W4A16 dense M<=2 GEMV).
+        "VLLM_SM70_MODELOPT_NVFP4_GEMV": kill_switch("VLLM_SM70_MODELOPT_NVFP4_GEMV"),
+        # "0": Sm70Config.fp8_moe_decode=False (Qwen FP8 MoE single-token route).
+        "VLLM_SM70_FP8_MOE_DECODE": kill_switch("VLLM_SM70_FP8_MOE_DECODE"),
+        # "0": Sm70Config.fp8_qpn8=False.
+        "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
+    },
+    "models": {
+        # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
+            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
+        ),
+        # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
+        "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
+        # "0": Sm70Config.dflash2_verifier="off".
+        "VLLM_SM70_DFLASH2_VERIFIER": kill_switch("VLLM_SM70_DFLASH2_VERIFIER"),
+        # "0": DFlash2 draft BF16 emulation off (read by M7).
+        "VLLM_SM70_DFLASH2_EMULATION": kill_switch("VLLM_SM70_DFLASH2_EMULATION"),
+        # "0": Sm70Config.shared_moe_overlap=False.
+        "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
+    },
     "passes": {},
 }
 
