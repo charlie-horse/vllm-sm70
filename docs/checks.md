@@ -22,9 +22,12 @@ requests and the eviction flood (a few minutes).
 
 ### Commands (on c4130, as charlie, from a checkout of this repo)
 
+Every sudo command takes the password on stdin from `$SERVER_PASSWORD`
+(`sudo -S -p ''`), so it is never typed, printed or written out.
+
 ```sh
 tmux new -s check6                     # or nohup; the run takes over an hour
-sudo systemctl restart vllm            # operator step; the script never uses sudo
+sudo -S -p '' systemctl restart vllm <<<"$SERVER_PASSWORD"   # the script never uses sudo
 python3 scripts/check6-lmcache-reaper.py run 2>&1 | tee ~/check6.log
 ```
 
@@ -41,16 +44,18 @@ INCOMPLETE and prints the exact command, including the `--since` time), save it
 and re-judge without re-running anything:
 
 ```sh
-sudo journalctl -u vllm-lmcache --since @<vllm start> -o short-unix --no-pager > ~/check6-lmcache.journal
+sudo -S -p '' journalctl -u vllm-lmcache --since @<vllm start> -o short-unix --no-pager <<<"$SERVER_PASSWORD" > ~/check6-lmcache.journal
 python3 scripts/check6-lmcache-reaper.py judge --journal-file ~/check6-lmcache.journal
 ```
 
-Results: per-criterion PASS/FAIL on stdout, exit 0 only on PASS, and the JSON
+Results: per-criterion PASS/FAIL/INVALID on stdout, the exit status (0 PASS,
+2 INVALID, 1 FAIL/INCOMPLETE/error; with `--dry-run` the verdicts are
+`SMOKE-PASS`/`SMOKE-INVALID`/`SMOKE-FAIL` with the same codes) and the JSON
 summary in `./check6-summary.json` (`verdict`, `criteria`, TTFTs, eviction,
 the `/status` timeline during the wait).
 
-Options worth knowing: `--dry-run` (no wait, verdict `SMOKE-PASS`/`SMOKE-FAIL`,
-for checking the plumbing at any time), `--wait-min`, `--base-url`,
+Options worth knowing: `--dry-run` (no wait and no quiet-period checks, for
+checking the plumbing at any time), `--wait-min`, `--base-url`,
 `--admin-url`, `--vllm-unit`/`--lmcache-unit` (if vLLM runs under another unit,
 e.g. `systemd-run --unit=vsm70-test`), `--no-probe`, `--evict`.
 
@@ -84,15 +89,23 @@ e.g. `systemd-run --unit=vsm70-test`), `--no-probe`, `--evict`.
    across it, and `usage.prompt_tokens_details.cached_tokens` is above 0
    (Flint runs with `--enable-prompt-tokens-details`). The summary also
    reports `vllm:prefix_cache_hits` (GPU) and
-   `vllm:prompt_tokens_cached_by_source`. If the GPU hits grew and the external
-   ones did not, the eviction failed: that FAIL says nothing about the fix.
+   `vllm:prompt_tokens_cached_by_source`.
 
 TTFT of request 1 vs 2 is reported as supporting information only.
 
-The run is INVALID (exit 1) if vllm restarted during it, a prompt over 200
-tokens or an LMCache store happened during the quiet hour, or the wait was
-shorter than `/status` `worker_liveness.registration_grace_seconds` plus one
-reaper interval (`reap_timeout_seconds / 4`).
+### INVALID (exit 2): no verdict on the fix
+
+- The run did not test the bug: vllm restarted during it, a prompt over 200
+  tokens or an LMCache store happened during the quiet hour, or the wait was
+  shorter than `/status` `worker_liveness.registration_grace_seconds` plus one
+  reaper interval (`reap_timeout_seconds / 4`).
+- The eviction did not take request 1 out of vLLM's GPU prefix cache, so
+  criterion 3 was not tested: the eviction errored, the flood was capped below
+  1.25× the KV capacity (raise `--max-flood-tokens`), or request 2 got GPU
+  prefix-cache hits and no external ones.
+
+A reap (criterion 1) or a wrong `registered_gpu_ids` count (criterion 2) is
+still a FAIL when the eviction failed. So is no external hit with no GPU hit.
 
 Against an LMCache build without the patch, the expected result is FAIL on
 all three criteria (the bug reproduced).

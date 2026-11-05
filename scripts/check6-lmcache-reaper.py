@@ -9,8 +9,9 @@ STORE is rejected (docs/upstream/lmcache-heartbeat-issue.md).
 
 Procedure (docs/checks.md has the operator steps):
 
-  start   Run right after `sudo systemctl restart vllm` (the operator's step;
-          this script never uses sudo). Waits until the API is up and both GPU
+  start   Run right after the operator's restart,
+          `sudo -S -p '' systemctl restart vllm <<<"$SERVER_PASSWORD"`
+          (this script never uses sudo). Waits until the API is up and both GPU
           instances are registered, records the anchor (the last
           "Registered KV cache" journal line, else the moment registration was
           observed), checks that no prompt over 200 tokens was served since
@@ -33,11 +34,19 @@ PASS iff all of:
      usage.prompt_tokens_details.cached_tokens > 0 when vLLM reports it.
 TTFT of request 1 vs 2 is printed as supporting information.
 
-The run is INVALID (exit 1, no verdict on the fix) if vllm restarted, a
-prompt over 200 tokens arrived during the quiet period, or the wait was
-shorter than the server's registration grace plus one reaper interval.
+The result is INVALID (exit 2, no verdict on the fix) if
+  - vllm restarted, a prompt over 200 tokens or an LMCache store arrived
+    during the quiet period, or the wait was shorter than the server's
+    registration grace plus one reaper interval (the run did not test the
+    bug; ignored with --dry-run); or
+  - the eviction did not take request 1 out of vLLM's GPU prefix cache:
+    the eviction errored, the flood was capped below --flood-factor x the
+    KV capacity, or request 2 got GPU prefix-cache hits and no external
+    ones (criterion 3 was not tested). A reap or a wrong
+    registered_gpu_ids count is still a FAIL.
 
-Exit status: 0 PASS (or a passing --dry-run smoke), 1 anything else.
+Exit status: 0 PASS (or SMOKE-PASS with --dry-run), 2 INVALID (or
+SMOKE-INVALID), 1 anything else (FAIL, INCOMPLETE, errors).
 Python 3 stdlib only.
 """
 from __future__ import annotations
@@ -438,9 +447,9 @@ def chat_once(cfg, messages: list[dict], max_tokens: int) -> dict:
     )
 
 
-def wait_l1_settled(cfg, before: int | None, timeout: float = 60) -> dict:
+def wait_l1_settled(cfg, before: int | None) -> dict:
     """Stores are asynchronous: wait until the L1 object count stops moving."""
-    deadline = time.time() + timeout
+    deadline = time.time() + cfg.store_settle_timeout
     last = lmcache_status(cfg.admin_url)
     while time.time() < deadline:
         time.sleep(cfg.settle_s)
@@ -547,8 +556,9 @@ def model_max_len(cfg) -> int:
 def print_journal_hint(cfg, since: float) -> None:
     cmd = " ".join(journal_cmd(cfg.lmcache_unit, since))
     print(
-        "  The LMCache journal is not readable as this user. Have the operator run:\n"
-        f"    sudo {cmd} > ~/check6-lmcache.journal\n"
+        "  The LMCache journal is not readable as this user. Have the operator run\n"
+        "  (password on stdin from $SERVER_PASSWORD, never typed on the command line):\n"
+        f"    sudo -S -p '' {cmd} <<<\"$SERVER_PASSWORD\" > ~/check6-lmcache.journal\n"
         "  then:\n"
         f"    python3 {sys.argv[0]} judge --state {cfg.state} "
         "--journal-file ~/check6-lmcache.journal",
@@ -614,7 +624,8 @@ def phase_start(cfg) -> dict:
     if long0:
         msg = (f"vLLM already served {int(long0)} prompt(s) over "
                f"{QUIET_MAX_PROMPT} tokens since it started; the quiet period is "
-               "broken. Restart vllm (operator) and run `start` again.")
+               "broken. Restart vllm (operator: sudo -S -p '' systemctl restart "
+               "vllm <<<\"$SERVER_PASSWORD\") and run `start` again.")
         if not cfg.dry_run:
             sys.exit(msg)
         log("dry run, continuing anyway: " + msg)
@@ -786,15 +797,27 @@ def judge(cfg, state: dict) -> int:
     # 3. external hit on request 2
     r2 = fin["request2"]
     ext, cached = r2.get("external_hits_delta"), r2.get("cached_tokens")
-    if ext is None:
+    ev = fin.get("evict") or {}
+    evict_invalid = []
+    if ev.get("error"):
+        evict_invalid.append(f"eviction failed: {ev['error']}")
+    if ev.get("capped_from"):
+        evict_invalid.append(
+            f"flood capped at {ev.get('target_tokens')} tokens, below "
+            f"{ev['capped_from']} (--flood-factor x KV capacity); raise "
+            "--max-flood-tokens")
+    if ext is not None and ext <= 0 and (r2.get("device_hits_delta") or 0) > 0:
+        evict_invalid.append(
+            "request 2 was served from vLLM's GPU prefix cache, so LMCache was "
+            "not asked: the eviction did not work")
+    why = "; ".join(evict_invalid)
+    if evict_invalid:
+        res = "INVALID"
+    elif ext is None:
         res = "UNKNOWN"
         why = "vllm:external_prefix_cache_hits not exported"
     else:
         res = "PASS" if ext > 0 and (cached is None or cached > 0) else "FAIL"
-        why = ""
-        if ext <= 0 and (r2.get("device_hits_delta") or 0) > 0:
-            why = ("request 2 was served from vLLM's GPU prefix cache, so LMCache "
-                   "was not asked: eviction did not work (see evict)")
     crit["external_hit_request2"] = {
         "result": res, "why": why,
         "external_prefix_cache_hits_delta": ext,
@@ -829,24 +852,30 @@ def judge(cfg, state: dict) -> int:
         invalid.append(f"waited {waited:.0f} s < registration grace + one reaper "
                        f"interval ({need:.0f} s)")
 
+    # Order: an untested run says nothing; a reap or a lost registration is a
+    # FAIL of the fix even if the eviction failed; a failed eviction voids
+    # only criterion 3.
+    dry = bool(state.get("dry_run"))
     results = [c["result"] for c in crit.values()]
-    if state.get("dry_run"):
-        verdict = "SMOKE-PASS" if all(r == "PASS" for r in results) else "SMOKE-FAIL"
-    elif invalid:
+    if invalid and not dry:
         verdict = "INVALID"
     elif "FAIL" in results:
         verdict = "FAIL"
+    elif "INVALID" in results:
+        verdict = "INVALID"
     elif "UNKNOWN" in results:
         verdict = "INCOMPLETE"
     else:
         verdict = "PASS"
+    if dry:
+        verdict = "SMOKE-" + verdict
 
     r1 = fin["request1"]
     summary = {
         "check": 6,
         "verdict": verdict,
         "dry_run": state.get("dry_run", False),
-        "invalid_reasons": invalid,
+        "invalid_reasons": invalid + evict_invalid,
         "criteria": crit,
         "ttft_s": {"request1": r1.get("ttft_s"), "request2": r2.get("ttft_s")},
         "request1": {k: r1.get(k) for k in ("prompt_tokens", "cached_tokens",
@@ -876,11 +905,16 @@ def judge(cfg, state: dict) -> int:
           f"{r2.get('ttft_s')} s; request 1 stored +{r1.get('l1_objects_delta')} "
           f"L1 objects; evict {fin.get('evict', {}).get('method')}")
     for reason in invalid:
-        print(f"  {'note' if state.get('dry_run') else 'INVALID':<8} {reason}")
+        print(f"  {'note' if dry else 'INVALID':<8} {reason}")
     print(f"VERDICT: {verdict}   (summary: {cfg.summary})")
     if crit["no_reaped_gpu_instances"]["result"] == "UNKNOWN":
         print_journal_hint(cfg, started)
-    return 0 if verdict in ("PASS", "SMOKE-PASS") else 1
+    return exit_code(verdict)
+
+
+def exit_code(verdict: str) -> int:
+    v = verdict.removeprefix("SMOKE-")
+    return {"PASS": 0, "INVALID": 2}.get(v, 1)
 
 
 # ---------------------------------------------------------------- CLI
@@ -925,6 +959,8 @@ def main(argv=None) -> int:
     common.add_argument("--ready-timeout-min", type=float, default=30.0)
     common.add_argument("--request-timeout", type=float, default=900.0)
     common.add_argument("--settle-s", type=float, default=3.0)
+    common.add_argument("--store-settle-timeout", type=float, default=60.0,
+                        help="max seconds to wait for request 1's LMCache store")
 
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
