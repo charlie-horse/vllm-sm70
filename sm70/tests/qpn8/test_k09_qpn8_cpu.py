@@ -1,0 +1,285 @@
+# SPDX-License-Identifier: Apache-2.0
+"""K09 CPU checks for the QPN8 ops (no GPU, no built _sm70_C).
+
+What: the QPN8 schemas in sm70/csrc/qpn8 are the three carried ops, with
+  `Tensor(a!)` outputs, CUDA impls and no `native_policy` or raw-pointer
+  argument; every op has a fake in vllm_sm70/ops/qpn8.py whose arguments
+  match the schema and whose shapes match the C++ op; the gemm guards admit
+  M in [1, 8] and no longer name a TP4 shape; every TP2 Qwen3.6/3.8 dense
+  FP8 shape is admitted and gets a split-K the kernel accepts; the
+  qpn8_native_linear custom op picks QPN8 / TurboMind / dequantize+mm by M
+  (ports the kernel-level parts of fork tests/quantization/
+  test_block_fp8_qpn8_capabilities.py).
+"""
+
+from __future__ import annotations
+
+import inspect
+import pathlib
+import re
+import subprocess
+import sys
+
+import pytest
+from _qpn8_helpers import TP2_SHAPES, qpn8_schemas
+
+torch = pytest.importorskip("torch")
+
+SM70 = pathlib.Path(__file__).resolve().parents[2]
+QPN8_PY = SM70 / "vllm_sm70" / "ops" / "qpn8.py"
+QPN8_CU = SM70 / "csrc" / "qpn8" / "fp8_qpn8_sm70.cu"
+
+
+# ------------------------------------------------------------------ schemas
+
+
+def test_schemas():
+    schemas = qpn8_schemas()
+    assert set(schemas) == {
+        "fp8_qpn8_prepare_sm70",
+        "fp8_qpn8_dequantize_sm70_out",
+        "fp8_qpn8_gemm_sm70_out",
+    }
+    for name, schema in schemas.items():
+        assert "native_policy" not in schema and "_ptr" not in schema, name
+        torch._C.parse_schema(schema)
+    assert schemas["fp8_qpn8_gemm_sm70_out"].startswith(
+        "fp8_qpn8_gemm_sm70_out(Tensor(a!) out,"
+    )
+    assert schemas["fp8_qpn8_dequantize_sm70_out"].startswith(
+        "fp8_qpn8_dequantize_sm70_out(Tensor(a!) out,"
+    )
+
+
+def test_cuda_impls_and_trim():
+    text = QPN8_CU.read_text()
+    block = re.search(r"TORCH_LIBRARY_IMPL\(_sm70_C, CUDA, m\) \{(.*?)\n\}", text, re.S)
+    assert block is not None
+    assert set(re.findall(r'm\.impl\("(\w+)"', block.group(1))) == set(qpn8_schemas())
+    for gone in (
+        "sm70_policy.h",
+        "qpn_pair_sm70.cuh",
+        "dense_weight_ptr",
+        "from_blob",
+        "twophase",
+        "gated_pair_sm70_out",
+        "hc_dispatch",
+        "TORCH_LIBRARY_FRAGMENT(_C",
+    ):
+        assert gone not in text, gone
+
+
+def test_gemm_guards_are_m8_and_shape_generic():
+    """The TP4-only lesson (#34/#40): no guard may name a model shape."""
+    body = QPN8_CU.read_text().split("void fp8_qpn8_gemm_sm70_out(", 1)[1]
+    checks = re.findall(r"TORCH_CHECK\((.*?)\);", body, re.S)
+    joined = " ".join(checks)
+    assert "m >= 1 && m <= 8" in joined
+    for literal in re.findall(r"\b\d{3,}\b", joined):
+        assert literal in ("128",), f"shape literal {literal} in a guard"
+
+
+def test_sources_cmake_lists_the_tu():
+    assert "fp8_qpn8_sm70.cu" in (SM70 / "csrc/qpn8/sources.cmake").read_text()
+    assert "csrc/qpn8/sources.cmake" in (SM70 / "CMakeLists.txt").read_text()
+
+
+def test_every_op_has_a_fake():
+    fakes = set(re.findall(r'register_fake\("_sm70_C::(\w+)"\)', QPN8_PY.read_text()))
+    assert fakes == set(qpn8_schemas())
+
+
+def test_fake_signatures_match_schemas(qpn8_stub):
+    problems = []
+    for name, schema in qpn8_schemas().items():
+        fake = getattr(qpn8_stub, f"_{name}_fake", None)
+        if fake is None:
+            problems.append(f"{name}: no fake")
+            continue
+        args = [a.name for a in torch._C.parse_schema(schema).arguments]
+        params = list(inspect.signature(fake).parameters)
+        if params != args:
+            problems.append(f"{name}: {params} vs {args}")
+    assert not problems, problems
+    assert qpn8_stub.NO_FAKE_OPS == frozenset()
+
+
+def _meta(*shape, dtype=torch.float16):
+    return torch.empty(*shape, dtype=dtype, device="meta")
+
+
+@pytest.mark.parametrize("n, k", [(128, 128), (4608, 2048), (17408, 5120)])
+def test_prepare_fake_shapes(qpn8_stub, n, k):
+    codes, scales = torch.ops._sm70_C.fp8_qpn8_prepare_sm70(
+        _meta(n, k, dtype=torch.float8_e4m3fn),
+        _meta(n // 128, k // 128, dtype=torch.float32),
+    )
+    assert (codes.shape, codes.dtype) == ((k, n), torch.uint8)
+    assert (scales.shape, scales.dtype) == ((k // 128, n // 32), torch.float16)
+    codes, scales = torch.ops._sm70_C.fp8_qpn8_prepare_sm70(
+        _meta(n, k, dtype=torch.float8_e4m3fn), _meta(n, 1, dtype=torch.float32)
+    )
+    assert scales.shape == (1, n)
+
+
+def test_out_op_fakes_return_none(qpn8_stub):
+    out = _meta(4, 256)
+    codes = _meta(512, 256, dtype=torch.uint8)
+    scales = _meta(4, 8)
+    assert (
+        torch.ops._sm70_C.fp8_qpn8_gemm_sm70_out(
+            out, _meta(4, 512), codes, scales, 16, 2, True, False
+        )
+        is None
+    )
+    assert (
+        torch.ops._sm70_C.fp8_qpn8_dequantize_sm70_out(_meta(512, 256), codes, scales)
+        is None
+    )
+
+
+def test_provenance_check_passes():
+    script = SM70 / "tools" / "check_qpn8_provenance.py"
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --------------------------------------------------------- config/admission
+
+
+@pytest.mark.parametrize("name", sorted(TP2_SHAPES))
+def test_tp2_dense_shapes_are_admitted(qpn8_stub, name):
+    n, k = TP2_SHAPES[name]
+    assert qpn8_stub.qpn8_rejection(n, k) is None
+    split, chains, prefetch = qpn8_stub.qpn8_config(k, n)
+    # Exactly the C++ guards of fp8_qpn8_gemm_sm70_out.
+    assert split in (4, 8, 12, 16, 32) and (k // 16) % split == 0
+    assert chains in (1, 2)
+    assert split != 12 or (chains == 2 and not prefetch)
+    assert (k, n, False) not in qpn8_stub.QPN8_CONFIGS  # generic at TP2
+
+
+def test_tp4_table_entries_kept(qpn8_stub):
+    assert qpn8_stub.qpn8_config(4352, 5120) == (16, 1, False)
+    assert qpn8_stub.qpn8_config(5120, 8704) == (16, 1, True)
+    assert qpn8_stub.qpn8_config(2048 + 128, 512) == (8, 2, False)  # K % 256
+
+
+@pytest.mark.parametrize(
+    "n, k", [(0, 128), (128, 0), (127, 128), (128, 129), (32, 2048)]
+)
+def test_unaligned_and_empty_weights_report_reason(qpn8_stub, n, k):
+    reason = qpn8_stub.qpn8_rejection(n, k)
+    assert reason is not None and "divisible by 128" in reason
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs, spec, copy",
+    [
+        (1, 5, False),
+        (8, 0, False),
+        (9, 0, True),
+        (2, 5, True),
+        (1, 7, False),
+        (4, 7, True),
+    ],
+)
+def test_turbomind_fallback_follows_decode_rows(qpn8_stub, max_num_seqs, spec, copy):
+    assert qpn8_stub.needs_turbomind_fallback(max_num_seqs, spec) is copy
+
+
+# ------------------------------------------------- the opaque linear op
+
+
+def _operands(n=256, k=512):
+    return (
+        torch.zeros(k, n, dtype=torch.uint8),
+        torch.zeros(k // 128, n // 32, dtype=torch.float16),
+    )
+
+
+@pytest.fixture
+def recorder(monkeypatch, qpn8_stub):
+    calls = []
+
+    def gemm(out, x, codes, scales, split, chains, fast, prefetch):
+        calls.append(("qpn8", x.shape[0], split, chains))
+        out.fill_(1)
+
+    def dequant(out, codes, scales):
+        calls.append(("dequant", tuple(out.shape)))
+        out.fill_(0.5)
+
+    class FakeTm:
+        @staticmethod
+        def fp8_gemm_sm70_out(out, x, w, s, g, k_ld, q_ld, gated):
+            calls.append(("turbomind", x.shape[0], k_ld, q_ld))
+            out.fill_(2)
+
+    import vllm_sm70.ops as ops_pkg
+
+    monkeypatch.setattr(qpn8_stub, "fp8_qpn8_gemm_sm70_out", gemm)
+    monkeypatch.setattr(qpn8_stub, "fp8_qpn8_dequantize_sm70_out", dequant)
+    monkeypatch.setattr(ops_pkg, "tm", FakeTm, raising=False)
+    monkeypatch.setitem(__import__("sys").modules, "vllm_sm70.ops.tm", FakeTm)
+    return calls
+
+
+def test_empty_activation_does_not_launch(recorder, qpn8_stub):
+    codes, scales = _operands()
+    y = qpn8_stub._qpn8_native_linear_impl(
+        torch.empty(0, 512, dtype=torch.float16), codes, scales, 16, 2, False
+    )
+    assert y.shape == (0, 256) and y.dtype == torch.float16
+    assert recorder == []
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+def test_m_le_8_uses_qpn8(recorder, qpn8_stub, m):
+    codes, scales = _operands()
+    y = qpn8_stub._qpn8_native_linear_impl(
+        torch.ones(m, 512, dtype=torch.float16), codes, scales, 16, 2, False
+    )
+    assert recorder == [("qpn8", m, 16, 2)] and y.shape == (m, 256)
+
+
+def test_m_gt_8_uses_turbomind_when_held(recorder, qpn8_stub):
+    codes, scales = _operands()
+    w, s = torch.zeros(1), torch.zeros(1)
+    y = qpn8_stub._qpn8_native_linear_impl(
+        torch.ones(9, 512, dtype=torch.float16), codes, scales, 16, 2, False, w, s, 7, 9
+    )
+    assert recorder == [("turbomind", 9, 7, 9)] and bool((y == 2).all())
+
+
+def test_m_gt_8_dequantizes_into_caller_scratch(recorder, qpn8_stub):
+    codes, scales = _operands()
+    scratch = torch.zeros(512 * 256 + 10, dtype=torch.float16)
+    x = torch.ones(16, 512, dtype=torch.float16)
+    y = qpn8_stub._qpn8_native_linear_impl(
+        x, codes, scales, 16, 2, False, dense_scratch=scratch
+    )
+    assert recorder == [("dequant", (512, 256))]
+    assert bool((scratch[: 512 * 256] == 0.5).all())  # written in place
+    assert torch.allclose(y.float(), torch.full((16, 256), 256.0))
+    recorder.clear()
+    y2 = qpn8_stub._qpn8_native_linear_impl(x, codes, scales, 16, 2, False)
+    assert recorder == [("dequant", (512, 256))]
+    assert torch.equal(y, y2)
+
+
+def test_custom_op_fake_and_wrapper_shapes(qpn8_stub):
+    prepared = qpn8_stub.Qpn8Prepared(
+        _meta(512, 384, dtype=torch.uint8), _meta(4, 12), 384, 512, 16, 2, False
+    )
+    y = qpn8_stub.qpn8_linear(_meta(2, 3, 512), prepared)
+    assert y.shape == (2, 3, 384)
+    with pytest.raises(TypeError, match="FP16"):
+        qpn8_stub.qpn8_linear(_meta(2, 512, dtype=torch.float32), prepared)
+
+
+def test_ops_area_imports_qpn8():
+    init = (SM70 / "vllm_sm70" / "ops" / "__init__.py").read_text()
+    assert "from vllm_sm70.ops import qpn8" in init
