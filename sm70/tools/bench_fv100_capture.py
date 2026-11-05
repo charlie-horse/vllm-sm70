@@ -129,7 +129,9 @@ def run(
                         call(hint, hint)
                     torch.cuda.current_stream().wait_stream(side)
                     g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g):
+                    # Capture on the same side stream as the warmup, as
+                    # vLLM does, so the workspace cache sees one stream.
+                    with torch.cuda.graph(g, stream=side):
                         call(hint, hint)
                     return g, _workspace_mib(fv100)
 
