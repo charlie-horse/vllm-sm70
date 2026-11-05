@@ -21,4 +21,7 @@ include = ["vllm_sm70*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: needs an SM70 GPU (deselect with -m 'not gpu')"]
+markers = [
+  "gpu: needs an SM70 GPU (deselect with -m 'not gpu')",
+  "slow: long-running benchmark (deselect with -m 'not slow')",
+]

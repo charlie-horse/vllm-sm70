@@ -27,8 +27,8 @@ The whole carry against upstream is these patches:
 | U2 | ~8 | `fla/ops/fused_sigmoid_gating.py:208-212`, `fla/ops/fused_recurrent.py:196-200` |
 | U3 | +20 | `fused_moe/runner/moe_runner.py:630, :907`, `platforms/interface.py` |
 | U4 | ~60 | `v1/worker/gpu_model_runner.py` :3403, :4208 |
-| U5 | ~330 | `csrc/custom_all_reduce.cu`, `csrc/torch_bindings.cpp`, `custom_all_reduce.py`, `cuda_communicator.py` |
-| **total** | **~100 without U5; ~430 with it** | |
+| U5 | 0 | none: K17's kernel is in `_sm70_C` and includes upstream's `csrc/custom_all_reduce.cuh` |
+| **total** | **~100** (U5 adds none) | |
 
 ## Phase 1: unpatched build
 
@@ -78,7 +78,11 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 
 ## Phase 4: Flint fast paths
 
-**D2:** the V1-vs-V2 sampler decision is deferred until V1 and V2 are measured, before K16. **D3:** U5 ships, and it lands last in this phase.
+**D2:** the V1-vs-V2 sampler decision is deferred until V1 and V2 are measured, before K16. **D3:** U5 needs no upstream patch. K17 builds the fused kernel in `_sm70_C` against upstream's own `custom_all_reduce.cuh` and takes `ca_comm._ptr` as an int. R5 (the FULL-capture `cudaIpcGetMemHandle` crash under expandable segments) needs no upstream line either. K17's op copies its input into the communicator's eager buffer, which is IPC-registered at init, then publishes a fenced start flag (`staged_barrier_at_start`, fork 9f175fc6e). So K17's op never registers graph buffers. Upstream's plain all-reduce still does, unchanged.
+
+**Upstream contract K17 depends on** (a rebase must keep it; the build fails loudly if the C++ side moves):
+- Python `CustomAllreduce` (`vllm/distributed/device_communicators/custom_all_reduce.py`): `_ptr`, `disabled`, `rank`, `world_size`, `buffer_ptrs`, `max_size`, `should_custom_ar`, `custom_all_reduce`.
+- C++ layout of `CustomAllreduce`, `Signal`, `RankData` and `RankSignals` in `csrc/custom_all_reduce.cuh`: pinned by `static_assert`. CMake and a CPU test also check the sha256 of the three upstream headers K17 includes against BASE+series.
 
 | node | level | what | owner | depends | kill switch | exit test |
 |---|---|---|---|---|---|---|
@@ -92,8 +96,8 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 | K16 | 1 | Flint top-k candidate sampler (op) | Kai | K01, U4 | – (switch is M10's) | fork tests; greedy-identical with the switch off |
 | M10 | 6 | Wire K13 (router) and K16 (sampler) into M5 | Mara | M5, K13, K16 | `VLLM_SM70_FLINT_FUSED_ROUTER=0`, `VLLM_SM70_FLINT_SAMPLER=0` | GPU e2e: greedy-identical with each switch off |
 | K04 | 3 | opt: AWQ/int4 | Kai | K03 | `VLLM_SM70_TURBOMIND_AWQ=0` | GPU: AWQ cases in `test_sm70_turbomind_adapter` |
-| U5 | 0 | TP2 fused all-reduce + add + RMSNorm, stable ABI. **Lands last** (D3) | Kai | – | `VLLM_SM70_FLINT_AR_RMSNORM=0` | GPU, 2 GPUs: `test_sm70_tp2_ar_fused_add_rms_norm` bitwise-equal to unfused |
-| K17 | 1 | Flint AR+RMSNorm fusion pattern (composite post-grad pass) | Kai | K01, U5 | `VLLM_SM70_FLINT_AR_RMSNORM=0` (same switch as U5) | GPU: pass fires on the Flint graph; output greedy-identical with the switch off |
+| U5 | 0 | No patch (D3). Guards in K17: `static_assert` on the layout of `CustomAllreduce`, `Signal`, `RankData` and `RankSignals`; a CMake check and a CPU test that the three upstream headers hash to BASE+series | Kai | – | – (K17's `VLLM_SM70_FLINT_AR_RMSNORM=0`) | CPU: header-hash test; GPU: FULL capture with expandable segments (R5) |
+| K17 | 1 | Flint TP2 fused all-reduce + add + RMSNorm: kernel in `_sm70_C` (upstream `custom_all_reduce.cuh`, fork kernel ported to its layout) plus the composite post-grad pass. Needs sm70-ext to take vLLM's `csrc` include dir (Felix) | Kai | K01, U5 | `VLLM_SM70_FLINT_AR_RMSNORM=0` | GPU, 2 GPUs: `test_sm70_tp2_ar_fused_add_rms_norm` bitwise-equal to unfused; pass fires on the Flint graph; greedy-identical with the switch off |
 
 **Phase 4 exit:** Flint TP2 4K decode is at least **170 tok/s** on c4130, with every fast path on. Every kill switch set to 0 gives greedy-identical output.
 
@@ -103,13 +107,13 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 |---|---|---|---|---|
 | C1 | Side-by-side bench and quality run vs the fork (cf9492a) on c4130: `verify_vllm.py`, `bench_vllm.py`, `kvtier_test.py`, and the SWE-bench slice (fork ≈37/50) | Astro + Mara | phase 2–4 exits | report attached to the cutover PR |
 | C2 | LMCache 0.5.6 from sdist (cu12, sm_70) in the flake, loaded via `kv_connector_module_path`, no vLLM patch | Theo + Felix | N2 | `kvtier_test.py` passes |
-| C3 | Switch `hosts/c4130/vllm` in charlie-horse/flake to this flake (after the GC of old generations c4130 needs first) | Felix + Charlie | C1, C2 | `nixos-rebuild switch` succeeds; etcd health OK; service serves |
+| C3 | Switch `hosts/c4130/vllm` in charlie-horse/flake to this flake's `latest` branch (gated per `docs/release.md`; after the GC of old generations c4130 needs first) | Felix + Charlie | C1, C2 | `nixos-rebuild switch` succeeds; etcd health OK; service serves |
 | C4 | Archive the fork (charlie-horse/vLLM) as reference only | Charlie | C3 | – |
 
 ## Series order for `patches/`
 
 1. 0001–0099 build: 0001 trims the external projects that build nothing for sm_70 (`VLLM_SM70_TRIM_EXTERNALS=1`, set by nix/package.nix; unset or ≠1 → upstream). The remaining FetchContent sources are fed by Nix.
-2. 0100–0199 platform: U1, U2, U3, U4, then U5 last.
+2. 0100–0199 platform: U1, U2, U3, U4. U5 has no patch.
 3. 0500–0699 models: none. The M7 subclass route works without a patch.
 4. 0700–0799 kv: none.
 
@@ -119,5 +123,5 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 - **Kill-switch placement** (Kai and Mara): one switch per feature, read where the path is chosen, normally in M wiring. K14 (attention) and K17 (pass) are the exceptions, because their path is chosen inside Kai's code. K ops carry no runtime switch. Only `0` acts; env never turns a feature on. The seven Flint switch names stay exactly as the fork's operator docs have them: `MODELOPT_NVFP4_GEMV`, `FLINT_MOE_QPN_DECODE`, `FLINT_QK_ROPE_KV`, `FLINT_FUSED_ROUTER`, `FLINT_SAMPLER`, `FLINT_ATTN_FUSED_DECODE`, `FLINT_AR_RMSNORM` (each `VLLM_SM70_`-prefixed).
 - **K15 is the op and M5 calls it,** with `VLLM_SM70_FLINT_QK_ROPE_KV` as the only switch. `VLLM_SM70_FLINT_FUSIONS` is dropped.
 - **M6-M (Marlin-SM70 FP8) is dropped for v1.** Revisit only if M6 is blocked.
-- **D2** is deferred to phase 4, measured before K16. **D3:** U5 ships, last in phase 4.
+- **D2** is deferred to phase 4, measured before K16. **D3:** U5 is no patch; K17 carries the kernel and the pass; R5 needs no upstream line.
 - **kv:** no vLLM-side patches (Theo).
