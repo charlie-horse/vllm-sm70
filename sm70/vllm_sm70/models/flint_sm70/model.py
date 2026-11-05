@@ -15,15 +15,16 @@ FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
                                        92). RoutedExperts.load_weights builds
                                        its own mapping (UP fused_moe/
                                        routed_experts.py:1004-1008)
-runner.router_provider :229            dropped in v1 (fused router deferred)
+runner.router_provider :229            K13 via U3's platform getter (M10;
+                                       no model hook)
 Attention.forward(kv_cache_updated=)   op returns a dummy dep, then
   :386                                 torch.ops.vllm.unified_attention_with_
                                        output(kv_cache_dummy_dep=) (UP
                                        attention/attention.py:772-800)
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
-layer_policy(...).value("flint_        dropped in v1 (sampler deferred)
-  sampler") :570-577
+layer_policy(...).value("flint_        supports_sm70_topk_sampler = True
+  sampler") :570-577                  (K16 on U4, M10)
 AutoWeightsLoader(skip_prefixes=)      filter lm_head.* when tied (UP
   :629-632                             AutoWeightsLoader has no skip_prefixes,
                                        vllm/model_executor/models/
@@ -35,7 +36,8 @@ FP16 rescale :87-107, :402-447, :623-  fp16_rescale.py
 Not ported (fork cf9492a model.py): ``_expert_params_mapping`` :117-126 (UP
 RoutedExperts builds the mapping), ``get_expert_mapping`` :616-617, the
 sampler hooks ``_get_top_tokens`` :597-603 and ``_sample_topk_candidates``
-:605-614 (deferred to M10), and the fused-router hook :227-229 (M10).
+:605-614 (K16's U4 hook samples instead; M10 opts in), and the
+fused-router hook :227-229 (K13 binds through U3's platform getter).
 
 Quantization isn't special-cased here: dense ModelOpt W4A16 linears go to
 M3 (vllm_sm70/quant/nvfp4_linear.py) and routed experts to M4
@@ -217,7 +219,8 @@ class FlintSm70SparseMoeBlock(nn.Module):
         # (vllm/model_executor/layers/fused_moe/routed_experts.py:1007) from the
         # default ckpt_names=("gate_proj","down_proj","up_proj")
         # (vllm/model_executor/layers/fused_moe/layer.py:125); and the fork's
-        # runner.router_provider (:229, fused router deferred).
+        # runner.router_provider (:229; in M10, K13 binds through U3's
+        # platform getter instead).
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -560,7 +563,19 @@ class FlintSm70Model(nn.Module):
 
 # ported from FORK vllm/models/flint/model.py:527-668
 class FlintSm70ForCausalLM(nn.Module, SupportsPP):
-    """fork :527-668, minus the sampler hooks (:570-577, :597-614, deferred)."""
+    """fork :527-668. The fork's sampler hooks (:570-577, :597-614) are
+    replaced by the K16 opt-in below; the fused router (:227-229) needs no
+    hook here (M10)."""
+
+    # M10: opt in to Kai's K16 top-k candidate sampler (vllm_sm70/sample_v1.py
+    # MODEL_OPT_IN, replacing fork :570-577, :605-614). It samples from
+    # self.lm_head and self.logits_processor. VLLM_SM70_FLINT_SAMPLER=0 is
+    # read in Sm70CudaPlatform.get_hidden_state_sampler. K13 (the fused
+    # router, replacing fork :227-229) needs no declaration: U3's platform
+    # getter admits each MoE runner by structure, and the FP32 GateLinear in
+    # FlintSm70SparseMoeBlock is what it needs (VLLM_SM70_FLINT_FUSED_ROUTER=0
+    # is read in vllm_sm70/router.py).
+    supports_sm70_topk_sampler = True
 
     # fork :528-542 == UP models/flint/model.py:600-614
     hf_to_vllm_mapper = WeightsMapper(
