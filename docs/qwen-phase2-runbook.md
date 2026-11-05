@@ -16,8 +16,9 @@ write under `$OUT`. Scripts: `sm70/scripts/qwen_phase2/`.
 - Run inside `tmux`: a dropped SSH session kills the run.
 
 Env the scripts set if unset (from `docs/phase1-gpu-runbook.md`):
-`VLLM_ATTENTION_BACKEND=TRITON_ATTN HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1
-VLLM_USE_FLASHINFER_SAMPLER=0`. If TRITON_ATTN fails in ptxas, the
+`HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 VLLM_USE_FLASHINFER_SAMPLER=0`.
+The attention backend is passed as `--attention-backend TRITON_ATTN`
+(override with `QP2_ATTN_BACKEND`); v0.33.0 ignores `VLLM_ATTENTION_BACKEND`. If TRITON_ATTN fails in ptxas, the
 `TRITON_PTXAS_PATH` fallback from that runbook applies here too.
 
 ## Commands (inside the window, after Flint is stopped)
