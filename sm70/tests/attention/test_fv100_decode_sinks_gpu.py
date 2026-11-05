@@ -9,8 +9,10 @@ and the CPU dispatch cases (:942-1591) belong to K14 (C4) and K06.
 
 D128, GQA 8:1 (TP1 32q/4kv, TP2 16q/2kv), sliding window 513 and full
 attention, fp16 paged KV, P256/P512/P1024, batches 1-8, verifier rows and
-CUDA-graph replay. With sinks, these shapes take the grouped two-launch
-kernel (the fused kernel is not built in K05).
+CUDA-graph replay. With sinks, these shapes take the one-launch fused kernel
+since K14 (VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0: the grouped two-launch
+kernel); the grouped-vs-per-head case runs both routes. The fused-only cases
+are in test_fv100_fused_decode_gpu.py.
 """
 
 from __future__ import annotations
@@ -234,11 +236,13 @@ def test_decode_sinks_none_is_bit_identical(fv100_gpu, window):
     [[1], [255, 256, 257], [513, 3000, 70], [8192]],
     ids=["one", "edges", "mixed", "long"],
 )
+@pytest.mark.parametrize("fused", ["0", "1"], ids=["two-launch", "fused"])
 @torch.inference_mode()
 def test_decode_sinks_grouped_kernel_matches_per_head_kernel(
-    fv100_gpu, window, heads, partition_size, seq_lens
+    fv100_gpu, monkeypatch, window, heads, partition_size, seq_lens, fused
 ):
     """A sink of -1e4 adds an exact zero, so grouped == per-head sink-free."""
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", fused)
     device, fv100 = fv100_gpu
     num_heads, num_kv_heads = heads
     k_cache, v_cache, block_table, _ = paged_kv(

@@ -22,11 +22,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_011nZrmUQtD6qJskP867jP1x
 
 diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
-index e64bd77f9cfd..4375a06e3e2a 100644
+index 57792438b4c6..87f1ab5d3c62 100644
 --- a/vllm/platforms/interface.py
 +++ b/vllm/platforms/interface.py
-@@ -1222,6 +1222,16 @@ class Platform:
-         expert gates, or EP/sequence-parallel dispatch."""
+@@ -1225,6 +1225,16 @@ class Platform:
+         shared expert gates, or EP/sequence-parallel dispatch."""
          return None
  
 +    @classmethod

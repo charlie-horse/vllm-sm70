@@ -44,6 +44,7 @@
         default = p.vllm;
         inherit (p) vllm tree venv;
         sm70-ext = p.sm70ext;
+        lmcache = p.lmcacheBuild;
         source = src;
         flint-checkpoint = checkpoint.flintCheckpoint;
       };

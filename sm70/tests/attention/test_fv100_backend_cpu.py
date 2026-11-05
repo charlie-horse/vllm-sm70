@@ -122,7 +122,7 @@ def test_kernel_block_sizes_take_a_spec(backend_cls):
     assert not backend_cls.supports_block_size(8)
 
 
-def test_builder_flags():
+def test_builder_flags(monkeypatch):
     from vllm.v1.attention.backend import AttentionCGSupport
 
     from vllm_sm70.attention.flash_v100.metadata import FlashAttnV100MetadataBuilder
@@ -131,7 +131,14 @@ def test_builder_flags():
         AttentionCGSupport.UNIFORM_BATCH
     )
     assert FlashAttnV100MetadataBuilder.supports_draft_decode_metadata_update is False
-    spec_cfg = SimpleNamespace(speculative_config=object())
+    spec = SimpleNamespace(num_speculative_tokens=7, parallel_drafting=False)
+    spec_cfg = SimpleNamespace(speculative_config=spec)
+    # K07: verify batches are capture-safe; the spec kill switch restores K06.
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    assert FlashAttnV100MetadataBuilder.get_cudagraph_support(spec_cfg, None) is (
+        AttentionCGSupport.UNIFORM_BATCH
+    )
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_SPEC", "0")
     assert FlashAttnV100MetadataBuilder.get_cudagraph_support(spec_cfg, None) is (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
@@ -387,6 +394,9 @@ def cpu_ops(monkeypatch):
 
     from vllm_sm70.ops import fv100
 
+    # Two-launch ops whatever the build has (K14's fused route: see
+    # test_fv100_fused_decode_cpu.py).
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     ops = CpuOps()
     monkeypatch.setattr(fv100, "_op", ops)
     fv100.clear_workspaces()

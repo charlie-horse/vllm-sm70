@@ -26,4 +26,4 @@ Depends on (PRs / nodes):
 - [ ] `scripts/regen-patches.sh --check` passes (if `patches/` changed)
 - [ ] Upstream edits are text-only, minimal, and no-ops without the plugin
 - [ ] The kill switch restores the upstream path, and is tested
-- [ ] No secrets, host names or credentials in code, logs or this description
+- [ ] No secrets, credentials, IPs or tailnet names in code, logs or this description (host names like r440 or c4130 are fine)
