@@ -8,8 +8,10 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
   - routing per resolved Sm70Config.fp8_qpn8 (True / False / auto through the
     DFlash2 verifier contract), the VLLM_SM70_FP8_QPN8=0 kill (and "1" never
     enabling), the TP gate (1 and 2 only);
-  - the M boundary inside K09's op: M<=8 the QPN8 GEMV, M=9 the dequantize
-    into the layer's load-time scratch, never the GEMV;
+  - the M boundary inside K09's op (QPN8_MAX_M read from the module): up to
+    it the QPN8 GEMV, above it the dequantize into the layer's load-time
+    scratch, never the GEMV;
+  - the max-rows gate: max_num_seqs * (k + 1) <= QPN8_MAX_M;
   - missing K09 module / ops / rejected shape -> the plain M6 path;
   - prepare runs once at load, apply allocates no weight-sized tensor and
     changes no buffer; the scratch is shared per device and grown at load;
@@ -18,7 +20,8 @@ What: the CPU tests run Kai's real vllm_sm70.ops.qpn8 Python layer
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m8_qpn8_wiring.py -m gpu
   QPN8 route vs M6 route at the Qwen3.8-27B TP2 dense shapes, M in {1, 2, 8}
   (K09 tolerances: max-abs-rel < 1e-2, rel-L2 < 1e-3 vs the dequantized
-  reference), M=9 falls back off the GEMV, and an M=1 CUDA graph replay.
+  reference), M=QPN8_MAX_M+1 falls back off the GEMV, and an M=1 CUDA
+  graph replay.
 Why: a wrong route or scale layout is silent garbage, not a crash.
 Kill-switch: VLLM_SM70_FP8_QPN8=0.
 """
@@ -302,21 +305,35 @@ def test_tp_gate(mods, engine, tp, routed):
 
 
 @pytest.mark.parametrize(
-    "max_num_seqs, spec_k, max_m, routed",
+    "max_num_seqs, spec_k, max_m",
     [
-        (1, 7, None, True),  # M = 8
-        (2, 7, None, False),  # M = 16
-        (8, None, None, True),  # no spec, M = 8
-        (9, None, None, False),
-        (4, 7, 32, True),  # K09 with M<=32 restored: M = 32
-        (5, 7, 32, False),  # M = 40
+        (1, 7, 8),  # M = 8: admitted
+        (2, 7, 8),  # M = 16: M6
+        (8, None, 8),  # no spec, M = 8: admitted
+        (9, None, 8),  # M6
+        (4, 7, 32),  # K09 with M<=32: M = 32, admitted
+        (5, 7, 32),  # M = 40: M6
+        (4, 7, None),  # the real K09 constant
+        (5, 7, None),
+        (1, 7, None),
     ],
-    ids=["1x8", "2x8", "8x1", "9x1", "4x8-max32", "5x8-max32"],
+    ids=[
+        "1x8-max8",
+        "2x8-max8",
+        "8x1-max8",
+        "9x1-max8",
+        "4x8-max32",
+        "5x8-max32",
+        "4x8-real",
+        "5x8-real",
+        "1x8-real",
+    ],
 )
-def test_max_rows_gate(mods, engine, monkeypatch, max_num_seqs, spec_k, max_m, routed):
+def test_max_rows_gate(mods, engine, monkeypatch, max_num_seqs, spec_k, max_m):
     lin, qpn8, calls = mods()
     if max_m is not None:
         monkeypatch.setattr(qpn8, "QPN8_MAX_M", max_m)
+    routed = max_num_seqs * ((spec_k or 0) + 1) <= qpn8.QPN8_MAX_M
     engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=max_num_seqs, spec_k=spec_k))
     method, layer, w, s = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is routed
@@ -346,7 +363,7 @@ def test_no_vllm_config_is_m6(mods, engine):
 # --------------------------------------------------------------------------
 # CPU: M range (inside K09's opaque op)
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize("m", [0, 1, 2, 8, 9, 64])
+@pytest.mark.parametrize("m", [0, 1, 2, 8, 9, 32, 33, 64])
 def test_m_boundary(mods, engine, m):
     lin, qpn8, calls = mods()
     engine(_vllm_config({"fp8_qpn8": True}))
@@ -438,7 +455,7 @@ def test_prepare_once_at_load_no_alloc_in_apply(mods, engine, monkeypatch):
         return real_empty(*shape, **kw)
 
     monkeypatch.setattr(torch, "empty", spy_empty)
-    for m in (1, 8, 9, 32):
+    for m in (1, 8, 9, 32, 33, 64):
         method.apply(layer, _x(m, 512))
     monkeypatch.setattr(torch, "empty", real_empty)
     assert big == []  # M>8 used the load-time scratch
@@ -564,7 +581,7 @@ def test_gpu_qpn8_matches_m6(gpu_ops, engine, name, m):
 @pytest.mark.gpu
 @pytest.mark.skipif(not HAS_SM70_GPU, reason="requires an SM70 GPU")
 @pytest.mark.parametrize("name", ["mlp.gate_up_proj", "mlp.down_proj"])
-def test_gpu_m9_falls_back_off_the_gemv(gpu_ops, engine, monkeypatch, name):
+def test_gpu_above_max_m_falls_back_off_the_gemv(gpu_ops, engine, monkeypatch, name):
     lin, qpn8 = gpu_ops
     parts, k = QWEN38_TP2[name]
     (m6, l6), (q8, lq), ref_w = _gpu_pair(lin, engine, parts, k)
@@ -575,14 +592,15 @@ def test_gpu_m9_falls_back_off_the_gemv(gpu_ops, engine, monkeypatch, name):
         "fp8_qpn8_gemm_sm70_out",
         lambda *a, **kw: gemv.append(1) or real(*a, **kw),
     )
-    x = _x(9, k, device="cuda")
+    m_max = qpn8.QPN8_MAX_M  # 32 with K09 M9..32
+    x = _x(m_max + 1, k, device="cuda")
     yq = q8.apply(lq, x)
     assert gemv == []
     ref = x.float() @ ref_w.t()
     err = _errors(yq, ref)
     assert err["max_abs_rel"] < 1e-2 and err["rel_l2"] < 1e-3, err
     assert _errors(yq, m6.apply(l6, x).float())["max_abs_rel"] < 1e-2
-    q8.apply(lq, _x(8, k, device="cuda"))
+    q8.apply(lq, _x(m_max, k, device="cuda"))
     assert gemv == [1]
 
 

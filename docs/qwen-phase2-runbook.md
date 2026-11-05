@@ -32,6 +32,7 @@ sm70/scripts/qwen_phase2/qwen_matrix.sh all   # rows 1-4 in order
 # or one row at a time: qwen_matrix.sh 1 | 2 | 3 | 4
 sm70/scripts/qwen_phase2/qwen_matrix.sh 4-noemu   # M7 A/B (optional, INFO only)
 sm70/scripts/qwen_phase2/qwen_matrix.sh summary   # reprint all rows in $OUT
+sm70/scripts/qwen_phase2/m8_qpn8_ab.sh        # M8 QPN8 A/B (section below)
 ```
 Optional overrides: `MAX_MODEL_LEN` (default 32768; lower it if startup says
 "estimated maximum model length is N", the needle test then scales down with
@@ -107,3 +108,40 @@ row2 PASS math 10/10 code 5/5 needle 3/3 gibberish 0/20 decode4k 98.3 tok/s acce
 ```
 Send Mara the summary lines and the `$OUT` directory (server logs included).
 On a FAIL, the bracketed reasons at the end of the line name the failed gates.
+
+## M8 QPN8 A/B
+Run this after the M8 GPU tests pass, in this order:
+```sh
+cd <repo checkout>   # PR #65 head
+$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/qpn8 -v                      # K09 ops
+$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/quant/test_m8_qpn8_wiring.py -v  # M8 wiring (21)
+sm70/scripts/qwen_phase2/m8_qpn8_ab.sh
+```
+`m8_qpn8_ab.sh` serves row 4 (Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2, `dflash`
+k=7 probabilistic) with `--max-num-seqs 4`, twice, with the same server
+settings and teardown as `qwen_matrix.sh`:
+
+| arm | env | expected M8 route |
+|---|---|---|
+| `on` | default | QPN8: 4 × (7 + 1) = 32 ≤ K09 `QPN8_MAX_M` (32) |
+| `off` | `VLLM_SM70_FP8_QPN8=0` | M6 TurboMind |
+
+`probe.py ab-run` sends a fixed ~1K-token prompt at concurrency 1, 2, 3 and 4.
+Each stream decodes 256 tokens (`ignore_eos`, temperature 0), and each
+concurrency runs 3 rounds. The aggregate decode tok/s (the sum of the
+per-stream rates) is recorded as the median of those rounds. The probe also
+records the greedy first 32 tokens of 5 fixed prompts.
+`probe.py ab-compare` prints one line per concurrency
+(`c=N qpn8 X m6 Y tok/s ratio R`) plus the greedy match count.
+**PASS** = ratio ≥ 0.98 (noise band) at every concurrency, and all 5 greedy outputs match.
+
+The script also greps `server.log` for `SM70 FP8 QPN8` into
+`$OUT/m8/<arm>/m8_log.txt`. Expected lines: `on` has
+"SM70 FP8 QPN8 decode (M<=32) enabled ..."; `off` has no line, because the
+kill switch stops M8 before it logs. A "not used: decode/verify can reach M=..."
+line in `on` means the gate refused, so the A/B compared M6 with M6.
+
+Results: `$OUT/m8/{on,off}/` hold `ab.json`, `server.log`, `probe.log`,
+`cmd.txt`, `nvidia-smi.csv` and `m8_log.txt`. `$OUT/m8/summary.txt` and
+`ab_summary.json` hold the comparison. Duration: about 2 × (10 min load + 5 min probe).
+Exit codes: 0 PASS, 1 FAIL, 2 refused (same refusals as above).

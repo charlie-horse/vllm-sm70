@@ -27,7 +27,7 @@ M8 (QPN8 decode): when the resolved ``Sm70Config.fp8_qpn8`` is True (auto:
   (vllm_sm70.ops.qpn8) and ``qpn8_rejection(N, K)`` is None, the layer is
   repacked at load with ``qpn8_prepare`` instead of TurboMind and served by
   ``qpn8_linear``. Also only when max_num_seqs * (num_speculative_tokens
-  + 1) <= K09's QPN8_MAX_M (8 today; it widens with K09 by itself), so
+  + 1) <= K09's QPN8_MAX_M (32 since K09 restored M9..32), so
   decode and DFlash2 verify always fit the GEMV. M<=QPN8_MAX_M runs the
   QPN8 GEMV; larger M (prefill) dequantizes into one shared per-device fp16
   scratch (allocated at load) and runs torch.mm. The M choice
@@ -69,6 +69,9 @@ from vllm_sm70.quant.nvfp4_linear import (
 )
 
 logger = logging.getLogger(__name__)
+# M8 route lines go under "vllm" so vLLM's handler prints them in server.log
+# (m8_qpn8_ab.sh greps "SM70 FP8 QPN8").
+m8_logger = logging.getLogger("vllm.sm70")
 
 FP8_BLOCK = 128
 PREPARE_OP = "fp8_sm70_prepare"
@@ -197,7 +200,7 @@ _LOGGED: set[str] = set()
 def _log_once(msg: str) -> None:
     if msg not in _LOGGED:
         _LOGGED.add(msg)
-        logger.info(msg)
+        m8_logger.info(msg)
 
 
 def clear_qpn8_scratch() -> None:
@@ -354,8 +357,9 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         layer.sm70_fp8_turbomind = False
         self._qpn8 = qpn8
         _log_once(
-            "SM70 FP8 QPN8 decode (M<=8) enabled for block-FP8 linears; "
-            "M>8 dequantizes into a shared FP16 scratch."
+            f"SM70 FP8 QPN8 decode (M<={max_m}) enabled for block-FP8 linears "
+            f"(max decode/verify M={rows}); larger M dequantizes into a shared "
+            "FP16 scratch."
         )
         return True
 
