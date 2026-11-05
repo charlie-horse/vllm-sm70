@@ -26,8 +26,11 @@ M8 (QPN8 decode): when the resolved ``Sm70Config.fp8_qpn8`` is True (auto:
   VLLM_SM70_FP8_QPN8 is not "0", TP is 1 or 2, K09's ops are present
   (vllm_sm70.ops.qpn8) and ``qpn8_rejection(N, K)`` is None, the layer is
   repacked at load with ``qpn8_prepare`` instead of TurboMind and served by
-  ``qpn8_linear``: M<=8 runs the QPN8 GEMV, M>8 dequantizes into one shared
-  per-device fp16 scratch (allocated at load) and runs torch.mm. The M choice
+  ``qpn8_linear``. Also only when max_num_seqs * (num_speculative_tokens
+  + 1) <= K09's QPN8_MAX_M (8 today; it widens with K09 by itself), so
+  decode and DFlash2 verify always fit the GEMV. M<=QPN8_MAX_M runs the
+  QPN8 GEMV; larger M (prefill) dequantizes into one shared per-device fp16
+  scratch (allocated at load) and runs torch.mm. The M choice
   is inside K09's opaque op, so a graph traced at small M stays correct.
   Memory-neutral, as the fork's c4130 route was (FORK qpn/fp8.py:686-787:
   QPN8 codes replace the weight, exact-dense prefill workspace for M>8): no
@@ -82,6 +85,7 @@ QPN8_API = ("qpn8_prepare", "qpn8_linear", "qpn8_rejection", "Qpn8Prepared")
 # QPN8 meaning (PP2/TP4 tables) is not carried.
 QPN8_TP_SIZES = (1, 2)
 QPN8_SCRATCH = "sm70_qpn8_dense_scratch"
+QPN8_DEFAULT_MAX_M = 8  # used only if the K09 module names no QPN8_MAX_M
 
 
 def check_fp8_sm70_config(quant_config: Any) -> None:
@@ -131,29 +135,62 @@ def qpn8_route_enabled(vllm_config: Any = None) -> bool:
     return tp in QPN8_TP_SIZES
 
 
-class _Qpn8ScratchPool:
-    """One fp16 dense scratch per device, shared by every QPN8 layer there.
+def qpn8_max_rows(vllm_config: Any = None) -> int | None:
+    """Largest decode/verify M: max_num_seqs * (num_speculative_tokens + 1).
 
-    Grown at load to the largest K*N; layers already bound are re-pointed, so
-    nothing is allocated after loading. Layers run one at a time on the model
-    stream, as the fork's shared exact-dense workspace assumed (FORK
-    qpn/fp8.py:318-352).
+    None when the scheduler config is not reachable (QPN8 is then refused).
+    """
+    if vllm_config is None:
+        vllm_config = get_current_vllm_config_or_none()
+    sched = getattr(vllm_config, "scheduler_config", None)
+    seqs = getattr(sched, "max_num_seqs", None)
+    if seqs is None:
+        return None
+    spec = getattr(vllm_config, "speculative_config", None)
+    k = int(getattr(spec, "num_speculative_tokens", 0) or 0) if spec else 0
+    return int(seqs) * (k + 1)
+
+
+def qpn8_max_m(qpn8: Any) -> int:
+    """K09's largest QPN8 GEMV M (QPN8_MAX_M), 8 if the module names none."""
+    return int(getattr(qpn8, "QPN8_MAX_M", QPN8_DEFAULT_MAX_M))
+
+
+class _Qpn8DenseScratch:
+    """All of M8's shared dense-scratch plumbing (K09's ``dense_scratch``).
+
+    One fp16 buffer per device, shared by every QPN8 layer there, grown at
+    load to the largest K*N; layers already bound are re-pointed, so nothing
+    is allocated after loading. Layers run one at a time on the model stream,
+    as the fork's shared exact-dense workspace assumed (FORK
+    qpn/fp8.py:318-352). If K09 drops the ``Tensor(a!)`` argument (Inductor
+    cloning it), only this class changes: ``bind`` becomes a no-op and
+    ``linear`` stops passing ``dense_scratch``.
     """
 
     def __init__(self) -> None:
-        self.tensor: torch.Tensor | None = None
-        self.layers: weakref.WeakSet[torch.nn.Module] = weakref.WeakSet()
+        self.pools: dict[str, tuple[list[torch.Tensor], weakref.WeakSet]] = {}
 
     def bind(self, layer: torch.nn.Module, numel: int, device: torch.device) -> None:
-        if self.tensor is None or self.tensor.numel() < numel:
-            self.tensor = torch.empty((numel,), dtype=torch.float16, device=device)
-            for other in self.layers:
-                other._buffers[QPN8_SCRATCH] = self.tensor
-        layer.register_buffer(QPN8_SCRATCH, self.tensor, persistent=False)
-        self.layers.add(layer)
+        holder, layers = self.pools.setdefault(str(device), ([], weakref.WeakSet()))
+        if not holder or holder[0].numel() < numel:
+            holder[:] = [torch.empty((numel,), dtype=torch.float16, device=device)]
+            for other in layers:
+                other._buffers[QPN8_SCRATCH] = holder[0]
+        layer.register_buffer(QPN8_SCRATCH, holder[0], persistent=False)
+        layers.add(layer)
+
+    @staticmethod
+    def linear(qpn8, layer, x, prepared, bias):
+        return qpn8.qpn8_linear(
+            x, prepared, bias, dense_scratch=getattr(layer, QPN8_SCRATCH)
+        )
+
+    def clear(self) -> None:
+        self.pools.clear()
 
 
-_QPN8_SCRATCH_POOLS: dict[str, _Qpn8ScratchPool] = {}
+_QPN8_DENSE_SCRATCH = _Qpn8DenseScratch()
 _LOGGED: set[str] = set()
 
 
@@ -164,7 +201,7 @@ def _log_once(msg: str) -> None:
 
 
 def clear_qpn8_scratch() -> None:
-    _QPN8_SCRATCH_POOLS.clear()
+    _QPN8_DENSE_SCRATCH.clear()
 
 
 @register_weight_loader_v2_supported_method
@@ -176,6 +213,7 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
         check_fp8_sm70_config(quant_config)
         super().__init__(quant_config)  # UP fp8.py:241-280 (keys only)
         self.qpn8_enabled = qpn8_route_enabled()
+        self.qpn8_max_rows = qpn8_max_rows() if self.qpn8_enabled else None
         self._qpn8: Any = None
 
     def create_weights(
@@ -268,6 +306,16 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
                 "missing; using TurboMind FP8."
             )
             return False
+        max_m = qpn8_max_m(qpn8)
+        rows = self.qpn8_max_rows
+        if rows is None or rows > max_m:
+            _log_once(
+                "SM70 FP8 QPN8 not used: decode/verify can reach M="
+                f"{rows if rows is not None else 'unknown'} (max_num_seqs x "
+                f"(num_speculative_tokens + 1)) and the QPN8 GEMV covers M<="
+                f"{max_m}; using TurboMind FP8."
+            )
+            return False
         if weight.dim() != 2:
             return False
         n, k = (int(d) for d in weight.shape)
@@ -290,11 +338,7 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             prepared.prefetch_codes,
         )
         device = prepared.codes.device
-        key = str(device)
-        pool = _QPN8_SCRATCH_POOLS.get(key)
-        if pool is None:
-            pool = _QPN8_SCRATCH_POOLS[key] = _Qpn8ScratchPool()
-        pool.bind(layer, n * k, device)
+        _QPN8_DENSE_SCRATCH.bind(layer, n * k, device)
         # Free the checkpoint layout (K09: "the caller frees the checkpoint
         # weight afterwards"); the parameters stay for weight reloading.
         replace_parameter(
@@ -329,9 +373,7 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
             chains,
             prefetch,
         )
-        return qpn8.qpn8_linear(
-            x, prepared, bias, dense_scratch=getattr(layer, QPN8_SCRATCH)
-        )
+        return _QPN8_DENSE_SCRATCH.linear(qpn8, layer, x, prepared, bias)
 
     def apply(
         self,

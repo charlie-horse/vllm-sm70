@@ -106,7 +106,7 @@ def make_mock_tm(calls):
     return tm
 
 
-def _vllm_config(sm70=None, tp=2, qualified=False):
+def _vllm_config(sm70=None, tp=2, qualified=False, max_num_seqs=1, spec_k=7):
     """A vllm_config stand-in; qualified=True matches the fork's Qwen3.8
     DFlash2 verifier contract, False is Qwen3.6-35B-A3B (MoE arch)."""
     arch = "Qwen3_5ForCausalLM" if qualified else "Qwen3_5MoeForCausalLM"
@@ -122,13 +122,16 @@ def _vllm_config(sm70=None, tp=2, qualified=False):
                 head_dim=256,
             ),
         ),
-        speculative_config=SimpleNamespace(
+        speculative_config=None
+        if spec_k is None
+        else SimpleNamespace(
             method="dflash",
-            num_speculative_tokens=7,
+            num_speculative_tokens=spec_k,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
             ),
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp, pipeline_parallel_size=1
         ),
@@ -296,6 +299,42 @@ def test_tp_gate(mods, engine, tp, routed):
     engine(_vllm_config({"fp8_qpn8": True}, tp=tp))
     _, layer, _, _ = _layer(lin, 256, [256])
     assert layer.sm70_fp8_qpn8 is routed
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs, spec_k, max_m, routed",
+    [
+        (1, 7, None, True),  # M = 8
+        (2, 7, None, False),  # M = 16
+        (8, None, None, True),  # no spec, M = 8
+        (9, None, None, False),
+        (4, 7, 32, True),  # K09 with M<=32 restored: M = 32
+        (5, 7, 32, False),  # M = 40
+    ],
+    ids=["1x8", "2x8", "8x1", "9x1", "4x8-max32", "5x8-max32"],
+)
+def test_max_rows_gate(mods, engine, monkeypatch, max_num_seqs, spec_k, max_m, routed):
+    lin, qpn8, calls = mods()
+    if max_m is not None:
+        monkeypatch.setattr(qpn8, "QPN8_MAX_M", max_m)
+    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=max_num_seqs, spec_k=spec_k))
+    method, layer, w, s = _layer(lin, 256, [256])
+    assert layer.sm70_fp8_qpn8 is routed
+    assert [c[0] for c in calls.tm] == ([] if routed else ["tm_prepare"])
+    x = _x(2, 256)
+    _close(method.apply(layer, x), x.float() @ _ref_dequant(w, s).t())
+
+
+def test_missing_max_m_constant_is_8(mods, engine, monkeypatch):
+    lin, qpn8, _ = mods()
+    monkeypatch.delattr(qpn8, "QPN8_MAX_M")
+    assert lin.qpn8_max_m(qpn8) == 8
+    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=8, spec_k=None))
+    assert _layer(lin, 256, [256])[1].sm70_fp8_qpn8 is True
+    lin.clear_qpn8_scratch()
+    sm70_cfg.clear_cache()
+    engine(_vllm_config({"fp8_qpn8": True}, max_num_seqs=9, spec_k=None))
+    assert _layer(lin, 256, [256])[1].sm70_fp8_qpn8 is False
 
 
 def test_no_vllm_config_is_m6(mods, engine):
