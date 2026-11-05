@@ -1,0 +1,98 @@
+# Hardware regression checks
+
+## Check 6: LMCache still stores and serves after 1 h of quiet
+
+Guards `nix/patches/lmcache/0001-mp-worker-heartbeat-from-registration.patch`
+(the bug: `docs/upstream/lmcache-heartbeat-issue.md`). Without the patch, a
+vLLM worker that gets no prompt of at least one 256-token chunk within 3600 s
+of registering is reaped by the LMCache server and never re-registers, so
+every later STORE is rejected and nothing is reused until vLLM restarts.
+
+Script: `scripts/check6-lmcache-reaper.py` (Python 3 stdlib only, no sudo; it
+only talks to `127.0.0.1:8000` and `127.0.0.1:8080` and runs `systemctl show`
+and `journalctl`).
+
+**When:** in the 00:00–06:00 ET window. It needs the GPUs serving and no other
+clients: any prompt over 200 tokens during the quiet hour makes the run
+INVALID.
+
+**Duration:** ~65–80 min after the restart: vLLM startup (Flint 3–5 min), 61
+min of quiet counted from the LMCache registration, then the two ~11K-token
+requests and the eviction flood (a few minutes).
+
+### Commands (on c4130, as charlie, from a checkout of this repo)
+
+```sh
+tmux new -s check6                     # or nohup; the run takes over an hour
+sudo systemctl restart vllm            # operator step; the script never uses sudo
+python3 scripts/check6-lmcache-reaper.py run 2>&1 | tee ~/check6.log
+```
+
+`run` = `start` + wait + `finish`. The same in two steps (e.g. if the session
+may drop; the state is in `./check6-state.json`):
+
+```sh
+python3 scripts/check6-lmcache-reaper.py start     # right after the restart
+python3 scripts/check6-lmcache-reaper.py finish    # any time later; waits out the rest
+```
+
+If the LMCache journal is not readable as charlie (the run then ends
+INCOMPLETE and prints the exact command, including the `--since` time), save it
+and re-judge without re-running anything:
+
+```sh
+sudo journalctl -u vllm-lmcache --since @<vllm start> -o short-unix --no-pager > ~/check6-lmcache.journal
+python3 scripts/check6-lmcache-reaper.py judge --journal-file ~/check6-lmcache.journal
+```
+
+Results: per-criterion PASS/FAIL on stdout, exit 0 only on PASS, and the JSON
+summary in `./check6-summary.json` (`verdict`, `criteria`, TTFTs, eviction,
+the `/status` timeline during the wait).
+
+Options worth knowing: `--dry-run` (no wait, verdict `SMOKE-PASS`/`SMOKE-FAIL`,
+for checking the plumbing at any time), `--wait-min`, `--base-url`,
+`--admin-url`, `--vllm-unit`/`--lmcache-unit` (if vLLM runs under another unit,
+e.g. `systemd-run --unit=vsm70-test`), `--no-probe`, `--evict`.
+
+### What it does
+
+1. `start`: reads the vllm unit's `ActiveEnterTimestamp`, waits until
+   `/v1/models` answers and `/status` lists 2 `registered_gpu_ids`, and takes
+   the anchor from the last `Registered KV cache for GPU ID` journal line
+   (else the moment it saw the registration). It aborts if vLLM already served
+   a prompt over 200 tokens since it started (`vllm:request_prompt_tokens`
+   histogram), then sends one tiny prompt (under 200 tokens; `--no-probe` to
+   skip).
+2. Waits until anchor + 61 min, polling `/status` every 5 min.
+3. `finish`: sends a ~11K-token synthetic prompt (fixed text after a random
+   per-run nonce, so earlier runs' cache can't match), drops it from vLLM's own
+   GPU prefix cache, and sends it again. The drop is needed because vLLM only
+   asks LMCache for tokens its GPU cache doesn't already hold. It uses
+   `POST /reset_prefix_cache` if vLLM runs with `VLLM_SERVER_DEV_MODE=1`, else
+   it floods distinct filler prompts totalling 1.25× the GPU KV capacity
+   (`num_gpu_blocks × block_size` from `vllm:cache_config_info`). The flood is
+   also stored in LMCache (L1 64 GB, L2 32 GB).
+
+### PASS criteria (all must hold)
+
+1. No `Reaped GPU instance` line in `journalctl -u vllm-lmcache` since the
+   vllm start: none at 1 h (`pinged=False`) and none during startup or CUDA
+   graph capture (`pinged=True`). `Rejecting STORE` lines are counted too.
+2. `/status` `registered_gpu_ids` has 2 ids after the wait and after the
+   requests.
+3. Request 2 gets an external hit: `vllm:external_prefix_cache_hits` grows
+   across it, and `usage.prompt_tokens_details.cached_tokens` is above 0
+   (Flint runs with `--enable-prompt-tokens-details`). The summary also
+   reports `vllm:prefix_cache_hits` (GPU) and
+   `vllm:prompt_tokens_cached_by_source`. If the GPU hits grew and the external
+   ones did not, the eviction failed: that FAIL says nothing about the fix.
+
+TTFT of request 1 vs 2 is reported as supporting information only.
+
+The run is INVALID (exit 1) if vllm restarted during it, a prompt over 200
+tokens or an LMCache store happened during the quiet hour, or the wait was
+shorter than `/status` `worker_liveness.registration_grace_seconds` plus one
+reaper interval (`reap_timeout_seconds / 4`).
+
+Against an LMCache build without the patch, the expected result is FAIL on
+all three criteria (the bug reproduced).
