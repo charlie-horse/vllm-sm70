@@ -13,7 +13,9 @@
 #
 # vllm/python/tree come from ./package.nix (Phase 1 build). LMCache is not in
 # the venv yet, so bin/lmcache and lmcacheUi are still stubs that fail at
-# start; the LMCache sdist build (with ./patches/lmcache) replaces them.
+# start; the LMCache sdist build replaces them, applying
+# `import ./patches/lmcache` (a list of patch files, in order) with
+# patchFlags = [ "-p1" "--fuzz=0" "--no-backup-if-mismatch" ].
 {
   pkgs,
   lib,

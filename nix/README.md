@@ -23,6 +23,7 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 | `packages-module.nix` | integration | `_module.args.vllmSm70Packages` |
 | `packages.nix` | integration | `{ vllm, lmcacheUi, flintCheckpoint }` |
 | `vllm.nix` | build | `{ vllm, lmcacheUi }` (stub until the sm_70 build lands; contract in the file) |
+| `patches/lmcache/` | integration | LMCache sdist patches (list in `default.nix`), to be applied by the LMCache build in `vllm.nix` (Felix wires it in with the LMCache sdist build) |
 | `checkpoint.nix` | integration | `flintCheckpoint` FOD, recipe from input `vllm-legacy` |
 | `checks.nix` | integration | flake checks |
 
@@ -44,6 +45,20 @@ rejects them at startup until the patch series adds them:
 - `--kernel-config.sm70_skinny_moe false` (Flint).
 - `--attention-backend FLASH_ATTN_V100` (qwen3.8-27b) and the DFlash draft's
   `attention_backend = "FLASH_ATTN_V100"`. Without them vLLM picks TRITON_ATTN.
+
+## LMCache patches
+
+`patches/lmcache/default.nix` lists the patches for the LMCache 0.5.6 sdist.
+`checks.x86_64-linux.lmcache-patches-apply` checks that they apply to it.
+
+- `0001-mp-worker-heartbeat-from-registration.patch`: the MP worker starts
+  pinging at KV-cache registration. Without it, a worker that sees no
+  full-chunk request within `--worker-registration-grace-seconds` (1 h) of
+  registering is reaped while alive and never re-registers, so every STORE is
+  rejected until vLLM restarts. See `docs/upstream/lmcache-heartbeat-issue.md`.
+
+`services.lmcache-sm70.extraArgs` appends extra `lmcache server` flags, e.g.
+`[ "--worker-registration-grace-seconds" "604800" ]`.
 
 ## Kill switches (VLLM_SM70_*)
 

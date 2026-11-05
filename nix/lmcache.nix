@@ -10,6 +10,7 @@
   config,
   lib,
   pkgs,
+  utils,
   vllmSm70Packages,
   ...
 }:
@@ -38,7 +39,8 @@ let
       num_workers = 8;
       max_capacity_gb = cfg.l2SizeGb;
     })
-  ];
+  ]
+  ++ cfg.extraArgs;
 
   # LMCache's dashboard is a read-only proxy in front of the MP server's admin
   # API: `--nodes` is both the node list it renders and the allowlist its
@@ -142,6 +144,19 @@ in
       description = "L2 cap in GB (local disk, enforced by vllm-lmcache-l2-prune).";
     };
 
+    extraArgs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "--worker-registration-grace-seconds"
+        "604800"
+      ];
+      description = ''
+        Extra `lmcache server` arguments, appended after the module's own
+        (a later flag overrides an earlier one).
+      '';
+    };
+
     ui = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -189,7 +204,8 @@ in
               "lmcache"
               "lmcache/l2"
             ];
-            ExecStart = "${cfg.package}/bin/lmcache ${lib.escapeShellArgs lmcacheArgs}";
+            # systemd quoting (escapes `%` and `$` too), since extraArgs is free-form.
+            ExecStart = "${cfg.package}/bin/lmcache ${utils.escapeSystemdExecArgs lmcacheArgs}";
             Restart = "on-failure";
             RestartSec = 10;
             LimitMEMLOCK = "infinity";

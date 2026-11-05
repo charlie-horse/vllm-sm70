@@ -1,0 +1,55 @@
+lmcache: start the MP worker heartbeat at KV-cache registration
+
+What: LMCacheMPWorkerAdapter.register_kv_caches() starts the heartbeat thread,
+  instead of the first STORE/RETRIEVE/event poll doing so; the two comments
+  that described the lazy start are updated.
+Why: a vLLM worker that serves no full-chunk prompt within
+  --worker-registration-grace-seconds (3600 s) of registering is reaped while
+  alive (pinged=False), and PING always returns True, so it never re-registers
+  and every later STORE is rejected (c4130, 2026-11-04;
+  docs/upstream/lmcache-heartbeat-issue.md).
+Upstream-files: lmcache/integration/vllm/vllm_multi_process_adapter.py (LMCache sdist)
+Kill-switch: none (build-time); workaround extraArgs --worker-registration-grace-seconds
+Tests: build-time apply + ast.parse; hardware check 6 pending
+Upstream-status: candidate (draft issue, not filed)
+
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -1516,10 +1516,10 @@
+         self._health_event = threading.Event()
+         self._health_event.set()
+ 
+-        # Heartbeat thread is created but NOT started yet.
+-        # It will be lazily started on the first store or retrieve
+-        # request, by which time vLLM is fully ready (model loaded,
+-        # KV caches allocated, warmup & CUDA graph capture done).
++        # Heartbeat thread is created but NOT started yet. It starts when
++        # the KV caches are registered (register_kv_caches), or on the first
++        # store/retrieve/event poll if that comes first, so the server never
++        # reaps a live worker that has not stored anything yet.
+         self._heartbeat_interval = heartbeat_interval
+         self._heartbeat: HeartbeatThread | None = None
+         self._heartbeat_lock = threading.Lock()
+@@ -1629,6 +1629,12 @@
+             layout_hints if layout_hints is not None else vllm_layout_hints()
+         )
+         self._send_register_kv_caches_request(kv_caches)
++        # Ping from registration on, not from the first store/retrieve: a
++        # worker that serves only sub-chunk prompts (or none) for longer than
++        # --worker-registration-grace-seconds would otherwise be reaped while
++        # alive, and a later PING (always True) never re-registers it, so every
++        # STORE is rejected until vLLM restarts.
++        self._ensure_heartbeat_started()
+ 
+     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
+         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
+@@ -1680,7 +1686,8 @@
+             ) from None
+ 
+     def _ensure_heartbeat_started(self) -> None:
+-        """Lazily start the heartbeat on first store, retrieve, or event poll.
++        """Start the heartbeat once: at KV-cache registration, or on the first
++        store, retrieve or event poll if that comes first.
+ 
+         The heartbeat starts healthy (the event was set at construction). A
+         live worker pings every interval, refreshing its server-side
