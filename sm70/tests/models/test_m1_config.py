@@ -167,6 +167,7 @@ def _nvfp4_gemv_not_selected():
     """M3 path: with the switch at "0", the SM70 W4A16 linear method reads
     nvfp4_gemv=False and does not admit a Flint-shape layer to the GEMV, even
     though the shape, layout and op all qualify (vllm_sm70/quant/nvfp4_linear.py)."""
+    pytest.importorskip("vllm")  # the GEMV path check builds a real vllm layer
     import torch
 
     from vllm_sm70.quant import nvfp4_linear as nvl
