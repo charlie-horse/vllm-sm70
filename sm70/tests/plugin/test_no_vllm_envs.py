@@ -68,7 +68,7 @@ def test_import_pulls_in_no_vllm():
 
 
 def test_every_referenced_var_is_registered():
-    """Every VLLM_SM70_* name used by the build or the package is registered.
+    """Every VLLM_SM70_* env var the build, Python or C++ reads is registered.
 
     vLLM's validate_environ rejects unregistered VLLM_* vars that are set at
     runtime, so a var read only by setup.py or CMake must still be registered
@@ -80,13 +80,17 @@ def test_every_referenced_var_is_registered():
     from vllm_sm70 import envs
 
     root = pathlib.Path(__file__).resolve().parents[2]  # sm70/
-    sources = [root / "setup.py", root / "CMakeLists.txt"]
-    sources += sorted((root / "vllm_sm70").rglob("*.py"))
-    sources += sorted((root / "csrc").rglob("*.cmake"))
-    pattern = re.compile(r"VLLM_SM70_[A-Z0-9_]+")
+    quoted = re.compile(r"[\"'](VLLM_SM70_[A-Z0-9_]+)[\"']")  # env names in strings
+    cmake_env = re.compile(r"ENV\{(VLLM_SM70_[A-Z0-9_]+)\}")  # CMake $ENV{...}
     referenced = set()
-    for path in sources:
+    py_and_cpp = [root / "setup.py"]
+    py_and_cpp += sorted((root / "vllm_sm70").rglob("*.py"))
+    for ext in ("*.h", "*.cuh", "*.cc", "*.cpp", "*.cu"):
+        py_and_cpp += sorted((root / "csrc").rglob(ext))
+    for path in py_and_cpp:
+        referenced |= set(quoted.findall(path.read_text(errors="replace")))
+    for path in [root / "CMakeLists.txt", *sorted((root / "csrc").rglob("*.cmake"))]:
         if path.is_file():
-            referenced |= set(pattern.findall(path.read_text()))
+            referenced |= set(cmake_env.findall(path.read_text()))
     missing = sorted(referenced - set(envs.environment_variables()))
     assert not missing, f"unregistered VLLM_SM70_* vars: {missing}"
