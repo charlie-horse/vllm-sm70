@@ -155,6 +155,10 @@ let
     pkgs.ninja
     pkgs.coreutils
     pkgs.which
+    # torch Inductor hashes the preprocessed C++ prefix header with
+    # `openssl sha512` (torch/_inductor/codecache.py:3725) when it builds a
+    # CPU kernel; without it torch.compile of CPU code fails.
+    pkgs.openssl
   ];
   hostLibs = lib.makeLibraryPath [
     pkgs.stdenv.cc.cc.lib
