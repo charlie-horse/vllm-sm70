@@ -599,13 +599,21 @@ def _has_k11_gemv() -> bool:
     return tm.has_op("nvfp4_tm_gemv_dispatch_sm70_out")
 
 
-# K11 (Phase 4) ships the GEMV op; main's K03 build does not
-# (sm70/csrc/turbomind/PROVENANCE.md:258). Without it, admission refuses the
-# layer and the GEMM serves every M, which is correct behaviour.
-needs_k11_gemv = pytest.mark.skipif(
-    not _has_k11_gemv(),
-    reason="needs _sm70_C::nvfp4_tm_gemv_dispatch_sm70_out (K11, not in K03)",
-)
+# The GEMV op is K11's (sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu,
+# PROVENANCE.md "K11"). These tests also carry @needs_sm70, so they only run
+# on an SM70 GPU with vllm_sm70.ops importable; there, a missing op means the
+# build is wrong (admission would silently fall back to the GEMM), so the
+# test fails instead of skipping.
+@pytest.fixture
+def _k11_gemv_op():
+    if not _has_k11_gemv():
+        pytest.fail(
+            "SM70 GPU present but _sm70_C::nvfp4_tm_gemv_dispatch_sm70_out is "
+            "missing: the built _sm70_C lacks K11 (stale or partial build)"
+        )
+
+
+needs_k11_gemv = pytest.mark.usefixtures("_k11_gemv_op")
 
 
 # Flint TP2 per-rank (K, N), FORK sm70_turbomind.py:567-579
