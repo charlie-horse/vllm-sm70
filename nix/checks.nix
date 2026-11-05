@@ -69,8 +69,10 @@ in
       echo "applying $p"
       patch -p1 --fuzz=0 --no-backup-if-mismatch --batch --forward < "$p"
     done
-    ${pkgs.python3}/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' \
-      lmcache/integration/vllm/vllm_multi_process_adapter.py
+    ${pkgs.python3}/bin/python3 -I -c 'import ast, sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]' \
+      lmcache/integration/vllm/vllm_multi_process_adapter.py \
+      lmcache/v1/mp_observability/config.py \
+      lmcache/v1/mp_observability/otel_init.py
     touch $out
   '';
 

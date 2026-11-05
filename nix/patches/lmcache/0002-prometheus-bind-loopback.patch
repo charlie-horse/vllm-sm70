@@ -1,0 +1,81 @@
+lmcache: bind the Prometheus /metrics endpoint to 127.0.0.1 by default
+
+What: a --prometheus-host flag (ObservabilityConfig.prometheus_host, default
+  127.0.0.1) passed to prometheus_client.start_http_server(addr=...) in
+  init_otel_metrics; the startup log prints the real address.
+Why: with metrics on and no --otlp-endpoint, otel_init.py:117 called
+  start_http_server(9090) with no address, so it listened on 0.0.0.0:9090 on
+  every interface of c4130. Loopback by default; services.lmcache-sm70.
+  metricsHost sets another address when a scraper needs it.
+Upstream-files: lmcache/v1/mp_observability/{config,otel_init}.py (LMCache sdist)
+Kill-switch: --prometheus-host 0.0.0.0 (upstream behaviour)
+
+--- a/lmcache/v1/mp_observability/config.py
++++ b/lmcache/v1/mp_observability/config.py
+@@ -64,6 +64,10 @@
+     """Port for the Prometheus /metrics endpoint.  Only used when
+     ``otlp_endpoint`` is ``None`` (Prometheus pull fallback)."""
+ 
++    prometheus_host: str = "127.0.0.1"
++    """Address the Prometheus /metrics endpoint binds to (loopback by
++    default; prometheus_client's own default is 0.0.0.0)."""
++
+     metrics_sample_rate: float = 0.01
+     """Fraction of chunks/blocks to track for lifecycle histograms (0, 1.0].
+     Counters always count all events regardless of this setting."""
+@@ -189,6 +193,15 @@
+         ),
+     )
+     group.add_argument(
++        "--prometheus-host",
++        type=str,
++        default="127.0.0.1",
++        help=(
++            "Address the Prometheus /metrics endpoint binds to. "
++            "Only used when --otlp-endpoint is not set. Default is 127.0.0.1."
++        ),
++    )
++    group.add_argument(
+         "--metrics-sample-rate",
+         type=float,
+         default=0.01,
+@@ -329,6 +342,7 @@
+         tracing_enabled=args.enable_tracing,
+         otlp_endpoint=args.otlp_endpoint,
+         prometheus_port=args.prometheus_port,
++        prometheus_host=args.prometheus_host,
+         metrics_sample_rate=args.metrics_sample_rate,
+         lookup_hash_log=LookupHashLogConfig(
+             output_dir=args.lookup_hash_log_dir,
+@@ -421,6 +435,7 @@
+         init_otel_metrics(
+             otlp_endpoint=obs_config.otlp_endpoint,
+             prometheus_port=obs_config.prometheus_port,
++            prometheus_host=obs_config.prometheus_host,
+             resource_attributes=resource_attrs,
+             start_http_server=start_prometheus_http_server,
+             enable_grpc_metrics=bool(obs_config.grpc_metrics_enabled),
+--- a/lmcache/v1/mp_observability/otel_init.py
++++ b/lmcache/v1/mp_observability/otel_init.py
+@@ -48,6 +48,7 @@
+ def init_otel_metrics(
+     otlp_endpoint: str | None = None,
+     prometheus_port: int | None = None,
++    prometheus_host: str = "127.0.0.1",
+     resource_attributes: dict[str, str] | None = None,
+     start_http_server: bool = True,
+     enable_grpc_metrics: bool = False,
+@@ -114,10 +115,11 @@
+         if enable_grpc_metrics:
+             init_grpc_otel_metrics(provider)
+         if start_http_server:
+-            prometheus_client.start_http_server(prometheus_port)
++            prometheus_client.start_http_server(prometheus_port, addr=prometheus_host)
+             logger.info(
+                 "OTel MeterProvider initialised with Prometheus fallback "
+-                "(http://0.0.0.0:%d/metrics), resource=%s",
++                "(http://%s:%d/metrics), resource=%s",
++                prometheus_host,
+                 prometheus_port,
+                 dict(resource.attributes),
+             )
