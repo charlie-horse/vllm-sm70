@@ -94,6 +94,7 @@ def fresh_plugin(monkeypatch):
     from vllm_sm70 import _ext
 
     monkeypatch.setattr(vllm_sm70, "_registered", False)
+    monkeypatch.setattr(vllm_sm70, "_area_status", {})
     _ext.load.cache_clear()
     _ext.abi_version.cache_clear()
     _ext.so_sha256.cache_clear()

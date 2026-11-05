@@ -17,13 +17,16 @@ are imported from the first post-resolution hook: `import_kernels()` (run on
 
 from __future__ import annotations
 
+import atexit
 import importlib
 import logging
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.platforms.cuda import CudaPlatform
 
+import vllm_sm70
 from vllm_sm70 import AREAS, _ext
 
 if TYPE_CHECKING:
@@ -44,8 +47,54 @@ def _ensure_areas_imported() -> None:
     for area in AREAS:
         try:
             importlib.import_module(f"vllm_sm70.{area}")
-        except Exception:
+        except Exception as exc:
+            vllm_sm70._area_status.setdefault(
+                area, f"import {type(exc).__name__}: {exc}"
+            )
             logger.exception("vllm_sm70: importing area %r failed", area)
+
+
+def _enforce_strict() -> None:
+    """Fail-fast on SM70: a failed area must stop startup.
+
+    Called only from Sm70CudaPlatform hooks, i.e. only when the sm70 platform
+    is active (every visible GPU is cc 7.0). vLLM swallows exceptions raised
+    from a general plugin's register() (UP plugins/__init__.py:66-71), so
+    the raise has to happen here. VLLM_SM70_PLUGIN_STRICT=0 downgrades it.
+    """
+    failed = vllm_sm70.failed_areas()
+    if not failed:
+        return
+    detail = "; ".join(f"{a}: {e}" for a, e in failed.items())
+    if os.environ.get("VLLM_SM70_PLUGIN_STRICT") == "0":
+        logger.warning("vllm_sm70: areas failed (strict off): %s", detail)
+        return
+    raise RuntimeError(
+        "vllm_sm70: plugin areas failed to register on SM70: "
+        f"{detail}. Set VLLM_SM70_PLUGIN_STRICT=0 to start anyway."
+    )
+
+
+_shutdown_registered = False
+
+
+def _tm_runtime_close() -> None:
+    """Sync and release the process-wide TurboMind runtime (Quinn K02 N1)."""
+    try:
+        import torch
+
+        op = getattr(getattr(torch.ops, "_sm70_C", None), "tm_runtime_close", None)
+        if op is not None and torch.cuda.is_initialized():
+            op()
+    except Exception:  # never fail interpreter shutdown
+        logger.debug("vllm_sm70: tm_runtime_close failed", exc_info=True)
+
+
+def _register_shutdown() -> None:
+    global _shutdown_registered
+    if not _shutdown_registered:
+        _shutdown_registered = True
+        atexit.register(_tm_runtime_close)
 
 
 class Sm70CudaPlatform(CudaPlatform):
@@ -54,6 +103,8 @@ class Sm70CudaPlatform(CudaPlatform):
         super().import_kernels()
         _ext.load()
         _ensure_areas_imported()
+        vllm_sm70.retry_failed_areas()
+        _register_shutdown()
 
     @classmethod
     def get_attn_backend_cls(
@@ -72,6 +123,8 @@ class Sm70CudaPlatform(CudaPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         super().check_and_update_config(vllm_config)
         _ensure_areas_imported()
+        vllm_sm70.retry_failed_areas()
+        _enforce_strict()
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
