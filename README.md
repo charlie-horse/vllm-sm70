@@ -26,8 +26,9 @@ Full pins, hashes and evidence are in [docs/pins.md](docs/pins.md). Volta has no
 | `sm70/` | the plugin: `csrc/` and CMake for the `vllm_sm70._sm70_C` extension, and the `vllm_sm70` Python package |
 | `patches/` | upstream-file edits only: `BASE` (upstream tag), `series` (apply order), `NNNN-*.patch` |
 | `scripts/regen-patches.sh` | regenerates `patches/` from a vLLM working branch, or checks that the series applies |
+| `scripts/check6-lmcache-reaper.py` | hardware check 6: LMCache still stores and serves 1 h after a vLLM start (`docs/checks.md`) |
 | `tests/` | sm70 checks |
-| `docs/` | `pins.md` (locked pins), `patch-header.md` (change format), `roadmap.md` (ordered plan), `phase1-gpu-runbook.md` (c4130 test) |
+| `docs/` | `pins.md` (locked pins), `patch-header.md` (change format), `roadmap.md` (ordered plan), `phase1-gpu-runbook.md` (c4130 test), `checks.md` (hardware regression checks) |
 | `.github/` | PR template and CI |
 
 ## Contributing
@@ -42,6 +43,10 @@ New code goes in `sm70/`, as one PR per feature, with the header fields from `do
 4. Check that it applies to a clean tag: `scripts/regen-patches.sh --check ~/src/vllm`.
 
 To move to a new upstream release, rebase `sm70` onto the new tag, then repeat steps 3–4.
+
+## Releases
+
+Hosts use the `latest` branch, not `main`. It only moves forward, to a commit that passed CI, the C1 bench, a GPU gate and review. See [docs/release.md](docs/release.md).
 
 ## License
 

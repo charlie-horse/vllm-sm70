@@ -150,6 +150,16 @@ class Sm70CudaPlatform(CudaPlatform):
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
+        # K15: split the fused Flint q/k-norm + RoPE + KV-write op out of the
+        # compiled graph next to unified_kv_cache_update (FORK
+        # config/compilation.py:1172-1174). Off with VLLM_SM70_FLINT_QK_ROPE_KV=0.
+        from vllm_sm70.config import sm70_config
+        from vllm_sm70.flint import install_splitting_op
+
+        install_splitting_op(
+            vllm_config.compilation_config,
+            enabled=sm70_config(vllm_config).flint_qk_rope_kv,
+        )
 
     # U1 hooks (patches/0001): None keeps upstream behaviour.
     @classmethod

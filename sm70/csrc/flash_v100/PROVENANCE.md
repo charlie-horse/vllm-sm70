@@ -1,4 +1,4 @@
-# Flash-V100 attention, lean subset: provenance (patch K05)
+# Flash-V100 attention, lean subset: provenance (patches K05, K14)
 
 Source: charlie-horse/vLLM at **cf9492a01**, directory `flash-attention-v100/`
 (D. Skryabin's Flash-V100, BSD-3-Clause, `LICENSE`). Scope: Tier B section B
@@ -28,7 +28,7 @@ files, the build hook and the tests.
 |---|---|
 | decode, generic paged (`flash_attention_decode_partition_kernel` + `flash_attention_decode_reduce_kernel`) | D {128, 256} x partition {256, 512, 1024} x fp16 KV, not anchored; sinks and sliding window are runtime arguments |
 | decode, Flint grouped two-launch (`flash_attention_decode_gqa8_d128_{partition,reduce}_kernel`) | D128, GQA 8, fp16, with sinks, partition {256, 512, 1024} |
-| decode, one-launch fused sink decode (`flash_attention_decode_gqa8_d128_fused_kernel`) | compiled out: `#ifdef VLLM_SM70_FV100_FUSED_DECODE` (C4/K14 flips it on) |
+| decode, one-launch fused sink decode (`flash_attention_decode_gqa8_d128_fused_kernel<256>`) | K14: D128, GQA 8, fp16 KV, with sinks, not anchored; under `#ifdef VLLM_SM70_FV100_FUSED_DECODE`, which `sources.cmake` now defines by default (see *K14* below) |
 | decode, Qwen tensor-core XQA (`flash_attention_decode_xqa_tc_partition_kernel_256_wide` + reducer) | D256 x GQA {4, 6, 8} x partition {256, 512, 1024} x padded smem {G6/P256 only, otherwise off}, fp16 KV, generic page size |
 | prefill, generic paged (`flash_attention_forward_kernel_paged`) | D {128, 256} x causal {0, 1} x fp16; the only path with sinks; window is runtime |
 | prefill, D256 low-SMEM | `<LOW_SMEM, CONTIG_FAST>` for page 16, `<LOW_SMEM>` otherwise, `<LOW_SMEM, OUTPUT_STRIDE_268, SW_PIPELINE_QK, SW_PIPELINE_PV>` for page 784 (the fork defaults) |
@@ -100,8 +100,8 @@ Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.c
 | `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash-attention-v100/kernel/flash_decode_paged.cu` | adapted | 3254 | 7382 | 38f49201f | `eddf0f86e370664b0487423261b8c48136f7b21f539c4295a7b09721241e6af7` | `ede98fc9d28bea2812b4a871fa3ca3e0b12cd2ae783b4a76e95c8aeac0144cbe` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash-attention-v100/kernel/fused_mha_forward_paged.cu` | adapted | 3065 | 4228 | 5f9c273a8 | `8393eff871d5120e7c9f64e97f97235084163913e4798a5d8fb6dc549c3949dd` | `12d5b8a5118a47b040fb1963040e5db8c1805b0145fda67733c867460e06b630` |
 | `sm70/csrc/flash_v100/fv100_config.h` | `flash-attention-v100/include/flash_v100_policy.h` | new | 56 | 466 | c8efae47b | `76ee201719ee9646c4b3e057a6be3912842de8220a1ae2ace349cf44669f0788` | `1fabfd62dfe0284695af025fc1cd0478451a7d123703f6035befd57fa98231a0` |
-| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 208 | 166 | 38f49201f | `b414a3e4473def1449dbe166b8eb493e2b4f6b13997ad5232938d65e84848c63` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
-| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 57 | 143 | 8235544d4 | `f0a63ba3e1c76c2f1b1b732d8a0aae760b096981d6c44f70df7d622dcd70c3da` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
+| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 260 | 166 | 38f49201f | `f0c6d27680fafdb2c9bd5e0a6c219c16392f88856bf466370d67bf668c3e0da9` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
+| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 62 | 143 | 8235544d4 | `26f9db2ef1993faf84b149986470d1d94ae8b31cc0530772661953dc143b5ed5` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
 
 ## Adaptations (commit 3)
 
@@ -130,6 +130,63 @@ Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.c
   optional output, anchored arguments `std::nullopt, 0`).
 - `sources.cmake` (new, replaces `setup.py`'s `CUDAExtension`): the two
   kernel files and `fv100_ops.cpp`, with the fork's nvcc flags.
+
+## K14 (C4): one-launch sink decode and the counter fix
+
+Branch `kernels/k14-fused-sink-decode`. The kernel came over verbatim in K05
+(rows `kGqaFusedMaxChunk`, `flash_attention_decode_gqa8_d128_fused_kernel`,
+`gqa8_d128_fused_ctas_per_head`, `flash_attention_decode_paged_sinks_fused`
+and the fused branch of `launch_flash_attention_decode_paged` below; fork
+`38f49201f`), compiled out. K14 changes no `.cu` line; it builds it and wires
+it up. Fork commits carried: `38f49201f` (fused kernel), `7f12d21b8` (never
+create counters under capture, two-launch fallback, prepare hook,
+`_ZERO_COUNTERS`), `89f751847` (per-device counters, capture report),
+`7e1c8c089` (quiet kill switch, cheap hook), `7b2bacefd` (INFO once, DEBUG
+as totals grow).
+
+| new location | fork cf9492a | status |
+|---|---|---|
+| `sources.cmake`: `option(VLLM_SM70_FV100_FUSED_DECODE ... ON)` | `flash-attention-v100/setup.py` (always built) | new; `-DVLLM_SM70_FV100_FUSED_DECODE=OFF` restores the K05 set |
+| `fv100_ops.cpp`: `decode_paged_sinks_fused` + `fv100_decode_paged_sinks_fused` def/impl, all under the `#ifdef` | `kernel/fused_mha_api.cpp:29-30` `decode_paged_sinks_fused_fwd` | new (out op; `Tensor sinks`, `Tensor(e!) counters`; no anchored args) |
+| `vllm_sm70/ops/fv100.py`: `FUSED_DECODE_COUNTER_CAPACITY`, `_FusedDecodeCounters`, counter cache, capture counts | `flash_attn_v100/flash_attn_interface.py:30-36, 59-71` | ported |
+| `fv100.py`: `fused_decode_enabled`, `_fused_decode_zero_counters_enabled` | `flash_attn_v100/legacy_policy.py:42-47`, `flash_attn_interface.py:141-150` | ported; `_runtime` policy dropped, env read per call |
+| `fv100.py`: `_FUSED_DECODE_OFF*`, `_warn_fused_decode_once`, `_normalized_device` | `flash_attn_interface.py:153-185` | ported |
+| `fv100.py`: `_fused_decode_counters` | `flash_attn_interface.py:198-233` | ported; `_fused_decode_counter_cache_for(_runtime)` (:188-195) dropped |
+| `fv100.py`: `fused_decode_available` | `flash_attn_interface.py:236-240` | ported (`has_op` instead of `hasattr(native, ...)`) |
+| `fv100.py`: `flash_attn_decode_paged_sinks_prepare` | `flash_attn_interface.py:243-259` | ported |
+| `fv100.py`: `flash_attn_decode_paged_sinks_capture_counts` | `flash_attn_interface.py:272-275` | ported; `_fused_decode_capture_counts_for(_runtime)` (:262-269) dropped |
+| `fv100.py`: `fused_decode_eligible` + fused branch of `flash_attn_decode_paged` | `flash_attn_interface.py:1366-1391, 1428-1433` | ported; `e4m3_fp32` and anchored terms dropped (not in the lean build) |
+| `vllm_sm70/attention/flash_v100/dispatch.py`: `_SINK_CAPTURE_*`, `_log_sink_capture_summary` | `vllm/v1/attention/backends/flash_v100/impl.py:49-70` | ported |
+| `dispatch.py`: `fused_decode_hook` | `impl.py:894-920` (`_prepare_fused_sink_decode`) + `:942-948` | ported onto the K06 hook point |
+| `dispatch.py`: `init_fused_decode` (called from `FlashAttnV100Impl.__init__`) | none | new (R4, below) |
+| `vllm_sm70/envs.py`: `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` (kill switch), `..._ZERO_COUNTERS` (`opt_in`, only "1" acts) | `vllm/envs.py:689-690, 10514-10535` | fork names and defaults |
+
+Dropped: the `_runtime`/`PythonPolicy` plumbing (`sink_fused_decode`,
+`sink_fused_zero_counters` fields, `config/flash_v100.py:869-872, 1313-1316`),
+the `*_configured` twin of the fused op, and `ops.py:get_flash_decode_sinks_prepare_ops`
+(the impl calls `fv100` directly).
+
+**R4 (capture-time state).** The fork prepared the counters on a sink layer's
+first eager forward, counting on the profile run. In v0.33.0 the profile run
+has no attention metadata (the K06 impl returns before its hook), so the
+first eager attention forward would be the warmup of the largest capture
+size. K14 therefore also prepares at layer construction
+(`init_fused_decode`), on the current CUDA device: the counters exist before
+any capture, and no zero-dependent state is ever created under capture (a
+capture that finds none, or too few, takes the two-launch kernels and warns
+once). The kernel's last CTA re-zeroes its counter, so graphs of every batch
+size share one per-device buffer; `retired` keeps outgrown buffers alive.
+
+**Admitted shape set (2xV100).** `fused_decode_eligible` (Python) and
+`gqa8_d128_decode_eligible` + `gqa8_d128_decode_aligned(out)` (C++):
+head dim 128, `H_q == 8 * H_kv`, sinks present (fp32 `[H_q]`), fp16 KV
+(`auto`/`float16`), not anchored, q/K/V/out/tmp_out 16-byte aligned with
+strides % 8. Flint per rank: TP1 32q/4kv, **TP2 16q/2kv**, TP4 8q/1kv; any
+`H_kv` works (grid `(B, H_kv, Z)`, counters `B * H_kv`). LBNHC K/V views
+(stride(2) = 2 * D) pass. Everything else (GQA 4/6, D256, no sinks, FP8)
+takes the two-launch or XQA kernels. `Z = min(ceil(SMs * occupancy / (B *
+H_kv)), tmp_out.size(2), 256)`; it never depends on sequence lengths, so
+captured grids replay at any length.
 
 ## Definitions (fork function -> new file)
 

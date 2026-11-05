@@ -49,6 +49,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if self._fv100_reason is not None:
             _log_fallback_once(self._fv100_reason)
         self._kv_views_checked = False
+        dispatch.init_fused_decode(self)  # K14: counters before any capture
 
     def _unsupported_reason(self) -> str | None:
         if self.attn_type != AttentionType.DECODER:
@@ -139,7 +140,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             self._kv_views_checked = True
 
-        dispatch.fused_decode_hook(layer, attn_metadata)
+        dispatch.fused_decode_hook(self, attn_metadata)
         num_tokens = attn_metadata.num_actual_tokens
         query = query[:num_tokens]
         out = output[:num_tokens]
