@@ -16,9 +16,10 @@
 # that MUST catch them (Quinn/Astro, Nov 6):
 #   rope_pos_decode  positions + 1 on <= 8-token fused-op calls   -> t4d t7
 #   kv_slot_decode   slot_mapping + 1 on <= 8-token fused-op calls -> t4d t7
-#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> INFO only
-#                    (below the envelope gates' sensitivity floor; Quinn, Nov 7:
-#                    docs/m5-calibration-nov7.md "Sensitivity floor")
+#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> t4d
+#                    (caught by T4d's pooled-mean gate; Quinn, Nov 7)
+#   moe_decode_scale_half  the same x 1.005                       -> INFO only
+#                    (probe of the sensitivity floor, never required)
 #                    (both T7 arms run the same MoE, so T7 cannot see it)
 #   rope_theta_1p01  rope_theta x 1.01 via hf_overrides            -> INFO only
 #                    (too weak at ~70-token positions; reported, not gated)
@@ -59,11 +60,12 @@ declare -A NODE=(
 declare -A MUST=(
   [rope_pos_decode]="t4d t7"
   [kv_slot_decode]="t4d t7"
-  [moe_decode_scale]=""
+  [moe_decode_scale]="t4d"
+  [moe_decode_scale_half]=""
   [rope_theta_1p01]=""
 )
-declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7" [moe_decode_scale]="t4d")
-read -r -a MUTS <<< "${M5_MUTATIONS:-rope_pos_decode kv_slot_decode moe_decode_scale rope_theta_1p01}"
+declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7" [moe_decode_scale_half]="t4d")
+read -r -a MUTS <<< "${M5_MUTATIONS:-rope_pos_decode kv_slot_decode moe_decode_scale moe_decode_scale_half rope_theta_1p01}"
 read -r -a NODES <<< "${M5_MUTATION_NODES:-t4d t7}"
 
 used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; }
@@ -130,7 +132,7 @@ for mut in "${MUTS[@]}"; do
     if [[ $mut == rope_theta_1p01 ]]; then
       applied=$(grep -c '^M5_MUTATION rope_theta_1p01: hf_overrides' "$log")
       need=1
-    elif [[ $mut == moe_decode_scale ]]; then
+    elif [[ $mut == moe_decode_scale* ]]; then
       # the two TP workers run the MoE; the pytest process may not import it
       applied=$(grep -oE "M5_MUTATION $mut installed in pid [0-9]+" "$log" | sort -u | wc -l)
       need=2
@@ -149,7 +151,7 @@ for mut in "${MUTS[@]}"; do
       VERDICT[$name.$mut]="${tag}NOT APPLIED (marker seen $applied, need >= $need)"
     elif [[ $fired -lt 1 ]]; then
       extra=""
-      [[ $mut == moe_decode_scale ]] && ! grep -q "K12 M<=2 decode admitted" "$log" \
+      [[ $mut == moe_decode_scale* ]] && ! grep -q "K12 M<=2 decode admitted" "$log" \
         && extra=" (no 'K12 M<=2 decode admitted' line: decode not admitted in this build/config)"
       VERDICT[$name.$mut]="${tag}NOT FIRED (installed but never changed a call)$extra"
     elif [[ $RUN_RC -ne 0 && $n -gt 0 && $f -gt 0 && $e -eq 0 && $k -eq 0 \
@@ -158,10 +160,10 @@ for mut in "${MUTS[@]}"; do
     else
       VERDICT[$name.$mut]="${tag}NOT CAUGHT (rc $RUN_RC, tests=$n failures=$f errors=$e skipped=$k): $msg"
     fi
-    # moe_decode_scale is INFO for catching (sensitivity floor) but must still
-    # be applied and fire: that is the evidence K12 decode runs in this build.
+    # The INFO probe moe_decode_scale_half need not be caught, but must still
+    # be applied and fire: more evidence that K12 decode runs in this build.
     v=${VERDICT[$name.$mut]}
-    if [[ $mut == moe_decode_scale && ( $v == *"NOT APPLIED"* || $v == *"NOT FIRED"* ) ]]; then
+    if [[ $mut == moe_decode_scale_half && ( $v == *"NOT APPLIED"* || $v == *"NOT FIRED"* ) ]]; then
       rc=1
     fi
     [[ $info -eq 1 ]] || rc=1

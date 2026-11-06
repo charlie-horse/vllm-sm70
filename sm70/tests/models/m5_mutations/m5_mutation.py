@@ -31,7 +31,10 @@ into the graph.
                    flint_moe_decode_out in vllm_sm70.ops.flint_moe, which M4
                    (quant/nvfp4_moe.py) looks up as a module attribute at
                    call time. Catchable by T4d (ours vs fork) only: both T7
-                   arms run the same MoE.
+                   arms run the same MoE. REQUIRED catch, by T4d's pooled-mean
+                   gate (Quinn, Nov 7).
+  moe_decode_scale_half  the same at x 1.005: INFO probe of the sensitivity
+                   floor, never a required catch.
 Config mutation (applied by the tests themselves, on the mutated side only):
   rope_theta_1p01  hf_overrides with rope_theta x 1.01 (rope_parameters too);
                    INFO only (Quinn): too weak at ~70-token positions to be
@@ -47,8 +50,9 @@ import sys
 TARGET = "vllm_sm70.flint.qk_norm_rope_kv"
 MOE_TARGET = "vllm_sm70.ops.flint_moe"
 MOE_DECODE_SCALE = 1.01
+MOE_DECODE_SCALES = {"moe_decode_scale": MOE_DECODE_SCALE, "moe_decode_scale_half": 1.005}
 QK_MUTATIONS = ("rope_pos_decode", "kv_slot_decode")
-MOE_MUTATIONS = ("moe_decode_scale",)
+MOE_MUTATIONS = tuple(MOE_DECODE_SCALES)
 HOOK_MUTATIONS = QK_MUTATIONS + MOE_MUTATIONS
 CONFIG_MUTATIONS = ("rope_theta_1p01",)
 MUTATIONS = HOOK_MUTATIONS + CONFIG_MUTATIONS
@@ -114,7 +118,7 @@ def make_moe_wrapper(orig, mutation: str):
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
         out = orig(*args, **kwargs)
-        out.mul_(MOE_DECODE_SCALE)
+        out.mul_(MOE_DECODE_SCALES[mutation])
         _mark_fired(mutation)
         return out
 

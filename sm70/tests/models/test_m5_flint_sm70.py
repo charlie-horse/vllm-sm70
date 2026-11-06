@@ -1308,22 +1308,29 @@ def _effective(anchor, fork_env):
 
 
 def _gate_sets(tag, label, anchor, metric, a_by_set, b_by_set, ours_noise=None,
-               fork_env=None):
+               fork_env=None, pooled=False):
     """Gate every set's |dlogprob| stats (a vs b) against one effective
     anchor (see _effective); print a verdict line per set (counts > 0.1 and
     > 1.0, our instance noise, the fork's and the effective limits
-    included); return the breaches."""
+    included); with pooled (T4a/T4d/T7; Quinn, Nov 7) also the pooled-mean
+    gate over all sets (tf.pooled_gate), one more line; return the
+    breaches."""
     tf = _tf_module()
     assert tf.FACTOR == T4_ENVELOPE_FACTOR
     anchor = _effective(anchor, fork_env)
-    failures = []
+    failures, per_set = [], {}
     for k in sorted(a_by_set):
         ours = tf.stats(tf.metric(a_by_set[k], metric), tf.metric(b_by_set[k], metric))
+        per_set[k] = ours
         line, bad = tf.gate_line(tag, label, metric, k, ours, anchor,
                                  _noise_stats(ours_noise, metric, k),
                                  _noise_stats(fork_env, metric))
         print(line)
         failures += [f"{label} {metric} set{k}: {b}" for b in bad]
+    if pooled:
+        text, bad = tf.pooled_gate(per_set, anchor)
+        print(f"{tag} {label} {metric} {text}")
+        failures += [f"{label} {metric}: {b}" for b in bad]
     return failures
 
 
@@ -1487,7 +1494,8 @@ def test_envelope_aggregates_max_over_sets(tmp_path):
     assert ee["decode"]["anchor"]["max"] == pytest.approx(0.2)
     assert ee["decode"]["per_set"]["2"]["over_0_1"] == 10
     assert ee["prefill"]["anchor"] == {"mean": 0.0, "max": 0.0, "over_0_1": 0,
-                                       "over_1_0": 0, "seq_mean_max": 0.0}
+                                       "over_1_0": 0, "seq_mean_max": 0.0,
+                                       "pooled_mean": 0.0}
     # The largest per-sequence mean (one sequence per set here = the set mean).
     assert eg["decode"]["anchor"]["seq_mean_max"] == pytest.approx(0.04)
     assert "eager_vs_graphsonly" not in env["pairs"]  # no graphsonly files
@@ -1803,6 +1811,70 @@ def test_t5_near_tie_verdict():
     assert not _t5_near_tie_verdict("p", 0.01, good, None)[0]
 
 
+def _set_stats(means, n=512):
+    return {k: {"n": n, "mean": m, "max": 0.1, "over_0_1": 0, "over_1_0": 0}
+            for k, m in enumerate(means)}
+
+
+def test_pooled_mean_gate_nov7_numbers():
+    """Quinn/Astro, Nov 7: T4a/T4d/T7 add a pooled-mean gate at 1.25x the
+    fork's pooled mean. Nov 7 T4d: unmutated 0.82x PASS, moe_decode_scale
+    (x1.01) 1.57x CAUGHT even though every set passed the per-set gate."""
+    tf = _tf_module()
+    assert tf.POOLED_FACTOR == 1.25 and tf.POOLED_INVESTIGATE == 1.30
+    fork = _set_stats([0.01557, 0.01996, 0.02421])
+    anchor = tf.anchor_of({str(k): v for k, v in fork.items()})
+    assert anchor["pooled_mean"] == pytest.approx(0.019913, abs=1e-6)
+    eff = tf.effective_anchor(_env({"eager_vs_graphs": {
+        "decode": anchor, "prefill": anchor}}), "eager_vs_graphs", "decode")
+    assert eff["pooled_mean"] == anchor["pooled_mean"]
+    text, bad = tf.pooled_gate(_set_stats([0.01419, 0.01044, 0.02427]), eff)
+    assert not bad and "ratio 0.819" in text and text.endswith("-> PASS")
+    mutated = _set_stats([0.02939, 0.03301, 0.03113])
+    for k, v in mutated.items():  # every set passes the per-set gate ...
+        assert not [b for b in tf.gate_failures(v, eff) if b.startswith("mean")]
+    text, bad = tf.pooled_gate(mutated, eff)  # ... the pooled gate catches it
+    assert bad and "ratio 1.566" in text and "investigate" not in bad[0]
+    # Just over 1.25x but under 1.30x: a real change to investigate.
+    text, bad = tf.pooled_gate(_set_stats([0.0255] * 3), eff)
+    assert bad and "never raise POOLED_FACTOR" in bad[0]
+    # n-weighted pooling.
+    assert tf.pooled_mean([{"n": 1, "mean": 1.0}, {"n": 3, "mean": 0.0}]) == 0.25
+    # An envelope without pooled_mean fails closed.
+    old = _eff()
+    assert "pooled_mean" not in old
+    text, bad = tf.pooled_gate(_set_stats([0.0]), old)
+    assert bad and "rebuild" in bad[0].lower() and text.endswith("-> FAIL")
+
+
+def test_gate_sets_pooled_line_and_failure(capsys):
+    tf = _tf_module()
+    a = {k: {"seqs": [{"decode": [-1.0] * 4}]} for k in range(3)}
+    b = {k: {"seqs": [{"decode": [-1.0, -1.0, -1.0, -1.08]}]} for k in range(3)}
+    anchor = tf.effective_anchor(_env({"p": {"decode": _anchor(0.05, 1.0) | {
+        "pooled_mean": 0.01}}}), "p", "decode")
+    fails = _gate_sets("T4d", "x", anchor, "decode", a, b, pooled=True)
+    out = capsys.readouterr().out
+    assert "T4d x decode pooled over 3 sets: ours mean=0.02" in out
+    assert len(fails) == 1 and fails[0].startswith("x decode: pooled mean 0.02 > 1.25")
+    assert _gate_sets("T4e", "x", anchor, "decode", a, b) == []  # pooled is opt-in
+
+
+def test_mutation_moe_decode_scale_half_is_the_floor_probe():
+    mm = _mutation_module()
+    assert mm.MOE_DECODE_SCALES == {"moe_decode_scale": 1.01, "moe_decode_scale_half": 1.005}
+    assert "moe_decode_scale_half" in mm.MOE_MUTATIONS and "moe_decode_scale_half" in mm.MUTATIONS
+    mm._FIRED.discard("moe_decode_scale_half")
+    w = mm.make_moe_wrapper(lambda out: out.fill_(2.0), "moe_decode_scale_half")
+    assert torch.allclose(w(torch.zeros(2)), torch.full((2,), 2.0 * 1.005))
+    assert mm._target_for("moe_decode_scale_half") == (mm.MOE_TARGET, "flint_moe_decode_out")
+    script = (pathlib.Path(__file__).resolve().parents[2] / "scripts"
+              / "m5_mutation_check.sh").read_text()
+    assert '[moe_decode_scale]="t4d"' in script  # a REQUIRED catch again
+    assert '[moe_decode_scale_half]="t4d")' in script.replace(
+        'declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7" ', "")
+
+
 def test_t5_sequence_anchor_nov7_sky():
     """Quinn, Nov 7: rule (b) gates ONE 64-token sequence, so its mean is
     anchored on the fork's largest per-sequence eager_vs_graphs decode mean
@@ -2100,7 +2172,7 @@ def test_t4a_teacher_forced_eager_vs_graphs():
     failures = []
     for m in tf.METRICS:
         failures += _gate_sets("T4a", "eager_vs_graphs", anchors[m], m, eager, graphs,
-                               noise, env)
+                               noise, env, pooled=True)
     assert not failures, f"T4a outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
 
 
@@ -2285,7 +2357,7 @@ def test_t4d_graphs_vs_fork_graphs():
     ours, _ = _score_sets(seq_sets, prefill=False, **_mutated())
     _print_top1("T4d", "ours graphs", ours)
     failures = _gate_sets("T4d", "ours_graphs_vs_fork_graphs", anchor, "decode", ours, fork,
-                          _ours_noise(), env)
+                          _ours_noise(), env, pooled=True)
     assert not failures, (
         f"T4d outside {T4_ENVELOPE_FACTOR}x the fork's eager_vs_graphs anchor: {failures}")
 
@@ -2527,5 +2599,5 @@ def test_t7_unfused_path_matches(monkeypatch):
     failures = []
     for m in tf.METRICS:
         failures += _gate_sets("T7", "fused_vs_unfused", anchors[m], m, fused, unfused,
-                               noise, env)
+                               noise, env, pooled=True)
     assert not failures, f"T7 outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
