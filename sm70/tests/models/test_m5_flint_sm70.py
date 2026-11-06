@@ -503,12 +503,26 @@ def device(monkeypatch):
     sm70_platform.is_sm70_ready.cache_clear()
 
 
-def _vllm_config(dtype=torch.float16, backend=None, kv="auto"):
+def _vllm_config(dtype=torch.float16, backend=None, kv="auto", head_dim=128, spec=None):
     return SimpleNamespace(
-        model_config=SimpleNamespace(dtype=dtype),
+        model_config=SimpleNamespace(
+            dtype=dtype, hf_text_config=SimpleNamespace(head_dim=head_dim)
+        ),
         attention_config=SimpleNamespace(backend=backend),
         cache_config=SimpleNamespace(cache_dtype=kv),
+        speculative_config=spec,
     )
+
+
+@pytest.fixture
+def fv100_ops(monkeypatch):
+    """Control whether the Flash-V100 ops count as built (CPU tests)."""
+    from vllm_sm70 import attention
+
+    state = {"ok": True}
+    monkeypatch.setattr(attention, "_ops_available", lambda: state["ok"])
+    monkeypatch.delenv(attention.KILL_SWITCH, raising=False)
+    return state
 
 
 def test_config_refuses_off_sm70(device):
@@ -527,7 +541,8 @@ def test_config_refuses_non_fp16(device):
         FlintSm70ModelConfig.verify_and_update_config(_vllm_config(torch.bfloat16))
 
 
-def test_config_selects_triton_and_refuses_fp8_kv(device):
+def test_config_selects_flash_v100_with_sinks(device, fv100_ops):
+    """fork config.py:375-399: Flash-V100 (CUSTOM) when its sink route admits."""
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     from vllm_sm70.models.flint_sm70.config import FlintSm70ModelConfig
@@ -535,12 +550,50 @@ def test_config_selects_triton_and_refuses_fp8_kv(device):
     device(7, 0)
     vc = _vllm_config()
     FlintSm70ModelConfig.verify_and_update_config(vc)
+    assert vc.attention_config.backend == AttentionBackendEnum.CUSTOM
+
+
+@pytest.mark.parametrize(
+    "case, kw, why",
+    [
+        ("kill switch", {}, "VLLM_SM70_FLASH_V100=0"),
+        ("ops missing", {}, "ops are missing"),
+        ("head 256", {"head_dim": 256}, "head_dim=256"),
+        ("spec decode", {"spec": object()}, "speculative"),
+    ],
+)
+def test_config_falls_back_to_triton(device, fv100_ops, monkeypatch, case, kw, why):
+    """fork config.py:276-305, 400-405: TRITON_ATTN when the sink route rejects."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_sm70.models.flint_sm70 import config as fcfg
+
+    device(7, 0)
+    if case == "kill switch":
+        monkeypatch.setenv("VLLM_SM70_FLASH_V100", "0")
+    if case == "ops missing":
+        fv100_ops["ok"] = False
+    vc = _vllm_config(**kw)
+    assert why in fcfg.flash_v100_sink_route_rejection(vc)
+    fcfg.FlintSm70ModelConfig.verify_and_update_config(vc)
     assert vc.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
+
+
+def test_config_refuses_fp8_kv_and_keeps_explicit_backend(device, fv100_ops):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_sm70.models.flint_sm70.config import FlintSm70ModelConfig
+
+    device(7, 0)
+    # FP8 KV: Flash-V100's sink route rejects, then TRITON refuses fp8 on SM70.
     with pytest.raises(ValueError, match="FP16 KV cache"):
         FlintSm70ModelConfig.verify_and_update_config(_vllm_config(kv="fp8_e4m3"))
     explicit = _vllm_config(backend=AttentionBackendEnum.FLEX_ATTENTION)
     FlintSm70ModelConfig.verify_and_update_config(explicit)
     assert explicit.attention_config.backend == AttentionBackendEnum.FLEX_ATTENTION
+    explicit = _vllm_config(backend=AttentionBackendEnum.TRITON_ATTN)
+    FlintSm70ModelConfig.verify_and_update_config(explicit)
+    assert explicit.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
 
 
 @pytest.fixture
@@ -969,7 +1022,8 @@ _T3_LOGGING_CONFIG = {
 @needs_ckpt
 def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     """T3 (2 GPUs): the NVFP4 checkpoint loads at TP2 fp16 and every layer
-    takes the fused route on TRITON_ATTN.
+    takes the fused route (Flash-V100 by default, TRITON_ATTN with
+    VLLM_SM70_FLASH_V100=0).
 
     The route line is logged in the TP worker processes, and the vllm logger
     does not propagate, so caplog never sees it. capfd reads the inherited
