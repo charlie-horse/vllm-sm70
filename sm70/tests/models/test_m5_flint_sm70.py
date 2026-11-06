@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for M5 flint-sm70-model (vllm_sm70/models/flint_sm70/).
 
-CPU: fp16_rescale against frozen copies of the fork's math; the
-  qk_norm_rope_kv torch oracle against the unfused route and against
-  upstream's Triton KV-cache layout (fused-route admission included);
+CPU: fp16_rescale against frozen copies of the fork's math; a torch
+  oracle of K15's qk_norm_rope_kv (vllm_sm70/flint) against the unfused
+  route and against upstream's Triton KV-cache layout through K15's
+  _direct_cache_views (Flint's fused-route admission included);
   FlintSm70ModelConfig refusals; registry wiring at cc 7.0 vs 8.0; and the
   VLLM_SM70_FLINT_QK_ROPE_KV kill switch.
 GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
@@ -50,7 +51,7 @@ from vllm_sm70 import _ext
 from vllm_sm70 import platform as sm70_platform
 from vllm_sm70.models import flint_sm70
 from vllm_sm70.models.flint_sm70 import fp16_rescale as fr
-from vllm_sm70.models.flint_sm70 import qk_norm_rope_kv as qk
+from vllm_sm70.flint import qk_norm_rope_kv as qk  # K15 (#54)
 
 # --------------------------------------------------------------------------
 # Frozen copies of the fork's FP16 math (FORK cf9492a
@@ -252,9 +253,61 @@ def test_lm_head_scale_folds_in_fp16_and_scales_logits_otherwise():
 
 
 # --------------------------------------------------------------------------
-# qk_norm_rope_kv: torch oracle and the upstream Triton cache layout
+# K15 qk_norm_rope_kv: torch oracle and the upstream Triton cache layout
 # --------------------------------------------------------------------------
 HQ, HKV, D, PAGE = 4, 2, 128, 16
+
+
+def _qk_oracle(
+    qkv: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    epsilon: float,
+    key_cache: torch.Tensor | None = None,
+    value_cache: torch.Tensor | None = None,
+    slot_mapping: torch.Tensor | None = None,
+) -> None:
+    """Pure-torch oracle with K15 ``qk.qk_norm_rope_kv``'s signature (CPU and
+    GPU) and the kernel's rounding points (FORK
+    vllm/models/flint/qk_norm_rope_kv.py:65-125): FP32 norm, one FP16
+    rounding, RoPE in FP32 on the rounded values, one FP16 rounding. The
+    unfused route (RMSNorm + NeoX RotaryEmbedding +
+    triton_reshape_and_cache_flash) is expected to match it."""
+    head_dim = q_weight.shape[0]
+    hq = q_out.shape[1] // head_dim
+    hkv = k_out.shape[1] // head_dim
+    n = qkv.shape[0]
+    heads = qkv[:, : (hq + hkv) * head_dim].float().reshape(n, hq + hkv, head_dim)
+    w = torch.cat(
+        [q_weight.float().expand(hq, head_dim), k_weight.float().expand(hkv, head_dim)]
+    )
+    inv = torch.rsqrt(heads.pow(2).mean(-1, keepdim=True) + epsilon)
+    normed = (heads * inv * w).half()
+    out = normed
+    if cos_sin_cache is not None:
+        half = head_dim // 2
+        pos = positions.long()
+        pos = torch.where(pos < 0, pos + cos_sin_cache.shape[0], pos)
+        cos = cos_sin_cache[pos, :half].float()[:, None, :]
+        sin = cos_sin_cache[pos, half:].float()[:, None, :]
+        x1, x2 = normed[..., :half].float(), normed[..., half:].float()
+        out = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).half()
+    q_out.copy_(out[:, :hq].reshape(n, -1))
+    k_out.copy_(out[:, hq:].reshape(n, -1))
+    if key_cache is None:
+        return
+    page = key_cache.shape[1]
+    v = qkv[:, (hq + hkv) * head_dim :].reshape(n, hkv, head_dim)
+    for t in range(min(n, slot_mapping.shape[0])):
+        slot = int(slot_mapping[t])
+        if slot < 0:
+            continue
+        key_cache[slot // page, slot % page] = out[t, hq:]
+        value_cache[slot // page, slot % page] = v[t]
 
 
 def _cos_sin(max_pos=64, dtype=torch.float16):
@@ -282,7 +335,7 @@ def test_reference_matches_unfused_route(rope):
     cs = _cos_sin() if rope else None
     q = torch.empty(n, HQ * D, dtype=torch.half)
     k = torch.empty(n, HKV * D, dtype=torch.half)
-    qk.qk_norm_rope_kv_reference(qkv, q, k, qw, kw, pos, cs, 1e-6)
+    _qk_oracle(qkv, q, k, qw, kw, pos, cs, 1e-6)
 
     def norm(x, w):
         x = x.float()
@@ -314,6 +367,16 @@ def _triton_impl():
     return impl
 
 
+def _cache_views(kv):
+    """The K/V views K15's op writes for a TRITON_ATTN (or Flash-V100) layer:
+    ``qk._direct_cache_views`` on a [B, Hkv, N, 2*D] layer cache."""
+    layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
+    slots = torch.zeros(1, dtype=torch.long, device=kv.device)
+    views = qk._direct_cache_views(layer, kv, slots, kv.shape[1], D)
+    assert views is not None
+    return views
+
+
 def test_cache_write_uses_upstream_triton_layout():
     """kv_cache is [blocks, Hkv, page, 2*D]
     (UP vllm/v1/attention/backends/triton_attn.py:598-599); K goes to
@@ -323,15 +386,13 @@ def test_cache_write_uses_upstream_triton_layout():
     kv_cache = torch.zeros(3, HKV, PAGE, 2 * D, dtype=torch.half)
     slots = torch.tensor([0, 17, -1, 47])
     layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
-    views = qk._direct_cache_views(layer, kv_cache, slots, HKV)
+    views = qk._direct_cache_views(layer, kv_cache, slots, HKV, D)
     assert views is not None
     for v in views:
         assert v.shape == (3, PAGE, HKV, D) and v.data_ptr() >= kv_cache.data_ptr()
     q = torch.empty(4, HQ * D, dtype=torch.half)
     k = torch.empty(4, HKV * D, dtype=torch.half)
-    qk.qk_norm_rope_kv_reference(
-        qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *views, slots
-    )
+    _qk_oracle(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *views, slots)
     vv = qkv[:, (HQ + HKV) * D :].reshape(4, HKV, D)
     kk = k.reshape(4, HKV, D)
     written = torch.zeros_like(kv_cache, dtype=torch.bool)
@@ -380,13 +441,11 @@ def test_cache_write_honours_permuted_layouts(layout):
         assert not cache.is_contiguous()
     layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
     for kv in (ref, cache):
-        views = qk._direct_cache_views(layer, kv, slots, HKV)
+        views = qk._direct_cache_views(layer, kv, slots, HKV, D)
         assert views is not None  # admitted: the kernel honours the strides
         q = torch.empty(6, HQ * D, dtype=torch.half)
         k = torch.empty(6, HKV * D, dtype=torch.half)
-        qk.qk_norm_rope_kv_reference(
-            qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *views, slots
-        )
+        _qk_oracle(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *views, slots)
     assert torch.equal(cache, ref)
     assert ref.any()
 
@@ -396,14 +455,14 @@ def test_direct_cache_views_refuses_other_layouts():
     slots = torch.tensor([0])
     impl = _triton_impl()
     ok = SimpleNamespace(impl=impl, kv_cache_dtype="auto")
-    assert qk._direct_cache_views(ok, kv, slots, HKV) is not None
+    assert qk._direct_cache_views(ok, kv, slots, HKV, D) is not None
     fp8 = SimpleNamespace(impl=impl, kv_cache_dtype="fp8")
-    assert qk._direct_cache_views(fp8, kv, slots, HKV) is None
+    assert qk._direct_cache_views(fp8, kv, slots, HKV, D) is None
     other = SimpleNamespace(impl=_OtherImpl(), kv_cache_dtype="auto")
-    assert qk._direct_cache_views(other, kv, slots, HKV) is None  # CUSTOM backend
-    assert qk._direct_cache_views(ok, kv.float(), slots, HKV) is None
+    assert qk._direct_cache_views(other, kv, slots, HKV, D) is None  # CUSTOM backend
+    assert qk._direct_cache_views(ok, kv.float(), slots, HKV, D) is None
     impl._is_per_token_head_quant = True
-    assert qk._direct_cache_views(ok, kv, slots, HKV) is None
+    assert qk._direct_cache_views(ok, kv, slots, HKV, D) is None
 
 
 class _OtherImpl:
@@ -440,6 +499,7 @@ def _rejection(**kw):
         rotary_emb=_neox_rope(),
         kv_cache_dtype="auto",
         attn_type="decoder",
+        calculate_kv_scales=False,
         kv_sharing=False,
         backend_writes_kv_in_forward=False,
     )
@@ -470,8 +530,27 @@ def test_kill_switch_disables_fusion(monkeypatch):
 
 
 def test_op_registered_under_sm70_name():
-    assert qk.OP_NAME == "sm70_flint_qk_norm_rope_kv_cache_update"
+    assert qk.OP_NAME == "sm70_qk_norm_rope_kv_cache_update"
     assert hasattr(torch.ops.vllm, qk.OP_NAME)
+
+
+def test_fused_route_runs_k15_op_and_attention():
+    """M5's fused route calls K15's registered op (the one the platform hook
+    splits out and the mutation hooks patch), then K15's
+    attention_after_fused_write; M5 keeps no copy of either."""
+    import inspect
+
+    from vllm_sm70.flint import QK_ROPE_KV_SPLITTING_OP
+    from vllm_sm70.models.flint_sm70 import model as m
+
+    src = inspect.getsource(m.FlintSm70Attention._forward_fused)
+    assert f"torch.ops.vllm.{qk.OP_NAME}(" in src
+    assert "attention_after_fused_write(self.attn, q, k, v)" in src
+    assert QK_ROPE_KV_SPLITTING_OP == f"vllm::{qk.OP_NAME}"
+    assert m.fused_route_rejection is qk.fused_route_rejection
+    assert m.attention_after_fused_write is qk.attention_after_fused_write
+    assert _mutation_module().TARGET == qk.__name__
+    assert importlib.util.find_spec("vllm_sm70.models.flint_sm70.qk_norm_rope_kv") is None
 
 
 # --------------------------------------------------------------------------
@@ -862,16 +941,16 @@ def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
         q = torch.empty(n, HQ * D, dtype=torch.half, device=device)
         k = torch.empty(n, HKV * D, dtype=torch.half, device=device)
         fn(to(qkv), q, k, to(qw), to(kw), to(pos), to(cs), 1e-6,
-           *qk.triton_cache_views(kv, D), to(slots))
+           *_cache_views(kv), to(slots))
         return q, k, kv
 
     tq, tk, tkv = run(qk.qk_norm_rope_kv, "cuda")
-    rq, rk, rkv = run(qk.qk_norm_rope_kv_reference, "cuda")
+    rq, rk, rkv = run(_qk_oracle, "cuda")
     if n <= T2_BITWISE_MAX_N:
         for a, b in zip((tq, tk, tkv), (rq, rk, rkv)):
             assert torch.equal(a, b)
         return
-    cq, ck, ckv = run(qk.qk_norm_rope_kv_reference, "cpu")
+    cq, ck, ckv = run(_qk_oracle, "cpu")
     pairs = {
         "q": (tq, rq, cq),
         "k": (tk, rk, ck),
@@ -928,7 +1007,7 @@ def test_t2b_permuted_cache_matches_upstream_writer(layout, rope):
     q = torch.empty(n, HQ * D, dtype=torch.half, device="cuda")
     k = torch.empty(n, HKV * D, dtype=torch.half, device="cuda")
     qk.qk_norm_rope_kv(
-        qkv, q, k, qw, kw, pos, cs, 1e-6, *qk.triton_cache_views(ours, D), slots
+        qkv, q, k, qw, kw, pos, cs, 1e-6, *_cache_views(ours), slots
     )
     impl = _triton_impl()
     impl.attn_type = AttentionType.DECODER
@@ -1441,7 +1520,7 @@ def _qk_call(n, slots=None, blocks=3):
 
 
 def _run_registered_op(monkeypatch, n, slots=None):
-    """Call torch.ops.vllm.sm70_flint_qk_norm_rope_kv_cache_update on CPU (its
+    """Call K15's torch.ops.vllm.sm70_qk_norm_rope_kv_cache_update on CPU (its
     CPU kernel is the module's Python op body) with a fake attention context
     whose layer takes the direct cache-write branch."""
     import vllm.model_executor.layers.attention.attention as attention
@@ -1460,8 +1539,7 @@ def _reference(n, qkv, qw, kw, pos, slots, blocks=3):
     kv = torch.zeros(blocks, HKV, PAGE, 2 * D, dtype=torch.half)
     q = torch.empty(n, HQ * D, dtype=torch.half)
     k = torch.empty(n, HKV * D, dtype=torch.half)
-    qk.qk_norm_rope_kv_reference(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6,
-                                 *qk.triton_cache_views(kv, D), slots)
+    _qk_oracle(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, *_cache_views(kv), slots)
     return q, k, kv
 
 def test_mutation_fired_marker_only_when_a_call_changes(capfd):
@@ -1520,7 +1598,7 @@ def test_mutation_rope_pos_decode_reaches_registered_op(monkeypatch, n):
     computes: positions + 1 at <= 8 tokens, untouched above."""
     mm = _mutation_module()
     monkeypatch.setattr(qk, "qk_norm_rope_kv",
-                        mm.make_wrapper(qk.qk_norm_rope_kv_reference, "rope_pos_decode"))
+                        mm.make_wrapper(_qk_oracle, "rope_pos_decode"))
     q, k, kv, (qkv, qw, kw, pos, slots) = _run_registered_op(monkeypatch, n)
     want_pos = pos + 1 if n <= mm.DECODE_MAX_TOKENS else pos
     rq, rk, rkv = _reference(n, qkv, qw, kw, want_pos, slots)
@@ -1533,7 +1611,7 @@ def test_mutation_rope_pos_decode_reaches_registered_op(monkeypatch, n):
 def test_mutation_kv_slot_decode_reaches_registered_op(monkeypatch, n):
     mm = _mutation_module()
     monkeypatch.setattr(qk, "qk_norm_rope_kv",
-                        mm.make_wrapper(qk.qk_norm_rope_kv_reference, "kv_slot_decode"))
+                        mm.make_wrapper(_qk_oracle, "kv_slot_decode"))
     slots = torch.tensor([0, 17, -1, 47 if n > 8 else 30] + [20 + i for i in range(n - 4)])
     q, k, kv, (qkv, qw, kw, pos, slots) = _run_registered_op(monkeypatch, n, slots)
     total = 3 * PAGE
@@ -1555,7 +1633,7 @@ def test_mutation_install_wraps_the_triton_function(monkeypatch):
     assert qk.qk_norm_rope_kv._m5_original is original
     assert qk.qk_norm_rope_kv._m5_mutation == "rope_pos_decode"
     # The op body resolves the name in the module globals at call time.
-    assert qk.sm70_flint_qk_norm_rope_kv_cache_update.__globals__ is vars(qk)
+    assert qk.qk_norm_rope_kv_cache_update.__globals__ is vars(qk)
     with pytest.raises(ValueError, match="known"):
         mm.install_import_hook("no_such_bug")
 
@@ -1575,7 +1653,7 @@ def test_mutation_sitecustomize_in_fresh_process(tmp_path, mutation):
     env["M5_MUTATION"] = mutation
     code = (
         "import os, json\n"
-        "from vllm_sm70.models.flint_sm70 import qk_norm_rope_kv as qk\n"
+        "from vllm_sm70.flint import qk_norm_rope_kv as qk\n"
         "print(json.dumps([os.environ.get('M5_SHADOWED_RAN'),"
         " getattr(qk.qk_norm_rope_kv, '_m5_mutation', None),"
         " getattr(getattr(qk.qk_norm_rope_kv, '_m5_original', None), '__name__', None)]))\n"
