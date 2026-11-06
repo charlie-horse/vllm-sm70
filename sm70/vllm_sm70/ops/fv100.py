@@ -438,7 +438,15 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
+    fill_active: bool = True,
 ):
+    """Workspace views for `plan`.
+
+    With `active_num_partitions` None, the workspace's own counter is filled
+    with plan.actual_num_partitions (recorded into a graph under capture)
+    unless `fill_active` is False: the caller then fills it itself if the
+    launch will read it (flash_attn_decode_paged, K14 fused route).
+    """
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
     # Rows are shared across batch sizes (fork default share_workspace=on).
@@ -483,7 +491,8 @@ def _get_decode_workspace_for_plan(
     if _cuda_graph_capture_active():
         workspace.captured = True
     if active_num_partitions is None:
-        workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+        if fill_active:
+            workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
         workspace.tmp_out[:batch_capacity],
@@ -665,6 +674,29 @@ def flash_attn_decode_paged_sinks_capture_counts() -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
+def _gqa8_d128_aligned(t: torch.Tensor) -> bool:
+    """flash_decode_paged.cu gqa8_d128_decode_aligned: half8 vector loads."""
+    if t.data_ptr() % 16 != 0 or t.stride(-1) != 1:
+        return False
+    return all(t.stride(i) % 8 == 0 for i in range(t.dim() - 1))
+
+
+def _fused_kernel_launches(*tensors: torch.Tensor) -> bool:
+    """True when the C++ launcher will take the fused kernel for these
+    q, k_cache, v_cache, tmp_out and out, given that the Python gate
+    (fused_decode_eligible, counters present) already passed.
+
+    Mirrors the remaining C++ checks of launch_flash_attention_decode_paged
+    (gqa8_d128_decode_eligible's alignment terms and
+    gqa8_d128_decode_aligned(out)). False whenever a pointer cannot be read
+    (fake or meta tensors), so those calls keep the fill.
+    """
+    try:
+        return all(_gqa8_d128_aligned(t) for t in tensors)
+    except (RuntimeError, NotImplementedError):
+        return False
+
+
 def _validate_decode_sinks(sinks: torch.Tensor, q: torch.Tensor) -> None:
     """Metadata-only checks: no host sync, copy or allocation per call."""
     if not isinstance(sinks, torch.Tensor):
@@ -777,6 +809,7 @@ def flash_attn_decode_paged(
     )
     if fused_ok and _cuda_graph_capture_active():
         _fused_decode_capture_counts["two_launch" if counters is None else "fused"] += 1
+    own_active = active_num_partitions is None
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -785,8 +818,20 @@ def flash_attn_decode_paged(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            fill_active=False,
         )
     )
+    # The fused kernel never reads active_num_partitions, so a call that
+    # will take it records no fill_ (one graph node per layer otherwise).
+    # Every other launch (sink-free, two-launch, a C++ alignment fallback)
+    # fills exactly as before, ahead of its op.
+    fused_launch = (
+        sinks is not None
+        and counters is not None
+        and _fused_kernel_launches(q, k_cache, v_cache, tmp_out, out)
+    )
+    if own_active and not fused_launch:
+        active_num_partitions.fill_(plan.actual_num_partitions)
     args = (
         out,
         q,

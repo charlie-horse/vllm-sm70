@@ -33,7 +33,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 # K06's builder fixture, LBNHC forward helper and stable-libtorch stub.
-from test_fv100_backend_cpu import (  # noqa: E402,F401
+from test_fv100_backend_cpu import (  # noqa: F401
     _forward_case,
     _stub_stable_libtorch,
     builder,
@@ -627,3 +627,91 @@ def test_impl_forward_fused(load, monkeypatch, builder):
     counters = decode["counters"]
     assert counters.dtype == torch.int32 and counters.numel() >= 2 * 2
     assert impl._fv100_fused_ready
+
+
+# ------------------------------------------- active_num_partitions fill (new)
+# The fused kernel never reads active_num_partitions (schema position 9), so
+# the wrapper records no fill_ for a call that takes it; every other launch
+# fills as before. Sentinel -1 in the workspace counter shows whether a call
+# filled it.
+
+ACTIVE = 9
+
+
+def _sentinel_active(fv100):
+    (ws,) = fv100._decode_workspace_cache.values()
+    ws.active_num_partitions.fill_(-1)
+    return ws.active_num_partitions
+
+
+def _decode(fv100, *, sinks, out=None, capture_hints=False):
+    q, k, v, table, lens = _inputs()
+    kw = {"window_size": SWA_WINDOW, "sinks": sinks, "out": out}
+    if capture_hints:
+        kw.update(max_seq_len_hint=4096, workspace_seq_capacity_hint=4096)
+    fv100.flash_attn_decode_paged(q, k, v, table, lens, **kw)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_fused_launch_records_no_active_fill(load, monkeypatch, capture):
+    fv100, rec = load()
+    _decode(fv100, sinks=_sinks(), capture_hints=capture)  # counters, workspace
+    active = _sentinel_active(fv100)
+    _capturing(monkeypatch, fv100, capture)
+    _decode(fv100, sinks=_sinks(), capture_hints=capture)
+    assert rec.names == [FUSED, FUSED]
+    assert rec.calls[-1][1][ACTIVE] is active
+    assert active.item() == -1
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_two_launch_still_fills(load, monkeypatch, capture):
+    fv100, rec = load()
+    monkeypatch.setenv(FUSED_ENV, "0")
+    _decode(fv100, sinks=_sinks(), capture_hints=capture)
+    active = _sentinel_active(fv100)
+    _capturing(monkeypatch, fv100, capture)
+    _decode(fv100, sinks=_sinks(), capture_hints=capture)
+    assert rec.names == [TWO, TWO]
+    assert rec.calls[-1][1][ACTIVE] is active
+    # 4096 / 256 under the capture envelope, 20 / 256 -> 1 eagerly (the plan
+    # sizes active partitions for the hint, as today).
+    assert active.item() == (16 if capture else 1)
+
+
+def test_sink_free_and_unbuilt_fused_still_fill(load):
+    for with_fused, sinks, name in (
+        (True, None, "fv100_decode_paged"),
+        (False, _sinks(), TWO),
+    ):
+        fv100, rec = load(with_fused)
+        _decode(fv100, sinks=sinks)
+        active = _sentinel_active(fv100)
+        _decode(fv100, sinks=sinks)
+        assert rec.names == [name, name]
+        assert active.item() == 1
+
+
+def test_misaligned_out_keeps_the_fill(load):
+    """C++ falls back to two launches for an unaligned out, and those read
+    active_num_partitions: the wrapper must still fill it."""
+    fv100, rec = load()
+    _decode(fv100, sinks=_sinks())
+    active = _sentinel_active(fv100)
+    buf = torch.zeros(2 * 16 * HEAD_DIM + 4, dtype=torch.float16)
+    out = buf[4:].view(2, 16, HEAD_DIM)  # 8-byte offset: not 16-byte aligned
+    _decode(fv100, sinks=_sinks(), out=out)
+    assert rec.names == [FUSED, FUSED]
+    assert active.item() == 1
+
+
+def test_caller_active_partitions_are_never_filled(load):
+    fv100, rec = load()
+    q, k, v, table, lens = _inputs()
+    mine = torch.full((1,), -7, dtype=torch.int32)
+    for sinks in (_sinks(), None):
+        fv100.flash_attn_decode_paged(
+            q, k, v, table, lens, sinks=sinks, active_num_partitions=mine
+        )
+        assert rec.calls[-1][1][ACTIVE] is mine
+    assert mine.item() == -7
