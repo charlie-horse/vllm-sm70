@@ -694,6 +694,10 @@ def _shutdown(llm, settle_mib=2048, timeout_s=120):
     raise RuntimeError(f"GPU memory not released after shutdown: {used} MiB")
 
 
+# T4/T7 floor (Quinn): even if every flip is a near-tie, fail when more than
+# half of the prompts diverge before this many tokens.
+NEAR_TIE_FLOOR_TOKENS = 16
+
 # T4: a flip counts as a near-tie when both runs rank the two tokens as their
 # top-2 and their logprobs are within this many nats in both runs.
 T4_NEAR_TIE = 0.1
@@ -737,8 +741,11 @@ def _near_tie(a, b, lp_a, lp_b, tol=T4_NEAR_TIE):
 
 def _assert_identical_until_near_tie(label, runs_a, runs_b, n):
     """Per prompt: tokens identical, or identical up to a first flip that
-    _near_tie classifies as a near-tie. Prints each prompt's verdict."""
+    _near_tie classifies as a near-tie. Prints each prompt's verdict. Floor:
+    fail if more than half of the prompts diverge before
+    NEAR_TIE_FLOOR_TOKENS, near-ties or not."""
     bad = []
+    early = 0
     for i, ((ta, lpa), (tb, lpb)) in enumerate(zip(runs_a, runs_b)):
         pos = next((j for j, (a, b) in enumerate(zip(ta, tb)) if a != b), None)
         if pos is None:
@@ -747,9 +754,39 @@ def _assert_identical_until_near_tie(label, runs_a, runs_b, n):
             continue
         verdict = _near_tie(ta[pos], tb[pos], lpa[pos], lpb[pos])
         print(f"{label} prompt {i}: first divergence at {pos}: {verdict}")
+        early += pos < NEAR_TIE_FLOOR_TOKENS
         if not verdict.startswith("near-tie"):
             bad.append((i, pos, verdict))
     assert not bad, f"{label}: confident disagreement {bad}"
+    total = len(runs_a)
+    print(f"{label}: {early}/{total} prompts diverge before {NEAR_TIE_FLOOR_TOKENS}")
+    assert early * 2 <= total, (
+        f"{label}: {early}/{total} prompts diverge before token "
+        f"{NEAR_TIE_FLOOR_TOKENS} (floor: at most half)"
+    )
+
+
+def test_near_tie_floor():
+    tie = ({1: -0.69, 2: -0.70}, {2: -0.69, 1: -0.70})
+    def run(tokens, flip_at):
+        a = list(tokens)
+        b = list(tokens)
+        lpa = [{t: 0.0} for t in tokens]
+        lpb = [{t: 0.0} for t in tokens]
+        if flip_at is not None:
+            a[flip_at], b[flip_at] = 1, 2
+            lpa[flip_at], lpb[flip_at] = tie
+        return (a, lpa), (b, lpb)
+    toks = [5] * 32
+    # 1 of 3 diverges early (near-tie): passes
+    pairs = [run(toks, 3), run(toks, 20), run(toks, None)]
+    _assert_identical_until_near_tie("X", [p[0] for p in pairs], [p[1] for p in pairs], 32)
+    # 2 of 3 diverge early: floor fails even though all are near-ties
+    pairs = [run(toks, 3), run(toks, 5), run(toks, None)]
+    with pytest.raises(AssertionError, match="floor"):
+        _assert_identical_until_near_tie(
+            "X", [p[0] for p in pairs], [p[1] for p in pairs], 32
+        )
 
 
 def test_near_tie_classifier():
