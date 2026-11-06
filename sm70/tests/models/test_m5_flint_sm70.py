@@ -694,107 +694,9 @@ def _shutdown(llm, settle_mib=2048, timeout_s=120):
     raise RuntimeError(f"GPU memory not released after shutdown: {used} MiB")
 
 
-# T4/T7 floor (Quinn): even if every flip is a near-tie, fail when more than
-# half of the prompts diverge before this many tokens.
-NEAR_TIE_FLOOR_TOKENS = 16
-
-# T4: a flip counts as a near-tie when both runs rank the two tokens as their
-# top-2 and their logprobs are within this many nats in both runs.
+# T5 INFO: a first mismatch counts as a near-tie when the golden token is our
+# #2 within this many nats.
 T4_NEAR_TIE = 0.1
-
-
-def _greedy_lp(llm, n=64, prompts=PROMPTS):
-    """Greedy tokens plus each step's top-2 {token: logprob}."""
-    from vllm import SamplingParams
-
-    sp = SamplingParams(temperature=0, max_tokens=n, logprobs=2)
-    outs = llm.generate(prompts, sp)
-    res = []
-    for o in outs:
-        c = o.outputs[0]
-        steps = [{t: lp.logprob for t, lp in step.items()} for step in c.logprobs]
-        res.append((list(c.token_ids), steps))
-    return res
-
-
-def _greedy_lp_once(n=64, prompts=PROMPTS, **llm_kw):
-    llm = _llm(**llm_kw)
-    try:
-        return _greedy_lp(llm, n, prompts)
-    finally:
-        _shutdown(llm)
-
-
-def _near_tie(a, b, lp_a, lp_b, tol=T4_NEAR_TIE):
-    """Classify the first greedy flip between two runs (a chosen by run A
-    with step logprobs lp_a, b by run B with lp_b)."""
-    for name, lp in (("A", lp_a), ("B", lp_b)):
-        top2 = sorted(lp, key=lp.get, reverse=True)[:2]
-        if {a, b} != set(top2):
-            return f"run {name} top-2 {top2} does not hold both {a} and {b}"
-        gap = abs(lp[a] - lp[b])
-        if gap > tol:
-            return f"run {name} gap {gap:.4f} > {tol} nats"
-    gaps = (abs(lp_a[a] - lp_a[b]), abs(lp_b[a] - lp_b[b]))
-    return f"near-tie (gaps {gaps[0]:.4f} / {gaps[1]:.4f} nats)"
-
-
-def _assert_identical_until_near_tie(label, runs_a, runs_b, n):
-    """Per prompt: tokens identical, or identical up to a first flip that
-    _near_tie classifies as a near-tie. Prints each prompt's verdict. Floor:
-    fail if more than half of the prompts diverge before
-    NEAR_TIE_FLOOR_TOKENS, near-ties or not."""
-    bad = []
-    early = 0
-    for i, ((ta, lpa), (tb, lpb)) in enumerate(zip(runs_a, runs_b)):
-        pos = next((j for j, (a, b) in enumerate(zip(ta, tb)) if a != b), None)
-        if pos is None:
-            assert len(ta) == len(tb) == n, (label, i, len(ta), len(tb))
-            print(f"{label} prompt {i}: identical for {len(ta)} tokens")
-            continue
-        verdict = _near_tie(ta[pos], tb[pos], lpa[pos], lpb[pos])
-        print(f"{label} prompt {i}: first divergence at {pos}: {verdict}")
-        early += pos < NEAR_TIE_FLOOR_TOKENS
-        if not verdict.startswith("near-tie"):
-            bad.append((i, pos, verdict))
-    assert not bad, f"{label}: confident disagreement {bad}"
-    total = len(runs_a)
-    print(f"{label}: {early}/{total} prompts diverge before {NEAR_TIE_FLOOR_TOKENS}")
-    assert early * 2 <= total, (
-        f"{label}: {early}/{total} prompts diverge before token "
-        f"{NEAR_TIE_FLOOR_TOKENS} (floor: at most half)"
-    )
-
-
-def test_near_tie_floor():
-    tie = ({1: -0.69, 2: -0.70}, {2: -0.69, 1: -0.70})
-    def run(tokens, flip_at):
-        a = list(tokens)
-        b = list(tokens)
-        lpa = [{t: 0.0} for t in tokens]
-        lpb = [{t: 0.0} for t in tokens]
-        if flip_at is not None:
-            a[flip_at], b[flip_at] = 1, 2
-            lpa[flip_at], lpb[flip_at] = tie
-        return (a, lpa), (b, lpb)
-    toks = [5] * 32
-    # 1 of 3 diverges early (near-tie): passes
-    pairs = [run(toks, 3), run(toks, 20), run(toks, None)]
-    _assert_identical_until_near_tie("X", [p[0] for p in pairs], [p[1] for p in pairs], 32)
-    # 2 of 3 diverge early: floor fails even though all are near-ties
-    pairs = [run(toks, 3), run(toks, 5), run(toks, None)]
-    with pytest.raises(AssertionError, match="floor"):
-        _assert_identical_until_near_tie(
-            "X", [p[0] for p in pairs], [p[1] for p in pairs], 32
-        )
-
-
-def test_near_tie_classifier():
-    assert _near_tie(1, 2, {1: -0.69, 2: -0.70}, {2: -0.69, 1: -0.70}).startswith(
-        "near-tie"
-    )
-    assert "gap" in _near_tie(1, 2, {1: -0.1, 2: -2.5}, {2: -0.6, 1: -0.8})
-    assert "top-2" in _near_tie(1, 2, {1: -0.1, 3: -0.2}, {2: -0.1, 1: -0.12})
 
 
 def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
@@ -1080,25 +982,116 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     assert all(len(t) == 64 for t in toks)
 
 
+# T4a/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6).
+# FLINT_SM70_T4_SEQS: fixed sequences from `m5_teacher_forced.py gen`.
+# FLINT_SM70_T4_ENVELOPE: the fork's own stats from `m5_teacher_forced.py
+# envelope` (pairs "eager_vs_graphs" and "fused_vs_unfused").
+T4_SEQS = os.environ.get("FLINT_SM70_T4_SEQS")
+T4_ENVELOPE = os.environ.get("FLINT_SM70_T4_ENVELOPE")
+T4_ENVELOPE_FACTOR = 1.5
+needs_envelope = pytest.mark.skipif(
+    T4_SEQS is None or T4_ENVELOPE is None,
+    reason="set FLINT_SM70_T4_SEQS and FLINT_SM70_T4_ENVELOPE (fork calibration)",
+)
+
+
+def _tf_module():
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "m5_teacher_forced.py"
+    spec = importlib.util.spec_from_file_location("m5_teacher_forced", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _teacher_forced_scores(seqs, **llm_kw):
+    """Per-sequence logprobs of each continuation token (prompt_logprobs)."""
+    from vllm import SamplingParams
+
+    llm = _llm(**llm_kw)
+    try:
+        outs = llm.generate(
+            [{"prompt_token_ids": s["ids"]} for s in seqs],
+            SamplingParams(max_tokens=1, prompt_logprobs=1),
+        )
+        return [
+            [o.prompt_logprobs[i][s["ids"][i]].logprob
+             for i in range(s["start"], len(s["ids"]))]
+            for s, o in zip(seqs, outs)
+        ]
+    finally:
+        _shutdown(llm)
+
+
+def _assert_within_fork_envelope(pair, a, b):
+    """mean and p99 |dlogprob| <= T4_ENVELOPE_FACTOR x the fork's own."""
+    tf = _tf_module()
+    ours = tf.stats(a, b)
+    with open(T4_ENVELOPE) as f:
+        fork = json.load(f)[pair]
+    print(f"{pair}: ours {json.dumps(ours)} fork {json.dumps(fork)} "
+          f"(limit {T4_ENVELOPE_FACTOR}x mean and p99)")
+    for key in ("mean", "p99"):
+        assert ours[key] <= T4_ENVELOPE_FACTOR * fork[key] + 1e-6, (
+            f"{pair}: {key} {ours[key]:.4f} > {T4_ENVELOPE_FACTOR} x fork "
+            f"{fork[key]:.4f}"
+        )
+
+
+def test_envelope_gate(monkeypatch, tmp_path):
+    env = tmp_path / "env.json"
+    env.write_text(json.dumps({"eager_vs_graphs": {"mean": 0.02, "p99": 0.4}}))
+    monkeypatch.setitem(globals(), "T4_ENVELOPE", str(env))
+    base = [[-1.0] * 100]
+    near = [[-1.0 - (0.5 if i == 0 else 0.02) for i in range(100)]]  # mean ~0.0248, p99 0.02
+    _assert_within_fork_envelope("eager_vs_graphs", base, near)
+    far = [[-1.0 - 0.05 for _ in range(100)]]  # mean 0.05 > 1.5 x 0.02
+    with pytest.raises(AssertionError, match="mean"):
+        _assert_within_fork_envelope("eager_vs_graphs", base, far)
+    spiky = [[-1.0 - (0.9 if i < 3 else 0.0) for i in range(100)]]  # p99 0.9 > 0.6
+    with pytest.raises(AssertionError, match="p99"):
+        _assert_within_fork_envelope("eager_vs_graphs", base, spiky)
+
+
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
-def test_t4_compiled_graphs_match_eager():
-    """T4 (2 GPUs): eager vs compiled + FULL_AND_PIECEWISE CUDA graphs agree
-    on greedy tokens up to the first near-tie.
+@needs_envelope
+def test_t4a_teacher_forced_eager_vs_graphs():
+    """T4a (2 GPUs): eager vs compiled + CUDA graphs on fixed sequences.
 
-    Under compile, Inductor lowers upstream's native fused_add_rms_norm IR
-    (fp32 residual) where eager runs the vllm_c custom op, so logits differ
-    in the last bits and a greedy near-tie can flip, after which the two
-    continuations legitimately diverge. The fork's standard: identical until
-    the first near-tie. At the first differing position both runs must
-    rank the two tokens as their top-2 and put them within T4_NEAR_TIE nats;
-    anything else (a confident disagreement) is a real bug. Every prompt's
-    first-divergence position and gap is printed."""
-    eager = _greedy_lp_once(256, enforce_eager=True)
-    graphs = _greedy_lp_once(256)
-    _assert_identical_until_near_tie("T4 eager vs graphs", eager, graphs, 256)
+    Bea's t4_bisect (Nov 6): Inductor codegen accounts for all of the
+    teacher-forced difference (graphs_only = 0.0), so this is the Inductor
+    numeric envelope. Gate: within 1.5x of the fork's own eager-vs-graphs
+    mean and p99 on the same sequences."""
+    with open(T4_SEQS) as f:
+        seqs = json.load(f)["seqs"]
+    eager = _teacher_forced_scores(seqs, enforce_eager=True)
+    graphs = _teacher_forced_scores(seqs)
+    _assert_within_fork_envelope("eager_vs_graphs", eager, graphs)
 
+
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+def test_t4b_graph_replay_exact_at_one_seq():
+    """T4b (2 GPUs): CUDA-graph replay is exact when M cannot change.
+
+    max_num_seqs=1 means every decode step has M=1 in both runs (no capture
+    padding), and mode NONE + cudagraph FULL takes Inductor out. Greedy
+    tokens must then be identical to eager for all 256 tokens: any flip is a
+    capture/replay bug, not numerics."""
+    eager = _greedy_once(256, enforce_eager=True, max_num_seqs=1)
+    graphs = _greedy_once(
+        256, max_num_seqs=1,
+        compilation_config={"mode": 0, "cudagraph_mode": "FULL"},
+    )
+    for i, (e, g) in enumerate(zip(eager, graphs)):
+        pos = next((j for j, (a, b) in enumerate(zip(e, g)) if a != b), None)
+        print(f"T4b prompt {i}: " + ("identical" if pos is None else f"differs at {pos}"))
+    assert eager == graphs
 
 # Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
 GOLDEN_EXACT_TOKENS = 32
@@ -1193,17 +1186,15 @@ def test_t6_fp16_headroom_8k():
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
+@needs_envelope
 def test_t7_unfused_path_matches(monkeypatch):
-    """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream Attention)
-    agrees with the fused route up to the first near-tie.
-
-    Both routes use FP32 math with the same rounding points, but upstream's
-    unfused RMSNorm sums the squares with a CUDA block reduction
-    (csrc/layernorm_kernels.cu) while the fused Triton kernel uses tl.sum,
-    and FMA contraction can differ. So q/k can differ by an FP16 ulp (the
-    fork's contract for this kernel) and a greedy near-tie can flip; a
-    confident disagreement is a bug (same rule and threshold as T4)."""
-    fused = _greedy_lp_once(enforce_eager=True)
+    """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream
+    Attention) vs the fused route, both eager, teacher-forced on fixed
+    sequences. Gate: within 1.5x of the fork's own fused-vs-unfused mean and
+    p99 (pair "fused_vs_unfused" in the envelope)."""
+    with open(T4_SEQS) as f:
+        seqs = json.load(f)["seqs"]
+    fused = _teacher_forced_scores(seqs, enforce_eager=True)
     monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", "0")
-    unfused = _greedy_lp_once(enforce_eager=True)
-    _assert_identical_until_near_tie("T7 fused vs unfused", fused, unfused, 64)
+    unfused = _teacher_forced_scores(seqs, enforce_eager=True)
+    _assert_within_fork_envelope("fused_vs_unfused", fused, unfused)

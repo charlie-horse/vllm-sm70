@@ -7,7 +7,8 @@
 # no failures, errors or skips (a skip, e.g. a missing env var, is a FAIL).
 #
 # Required env: VLLM_PY (venv python with pytest), FLINT_SM70_CHECKPOINT,
-# FLINT_SM70_GOLDEN. Optional: OUT (log dir), M5_NODES (space-separated
+# FLINT_SM70_GOLDEN, FLINT_SM70_T4_SEQS and FLINT_SM70_T4_ENVELOPE (T4a/T7:
+# fixed sequences and the fork's envelope, from m5_teacher_forced.py). Optional: OUT (log dir), M5_NODES (space-separated
 # subset of the names below, default: all, in this order).
 set -uo pipefail
 
@@ -22,13 +23,14 @@ F=sm70/tests/models/test_m5_flint_sm70.py
 declare -A NODE=(
   [t1]="$F::test_t1_tiny_random_forward"
   [t6]="$F::test_t6_fp16_headroom_8k"
-  [t4]="$F::test_t4_compiled_graphs_match_eager"
+  [t4a]="$F::test_t4a_teacher_forced_eager_vs_graphs"
+  [t4b]="$F::test_t4b_graph_replay_exact_at_one_seq"
   [t5]="$F::test_t5_golden_tokens_vs_fork"
   [t7]="$F::test_t7_unfused_path_matches"
   [t2]="$F::test_t2_triton_kernel_bitwise_vs_reference"
   [t3]="$F::test_t3_checkpoint_loads"
 )
-read -r -a ORDER <<< "${M5_NODES:-t4 t5 t7 t2 t3 t1 t6}"
+read -r -a ORDER <<< "${M5_NODES:-t4a t4b t5 t7 t2 t3 t1 t6}"
 
 check_junit() {  # XML
   "$VLLM_PY" - "$1" <<'PY'
@@ -69,7 +71,7 @@ done
 
 echo
 echo "== verdicts ($OUT)"
-grep -hE '^(T2 n=|T4 |T5 |T7 |junit: )' "$OUT"/*.log || true
+grep -hE '^(T2 n=|T4b |T5 |eager_vs_graphs:|fused_vs_unfused:|junit: )' "$OUT"/*.log || true
 echo
 echo "== summary"
 rc=0
