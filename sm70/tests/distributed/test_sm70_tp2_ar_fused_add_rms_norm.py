@@ -27,6 +27,7 @@ through a group stand-in, fused (decode rows) and unfused (prefill rows).
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -283,9 +284,18 @@ def test_sm70_tp2_all_reduce_fused_add_rms_norm(monkeypatch, tmp_path, expandabl
         monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     else:
         monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    mp.spawn(
+    # spawn (never fork after CUDA init) and a bounded wait, so a stuck
+    # rank fails the test instead of hanging the run.
+    ctx = mp.spawn(
         _check,
         args=((tmp_path / "rendezvous").as_uri(), expandable),
         nprocs=2,
-        join=True,
+        join=False,
     )
+    deadline = time.monotonic() + 600
+    while not ctx.join(timeout=5):
+        if time.monotonic() > deadline:
+            for proc in ctx.processes:
+                if proc.is_alive():
+                    proc.kill()
+            pytest.fail("TP2 all-reduce ranks did not finish within 600 s")
