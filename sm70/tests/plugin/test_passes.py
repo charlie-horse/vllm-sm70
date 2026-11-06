@@ -66,7 +66,11 @@ def test_uuid_stable_across_processes(passes):
     )
     runs = {
         subprocess.run(
-            [sys.executable, "-c", code], check=True, capture_output=True, text=True
+            [sys.executable, "-c", code],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
         ).stdout.strip()
         for _ in range(2)
     }
