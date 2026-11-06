@@ -199,22 +199,51 @@ class Sm70CudaPlatform(CudaPlatform):
         # Flint only (K17 admission): there the fused AR kernel keeps the
         # residual in fp16, so the unfused path (switch off) must too. Other
         # models keep upstream's priority (fork parity).
-        if not _k17_admits(vllm_config):
+        reason = _k17_rejection(vllm_config)
+        if reason is not None:
+            _log_pin_once(
+                "vllm_sm70: fused_add_rms_norm IR priority not pinned (%s); "
+                "using upstream's %s",
+                reason,
+                list(priority.fused_add_rms_norm),
+            )
             return priority
-        return dataclasses.replace(
-            priority, fused_add_rms_norm=list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        pinned = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        _log_pin_once(
+            "vllm_sm70: fused_add_rms_norm IR priority pinned to %s "
+            "(K17 admits this model; was %s)",
+            pinned,
+            list(priority.fused_add_rms_norm),
         )
+        return dataclasses.replace(priority, fused_add_rms_norm=pinned)
 
 
-def _k17_admits(vllm_config: Any) -> bool:
-    """True when K17's rejection() is None for this engine config."""
+_PIN_LOGGED: set[str] = set()
+
+
+def _log_pin_once(fmt: str, *args: Any) -> None:
+    # INFO, once per distinct message: the hook runs for every VllmConfig,
+    # but a silent "off" is what this line exists to rule out.
+    msg = fmt % args
+    if msg not in _PIN_LOGGED:
+        _PIN_LOGGED.add(msg)
+        logger.info(msg)
+
+
+def _k17_rejection(vllm_config: Any) -> str | None:
+    """K17's rejection() for this engine config: None when it admits."""
     if getattr(vllm_config, "model_config", None) is None:
-        return False
+        return "no model config yet"
     try:
         from vllm_sm70 import ar_rms_fusion
 
         tp = vllm_config.parallel_config.tensor_parallel_size
-        return ar_rms_fusion.rejection(vllm_config, tp) is None
-    except Exception:
+        return ar_rms_fusion.rejection(vllm_config, tp)
+    except Exception as e:
         logger.debug("vllm_sm70: K17 admission check failed", exc_info=True)
-        return False
+        return f"K17 admission check failed: {type(e).__name__}: {e}"
+
+
+def _k17_admits(vllm_config: Any) -> bool:
+    """True when K17's rejection() is None for this engine config."""
+    return _k17_rejection(vllm_config) is None

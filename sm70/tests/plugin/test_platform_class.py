@@ -191,3 +191,39 @@ def test_fused_add_rms_norm_priority_merges_into_kernel_config(
     user = KernelConfig(ir_op_priority=IrOpPriorityConfig(fused_add_rms_norm=["native"]))
     user.set_platform_defaults(cfg)
     assert user.ir_op_priority.fused_add_rms_norm == ["native", "vllm_c"]
+
+
+@pytest.mark.parametrize(
+    "reason, expect",
+    [
+        (None, "pinned to ['vllm_c', 'native']"),
+        (
+            "_sm70_C lacks tp2_all_reduce_fused_add_rms_norm",
+            "not pinned (_sm70_C lacks tp2_all_reduce_fused_add_rms_norm)",
+        ),
+    ],
+)
+def test_fused_add_rms_norm_pin_is_logged(platform_cls, monkeypatch, reason, expect):
+    """The pin's state is logged at INFO, with K17's reason when off, so a
+    missing kernel can never silently leave it off."""
+    from vllm.config.compilation import CompilationMode
+
+    from vllm_sm70 import _cuda_platform, ar_rms_fusion
+
+    monkeypatch.setattr(ar_rms_fusion, "rejection", lambda config, tp: reason)
+    monkeypatch.setattr(_cuda_platform, "_PIN_LOGGED", set())
+    seen = []
+    monkeypatch.setattr(
+        _cuda_platform.logger, "info", lambda msg, *a: seen.append(msg % a if a else msg)
+    )
+    cc = SimpleNamespace(backend="inductor", mode=CompilationMode.VLLM_COMPILE)
+    cfg = SimpleNamespace(
+        compilation_config=cc,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    platform_cls.get_default_ir_op_priority(cfg)
+    platform_cls.get_default_ir_op_priority(cfg)  # logged once, not twice
+    pin_lines = [m for m in seen if "fused_add_rms_norm IR priority" in m]
+    assert len(pin_lines) == 1
+    assert expect in pin_lines[0]
