@@ -559,6 +559,64 @@ def cmd_score(a):
         print(msg)
 
 
+def cmd_greedy(a):
+    """Free-running greedy on PROMPT_SETS[--set] (all prompts submitted at
+    once, max_num_seqs as given), for T4b on either stack (Quinn, Nov 7:
+    does the fork also diverge eager vs graph replay?)."""
+    from vllm import SamplingParams
+
+    extra = json.loads(a.llm_kwargs) if a.llm_kwargs else {}
+    extra["max_num_seqs"] = a.max_num_seqs
+    if a.mode == "eager":
+        extra["enforce_eager"] = True
+    llm = _llm(a, **extra)
+    try:
+        prompts = PROMPT_SETS[a.set]
+        outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=a.n))
+        toks = [list(o.outputs[0].token_ids) for o in outs]
+    finally:
+        _close(llm)
+    out = pathlib.Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"set": a.set, "mode": a.mode, "max_num_seqs": a.max_num_seqs,
+                               "llm_kwargs": extra, "prompts": prompts, "tokens": toks}))
+    print(f"wrote {out}: {len(toks)} prompts x {a.n} tokens")
+
+
+def first_divergence(x: list[int], y: list[int]) -> int | None:
+    return next((i for i, (p, q) in enumerate(zip(x, y)) if p != q),
+                None if len(x) == len(y) else min(len(x), len(y)))
+
+
+def cmd_compare_greedy(a):
+    ga, gb = (json.loads(pathlib.Path(f).read_text()) for f in (a.a, a.b))
+    same = 0
+    for i, (x, y) in enumerate(zip(ga["tokens"], gb["tokens"])):
+        d = first_divergence(x, y)
+        same += d is None
+        print(f"prompt {i}: " + ("identical" if d is None else f"differs at {d}"))
+    print(f"identical {same}/{len(ga['tokens'])}")
+
+
+def cmd_seqs_from_golden(a):
+    """Golden greedy records (T5's FLINT_SM70_GOLDEN) -> a scorable seqs
+    file, for forced decode of the golden continuation (T5 near-tie rule)."""
+    golden = json.loads(pathlib.Path(a.golden).read_text())
+    seqs = []
+    for g in golden:
+        if a.match and a.match not in g["prompt"]:
+            continue
+        ids = list(g["prompt_token_ids"])
+        seqs.append({"prompt": g["prompt"], "start": len(ids),
+                     "ids": ids + list(g["token_ids"])})
+    if not seqs:
+        raise SystemExit(f"no golden prompt contains {a.match!r}")
+    out = pathlib.Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"set": a.set, "seqs_sha256": seqs_sha256(seqs), "seqs": seqs}))
+    print(f"wrote {out}: {len(seqs)} golden sequence(s) as set {a.set}")
+
+
 def cmd_compare(a):
     s = stats(metric(json.load(open(a.a)), a.metric), metric(json.load(open(a.b)), a.metric))
     print(json.dumps(s))
@@ -635,11 +693,32 @@ def main(argv=None):
     ep.add_argument("--min-sets", type=int, default=MIN_SETS)
     ep.add_argument("--pairs", action="append", choices=sorted(PAIRS),
                     help="restrict to these pairs (e.g. eager_vs_eager for our own noise)")
+    gr = sub.add_parser("greedy")
+    gr.add_argument("--model", required=True)
+    gr.add_argument("--tp", type=int, default=2)
+    gr.add_argument("--hf-overrides", default=None)
+    gr.add_argument("--gpu-util", type=float, default=0.85)
+    gr.add_argument("--mode", choices=["eager", "graphs"], required=True)
+    gr.add_argument("--set", type=int, default=0)
+    gr.add_argument("--n", type=int, default=256)
+    gr.add_argument("--max-num-seqs", type=int, default=1)
+    gr.add_argument("--llm-kwargs", default=None, help="JSON merged into LLM(...)")
+    gr.add_argument("--out", required=True)
+    cg = sub.add_parser("compare-greedy")
+    cg.add_argument("a")
+    cg.add_argument("b")
+    sg = sub.add_parser("seqs-from-golden")
+    sg.add_argument("--golden", required=True)
+    sg.add_argument("--match", default=None, help="substring of the prompt")
+    sg.add_argument("--set", type=int, default=9, help="set id to write")
+    sg.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "gen" and not (a.out or a.out_dir):
         ap.error("gen needs --out-dir (or --out for one set)")
     {"gen": cmd_gen, "score": cmd_score, "compare": cmd_compare,
-     "envelope": cmd_envelope}[a.cmd](a)
+     "envelope": cmd_envelope, "greedy": cmd_greedy,
+     "compare-greedy": cmd_compare_greedy,
+     "seqs-from-golden": cmd_seqs_from_golden}[a.cmd](a)
 
 
 if __name__ == "__main__":
