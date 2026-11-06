@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,11 @@ ROUTER_SWITCH = "VLLM_SM70_FLINT_FUSED_ROUTER"
 
 # Log line (vllm_sm70/router.py admit_flint_fused_router) that shows K13 ran.
 ROUTER_ON_LOG = "vllm_sm70: fused E256/K6 sigmoid router enabled"
+# K13 prepare_model (router.py, from kernel_warmup before capture), once per
+# rank. The layer count is the strong check: fewer than the model's MoE
+# layers means a partial non-admission (per-layer reasons are DEBUG only).
+ROUTER_ADMITTED_LOG = re.compile(r"vllm_sm70: fused router admitted on (\d+) layers")
+CKPT_MOE_LAYERS = 47  # checkpoint: 49 layers, 47 with MoE (mlp.gate.weight)
 
 
 # --------------------------------------------------------------------------
@@ -472,12 +478,17 @@ def _tiny_prompts():
     return [{"prompt_token_ids": p} for p in TINY_IDS]
 
 
-def _router_on_off(make_llm, prompts, n, monkeypatch, capfd):
+def _router_on_off(make_llm, prompts, n, monkeypatch, capfd, *, moe_layers, tp):
     reqs = [(prompts, _greedy_params(n))]
     on, on_logs = _run(make_llm, {ROUTER_SWITCH: None}, reqs, monkeypatch, capfd)
     off, off_logs = _run(make_llm, {ROUTER_SWITCH: "0"}, reqs, monkeypatch, capfd)
-    assert ROUTER_ON_LOG in on_logs, "K13 was not admitted on any layer"
+    assert on_logs.count(ROUTER_ON_LOG) == tp, "K13 enabled line not once per rank"
+    admitted = [int(m) for m in ROUTER_ADMITTED_LOG.findall(on_logs)]
+    assert admitted == [moe_layers] * tp, (
+        f"K13 admitted per rank {admitted}, expected {moe_layers} on each of {tp}"
+    )
     assert ROUTER_ON_LOG not in off_logs
+    assert not ROUTER_ADMITTED_LOG.search(off_logs)
     assert all(len(t) == n for t in on[0])
     assert on == off
 
@@ -488,7 +499,16 @@ def test_g1_tiny_router_on_off_greedy_identical(tmp_path, monkeypatch, capfd):
     """G1 (1 GPU, #66's G1): tiny Flint TP1, CUDA graphs: K13 on vs
     VLLM_SM70_FLINT_FUSED_ROUTER=0, greedy."""
     path = _tiny_flint_dir(tmp_path)
-    _router_on_off(lambda: _tiny_llm(path), _tiny_prompts(), 16, monkeypatch, capfd)
+    # 2 layers, mlp_only_layers=[0]: one MoE layer.
+    _router_on_off(
+        lambda: _tiny_llm(path),
+        _tiny_prompts(),
+        16,
+        monkeypatch,
+        capfd,
+        moe_layers=1,
+        tp=1,
+    )
 
 
 @pytest.mark.gpu
@@ -497,4 +517,6 @@ def test_g1_tiny_router_on_off_greedy_identical(tmp_path, monkeypatch, capfd):
 def test_g2_ckpt_tp2_router_on_off_greedy_identical(monkeypatch, capfd):
     """G2 (2 GPUs, #66's G4): checkpoint TP2, CUDA graphs: K13 on vs off,
     greedy."""
-    _router_on_off(_ckpt_llm, PROMPTS, 64, monkeypatch, capfd)
+    _router_on_off(
+        _ckpt_llm, PROMPTS, 64, monkeypatch, capfd, moe_layers=CKPT_MOE_LAYERS, tp=2
+    )
