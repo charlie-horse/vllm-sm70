@@ -173,6 +173,14 @@ for gates). **T4c must PASS under this setting before T4a/T4d/T4e/T7 count.**
 The runner reports them `NOT COUNTED` if T4c fails. Check that every log
 has the `tuning: ...=0` line, the fork's included.
 
+**Tuning on with a LUT (#87; Quinn, Nov 7).** A gate run with tuning on
+(`M5_ALLOW_TUNING=1`) and a persisted TurboMind LUT
+(`VLLM_SM70_GEMM_LUT_PATH`) must also set `VLLM_SM70_GEMM_LUT_STRICT=1`, so a
+missing or stale LUT fails instead of re-tuning per engine. `m5_window.sh`,
+`m5_mutation_check.sh` and `m5_teacher_forced.py` exit, and the test module
+fails collection, otherwise. Their `tuning:` line also prints
+`LUT: path=… strict=…`.
+
 ## 1. Sequences, on ours (1 load, ~5 min)
 ```sh
 $VLLM_PY $TF gen --model "$CKPT" --hf-overrides "$OURS_ARCH" \

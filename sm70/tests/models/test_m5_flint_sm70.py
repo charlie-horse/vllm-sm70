@@ -43,6 +43,12 @@ import pytest
 if os.environ.get("M5_ALLOW_TUNING") != "1":
     for _q in ("NVFP4", "FP8", "AWQ", "MXFP4"):
         os.environ.setdefault(f"VLLM_SM70_{_q}_TUNE_SMALL_SHAPES", "0")
+# Quinn (Nov 7, after #87): tuning on + a persisted LUT only in strict mode
+# (same rule as m5_teacher_forced.lut_strict_problem; fails collection).
+if (os.environ.get("M5_ALLOW_TUNING") == "1" and os.environ.get("VLLM_SM70_GEMM_LUT_PATH")
+        and os.environ.get("VLLM_SM70_GEMM_LUT_STRICT") != "1"):
+    raise RuntimeError("M5_ALLOW_TUNING=1 with VLLM_SM70_GEMM_LUT_PATH set needs "
+                       "VLLM_SM70_GEMM_LUT_STRICT=1 (Quinn, Nov 7)")
 
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
@@ -1814,6 +1820,23 @@ def test_t5_near_tie_verdict():
 def _set_stats(means, n=512):
     return {k: {"n": n, "mean": m, "max": 0.1, "over_0_1": 0, "over_1_0": 0}
             for k, m in enumerate(means)}
+
+
+def test_lut_strict_required_when_tuning_with_a_lut():
+    """Quinn, Nov 7 (after #87): tuning on + a LUT needs strict mode, in the
+    harness and both runner scripts."""
+    tf = _tf_module()
+    lut = {"M5_ALLOW_TUNING": "1", "VLLM_SM70_GEMM_LUT_PATH": "/x.lut"}
+    assert "VLLM_SM70_GEMM_LUT_STRICT=1" in tf.lut_strict_problem(lut)
+    assert tf.lut_strict_problem(lut | {"VLLM_SM70_GEMM_LUT_STRICT": "1"}) is None
+    assert tf.lut_strict_problem({"M5_ALLOW_TUNING": "1"}) is None  # no LUT
+    assert tf.lut_strict_problem({"VLLM_SM70_GEMM_LUT_PATH": "/x.lut"}) is None  # tuning off
+    scripts = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+    for name in ("m5_window.sh", "m5_mutation_check.sh"):
+        env = {"PATH": os.environ["PATH"], **lut}
+        r = subprocess.run(["bash", str(scripts / name)], env=env, capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 2 and "VLLM_SM70_GEMM_LUT_STRICT=1" in r.stdout, (name, r)
 
 
 def test_pooled_mean_gate_nov7_numbers():
