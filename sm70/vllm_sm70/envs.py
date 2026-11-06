@@ -96,6 +96,16 @@ def _tuning(name: str) -> Callable[[], str | None]:
     return getter
 
 
+def _path(name: str) -> Callable[[], str | None]:
+    """Optional file path; unset or empty means no file."""
+
+    def getter() -> str | None:
+        return os.environ.get(name) or None
+
+    getter.__name__ = f"path_{name}"
+    return getter
+
+
 def _ext_fingerprint() -> str:
     from vllm_sm70._ext import fingerprint
 
@@ -271,6 +281,20 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": the TP2 all-reduce + fused_add_rms_norm pattern is not applied;
         # graphs keep upstream's all_reduce and fused_add_rms_norm.
         "VLLM_SM70_FLINT_AR_RMSNORM": kill_switch("VLLM_SM70_FLINT_AR_RMSNORM"),
+    },
+    # Kai (TurboMind pre-capture warmup, vllm_sm70/warmup). Read once per
+    # worker by Sm70CudaPlatform.kernel_warmup, before CUDA graph capture.
+    "warmup": {
+        # "0": no pre-capture TurboMind tuning and no TP plan exchange. Then
+        # eager's first call of a shape measures per rank, and capture of an
+        # untuned shape takes the default spec, as on main before this.
+        "VLLM_SM70_TM_PRECAPTURE_WARMUP": kill_switch(
+            "VLLM_SM70_TM_PRECAPTURE_WARMUP"
+        ),
+        # Optional TurboMind dispatch-cache file (fork name), imported on the
+        # plan's source rank before tuning and so shared with every TP rank.
+        # "{device}", "{rank}" and "{arch}" are substituted. Unset: no file.
+        "VLLM_SM70_GEMM_LUT_PATH": _path("VLLM_SM70_GEMM_LUT_PATH"),
     },
 }
 

@@ -23,6 +23,7 @@ def test_names_and_sections():
         "quant",
         "models",
         "passes",
+        "warmup",
     ]
 
 

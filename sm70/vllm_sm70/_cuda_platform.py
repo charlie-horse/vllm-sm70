@@ -177,7 +177,13 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        return None
+        # TurboMind pre-capture tuning, TP-coordinated (vllm_sm70/warmup).
+        # U1 calls this before capture_model. Keep this body to the single
+        # call so later kernel_warmup additions merge cleanly.
+        # Off with VLLM_SM70_TM_PRECAPTURE_WARMUP=0.
+        from vllm_sm70 import warmup
+
+        warmup.run(worker)
 
     # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
     # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
