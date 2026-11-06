@@ -177,7 +177,14 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        return None
+        # K13 (risk R4): admit the fused router and allocate its per-layer
+        # workspace before CUDA graph capture.
+        get_model = getattr(worker, "get_model", None)
+        if get_model is None:
+            return
+        from vllm_sm70 import router
+
+        router.prepare_model(get_model())
 
     # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
     # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
@@ -216,6 +223,14 @@ class Sm70CudaPlatform(CudaPlatform):
             list(priority.fused_add_rms_norm),
         )
         return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()
 
 
 _PIN_LOGGED: set[str] = set()
