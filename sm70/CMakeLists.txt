@@ -139,11 +139,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
 endif()
 
-# Hook for K13 (Flint fused router). Same contract.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
-  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
-endif()
-
 # Hook for K12 (Flint NVFP4 MoE M<=2 QPN decode). Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
