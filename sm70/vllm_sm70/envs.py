@@ -314,10 +314,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # later run's VLLM_SM70_GEMM_LUT_PATH. Same substitutions. Unset: none.
         "VLLM_SM70_GEMM_LUT_EXPORT_PATH": _path("VLLM_SM70_GEMM_LUT_EXPORT_PATH"),
         # Opt-in check for gate runs (only "1" acts; adds a check, never a
-        # kernel): with VLLM_SM70_GEMM_LUT_PATH set, a missing, old-version,
-        # unreadable or mismatched manifest (sha256, _sm70_C build, GPU or
-        # "ops" knobs) raises RuntimeError on every rank, listing the
-        # differences, instead of the WARNING + re-tune. Kept out of "ops",
+        # kernel): with VLLM_SM70_GEMM_LUT_PATH set, a missing or unreadable
+        # LUT file, or a missing, old-version, unreadable or mismatched
+        # manifest (sha256, _sm70_C build, GPU or "ops" knobs) raises
+        # RuntimeError on every rank, listing the differences, instead of
+        # the WARNING + re-tune. Path unset: no effect. Kept out of "ops",
         # so it is not part of the LUT identity.
         "VLLM_SM70_GEMM_LUT_STRICT": opt_in("VLLM_SM70_GEMM_LUT_STRICT"),
     },

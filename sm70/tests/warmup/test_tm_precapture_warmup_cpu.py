@@ -775,6 +775,41 @@ def test_lut_strict_off_keeps_warning_and_retune(
     assert fakes[0].cache == fakes[1].cache
 
 
+@pytest.mark.parametrize("how", ["absent", "unreadable", "empty"])
+def test_lut_strict_raises_on_missing_or_unreadable_file(tmp_path, monkeypatch, how):
+    lut = tmp_path / "tm-sm70.bin"
+    phrase = {
+        "absent": "no LUT file",
+        "unreadable": "cannot read the LUT",
+        "empty": "no usable table",
+    }[how]
+    if how == "unreadable":
+        lut.write_bytes(cache.MAGIC + b"{not json")
+    elif how == "empty":
+        lut.write_bytes(b"")
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", "1")
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, calls = _run_ranks([flint_model(), flint_model()], fakes)
+    assert calls == ["all_gather", "broadcast"]  # raised together, none waits
+    for e in errors:
+        assert isinstance(e, RuntimeError), e
+        assert "VLLM_SM70_GEMM_LUT_STRICT=1" in str(e) and phrase in str(e)
+    # Strict off: the same file is INFO/WARNING and a normal tune.
+    monkeypatch.delenv("VLLM_SM70_GEMM_LUT_STRICT")
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None] and fakes[0].measured == FLINT_CALLS
+
+
+def test_lut_strict_without_a_path_does_nothing(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", "1")
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    assert fakes[0].measured == FLINT_CALLS and fakes[0].cache == fakes[1].cache
+
+
 def test_lut_strict_accepts_a_matching_lut(tmp_path, monkeypatch):
     lut, first = _export_run(tmp_path, monkeypatch)
     monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))

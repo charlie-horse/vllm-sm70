@@ -258,6 +258,15 @@ class LutRefused(RuntimeError):
     or written for another build or setup."""
 
 
+def _refused(path: str, problems: list[str]) -> LutRefused:
+    return LutRefused(
+        f"vllm_sm70: TurboMind LUT {path} refused (VLLM_SM70_GEMM_LUT_STRICT=1): "
+        + "; ".join(problems)
+        + ". Re-export it with VLLM_SM70_GEMM_LUT_EXPORT_PATH on this build "
+        "and setup, or unset VLLM_SM70_GEMM_LUT_STRICT."
+    )
+
+
 def load_lut(
     path: str, expected: dict[str, Any] | None = None, strict: bool = False
 ) -> Lut | None:
@@ -271,23 +280,32 @@ def load_lut(
     it is not fatal. A LUT without a manifest (fork files) cannot be
     checked and keeps the fork behaviour (every call tuned, then imported).
 
-    ``strict`` (VLLM_SM70_GEMM_LUT_STRICT=1, gate runs): any manifest
-    problem (missing, unreadable, not version MANIFEST_VERSION, sha256 not
-    matching the table, identity differing) raises LutRefused listing them
-    all, instead of the WARNING and re-tune.
+    ``strict`` (VLLM_SM70_GEMM_LUT_STRICT=1, gate runs): a missing or
+    unreadable LUT file, or any manifest problem (missing, unreadable, not
+    version MANIFEST_VERSION, sha256 not matching the table, identity
+    differing) raises LutRefused listing them, instead of the INFO/WARNING
+    and re-tune.
     """
     import hashlib
 
     p = Path(path)
     if not p.exists():
+        if strict:
+            raise _refused(path, ["no LUT file"])
         logger.info("vllm_sm70: no TurboMind LUT at %s; tuning as usual.", path)
         return None
     try:
         table = legacy_table(p.read_bytes())
     except Exception as exc:
+        if strict:
+            raise _refused(
+                path, [f"cannot read the LUT ({type(exc).__name__}: {exc})"]
+            ) from exc
         logger.warning("vllm_sm70: cannot read TurboMind LUT %s (%s).", path, exc)
         return None
     if not table:
+        if strict:
+            raise _refused(path, ["the LUT has no usable table"])
         logger.warning("vllm_sm70: TurboMind LUT %s has no usable table.", path)
         return None
     covers = None
@@ -324,12 +342,7 @@ def load_lut(
                 diffs = check_identity(manifest.get("identity"), expected)
                 problems += [d for d in diffs if d not in problems]
     if strict and problems:
-        raise LutRefused(
-            f"vllm_sm70: TurboMind LUT {path} refused (VLLM_SM70_GEMM_LUT_STRICT=1): "
-            + "; ".join(problems)
-            + ". Re-export it with VLLM_SM70_GEMM_LUT_EXPORT_PATH on this build "
-            "and setup, or unset VLLM_SM70_GEMM_LUT_STRICT."
-        )
+        raise _refused(path, problems)
     if diffs:
         logger.warning(
             "vllm_sm70: refusing TurboMind LUT %s: its manifest %s was "

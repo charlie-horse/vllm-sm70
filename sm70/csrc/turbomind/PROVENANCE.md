@@ -579,7 +579,8 @@ can diverge even with their TP ranks agreeing. To pin the specs:
    nothing is imported, and the warmup tunes as without a LUT (the summary
    says "LUT <path>: not loaded"). That is a stale cache, not an error, so it
    does not stop startup, unless `VLLM_SM70_GEMM_LUT_STRICT=1` (gate runs):
-   then a missing, unreadable or non-v2 manifest, a sha256 that does not match
+   then a missing or unreadable LUT file, a missing, unreadable or non-v2
+   manifest, a sha256 that does not match
    the table, or any identity difference raises RuntimeError on every rank
    (through the coordination protocol, so no rank waits), listing every
    difference.
@@ -645,7 +646,8 @@ In the `warmup` section of `vllm_sm70/envs.py`:
 - `VLLM_SM70_GEMM_LUT_PATH`: LUT to import, default none.
 - `VLLM_SM70_GEMM_LUT_EXPORT_PATH`: LUT to write, default none.
 - `VLLM_SM70_GEMM_LUT_STRICT`: opt-in (only "1" acts), default 0. With a LUT
-  path set, any manifest problem raises instead of the WARNING + re-tune.
+  path set, a missing or unreadable LUT file or any manifest problem raises
+  instead of the INFO/WARNING + re-tune; with the path unset it does nothing.
   Not in the `ops` section, so it is not part of the LUT identity.
 
 ### Tests
