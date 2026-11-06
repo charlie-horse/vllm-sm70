@@ -190,6 +190,11 @@ class Sm70CudaPlatform(CudaPlatform):
     # "native" stays as the fallback for args vllm_c does not support (a
     # weight dtype other than the input's, variance_size).
     SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
+    # Plain rms_norm, same scope: eager runs vllm_c (FP32 x * rsqrt * w,
+    # rounded once) while Inductor's "native" rounds x to FP16 before the
+    # weight multiply, so compiled Flint drifted from eager (T4: layer-0
+    # input norm and the unfused q/k norms).
+    SM70_RMS_NORM_PRIORITY = ("vllm_c", "native")
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> Any:
@@ -202,20 +207,25 @@ class Sm70CudaPlatform(CudaPlatform):
         reason = _k17_rejection(vllm_config)
         if reason is not None:
             _log_pin_once(
-                "vllm_sm70: fused_add_rms_norm IR priority not pinned (%s); "
-                "using upstream's %s",
+                "vllm_sm70: rms_norm and fused_add_rms_norm IR priority not "
+                "pinned (%s); using upstream's rms_norm=%s fused_add_rms_norm=%s",
                 reason,
+                list(priority.rms_norm),
                 list(priority.fused_add_rms_norm),
             )
             return priority
-        pinned = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        rms = list(cls.SM70_RMS_NORM_PRIORITY)
+        fused = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
         _log_pin_once(
-            "vllm_sm70: fused_add_rms_norm IR priority pinned to %s "
-            "(K17 admits this model; was %s)",
-            pinned,
+            "vllm_sm70: rms_norm and fused_add_rms_norm IR priority pinned to "
+            "rms_norm=%s fused_add_rms_norm=%s (K17 admits this model; was "
+            "rms_norm=%s fused_add_rms_norm=%s)",
+            rms,
+            fused,
+            list(priority.rms_norm),
             list(priority.fused_add_rms_norm),
         )
-        return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+        return dataclasses.replace(priority, rms_norm=rms, fused_add_rms_norm=fused)
 
 
 _PIN_LOGGED: set[str] = set()

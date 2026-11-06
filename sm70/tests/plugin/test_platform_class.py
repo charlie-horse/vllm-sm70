@@ -154,13 +154,16 @@ def test_fused_add_rms_norm_priority_is_vllm_c(
     ours = platform_cls.get_default_ir_op_priority(cfg)
     theirs = CudaPlatform.get_default_ir_op_priority(cfg)
     if admitted:
+        # Both norms take the C kernel, as eager does (T4).
         assert ours.fused_add_rms_norm == ["vllm_c", "native"]
+        assert ours.rms_norm == ["vllm_c", "native"]
     else:
         assert ours.fused_add_rms_norm == theirs.fused_add_rms_norm
-    assert ours.rms_norm == theirs.rms_norm
+        assert ours.rms_norm == theirs.rms_norm
     assert ours.gelu_and_mul_sparse == theirs.gelu_and_mul_sparse
     if inductor:
         assert theirs.fused_add_rms_norm == ["native"]
+        assert theirs.rms_norm == ["native"]
 
 
 def test_fused_add_rms_norm_priority_merges_into_kernel_config(
@@ -188,6 +191,7 @@ def test_fused_add_rms_norm_priority_merges_into_kernel_config(
     )
     kc.set_platform_defaults(cfg)
     assert kc.ir_op_priority.fused_add_rms_norm[0] == "vllm_c"
+    assert kc.ir_op_priority.rms_norm[0] == "vllm_c"
     user = KernelConfig(ir_op_priority=IrOpPriorityConfig(fused_add_rms_norm=["native"]))
     user.set_platform_defaults(cfg)
     assert user.ir_op_priority.fused_add_rms_norm == ["native", "vllm_c"]
@@ -196,7 +200,11 @@ def test_fused_add_rms_norm_priority_merges_into_kernel_config(
 @pytest.mark.parametrize(
     "reason, expect",
     [
-        (None, "pinned to ['vllm_c', 'native']"),
+        (
+            None,
+            "pinned to rms_norm=['vllm_c', 'native'] "
+            "fused_add_rms_norm=['vllm_c', 'native']",
+        ),
         (
             "_sm70_C lacks tp2_all_reduce_fused_add_rms_norm",
             "not pinned (_sm70_C lacks tp2_all_reduce_fused_add_rms_norm)",
