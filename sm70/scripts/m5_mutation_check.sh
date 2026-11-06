@@ -16,7 +16,9 @@
 # that MUST catch them (Quinn/Astro, Nov 6):
 #   rope_pos_decode  positions + 1 on <= 8-token fused-op calls   -> t4d t7
 #   kv_slot_decode   slot_mapping + 1 on <= 8-token fused-op calls -> t4d t7
-#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> t4d
+#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> INFO only
+#                    (below the envelope gates' sensitivity floor; Quinn, Nov 7:
+#                    docs/m5-calibration-nov7.md "Sensitivity floor")
 #                    (both T7 arms run the same MoE, so T7 cannot see it)
 #   rope_theta_1p01  rope_theta x 1.01 via hf_overrides            -> INFO only
 #                    (too weak at ~70-token positions; reported, not gated)
@@ -57,10 +59,10 @@ declare -A NODE=(
 declare -A MUST=(
   [rope_pos_decode]="t4d t7"
   [kv_slot_decode]="t4d t7"
-  [moe_decode_scale]="t4d"
+  [moe_decode_scale]=""
   [rope_theta_1p01]=""
 )
-declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7")
+declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7" [moe_decode_scale]="t4d")
 read -r -a MUTS <<< "${M5_MUTATIONS:-rope_pos_decode kv_slot_decode moe_decode_scale rope_theta_1p01}"
 read -r -a NODES <<< "${M5_MUTATION_NODES:-t4d t7}"
 
@@ -155,6 +157,12 @@ for mut in "${MUTS[@]}"; do
       VERDICT[$name.$mut]="${tag}CAUGHT: $msg"; continue
     else
       VERDICT[$name.$mut]="${tag}NOT CAUGHT (rc $RUN_RC, tests=$n failures=$f errors=$e skipped=$k): $msg"
+    fi
+    # moe_decode_scale is INFO for catching (sensitivity floor) but must still
+    # be applied and fire: that is the evidence K12 decode runs in this build.
+    v=${VERDICT[$name.$mut]}
+    if [[ $mut == moe_decode_scale && ( $v == *"NOT APPLIED"* || $v == *"NOT FIRED"* ) ]]; then
+      rc=1
     fi
     [[ $info -eq 1 ]] || rc=1
   done
