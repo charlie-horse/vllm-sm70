@@ -224,6 +224,14 @@ class Sm70CudaPlatform(CudaPlatform):
 
         return Sm70HiddenStateSampler()
 
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()
+
     # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
     # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
     # KernelConfig.ir_op_priority at config/kernel.py:461-478; a user-set

@@ -10,3 +10,6 @@ def register() -> None:
     if _registered:
         return
     _registered = True
+    from vllm_sm70 import router
+
+    router.register()  # K13: flint_route fake (provider binds via the platform)
