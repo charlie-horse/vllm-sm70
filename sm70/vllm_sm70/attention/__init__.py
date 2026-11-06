@@ -3,9 +3,7 @@
 
 register() points AttentionBackendEnum.CUSTOM at the Flash-V100 backend.
 Selection happens in Sm70CudaPlatform.get_attn_backend_cls (select_backend
-below); an explicit --attention-backend always wins. Flint sets the backend
-engine-wide from its model config hook instead: see flint_route.py
-(flint_sink_route_rejection, select_flint_attention_backend).
+below); an explicit --attention-backend always wins.
 """
 
 from __future__ import annotations

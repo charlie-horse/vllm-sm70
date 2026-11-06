@@ -79,6 +79,24 @@ def available() -> bool:
     return all(has_op(name) for name in OPS)
 
 
+# The two entry points that apply learned sinks (paged prefill and decode).
+SINK_OPS = ("fv100_prefill_paged_sinks", "fv100_decode_paged_sinks")
+
+
+def supports_sinks() -> bool:
+    """The loaded _sm70_C applies learned attention sinks.
+
+    True iff both K05 sink ops are registered. Replaces the fork's
+    `flash_attn_v100.SUPPORTS_SINKS` (cf9492a flash_attn_v100/__init__.py,
+    computed from `prefill_paged_sinks_fwd` and `decode_paged_sinks_fwd`;
+    read by vllm/model_executor/models/config.py:218-229). Unlike
+    FlashAttnV100Backend.supports_sink(), which is a constant class flag,
+    this reflects the build. Sinks apply on head size 128 only (the D256
+    kernels have no sink term).
+    """
+    return all(has_op(name) for name in SINK_OPS)
+
+
 logger = logging.getLogger("vllm.sm70")
 
 
