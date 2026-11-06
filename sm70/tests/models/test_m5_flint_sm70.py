@@ -1522,9 +1522,14 @@ def _qk_call(n, slots=None, blocks=3):
 
 
 def _run_registered_op(monkeypatch, n, slots=None):
-    """Call K15's torch.ops.vllm.<QK_ROPE_KV_OP_NAME> on CPU (its
-    CPU kernel is the module's Python op body) with a fake attention context
-    whose layer takes the direct cache-write branch."""
+    """Call K15's torch.ops.vllm.<QK_ROPE_KV_OP_NAME> on CPU with a fake
+    attention context whose layer takes the direct cache-write branch.
+
+    direct_register_custom_op registers the module's Python op body under the
+    platform's dispatch key: CPU on a host without the SM70 platform, CUDA
+    where it is active (c4130 with CUDA_VISIBLE_DEVICES="", Felix). For the
+    latter, register the same body for CPU for the duration of the call, so
+    the call still goes through the registered op's dispatch."""
     import vllm.model_executor.layers.attention.attention as attention
     from vllm.utils.torch_utils import _encode_layer_name
 
@@ -1533,7 +1538,17 @@ def _run_registered_op(monkeypatch, n, slots=None):
     monkeypatch.setattr(attention, "get_attention_context",
                         lambda name: (None, layer, kv, slots))
     op = getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
-    op(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, _encode_layer_name("m5.layer"))
+    cpu_lib = None
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(
+        f"vllm::{QK_ROPE_KV_OP_NAME}", "CPU"
+    ):
+        cpu_lib = torch.library.Library("vllm", "IMPL")
+        cpu_lib.impl(QK_ROPE_KV_OP_NAME, qk.qk_norm_rope_kv_cache_update, "CPU")
+    try:
+        op(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, _encode_layer_name("m5.layer"))
+    finally:
+        if cpu_lib is not None:
+            cpu_lib._destroy()
     return q, k, kv, (qkv, qw, kw, pos, slots)
 
 
