@@ -52,6 +52,7 @@ import weakref
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
@@ -72,7 +73,7 @@ from vllm_sm70.quant.nvfp4_linear import (
     restore_linear_output,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.quant.fp8")
 # M8 route lines go under "vllm" so vLLM's handler prints them in server.log
 # (m8_qpn8_ab.sh greps "SM70 FP8 QPN8").
 m8_logger = logging.getLogger("vllm.sm70")

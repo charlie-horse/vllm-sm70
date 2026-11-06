@@ -48,15 +48,15 @@ Upstream hooks this rests on (UP = vllm 4ba787e), with no upstream edit:
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm_sm70 import envs
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.dflash2")
 
 try:  # vllm.triton_utils gives placeholders when Triton is missing.
     from vllm.triton_utils import HAS_TRITON, tl, triton
