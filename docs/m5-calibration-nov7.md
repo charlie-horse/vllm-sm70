@@ -109,8 +109,13 @@ The Nov 7 run raised three gate issues. Quinn's rulings:
    only if both (a) the golden token at the first mismatch is our #2 within
    0.1 nats, and (b) forced decode of the golden sequence (prompt + golden
    continuation) with our graphs passes the T4d gate against the fork's
-   forced decode of the same sequence (1.5x the `eager_vs_graphs` effective
-   anchor). The fork file is `FLINT_SM70_T5_FORK_GOLDEN_SCORES` (step 2b),
+   forced decode of the same sequence, at the **per-sequence** scale: mean
+   <= 1.5x the fork's largest per-sequence `eager_vs_graphs` decode mean
+   (`seq_mean_max`, 0.0503 on Nov 7, so 0.075), max <= 1.5x the union max,
+   and the >1.0 count gate. One 64-token mean is noisier than a 512-token
+   set mean: on Nov 7, 3 of the fork's own 24 sequences exceed the 0.0363
+   set limit (Quinn, PASS-with-conditions). An envelope without
+   `seq_mean_max` fails closed (rebuild it, step 3). The fork file is `FLINT_SM70_T5_FORK_GOLDEN_SCORES` (step 2b),
    matched by prompt or `seqs_sha256`. If (a) holds but the file is unset
    or lacks the prompt, T5 FAILs with what to run. Our side costs one extra
    load, only when a near-tie needs it. One line per near-tie prompt:
@@ -256,6 +261,23 @@ T4a eager_vs_graphs decode set1: ours mean=… max=… >0.1=3/512 >1.0=0 | ours_
 Expected today: t4c FAIL (engine-instance nondeterminism, see above). Report
 every other FAIL.
 
+### Sensitivity floor (Quinn, Nov 7)
+The envelope gates cannot detect a **1% bias in the MoE decode output**.
+`moe_decode_scale` (K12 output x 1.01) fired, yet T4d stayed under
+1.5x the fork anchor: per-set means 0.029/0.033/0.031 vs 0.014/0.010/0.024
+unmutated, limit 0.0363. That is about 2x our unmutated distance from the
+fork, but within the fork's own eager-vs-graphs scale. A pooled-mean gate
+at 1.25x would have caught it (1.57x vs <= 1.10x on the unmutated runs);
+it was not adopted because that margin is too thin. Treat any change below
+this floor as invisible to T4a/T4d/T4e/T7.
+
+Planned follow-up (not part of #36): a **self-regression check** that
+pins our own forced-decode scores on the M5 sequence sets as a baseline and
+requires bitwise equality (0 tolerance) on later builds with tuning off.
+T4c showed two engine instances are bitwise identical, so any change,
+including a 1% MoE bias, shows up. An intended numeric change re-pins the
+baseline in the same PR, with a reason.
+
 ## 5. Mutation check (11 loads, ~30–40 min)
 Run this only after T4d and T7 have passed unmutated in step 4, or add
 `M5_BASELINE=1`, which costs 3 more loads.
@@ -268,7 +290,7 @@ Planted bugs and the gates that MUST catch them (Quinn/Astro, Nov 6):
 |---|---|---|
 | `rope_pos_decode` | positions + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
 | `kv_slot_decode` | slot_mapping + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
-| `moe_decode_scale` | K12 M≤2 MoE decode output × 1.01 | T4d (T7 can't see it: both arms run the same MoE) |
+| `moe_decode_scale` | K12 M≤2 MoE decode output × 1.01 | INFO only, on T4d: below the sensitivity floor (Nov 7: not caught; see above). Still must FIRE. |
 | `rope_theta_1p01` | rope_theta × 1.01 via hf_overrides | INFO only (too weak at ~70-token positions) |
 
 The check PASSes only if every required run fails the gate itself (not a

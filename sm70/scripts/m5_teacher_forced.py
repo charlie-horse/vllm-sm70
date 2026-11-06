@@ -352,20 +352,27 @@ def top1_disagreements(score: dict) -> tuple[int, int]:
 # Statistics, envelope and gate
 # --------------------------------------------------------------------------
 def stats(sa: list[list[float]], sb: list[list[float]]) -> dict:
-    """n / mean / max |dlogprob| and the counts above OVER and OVER_1_0 nats."""
+    """n / mean / max |dlogprob|, the counts above OVER and OVER_1_0 nats,
+    and seq_mean_max: the largest per-sequence mean (the noise scale a
+    single-sequence check is gated against; Quinn, Nov 7)."""
     if len(sa) != len(sb):
         raise ValueError(f"different sequence counts: {len(sa)} vs {len(sb)}")
-    d = []
+    d, seq_means = [], []
     for i, (xa, xb) in enumerate(zip(sa, sb)):
         if len(xa) != len(xb):
             raise ValueError(f"sequence {i}: {len(xa)} vs {len(xb)} scored tokens")
+        ds = []
         for x, y in zip(xa, xb):
             diff = 0.0 if x == y else abs(x - y)
-            d.append(math.inf if math.isnan(diff) else diff)
+            ds.append(math.inf if math.isnan(diff) else diff)
+        if ds:
+            seq_means.append(sum(ds) / len(ds))
+        d += ds
     if not d:
         raise ValueError("no scored tokens to compare")
     return {"n": len(d), "mean": sum(d) / len(d), "max": max(d),
-            "over_0_1": sum(x > OVER for x in d), "over_1_0": sum(x > OVER_1_0 for x in d)}
+            "over_0_1": sum(x > OVER for x in d), "over_1_0": sum(x > OVER_1_0 for x in d),
+            "seq_mean_max": max(seq_means)}
 
 
 def _set_id(path: pathlib.Path) -> int:
@@ -400,10 +407,13 @@ def anchor_of(per_set: dict) -> dict:
     """Anchor = ANCHOR_REDUCE (max) over sets of the per-set mean and max;
     the counts above OVER and OVER_1_0 are the max over sets."""
     vals = list(per_set.values())
-    return {"mean": ANCHOR_REDUCE(v["mean"] for v in vals),
-            "max": ANCHOR_REDUCE(v["max"] for v in vals),
-            "over_0_1": max(v["over_0_1"] for v in vals),
-            "over_1_0": max(v["over_1_0"] for v in vals)}
+    anchor = {"mean": ANCHOR_REDUCE(v["mean"] for v in vals),
+              "max": ANCHOR_REDUCE(v["max"] for v in vals),
+              "over_0_1": max(v["over_0_1"] for v in vals),
+              "over_1_0": max(v["over_1_0"] for v in vals)}
+    if all("seq_mean_max" in v for v in vals):
+        anchor["seq_mean_max"] = max(v["seq_mean_max"] for v in vals)
+    return anchor
 
 
 def envelope_from_scores(scores: dict, pairs=None, min_sets: int = MIN_SETS) -> dict:
@@ -510,6 +520,20 @@ def effective_anchor(env: dict, pair: str, metric: str, scores_dir=None) -> dict
             "max_by_metric": {m: an["max"] for m, an in sorted(anchors.items())}}
 
 
+def sequence_anchor(env: dict, pair: str, metric: str) -> dict:
+    """The gate anchor for a check over ONE sequence (T5 rule (b); Quinn,
+    Nov 7): mean = the fork's largest per-sequence mean for (pair, metric)
+    (a 64-token mean is noisier than a 512-token set mean); max and the count
+    above OVER_1_0 as effective_anchor (union over the pair's metrics).
+    Fails closed on an envelope without seq_mean_max."""
+    eff = effective_anchor(env, pair, metric)
+    raw = env["pairs"][pair][metric]["anchor"]
+    if "seq_mean_max" not in raw:
+        raise EnvelopeError(f"the envelope predates per-sequence anchors (no seq_mean_max "
+                            f"in the {pair} {metric} anchor): " + REBUILD_HINT)
+    return {**eff, "mean": raw["seq_mean_max"], "mean_basis": "per-sequence"}
+
+
 def count_limit(anchor_count: int, factor=None) -> int:
     """Allowed count of tokens above OVER_1_0: max(1, ceil(factor x anchor))."""
     f = GATE_COUNT_FACTOR if factor is None else factor
@@ -569,7 +593,9 @@ def limits_text(anchor: dict) -> str:
     by = anchor.get("max_by_metric") or {}
     over = (", ".join(f"{m} {v:.4g}" for m, v in by.items())
             if by else "+".join(anchor["max_over"]))
-    return (f"limits mean<={lim['mean']:.4g} ({GATE_MEAN_FACTOR}x), "
+    basis = (" fork per-sequence max mean" if anchor.get("mean_basis") == "per-sequence"
+             else "")
+    return (f"limits mean<={lim['mean']:.4g} ({GATE_MEAN_FACTOR}x{basis}), "
             f"max<={lim['max']:.4g} ({GATE_MAX_FACTOR}x max over {over}), "
             f">{OVER_1_0}<={lim['over_1_0']} "
             f"(max(1, ceil({GATE_COUNT_FACTOR}x{anchor['over_1_0']})))")

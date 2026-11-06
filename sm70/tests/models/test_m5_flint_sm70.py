@@ -1487,7 +1487,9 @@ def test_envelope_aggregates_max_over_sets(tmp_path):
     assert ee["decode"]["anchor"]["max"] == pytest.approx(0.2)
     assert ee["decode"]["per_set"]["2"]["over_0_1"] == 10
     assert ee["prefill"]["anchor"] == {"mean": 0.0, "max": 0.0, "over_0_1": 0,
-                                       "over_1_0": 0}
+                                       "over_1_0": 0, "seq_mean_max": 0.0}
+    # The largest per-sequence mean (one sequence per set here = the set mean).
+    assert eg["decode"]["anchor"]["seq_mean_max"] == pytest.approx(0.04)
     assert "eager_vs_graphsonly" not in env["pairs"]  # no graphsonly files
     only = tf.build_envelope(tmp_path, pairs=["eager_vs_eager"])
     assert list(only["pairs"]) == ["eager_vs_eager"] and only["gate"]["provisional"]
@@ -1741,10 +1743,13 @@ def test_t5_near_tie_inputs(tmp_path):
     seqs = tf.golden_seqs(golden)
     env_path = tmp_path / "env.json"
     env_path.write_text(json.dumps(_env({"eager_vs_graphs": {
-        "decode": _anchor(0.02, 0.5, 1, 1), "prefill": _anchor(0.03, 0.9, 1, 0)}})))
+        "decode": _anchor(0.02, 0.5, 1, 1) | {"seq_mean_max": 0.05},
+        "prefill": _anchor(0.03, 0.9, 1, 0) | {"seq_mean_max": 0.06}}})))
     fork = _fork_golden_scores(tmp_path / "f.json", seqs, [[-1.0] * 3] * 3)
     anchor, ready, why = _t5_near_tie_inputs(golden, ["p1"], str(env_path), fork)
-    assert anchor["max"] == 0.9 and anchor["mean"] == 0.02 and why == {}
+    # Quinn, Nov 7: the mean is the fork's largest per-sequence decode mean.
+    assert anchor["max"] == 0.9 and anchor["mean"] == 0.05 and why == {}
+    assert anchor["mean_basis"] == "per-sequence"
     assert ready["p1"][0] == seqs[1] and ready["p1"][1]["decode"] == [-1.0] * 3
     # By seqs_sha256 (records without prompts), e.g. seqs-from-golden --match p2.
     fork2 = _fork_golden_scores(tmp_path / "f2.json", seqs[2:], [[-2.0] * 3], with_prompt=False)
@@ -1764,6 +1769,11 @@ def test_t5_near_tie_inputs(tmp_path):
         "decode": {"mean": 0.1, "max": 0.1, "over_0_1": 0}}})))
     anchor, _, why = _t5_near_tie_inputs(golden, ["p0"], str(env_path), fork)
     assert anchor is None and "rebuild" in why["p0"]
+    # An envelope with the >1.0 counts but no per-sequence means also fails closed.
+    env_path.write_text(json.dumps(_env({"eager_vs_graphs": {
+        "decode": _anchor(0.02, 0.5, 1, 1), "prefill": _anchor(0.03, 0.9, 1, 0)}})))
+    anchor, _, why = _t5_near_tie_inputs(golden, ["p0"], str(env_path), fork)
+    assert anchor is None and "per-sequence" in why["p0"] and "rebuild" in why["p0"]
     # A file of other sequences matches nothing.
     other = [dict(seqs[0], ids=seqs[0]["ids"][:-1] + [99])]
     assert tf.match_scored_seqs(seqs, {"seqs_sha256": tf.seqs_sha256(other),
@@ -1791,6 +1801,33 @@ def test_t5_near_tie_verdict():
     ok, line = _t5_near_tie_verdict("p", 0.01, None, None, "set FLINT_SM70_T5_FORK_GOLDEN_SCORES")
     assert not ok and line.endswith("n/a -> FAIL: set FLINT_SM70_T5_FORK_GOLDEN_SCORES")
     assert not _t5_near_tie_verdict("p", 0.01, good, None)[0]
+
+
+def test_t5_sequence_anchor_nov7_sky():
+    """Quinn, Nov 7: rule (b) gates ONE 64-token sequence, so its mean is
+    anchored on the fork's largest per-sequence eager_vs_graphs decode mean
+    (0.0503 on Nov 7; 3 of the fork's 24 sequences exceed the 0.0363 set
+    limit), not the 512-token set mean. Nov 7 sky: mean 0.0381, max 0.227,
+    >1.0 0 -> PASS at the sequence anchor, FAIL at the set anchor."""
+    tf = _tf_module()
+    env = _env({"eager_vs_graphs": {
+        "decode": _anchor(0.02421, 2.616, 32, 2) | {"seq_mean_max": 0.0503},
+        "prefill": _anchor(0.02428, 0.8954, 29, 0) | {"seq_mean_max": 0.04}}})
+    seq_anchor = tf.sequence_anchor(env, "eager_vs_graphs", "decode")
+    assert seq_anchor["mean"] == 0.0503 and seq_anchor["max"] == 2.616
+    assert seq_anchor["over_1_0"] == 2 and seq_anchor["mean_basis"] == "per-sequence"
+    sky = {"n": 64, "mean": 0.0381, "max": 0.227, "over_0_1": 9, "over_1_0": 0}
+    ok, line = _t5_near_tie_verdict("Explain in two sentences why the sky is blue.",
+                                    0.0020, sky, seq_anchor)
+    assert ok and "fork per-sequence max mean" in line and line.endswith("-> PASS")
+    set_anchor = tf.effective_anchor(env, "eager_vs_graphs", "decode")
+    assert tf.gate_failures(sky, set_anchor)  # the set-mean anchor would fail it
+    # A sequence that is off by more than the fork's worst sequence still fails.
+    bad = dict(sky, mean=0.08)
+    assert not _t5_near_tie_verdict("p", 0.002, bad, seq_anchor)[0]
+    # stats() records the per-sequence max mean.
+    st = tf.stats([[-1.0, -1.0], [-1.0, -1.0]], [[-1.0, -1.0], [-1.4, -1.0]])
+    assert st["seq_mean_max"] == pytest.approx(0.2)
 
 
 def test_teacher_forced_cli_keeps_handed_out_commands(tmp_path, monkeypatch, capsys, tf_main):
@@ -2270,7 +2307,8 @@ T5_FORK_HOWTO = (
 
 def _t5_near_tie_inputs(golden, prompts, envelope_path, fork_scores_path):
     """CPU half of T5 rule (b) for the near-tie `prompts`: (anchor, ready,
-    why). anchor is the T4d (eager_vs_graphs) effective decode anchor;
+    why). anchor is the T4d pair's (eager_vs_graphs) decode SEQUENCE anchor
+    (tf.sequence_anchor: the fork's largest per-sequence mean; Quinn, Nov 7);
     ready maps prompt -> (our golden seq, the fork's score record); why maps
     every other prompt to what is missing (each is a FAIL)."""
     tf = _tf_module()
@@ -2281,8 +2319,8 @@ def _t5_near_tie_inputs(golden, prompts, envelope_path, fork_scores_path):
     else:
         try:
             with open(envelope_path) as f:
-                anchor = tf.effective_anchor(json.load(f), tf.GATE_ANCHOR_PAIR["T4d"],
-                                             "decode")
+                anchor = tf.sequence_anchor(json.load(f), tf.GATE_ANCHOR_PAIR["T4d"],
+                                            "decode")
         except (OSError, ValueError) as e:
             problem = f"envelope {envelope_path}: {e}"
     if problem is None and fork_scores_path is None:
@@ -2320,8 +2358,10 @@ def _t5_near_tie_verdict(prompt, gap, forced, anchor, missing=None):
     GOLDEN_EXACT_TOKENS only if (a) the golden token at the first mismatch
     is our #2 within T4_NEAR_TIE nats (gap; None if it is not our #2) and
     (b) forced decode of the golden sequence, our graphs vs the fork's
-    (forced: their stats), passes the T4d gate (anchor: the eager_vs_graphs
-    effective anchor). missing: why (b) could not be checked. Returns
+    (forced: their stats), passes the T4d gate at the per-sequence scale
+    (anchor: tf.sequence_anchor of eager_vs_graphs decode: 1.5x the fork's
+    largest per-sequence mean, 1.5x the union max, the >1.0 count). missing:
+    why (b) could not be checked. Returns
     (ok, the verdict line)."""
     tf = _tf_module()
     head = f"T5 near-tie {prompt[:40]!r}: golden #2 gap " + (
