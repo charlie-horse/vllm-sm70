@@ -13,7 +13,9 @@ default backend (Flash-V100) and with VLLM_SM70_FLASH_V100=0 (TRITON_ATTN).
 What counts. Flint's greedy tokens flip on last-bit differences (MoE top-6
 of 256 routing), so two valid backends may diverge after a shared prefix.
 compare prints each request's common prefix for eyeballing and FAILs only on:
-  * a run-to-run difference inside one engine (same batch, same backend);
+  * a run-to-run difference inside one engine (same batch, same backend;
+    with tuning off this must be zero, and on Flash-V100 it points at the
+    K14 fused decode's counters);
   * a degenerate Flash-V100 output (empty, or the last 32 tokens use fewer
     than 4 distinct ids) where Triton's output for that request is not;
   * a Flash-V100 output that diverges from Triton at token 0.
@@ -98,8 +100,13 @@ def cmd_compare(a) -> int:
             r0, r1 = data["batches"][n][0], data["batches"][n][1]
             for i, (x, y) in enumerate(zip(r0, r1)):
                 if x["token_ids"] != y["token_ids"]:
+                    # Tuning off (#77 default) makes one engine deterministic;
+                    # a Flash-V100-only diff points at the K14 fused decode's
+                    # counters, not the MoE (Kai).
+                    hint = " (K14 fused decode counters?)" if name == "fv100" else ""
                     fails.append(f"{name} batch {n} req {i}: run 1 != run 2 "
-                                 f"at token {_common(x['token_ids'], y['token_ids'])}")
+                                 f"at token {_common(x['token_ids'], y['token_ids'])}"
+                                 + hint)
         for i, (f, t) in enumerate(zip(fv["batches"][n][0], tr["batches"][n][0])):
             fi, ti = f["token_ids"], t["token_ids"]
             c = _common(fi, ti)

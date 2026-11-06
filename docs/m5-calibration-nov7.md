@@ -229,6 +229,11 @@ before trusting their numbers.
    ```sh
    grep -h "Flint SM70: using\|Triton forward\|grouped sink decode\|sink decode is off" "$W"/window/*.log
    ```
+   Also send Mara/Kai every `K12 decode skipped for an M=… call (<reason>)`
+   line (#79; names the MoE layer that misses K12 at decode):
+   ```sh
+   grep -h "K12 decode skipped\|K12 M<=2 decode" "$W"/window/*.log | sort | uniq -c
+   ```
 2. **Kernel tests.**
    ```sh
    $VLLM_PY -m pytest -m gpu -q sm70/tests/attention/test_fv100_fused_decode_gpu.py \
@@ -244,7 +249,8 @@ before trusting their numbers.
    $VLLM_PY $FV compare "$W/fv100.json" "$W/triton.json" --show
    ```
    Divergence after a shared prefix is expected (MoE routing flips on last
-   bits). FAIL on run-to-run differences, a degenerate or first-token
+   bits). FAIL on run-to-run differences (zero with tuning off; on
+   Flash-V100 a diff points at the K14 fused decode), a degenerate or first-token
    divergence (the script flags these), or text that reads as gibberish.
 4. **Bench.** Start `vllm serve` on the window stack with prod flags (no
    `--attention-backend`) and run `~/archive/scripts/bench_vllm.py` at 4K
