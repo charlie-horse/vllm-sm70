@@ -22,6 +22,7 @@ def test_names_and_sections():
         "fused_moe",
         "quant",
         "models",
+        "sampler",
         "passes",
     ]
 
