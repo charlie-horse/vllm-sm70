@@ -292,6 +292,8 @@ def test_prefix_decode_rows_match_prefill_route(fv100_gpu, monkeypatch, block_si
 def test_dflash_batch_matches_serial_with_graph(
     fv100_gpu, monkeypatch, batch, q_len, context, block
 ):
+    from vllm_sm70.attention.flash_v100.impl import symmetric_window
+
     device, fv100 = fv100_gpu
     heads, d = (8, 2), 128
     b, tri_b = _builders(monkeypatch, heads, d, block, device, 65536)
@@ -333,7 +335,9 @@ def test_dflash_batch_matches_serial_with_graph(
                 cm.seq_lens[i : i + 1],
                 softmax_scale=ours.scale,
                 causal=False,
-                window_size=tuple(ours.sliding_window),
+                # Non-causal windows are two-sided (Triton |dist| < w,
+                # upstream FA _maybe_symmetrize_window): (2047, 2047).
+                window_size=symmetric_window(tuple(ours.sliding_window), False),
             )[0]
             torch.testing.assert_close(
                 output[i * q_len : (i + 1) * q_len], expected, atol=2e-3, rtol=1e-2
