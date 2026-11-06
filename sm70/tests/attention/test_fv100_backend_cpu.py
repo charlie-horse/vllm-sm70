@@ -89,7 +89,7 @@ def test_backend_flags(backend_cls):
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.kv_cache_layout import KVCacheLayout
 
-    assert backend_cls.get_name() == "FLASH_ATTN_V100"
+    assert backend_cls.get_name() == "CUSTOM"
     assert backend_cls.supported_dtypes == [torch.float16]
     assert backend_cls.supported_kv_cache_dtypes == ["auto", "float16"]
     assert backend_cls.get_supported_head_sizes() == [128, 256]
@@ -556,3 +556,17 @@ def test_forward_checks_kv_views_once(builder, cpu_ops, monkeypatch):
     for _ in range(3):
         impl.forward(None, q, None, None, kv, md, torch.empty_like(q))
     assert calls == [1]
+
+
+def test_get_name_resolves_in_backend_enum(backend_cls):
+    """Every upstream Attention layer does AttentionBackendEnum[get_name()]
+    (UP attention.py:433); a name that is not an enum member crashes worker
+    init (Bea, c4130, Flint FV100 serve)."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_sm70 import attention
+
+    attention.register()
+    member = AttentionBackendEnum[backend_cls.get_name()]
+    assert member is AttentionBackendEnum.CUSTOM
+    assert member.get_path() == attention.custom_backend_path()
