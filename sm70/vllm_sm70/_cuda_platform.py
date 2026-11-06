@@ -177,7 +177,35 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
+        # Runs after model load and before CUDA graph capture (U1). K16:
+        # bind the V1 hidden-state sampler and create its device counter
+        # here, never lazily during capture (R4).
+        # A failure raises: if one TP rank silently fell back to upstream
+        # sampling while the other used K16, their collectives would no
+        # longer match and the engine would hang. VLLM_SM70_FLINT_SAMPLER=0
+        # is the way to run without it.
+        if _flint_sampler_enabled():
+            from vllm_sm70 import sample_v1
+
+            try:
+                sample_v1.prepare_worker(worker)
+            except Exception as e:
+                raise RuntimeError(
+                    "vllm_sm70: preparing the K16 top-k sampler failed; set "
+                    "VLLM_SM70_FLINT_SAMPLER=0 to use upstream sampling"
+                ) from e
         return None
+
+    # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
+    @classmethod
+    def get_hidden_state_sampler(cls) -> Any:
+        # K16: TP-local exact top-k (k <= 20) sampling for models that opt in
+        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 -> upstream.
+        if not _flint_sampler_enabled():
+            return None
+        from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
+
+        return Sm70HiddenStateSampler()
 
     # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
     # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
@@ -216,6 +244,12 @@ class Sm70CudaPlatform(CudaPlatform):
             list(priority.fused_add_rms_norm),
         )
         return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+
+
+def _flint_sampler_enabled() -> bool:
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_FLINT_SAMPLER)
 
 
 _PIN_LOGGED: set[str] = set()
