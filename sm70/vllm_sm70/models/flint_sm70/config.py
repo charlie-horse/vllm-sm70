@@ -31,7 +31,7 @@ from vllm.model_executor.models.config import VerifyAndUpdateConfig
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.sm70.flint")
 
 ARCH = "FlintSm70ForCausalLM"
 _FP16_KV = ("auto", "float16", "half")

@@ -1023,11 +1023,11 @@ def test_t1_tiny_random_forward(tmp_path):
     assert toks[0] == toks[1]
 
 
-# The route line comes from init_logger("vllm_sm70.models.flint_sm70.model"),
-# which is not under vLLM's configured "vllm" logger, so with vLLM's default
-# logging config its INFO lines go nowhere. T3 gives the engine processes a
-# logging config (VLLM_LOGGING_CONFIG_PATH, inherited by the workers) that
-# also routes "vllm_sm70" to stdout.
+# The route line comes from init_logger("vllm.sm70.flint"), under vLLM's
+# configured "vllm" logger (it used to be "vllm_sm70.models.flint_sm70.model",
+# which vLLM's default config silently drops). T3 still passes an explicit
+# logging config that routes both "vllm" and "vllm_sm70" to stdout, so the
+# check does not depend on vLLM's default handler or log level.
 _T3_LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,

@@ -94,7 +94,7 @@ from vllm_sm70.config import sm70_config
 from . import fp16_rescale
 from .qk_norm_rope_kv import fused_route_rejection
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.sm70.flint")
 
 # Shards that one fused linear loads. A fused NVFP4 linear keeps a single
 # global scale, so the shards' weight_scale_2 must agree (fork :76-84).
