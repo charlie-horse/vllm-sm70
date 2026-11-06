@@ -908,3 +908,27 @@ def test_default_tuning_off_plans_nothing(monkeypatch):
     assert P.TUNE_SMALL_SHAPES_DEFAULT == 0
     limits = P.limits()
     assert not any(lim.enabled for lim in limits.values())
+
+
+def test_lut_summary_phrases_are_stable(tmp_path, monkeypatch):
+    """M5's runner (Mara) greps every engine log for these exact phrases; a
+    rename must fail here, not silently in a gate. They are logged on a
+    "vllm.sm70.*" logger so they reach the engine log (#76)."""
+    from vllm_sm70 import warmup as W
+
+    assert W.logger.name.startswith("vllm.sm70")
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    seen = []
+    monkeypatch.setattr(
+        W.logger, "info", lambda msg, *a: seen.append(msg % a if a else msg)
+    )
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    summary = [m for m in seen if "pre-capture warmup" in m]
+    assert summary, seen
+    for line in summary:
+        assert "tuned (measured) 0 calls" in line
+        assert f"{FLINT_CALLS}/{FLINT_CALLS} calls covered" in line
+        assert "ranks agree" in line
