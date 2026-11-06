@@ -41,25 +41,8 @@ _FP16_KV = ("auto", "float16", "half")
 # whose generic Flash-V100 paged prefill and decode apply the learned sinks;
 # the D256-specialized, XQA and FP8 kernels have no sink term.
 FLASH_V100_SINK_HEAD_SIZES = (128,)
-# The Flash-V100 sink kernels (K05); the fork's flash_attn_v100.SUPPORTS_SINKS.
-FLASH_V100_SINK_OPS = ("fv100_prefill_paged_sinks", "fv100_decode_paged_sinks")
 # The Flash-V100 paged kernels need a KV block size that is a multiple of 16.
 FLASH_V100_BLOCK_MULTIPLE = 16
-
-
-def flash_v100_supports_sinks() -> bool:
-    """True iff the loaded _sm70_C has both Flash-V100 sink ops (prefill and
-    decode). Equivalent of the fork's ``flash_attn_v100.SUPPORTS_SINKS``
-    (fork config.py:218-240); Kai's ``fv100.supports_sinks()`` replaces this
-    once it lands."""
-    try:
-        from vllm_sm70.ops import fv100
-    except ImportError:
-        return False
-    supports = getattr(fv100, "supports_sinks", None)
-    if callable(supports):
-        return bool(supports())
-    return all(fv100.has_op(name) for name in FLASH_V100_SINK_OPS)
 
 
 # ported from FORK vllm/model_executor/models/config.py:276-305
@@ -69,18 +52,20 @@ def flash_v100_sink_route_rejection(vllm_config: "VllmConfig") -> str | None:
     Mirrors the fork's admission so an engine is never routed to a backend
     whose layers would then fail closed. The fork's
     ``attention_config.flash_v100.enabled`` maps to our kill switch, and its
-    ``flash_attn_v100.SUPPORTS_SINKS`` to ``flash_v100_supports_sinks()``.
+    ``flash_attn_v100.SUPPORTS_SINKS`` to ``vllm_sm70.ops.fv100.supports_sinks()``
+    (#80).
     Two checks beyond the fork (Kai/Lena's audit): the KV block size must be a
     multiple of 16, and CUSTOM must resolve to our Flash-V100 backend."""
     import torch
 
     from vllm_sm70 import attention
+    from vllm_sm70.ops import fv100
 
     if not attention.flash_v100_enabled():
         return f"{attention.KILL_SWITCH}=0"
     if not attention._ops_available():
         return "the Flash-V100 ops are missing from _sm70_C"
-    if not flash_v100_supports_sinks():
+    if not fv100.supports_sinks():
         return "the Flash-V100 sink ops are missing from _sm70_C"
     from vllm_sm70.attention.flash_v100 import BACKEND_PATH
 

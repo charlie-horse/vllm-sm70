@@ -13,11 +13,16 @@ What:
   non-128 tensor keeps upstream Triton/FLA.
 - Exactness at the Qwen3.6 TP2 (H8/HV16) and Qwen3.8 TP2 (H8/HV24) shapes,
   varlen with 2 sequences: FlashQLA prefill output and final state vs
-  upstream Triton chunk_gated_delta_rule, and FlashQLA decode output and
-  state vs upstream fused_recurrent_gated_delta_rule_packed_decode, each
-  rel-L2 < 1e-3; both also against a float64 recurrence.
+  upstream Triton fused_recurrent_gated_delta_rule, and FlashQLA decode
+  output and state vs upstream fused_recurrent_gated_delta_rule_packed_decode,
+  each rel-L2 < 1e-3; both also against a float64 recurrence. The prefill
+  comparison with upstream's Triton chunk_gated_delta_rule is opt-in
+  (SM70_TEST_TRITON_CHUNK=1): on sm_70 its kernels take ~10 min of ptxas per
+  shape, which made the 2026-11-06 c4130 run look hung. It runs in a
+  spawned child with a timeout.
 
 Run from the repo root: pytest -m gpu sm70/tests/gdn
+(add SM70_TEST_TRITON_CHUNK=1 for the chunk comparison, ~10 min per shape)
 """
 
 from __future__ import annotations
@@ -27,59 +32,22 @@ from _gdn_helpers import mock_ctor_env
 
 torch = pytest.importorskip("torch")
 F = pytest.importorskip("torch.nn.functional")
+from _gdn_ref import (  # noqa: E402
+    D,
+    SEQLENS,
+    _prefill_inputs,
+    errors_vs_fp64,
+    ref_recurrence,
+    rel_l2,
+)
 
 pytestmark = pytest.mark.gpu
 
-D = 128
 TOL = 1e-3
 SHAPES = [
     pytest.param(8, 16, id="qwen3.6-tp2-H8-HV16"),
     pytest.param(8, 24, id="qwen3.8-tp2-H8-HV24"),
 ]
-SEQLENS = (300, 517)  # varlen, 2 sequences; not multiples of the 64 chunk
-
-
-def rel_l2(x: torch.Tensor, ref: torch.Tensor) -> float:
-    x, ref = x.double(), ref.double()
-    return ((x - ref).norm() / ref.norm().clamp_min(1e-30)).item()
-
-
-def ref_recurrence(q, k, v, g, beta, h0, scale):
-    """float64 gated delta rule for one sequence, state [Hv, V, K].
-    q, k [T, H, K]; v [T, Hv, V]; g (log decay), beta [T, Hv]."""
-    rep = v.shape[1] // q.shape[1]
-    q = q.double().repeat_interleave(rep, dim=1)
-    k = k.double().repeat_interleave(rep, dim=1)
-    v, g, beta = v.double(), g.double(), beta.double()
-    state = h0.double().clone()
-    out = torch.empty_like(v)
-    for t in range(q.shape[0]):
-        state *= g[t].exp()[:, None, None]
-        kv = torch.einsum("hvk,hk->hv", state, k[t])
-        u = beta[t][:, None] * (v[t] - kv)
-        state += u[:, :, None] * k[t][:, None, :]
-        out[t] = torch.einsum("hvk,hk->hv", state, q[t]) * scale
-    return out, state
-
-
-def _prefill_inputs(h, hv, seed=0):
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    dev = "cuda"
-    T = sum(SEQLENS)
-
-    def rn(*s):
-        return torch.randn(*s, generator=gen, device=dev)
-
-    q = F.normalize(rn(1, T, h, D), dim=-1).half()
-    k = F.normalize(rn(1, T, h, D), dim=-1).half()
-    v = (0.5 * rn(1, T, hv, D)).half()
-    g = -(0.01 + 0.5 * torch.rand(1, T, hv, generator=gen, device=dev))
-    beta = torch.rand(1, T, hv, generator=gen, device=dev).sigmoid()
-    h0 = 0.1 * rn(len(SEQLENS), hv, D, D)
-    cu = torch.tensor(
-        [0, SEQLENS[0], SEQLENS[0] + SEQLENS[1]], dtype=torch.int32, device=dev
-    )
-    return q, k, v, g, beta, h0, cu
 
 
 # ------------------------------------------------------------- the ops
@@ -202,44 +170,88 @@ def test_non_qualifying_tensors_fall_back(gdn_gpu, dtype, head_dim, reason):
 
 
 @pytest.mark.parametrize("h, hv", SHAPES)
-def test_prefill_matches_triton_and_fp64(gdn_gpu, h, hv):
-    from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
+def test_prefill_matches_triton_recurrent_and_fp64(gdn_gpu, h, hv):
+    """FlashQLA prefill vs upstream Triton fused_recurrent_gated_delta_rule
+    (no tl.dot: compiles in seconds on sm_70) and a float64 recurrence.
+
+    The fused_recurrent kernel reads each sequence's initial state from
+    ssm_state_indices[n, 0] and stores every token's state to
+    ssm_state_indices[n, t]; one slot per sequence for all t leaves the final
+    state there (slot 0 is the null block)."""
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_recurrent_gated_delta_rule,
+    )
 
     q, k, v, g, beta, h0, cu = _prefill_inputs(h, hv)
     o, ht = gdn_gpu.flashqla_chunk_gated_delta_rule(
         q, k, v, g, beta, h0, True, cu_seqlens=cu
     )
-    o_tr, ht_tr = chunk_gated_delta_rule(
+    n_seq = len(SEQLENS)
+    pool = torch.zeros((n_seq + 1, *h0.shape[1:]), device="cuda", dtype=h0.dtype)
+    pool[1:] = h0
+    slots = torch.arange(1, n_seq + 1, device="cuda", dtype=torch.int32)
+    indices = slots[:, None].expand(n_seq, max(SEQLENS)).contiguous()
+    o_tr, _ = fused_recurrent_gated_delta_rule(
         q,
         k,
         v,
         g,
         beta,
         scale=D**-0.5,
-        initial_state=h0.clone(),
-        output_final_state=True,
+        initial_state=pool,
+        inplace_final_state=True,
         cu_seqlens=cu,
+        ssm_state_indices=indices,
         use_qk_l2norm_in_kernel=False,
     )
-    starts = cu.tolist()
-    o_ref = torch.empty_like(v, dtype=torch.float64)
-    ht_ref = torch.empty_like(h0, dtype=torch.float64)
-    for n in range(len(SEQLENS)):
-        s, e = starts[n], starts[n + 1]
-        o_ref[0, s:e], ht_ref[n] = ref_recurrence(
-            q[0, s:e], k[0, s:e], v[0, s:e], g[0, s:e], beta[0, s:e], h0[n], D**-0.5
-        )
     errors = {
-        "o vs triton": rel_l2(o, o_tr),
-        "state vs triton": rel_l2(ht, ht_tr),
-        "o vs fp64": rel_l2(o, o_ref),
-        "state vs fp64": rel_l2(ht, ht_ref),
-        "triton o vs fp64": rel_l2(o_tr, o_ref),  # context only
+        "o vs triton recurrent": rel_l2(o, o_tr),
+        "state vs triton recurrent": rel_l2(ht, pool[1:]),
+        **errors_vs_fp64(q, k, v, g, beta, h0, cu, o, ht),
     }
-    assert errors["o vs triton"] < TOL, errors
-    assert errors["state vs triton"] < TOL, errors
-    assert errors["o vs fp64"] < TOL, errors
-    assert errors["state vs fp64"] < TOL, errors
+    for key, err in errors.items():
+        assert err < TOL, (key, errors)
+
+
+CHUNK_ENV = "SM70_TEST_TRITON_CHUNK"
+CHUNK_TIMEOUT_ENV = "SM70_TEST_TRITON_CHUNK_TIMEOUT"
+
+
+@pytest.mark.parametrize("h, hv", SHAPES)
+def test_prefill_matches_triton_chunk(gdn_gpu, h, hv):
+    """FlashQLA prefill vs upstream Triton chunk_gated_delta_rule. Opt-in:
+    on sm_70 its autotuned tl.dot (FMA-lowered) kernels take ~10 min of
+    ptxas per shape (c4130 run of 2026-11-06 looked hung). Runs in a spawned
+    child (never fork after CUDA init) with a timeout, so a stuck compile
+    fails the test instead of the run."""
+    import multiprocessing as mp
+    import os
+
+    if os.environ.get(CHUNK_ENV) != "1":
+        pytest.skip(
+            f"set {CHUNK_ENV}=1 (and optionally {CHUNK_TIMEOUT_ENV}, s) to compare "
+            "with the slow-to-compile upstream Triton chunk kernels"
+        )
+    import _gdn_ref
+
+    timeout = float(os.environ.get(CHUNK_TIMEOUT_ENV, "1800"))
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_gdn_ref._child, args=(h, hv, child), daemon=True)
+    proc.start()
+    child.close()
+    try:
+        if not parent.poll(timeout):
+            pytest.fail(f"Triton chunk comparison did not finish in {timeout:.0f} s")
+        status, payload = parent.recv()
+    finally:
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+    assert status == "ok", payload
+    for key, err in payload.items():
+        assert err < TOL, (key, payload)
 
 
 def _decode_inputs(h, hv, indices, slots=6, seed=1):

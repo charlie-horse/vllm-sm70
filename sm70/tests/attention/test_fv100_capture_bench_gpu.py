@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import sys
 
 import pytest
 
@@ -22,6 +23,9 @@ TOOL = pathlib.Path(__file__).resolve().parents[2] / "tools" / "bench_fv100_capt
 def _tool():
     spec = importlib.util.spec_from_file_location("bench_fv100_capture", TOOL)
     mod = importlib.util.module_from_spec(spec)
+    # @dataclass resolves the tool's (string) annotations through
+    # sys.modules[cls.__module__]; an unregistered module is None there.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 

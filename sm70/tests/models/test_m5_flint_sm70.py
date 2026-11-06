@@ -603,11 +603,11 @@ def fv100_ops(monkeypatch):
     from vllm_sm70 import attention
 
     from vllm_sm70.attention.flash_v100 import BACKEND_PATH
-    from vllm_sm70.models.flint_sm70 import config as fcfg
+    from vllm_sm70.ops import fv100
 
     state = {"ok": True, "sinks": True, "custom": BACKEND_PATH}
     monkeypatch.setattr(attention, "_ops_available", lambda: state["ok"])
-    monkeypatch.setattr(fcfg, "flash_v100_supports_sinks", lambda: state["sinks"])
+    monkeypatch.setattr(fv100, "supports_sinks", lambda: state["sinks"])
     monkeypatch.setattr(attention, "custom_backend_path", lambda: state["custom"])
     monkeypatch.delenv(attention.KILL_SWITCH, raising=False)
     return state
