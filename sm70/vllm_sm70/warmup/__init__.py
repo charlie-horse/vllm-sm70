@@ -42,6 +42,7 @@ logger = logging.getLogger("vllm.sm70.warmup")
 KILL_SWITCH = "VLLM_SM70_TM_PRECAPTURE_WARMUP"
 CACHE_PATH = "VLLM_SM70_GEMM_LUT_PATH"
 EXPORT_PATH = "VLLM_SM70_GEMM_LUT_EXPORT_PATH"
+STRICT = "VLLM_SM70_GEMM_LUT_STRICT"
 # Ops whose presence means the build has TurboMind (K03).
 REQUIRED_OPS = ("sm70_gemm_import_cache", "sm70_gemm_export_cache")
 
@@ -103,7 +104,9 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
     Raises:
         RuntimeError: called during CUDA graph capture (it would tune inside
             the graph), the warmup failed on some TP rank, or the TP ranks
-            ended with different dispatch caches (digest mismatch).
+            ended with different dispatch caches (digest mismatch), or
+            VLLM_SM70_GEMM_LUT_STRICT=1 refused the LUT (raised on every
+            rank through the collectives).
     """
     if is_capturing():
         raise RuntimeError(
@@ -159,7 +162,17 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
     lut_path, export_path = _paths(device, rank)
     calls = _calls(plan)
     ident = cache.identity(device) if has_work and (lut_path or export_path) else None
-    lut = cache.load_lut(lut_path, ident) if (has_work and lut_path) else None
+    # Strict refusal is raised through the collectives (as import_lut, below),
+    # never before them: a rank raising here would leave the others waiting.
+    lut_error: Exception | None = None
+    try:
+        lut = (
+            cache.load_lut(lut_path, ident, strict=lut_strict())
+            if (has_work and lut_path)
+            else None
+        )
+    except cache.LutRefused as exc:
+        lut, lut_error = None, exc
     missing = lut.missing(calls) if lut is not None else []
     if lut is not None and missing:
         _warn_missing(lut, missing, len(calls))
@@ -189,7 +202,7 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
         export_bytes=export,
         import_bytes=import_,
         source_tune=tune_uncovered if lut is not None else tune_all,
-        import_lut=(lambda: import_(lut.table)) if lut is not None else None,
+        import_lut=_import_lut(lut, import_, lut_error),
     )
     if build_error is not None:
         raise RuntimeError(
@@ -225,6 +238,24 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
             f"{KILL_SWITCH}=0 skips the warmup."
         )
     return result
+
+
+def lut_strict() -> bool:
+    from vllm_sm70 import envs
+
+    return bool(getattr(envs, STRICT))
+
+
+def _import_lut(lut: Any, import_: Any, error: Exception | None) -> Any:
+    """The import_lut callable for coordinate(): imports the LUT, or (strict
+    refusal) raises inside the protocol, so every rank raises together."""
+    if error is not None:
+
+        def refused() -> int:
+            raise error
+
+        return refused
+    return (lambda: import_(lut.table)) if lut is not None else None
 
 
 def _paths(device: Any, rank: int) -> tuple[str | None, str | None]:

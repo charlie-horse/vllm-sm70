@@ -43,6 +43,7 @@ TUNE_VARS = (
     "VLLM_SM70_TM_PRECAPTURE_WARMUP",
     "VLLM_SM70_GEMM_LUT_PATH",
     "VLLM_SM70_GEMM_LUT_EXPORT_PATH",
+    "VLLM_SM70_GEMM_LUT_STRICT",
 )
 
 
@@ -693,6 +694,97 @@ def test_v1_manifest_without_identity_is_refused(tmp_path, monkeypatch, warnings
     assert cache.load_lut(str(lut)) is not None
 
 
+def _break_manifest(lut, how):
+    mp = pathlib.Path(cache.manifest_path(str(lut)))
+    if how == "missing":
+        mp.unlink()
+        return "no manifest"
+    manifest = json.loads(mp.read_bytes())
+    if how == "old_version":
+        manifest.pop("identity")
+        manifest["version"] = 1
+        mp.write_text(json.dumps(manifest))
+        return "manifest version 1"
+    if how == "sha":
+        manifest["sha256"] = "0" * 64
+        mp.write_text(json.dumps(manifest))
+        return "sha256 does not match"
+    if how == "knob":
+        return None  # identity mismatch via the environment
+    raise AssertionError(how)
+
+
+@pytest.mark.parametrize("how", ["missing", "old_version", "sha", "knob"])
+def test_lut_strict_raises_on_every_rank(tmp_path, monkeypatch, warnings_seen, how):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    phrase = _break_manifest(lut, how)
+    if how == "knob":
+        monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "0")
+        phrase = "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL"
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", "1")
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, calls = _run_ranks([flint_model(), flint_model()], fakes)
+    # Raised through the protocol: same collectives, no rank left waiting.
+    assert calls == ["all_gather", "broadcast"]
+    for e in errors:
+        assert isinstance(e, RuntimeError), e
+        msg = str(e)
+        assert "VLLM_SM70_GEMM_LUT_STRICT=1" in msg and phrase in msg, msg
+    assert fakes[1].cache == {}  # nothing imported on the follower
+    assert not [w for w in warnings_seen if "refusing TurboMind LUT" in w]
+
+
+def test_lut_strict_raises_locally_and_lists_every_difference(tmp_path, monkeypatch):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "0")
+    monkeypatch.setattr(cache, "gpu_name", lambda device: "Other GPU")
+    expected = cache.identity(torch.device("cpu"))
+    with pytest.raises(cache.LutRefused) as ei:
+        cache.load_lut(str(lut), expected, strict=True)
+    msg = str(ei.value)
+    assert "GPU" in msg and "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL" in msg
+    # TP 1 (no group): run() raises the same error.
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", "1")
+    with pytest.raises(RuntimeError, match="VLLM_SM70_GEMM_LUT_STRICT=1"):
+        warmup.run(
+            _worker(flint_model(), vcfg(FLINT_CAPTURE, max_seqs=8, spec=4)),
+            group=None,
+            executor=FakeTM(0, 3),
+        )
+
+
+@pytest.mark.parametrize("value", [None, "0", "true"])
+@pytest.mark.parametrize("how", ["missing", "old_version", "sha", "knob"])
+def test_lut_strict_off_keeps_warning_and_retune(
+    tmp_path, monkeypatch, warnings_seen, how, value
+):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    _break_manifest(lut, how)
+    if how == "knob":
+        monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "0")
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    if value is not None:  # only "1" acts (opt-in)
+        monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", value)
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    assert warnings_seen  # the non-strict WARNING
+    assert fakes[0].measured == FLINT_CALLS  # re-tuned
+    assert fakes[0].cache == fakes[1].cache
+
+
+def test_lut_strict_accepts_a_matching_lut(tmp_path, monkeypatch):
+    lut, first = _export_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_STRICT", "1")
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    assert fakes[0].measured == 0 and fakes[1].cache == first[0].cache
+
+
 def test_lut_summary_says_not_loaded_when_refused(tmp_path, monkeypatch):
     lut, _ = _export_run(tmp_path, monkeypatch)
     monkeypatch.setenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "32")
@@ -977,6 +1069,9 @@ def test_platform_kernel_warmup_calls_run_once(monkeypatch):
 
 
 def test_env_vars_registered_with_defaults():
+    assert "VLLM_SM70_GEMM_LUT_STRICT" in envs._SECTIONS["warmup"]
+    assert "VLLM_SM70_GEMM_LUT_STRICT" not in envs._SECTIONS["ops"]  # not identity
+    assert envs.VLLM_SM70_GEMM_LUT_STRICT is False
     names = envs.environment_variables()
     assert "VLLM_SM70_TM_PRECAPTURE_WARMUP" in envs._SECTIONS["warmup"]
     assert "VLLM_SM70_GEMM_LUT_PATH" in names

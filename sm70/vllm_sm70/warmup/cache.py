@@ -253,7 +253,14 @@ class Lut:
         return [c for c in calls if c not in self.covers]
 
 
-def load_lut(path: str, expected: dict[str, Any] | None = None) -> Lut | None:
+class LutRefused(RuntimeError):
+    """VLLM_SM70_GEMM_LUT_STRICT=1 and the LUT's manifest is missing, stale
+    or written for another build or setup."""
+
+
+def load_lut(
+    path: str, expected: dict[str, Any] | None = None, strict: bool = False
+) -> Lut | None:
     """Read a LUT (raw or SM70POLICY1) and its manifest; None if absent or
     unusable (logged).
 
@@ -263,6 +270,11 @@ def load_lut(path: str, expected: dict[str, Any] | None = None) -> Lut | None:
     A stale cache is an expected state after a rebuild or a knob change, so
     it is not fatal. A LUT without a manifest (fork files) cannot be
     checked and keeps the fork behaviour (every call tuned, then imported).
+
+    ``strict`` (VLLM_SM70_GEMM_LUT_STRICT=1, gate runs): any manifest
+    problem (missing, unreadable, not version MANIFEST_VERSION, sha256 not
+    matching the table, identity differing) raises LutRefused listing them
+    all, instead of the WARNING and re-tune.
     """
     import hashlib
 
@@ -279,35 +291,53 @@ def load_lut(path: str, expected: dict[str, Any] | None = None) -> Lut | None:
         logger.warning("vllm_sm70: TurboMind LUT %s has no usable table.", path)
         return None
     covers = None
+    problems: list[str] = []  # for strict
+    diffs: list[str] = []
     mp = Path(manifest_path(path))
-    if mp.exists():
+    if not mp.exists():
+        problems.append(f"no manifest {mp}")
+    else:
         try:
             manifest = json.loads(mp.read_bytes())
-            if manifest.get("sha256") != hashlib.sha256(table).hexdigest():
-                logger.warning(
-                    "vllm_sm70: %s does not match %s; treating every shape as "
-                    "uncovered.",
-                    mp,
-                    path,
+            if manifest.get("version") != MANIFEST_VERSION:
+                problems.append(
+                    f"manifest version {manifest.get('version')!r}, "
+                    f"expected {MANIFEST_VERSION}"
                 )
+            if manifest.get("sha256") != hashlib.sha256(table).hexdigest():
+                problems.append("manifest sha256 does not match the table")
+                if not strict:
+                    logger.warning(
+                        "vllm_sm70: %s does not match %s; treating every shape "
+                        "as uncovered.",
+                        mp,
+                        path,
+                    )
             else:
                 covers = {call_id(k, tuple(key), m) for k, key, m in manifest["calls"]}
         except Exception as exc:
-            logger.warning("vllm_sm70: bad LUT manifest %s (%s).", mp, exc)
+            problems.append(f"bad manifest {mp} ({type(exc).__name__}: {exc})")
+            if not strict:
+                logger.warning("vllm_sm70: bad LUT manifest %s (%s).", mp, exc)
         else:
-            diffs = (
-                check_identity(manifest.get("identity"), expected)
-                if expected is not None
-                else []
-            )
-            if diffs:
-                logger.warning(
-                    "vllm_sm70: refusing TurboMind LUT %s: its manifest %s was "
-                    "written for another build or setup (%s); not loading it, "
-                    "tuning as without a LUT.",
-                    path,
-                    mp,
-                    "; ".join(diffs),
-                )
-                return None
+            if expected is not None:
+                diffs = check_identity(manifest.get("identity"), expected)
+                problems += [d for d in diffs if d not in problems]
+    if strict and problems:
+        raise LutRefused(
+            f"vllm_sm70: TurboMind LUT {path} refused (VLLM_SM70_GEMM_LUT_STRICT=1): "
+            + "; ".join(problems)
+            + ". Re-export it with VLLM_SM70_GEMM_LUT_EXPORT_PATH on this build "
+            "and setup, or unset VLLM_SM70_GEMM_LUT_STRICT."
+        )
+    if diffs:
+        logger.warning(
+            "vllm_sm70: refusing TurboMind LUT %s: its manifest %s was "
+            "written for another build or setup (%s); not loading it, "
+            "tuning as without a LUT.",
+            path,
+            mp,
+            "; ".join(diffs),
+        )
+        return None
     return Lut(path, table, covers)
