@@ -1117,6 +1117,8 @@ def test_t5_golden_tokens_vs_fork():
     temperature 0, max_tokens 64): a JSON list of {"prompt",
     "prompt_token_ids", "token_ids", "stable_across_2_runs", ...}.
 
+    Each prompt is generated alone (as the golden was captured).
+
     Gate: prompts whose golden was stable across the fork's own two runs
     must match the first GOLDEN_EXACT_TOKENS tokens exactly. Prompts the
     fork itself could not reproduce are INFO only: we print the common
@@ -1128,12 +1130,18 @@ def test_t5_golden_tokens_vs_fork():
     with open(os.environ["FLINT_SM70_GOLDEN"]) as f:
         golden = json.load(f)
     assert any(g.get("stable_across_2_runs") for g in golden), "no stable prompt"
+    # One request at a time, as the golden was captured (raw /v1/completions
+    # on live fork Flint, one prompt per request): decode then runs at M=1
+    # like the fork did (K11 GEMV, K12 decode). Batching the prompts changes
+    # M per step and with it the kernel route and the greedy result (Bea,
+    # Nov 6: the 8K prompt matches 16/16 alone, diverges at 10 batched).
     llm = _llm()
     try:
-        outs = llm.generate(
-            [{"prompt_token_ids": g["prompt_token_ids"]} for g in golden],
-            SamplingParams(temperature=0, max_tokens=64, logprobs=2),
-        )
+        sp = SamplingParams(temperature=0, max_tokens=64, logprobs=2)
+        outs = [
+            llm.generate([{"prompt_token_ids": g["prompt_token_ids"]}], sp)[0]
+            for g in golden
+        ]
     finally:
         _shutdown(llm)
     failures = []
