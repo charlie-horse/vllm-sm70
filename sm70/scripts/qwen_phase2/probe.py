@@ -7,12 +7,18 @@ Talks to a running `vllm serve` over the OpenAI-compatible HTTP API:
   probe.py run     --url URL --model NAME --row ROW --out results.json
                    --max-model-len N [--spec] [--no-gate]
   probe.py summary --out-dir DIR
+  probe.py ab-run     --url URL --model NAME --label on|off --out ab.json
+  probe.py ab-compare --on on/ab.json --off off/ab.json --out ab_summary.json
 
 Phases of `run`: math (10 problems, exact numeric answer), code (5 tiny
 functions, asserts executed in a subprocess with a timeout), needle in a
 haystack at ~max-model-len (3 trials), no-gibberish at concurrency 20, and
 single-stream decode tok/s at ~4K context. For --spec rows it also diffs the
 vllm:spec_decode_* counters from /metrics around each phase.
+
+`ab-run` / `ab-compare` are the M8 QPN8 A/B (m8_qpn8_ab.sh): decode tok/s at
+concurrency 1..4 (~1K-token prompt, 256 forced tokens, median of 3 rounds)
+and greedy outputs for 5 fixed prompts, compared on vs off.
 
 Quality requests are greedy (temperature 0) and send
 chat_template_kwargs.enable_thinking=false explicitly.
@@ -287,9 +293,11 @@ class Client:
                 "max_tokens": max_tokens, "temperature": 0.0,
                 "chat_template_kwargs": {"enable_thinking": False}, **extra}
         r = get_json(self.base + "/v1/chat/completions", body)
+        lp = (r["choices"][0].get("logprobs") or {}).get("content") or []
         return {"text": r["choices"][0]["message"].get("content") or "",
                 "finish_reason": r["choices"][0].get("finish_reason"),
-                "usage": r.get("usage", {})}
+                "usage": r.get("usage", {}),
+                "tokens": [t.get("token") for t in lp] or None}
 
     def count_tokens(self, prompt: str) -> int | None:
         try:
@@ -534,6 +542,130 @@ def cmd_summary(a) -> int:
     return int(rc)
 
 
+# --------------------------------------------------------------------------
+# M8 QPN8 A/B
+# --------------------------------------------------------------------------
+AB_CONCURRENCY = (1, 2, 3, 4)
+AB_PROMPT_TOKENS = 1024
+AB_DECODE_TOKENS = 256
+AB_ROUNDS = 3
+AB_MATCH_TOKENS = 32
+AB_RATIO_MIN = 0.98  # QPN8 / M6 decode tok/s; below this is a regression
+AB_GREEDY_PROMPTS = [
+    "List the first ten prime numbers and explain how you found them.",
+    "Explain in plain words what a CUDA graph is.",
+    "Write a haiku about a lighthouse in winter.",
+    "What is the capital of Australia, and why is it not Sydney?",
+    "Translate into French: The quick brown fox jumps over the lazy dog.",
+]
+
+
+def ab_prompt(c: Client) -> str:
+    n, _ = size_haystack(c, AB_PROMPT_TOKENS - 64, 11)
+    return (" ".join(filler_sentences(n, 11)) + "\n\nUsing the notes above as loose "
+            "inspiration, write a long, detailed story about a lighthouse keeper.")
+
+
+def ab_round(c: Client, prompt: str, conc: int) -> dict:
+    """`conc` identical streams at once; aggregate decode tok/s = sum of the
+    per-stream decode rates (each stream decodes AB_DECODE_TOKENS)."""
+    with ThreadPoolExecutor(conc) as ex:
+        runs = list(ex.map(lambda _: c.stream_timed(prompt, AB_DECODE_TOKENS), range(conc)))
+    rates = [r["decode_tok_s"] for r in runs]
+    ok = all(rates) and all(r["completion_tokens"] == AB_DECODE_TOKENS for r in runs)
+    return {"aggregate_tok_s": sum(rates) if ok else None, "runs": runs}
+
+
+def ab_speed(c: Client) -> dict:
+    prompt = ab_prompt(c)
+    c.chat("Say hello.", 8)  # warm-up
+    out = {"prompt_tokens": c.count_tokens(prompt), "by_concurrency": {}}
+    for conc in AB_CONCURRENCY:
+        c.stream_timed(prompt, 16)  # settle the prefix cache / graphs
+        rounds = [ab_round(c, prompt, conc) for _ in range(AB_ROUNDS)]
+        agg = [r["aggregate_tok_s"] for r in rounds if r["aggregate_tok_s"]]
+        out["by_concurrency"][str(conc)] = {
+            "decode_tok_s_median": statistics.median(agg) if len(agg) == AB_ROUNDS else None,
+            "rounds": rounds,
+        }
+    return out
+
+
+def ab_greedy(c: Client) -> list[dict]:
+    items = []
+    for i, prompt in enumerate(AB_GREEDY_PROMPTS):
+        r = c.chat(prompt, AB_MATCH_TOKENS, ignore_eos=True, logprobs=True)
+        items.append({"i": i, "text": r["text"], "tokens": r.get("tokens"),
+                      "completion_tokens": r["usage"].get("completion_tokens")})
+    return items
+
+
+def cmd_ab_run(a) -> int:
+    c = Client(a.url, a.model)
+    res: dict = {"label": a.label, "model": a.model, "started": time.strftime("%FT%T")}
+    try:
+        res["speed"] = ab_speed(c)
+        res["greedy"] = ab_greedy(c)
+    except Exception as e:  # noqa: BLE001
+        res["error"] = repr(e)
+    res["finished"] = time.strftime("%FT%T")
+    Path(a.out).write_text(json.dumps(res, indent=2))
+    for conc, v in res.get("speed", {}).get("by_concurrency", {}).items():
+        print(f"  {a.label} c={conc}: {_fmt(v['decode_tok_s_median'], '{:.1f}')} tok/s",
+              flush=True)
+    if "error" in res:
+        print(f"  {a.label}: ERROR {res['error']}", flush=True)
+        return 1
+    return 0
+
+
+def ab_compare(on: dict, off: dict) -> dict:
+    """QPN8 (on) vs M6 (off): per-concurrency ratio and greedy-output match."""
+    lines, why = [], []
+    for err in (on.get("error"), off.get("error")):
+        if err:
+            why.append(err)
+    get = lambda r, c: (r.get("speed", {}).get("by_concurrency", {})  # noqa: E731
+                        .get(str(c), {}).get("decode_tok_s_median"))
+    for conc in AB_CONCURRENCY:
+        t_on, t_off = get(on, conc), get(off, conc)
+        ratio = t_on / t_off if t_on and t_off else None
+        lines.append(f"c={conc} qpn8 {_fmt(t_on, '{:.1f}')} m6 {_fmt(t_off, '{:.1f}')} "
+                     f"tok/s ratio {_fmt(ratio, '{:.3f}')}")
+        if ratio is None:
+            why.append(f"c={conc} no tok/s")
+        elif ratio < AB_RATIO_MIN:
+            why.append(f"c={conc} ratio {ratio:.3f} < {AB_RATIO_MIN}")
+    g_on, g_off = on.get("greedy") or [], off.get("greedy") or []
+    mismatched = []
+    if len(g_on) != len(AB_GREEDY_PROMPTS) or len(g_off) != len(AB_GREEDY_PROMPTS):
+        why.append("greedy outputs missing")
+    else:
+        for x, y in zip(g_on, g_off):
+            same = (x["tokens"] == y["tokens"]) if x.get("tokens") and y.get("tokens") \
+                else x["text"] == y["text"]
+            if not same:
+                mismatched.append(x["i"])
+        if mismatched:
+            why.append(f"greedy outputs differ for prompts {mismatched}")
+    lines.append(f"greedy first {AB_MATCH_TOKENS} tokens: "
+                 f"{len(AB_GREEDY_PROMPTS) - len(mismatched)}/{len(AB_GREEDY_PROMPTS)} match")
+    return {"status": "FAIL" if why else "PASS", "lines": lines, "fail_reasons": why,
+            "greedy_mismatch": mismatched}
+
+
+def cmd_ab_compare(a) -> int:
+    load = lambda f: json.loads(Path(f).read_text()) if Path(f).is_file() else {  # noqa: E731
+        "error": f"missing {f}"}
+    res = ab_compare(load(a.on), load(a.off))
+    for line in res["lines"]:
+        print(line)
+    print(f"M8 QPN8 A/B {res['status']}" + (
+        " [" + "; ".join(res["fail_reasons"]) + "]" if res["fail_reasons"] else ""))
+    Path(a.out).write_text(json.dumps(res, indent=2))
+    return 0 if res["status"] == "PASS" else 1
+
+
 def cmd_health(a) -> int:
     try:
         with _http(a.url.rstrip("/") + "/health", timeout=5) as r:
@@ -557,8 +689,18 @@ def main(argv=None) -> int:
     r.add_argument("--no-gate", dest="gate", action="store_false")
     s = sub.add_parser("summary")
     s.add_argument("--out-dir", required=True)
+    b = sub.add_parser("ab-run")
+    b.add_argument("--url", required=True)
+    b.add_argument("--model", required=True)
+    b.add_argument("--label", required=True)
+    b.add_argument("--out", required=True)
+    m = sub.add_parser("ab-compare")
+    m.add_argument("--on", required=True)
+    m.add_argument("--off", required=True)
+    m.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    return {"health": cmd_health, "run": cmd_run, "summary": cmd_summary}[a.cmd](a)
+    return {"health": cmd_health, "run": cmd_run, "summary": cmd_summary,
+            "ab-run": cmd_ab_run, "ab-compare": cmd_ab_compare}[a.cmd](a)
 
 
 if __name__ == "__main__":

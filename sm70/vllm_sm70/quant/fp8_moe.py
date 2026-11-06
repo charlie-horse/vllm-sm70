@@ -38,11 +38,11 @@ Kill-switch: ``VLLM_SM70_FP8_MOE_DECODE=0`` (``Sm70Config.fp8_moe_decode``)
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, Final
 
 import torch
 from torch.nn import Parameter
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     validate_fp8_block_shape_moe,
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
         SharedExperts,
     )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.quant.fp8_moe")
 
 REQUIRED_OPS: Final = (
     "fp8_sm70_prepare",

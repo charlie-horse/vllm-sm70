@@ -31,11 +31,11 @@ weighted top-k sum.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
         SharedExperts,
     )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.fused_moe")
 
 # Validated topologies. TP4+ is out of scope and untested: refuse, never fall
 # back to upstream (which has no cc 7.0 MoE kernel either).

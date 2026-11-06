@@ -207,8 +207,77 @@ class Sm70CudaPlatform(CudaPlatform):
 
         return Sm70HiddenStateSampler()
 
+    # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
+    # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
+    # KernelConfig.ir_op_priority at config/kernel.py:461-478; a user-set
+    # priority stays first). Under Inductor upstream picks ["native"], whose
+    # fused_add_rms_norm keeps the residual sum in FP32 before rounding
+    # (UP ir/ops/layernorm.py:44-62). On SM70 pin the C kernel (FP16
+    # residual, __hadd2), so the unfused graph, the kill-switched path and
+    # the fused TP2 all-reduce + RMSNorm collective (K17) share one rounding.
+    # "native" stays as the fallback for args vllm_c does not support (a
+    # weight dtype other than the input's, variance_size).
+    SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> Any:
+        import dataclasses
+
+        priority = super().get_default_ir_op_priority(vllm_config)
+        # Flint only (K17 admission): there the fused AR kernel keeps the
+        # residual in fp16, so the unfused path (switch off) must too. Other
+        # models keep upstream's priority (fork parity).
+        reason = _k17_rejection(vllm_config)
+        if reason is not None:
+            _log_pin_once(
+                "vllm_sm70: fused_add_rms_norm IR priority not pinned (%s); "
+                "using upstream's %s",
+                reason,
+                list(priority.fused_add_rms_norm),
+            )
+            return priority
+        pinned = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        _log_pin_once(
+            "vllm_sm70: fused_add_rms_norm IR priority pinned to %s "
+            "(K17 admits this model; was %s)",
+            pinned,
+            list(priority.fused_add_rms_norm),
+        )
+        return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+
 
 def _flint_sampler_enabled() -> bool:
     from vllm_sm70 import envs
 
     return bool(envs.VLLM_SM70_FLINT_SAMPLER)
+
+
+_PIN_LOGGED: set[str] = set()
+
+
+def _log_pin_once(fmt: str, *args: Any) -> None:
+    # INFO, once per distinct message: the hook runs for every VllmConfig,
+    # but a silent "off" is what this line exists to rule out.
+    msg = fmt % args
+    if msg not in _PIN_LOGGED:
+        _PIN_LOGGED.add(msg)
+        logger.info(msg)
+
+
+def _k17_rejection(vllm_config: Any) -> str | None:
+    """K17's rejection() for this engine config: None when it admits."""
+    if getattr(vllm_config, "model_config", None) is None:
+        return "no model config yet"
+    try:
+        from vllm_sm70 import ar_rms_fusion
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        return ar_rms_fusion.rejection(vllm_config, tp)
+    except Exception as e:
+        logger.debug("vllm_sm70: K17 admission check failed", exc_info=True)
+        return f"K17 admission check failed: {type(e).__name__}: {e}"
+
+
+def _k17_admits(vllm_config: Any) -> bool:
+    """True when K17's rejection() is None for this engine config."""
+    return _k17_rejection(vllm_config) is None
