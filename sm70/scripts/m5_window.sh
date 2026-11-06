@@ -7,16 +7,33 @@
 # no failures, errors or skips (a skip, e.g. a missing env var, is a FAIL).
 #
 # Required env: VLLM_PY (venv python with pytest), FLINT_SM70_CHECKPOINT,
-# FLINT_SM70_GOLDEN, FLINT_SM70_T4_SEQS and FLINT_SM70_T4_ENVELOPE (T4a/T7:
-# fixed sequences and the fork's envelope, from m5_teacher_forced.py). Optional: OUT (log dir), M5_NODES (space-separated
-# subset of the names below, default: all, in this order).
+# FLINT_SM70_GOLDEN (T5), and for the teacher-forced gates (T4a/T4c/T4d/T7,
+# from m5_teacher_forced.py, see docs/m5-calibration-nov7.md):
+#   FLINT_SM70_T4_SEQS_DIR      setK.json, >= 3 prompt sets (gen, on ours)
+#   FLINT_SM70_T4_ENVELOPE      the fork's envelope JSON (envelope)
+#   FLINT_SM70_FORK_SCORES_DIR  the fork's setK/{eager,eager2,graphs,unfused}.json
+# FLINT_SM70_OURS_NOISE defaults to $OUT/ours_eager_vs_eager.json: T4c (two
+# separate eager engine instances) writes it and T4a/T4d/T7 print it on every
+# gate line, so t4c runs first. T4c is EXPECTED to FAIL on today's build
+# (engine-instance nondeterminism, Bea Nov 6); it still writes the file.
+# Optional: OUT (log dir), M5_NODES (space-separated subset of the names
+# below, default: all, in this order), M5_MUTATION (mutation check only; see
+# m5_mutation_check.sh).
 set -uo pipefail
 
 : "${VLLM_PY:?set VLLM_PY to the venv python}"
 : "${FLINT_SM70_CHECKPOINT:?set FLINT_SM70_CHECKPOINT}"
 : "${FLINT_SM70_GOLDEN:?set FLINT_SM70_GOLDEN}"
+: "${FLINT_SM70_T4_SEQS_DIR:?set FLINT_SM70_T4_SEQS_DIR (dir of setK.json)}"
+: "${FLINT_SM70_T4_ENVELOPE:?set FLINT_SM70_T4_ENVELOPE (fork envelope JSON)}"
+: "${FLINT_SM70_FORK_SCORES_DIR:?set FLINT_SM70_FORK_SCORES_DIR (fork scores)}"
+for d in "$FLINT_SM70_T4_SEQS_DIR" "$FLINT_SM70_FORK_SCORES_DIR"; do
+  [[ -d "$d" ]] || { echo "not a directory: $d"; exit 2; }
+done
+[[ -f "$FLINT_SM70_T4_ENVELOPE" ]] || { echo "missing $FLINT_SM70_T4_ENVELOPE"; exit 2; }
 OUT="${OUT:-$HOME/vllm-sm70-work/bea/m5-window/$(date +%Y%m%dT%H%M)}"
 mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 2; }
+export FLINT_SM70_OURS_NOISE="${FLINT_SM70_OURS_NOISE:-$OUT/ours_eager_vs_eager.json}"
 F=sm70/tests/models/test_m5_flint_sm70.py
 [[ -f "$F" ]] || { echo "run from the repo root ($F not found)"; exit 2; }
 
@@ -24,13 +41,15 @@ declare -A NODE=(
   [t1]="$F::test_t1_tiny_random_forward"
   [t6]="$F::test_t6_fp16_headroom_8k"
   [t4a]="$F::test_t4a_teacher_forced_eager_vs_graphs"
-  [t4b]="$F::test_t4b_graph_replay_exact_at_one_seq"
+  [t4b]="$F::test_t4b_graph_replay_exact"
+  [t4c]="$F::test_t4c_eager_repeatable_across_engine_instances"
+  [t4d]="$F::test_t4d_graphs_vs_fork_graphs"
   [t5]="$F::test_t5_golden_tokens_vs_fork"
   [t7]="$F::test_t7_unfused_path_matches"
   [t2]="$F::test_t2_triton_kernel_bitwise_vs_reference"
   [t3]="$F::test_t3_checkpoint_loads"
 )
-read -r -a ORDER <<< "${M5_NODES:-t4a t4b t5 t7 t2 t3 t1 t6}"
+read -r -a ORDER <<< "${M5_NODES:-t4c t4a t4b t4d t5 t7 t2 t3 t1 t6}"
 
 check_junit() {  # XML
   "$VLLM_PY" - "$1" <<'PY'
@@ -71,7 +90,7 @@ done
 
 echo
 echo "== verdicts ($OUT)"
-grep -hE '^(T2 n=|T4b |T5 |eager_vs_graphs:|fused_vs_unfused:|junit: )' "$OUT"/*.log || true
+grep -hE '^(T2 n=|T4[abcd] |T5 |T7 |ours_eager_vs_eager|M5_MUTATION |junit: )' "$OUT"/*.log || true
 echo
 echo "== summary"
 rc=0

@@ -12,10 +12,18 @@ GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
     FLINT_SM70_CHECKPOINT  the ModelOpt NVFP4 Flint checkpoint dir
     FLINT_SM70_GOLDEN      JSON of fork cf9492a greedy records (T5); c4130:
                            ~/vllm-sm70-work/bea/golden/flint_cf9492a_greedy64.json
+    FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR,
+    FLINT_SM70_OURS_NOISE  teacher-forced T4a-T4d/T7 inputs (see the T4 section
+                           and docs/m5-calibration-nov7.md)
+    M5_MUTATION            planted bug for sm70/scripts/m5_mutation_check.sh
 """
 
+import functools
+import importlib
+import importlib.util
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -982,116 +990,674 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     assert all(len(t) == 64 for t in toks)
 
 
-# T4a/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6).
-# FLINT_SM70_T4_SEQS: fixed sequences from `m5_teacher_forced.py gen`.
-# FLINT_SM70_T4_ENVELOPE: the fork's own stats from `m5_teacher_forced.py
-# envelope` (pairs "eager_vs_graphs" and "fused_vs_unfused").
-T4_SEQS = os.environ.get("FLINT_SM70_T4_SEQS")
+# T4a-T4d/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6-7).
+# All scoring goes through sm70/scripts/m5_teacher_forced.py (the same code
+# calibrates the fork), one sequence at a time (M=1 in eager and in replay).
+# Metrics per continuation token: "decode" (forced decode: every token is a
+# real decode step, raw logprob of the forced token) and "prefill"
+# (prompt_logprobs over the whole sequence).
+#   FLINT_SM70_T4_SEQS_DIR      setK.json from `m5_teacher_forced.py gen` (>= 3 sets)
+#   FLINT_SM70_T4_ENVELOPE      `m5_teacher_forced.py envelope` over the fork's
+#                               scores: per pair/metric, anchor = max over sets
+#   FLINT_SM70_FORK_SCORES_DIR  the fork's scores,
+#                               setK/{eager,eager2,graphs,unfused}.json (the
+#                               envelope's input; T4d reads graphs.json)
+#   FLINT_SM70_OURS_NOISE       optional: ours_eager_vs_eager envelope JSON.
+#                               T4c writes it (two separate eager instances);
+#                               T4a/T4d/T7 print it on every gate line.
+# Every score comes from its own engine instance (one LLM build per score).
+# Gate (Quinn; factors PROVISIONAL, constants at the top of
+# m5_teacher_forced.py): per set, ours mean <= 1.5x anchor mean AND ours max
+# <= 1.5x anchor max; each line also shows count > 0.1 nats, our own
+# eager-vs-eager instance noise and the fork's. docs/m5-calibration-nov7.md
+# has the commands.
+T4_SEQS_DIR = os.environ.get("FLINT_SM70_T4_SEQS_DIR")
 T4_ENVELOPE = os.environ.get("FLINT_SM70_T4_ENVELOPE")
+FORK_SCORES_DIR = os.environ.get("FLINT_SM70_FORK_SCORES_DIR")
+OURS_NOISE = os.environ.get("FLINT_SM70_OURS_NOISE")
 T4_ENVELOPE_FACTOR = 1.5
+# Mutation check (sm70/scripts/m5_mutation_check.sh): which planted bug is on.
+M5_MUTATION = os.environ.get("M5_MUTATION")
+MUTATIONS_DIR = pathlib.Path(__file__).resolve().parent / "m5_mutations"
+needs_seqs = pytest.mark.skipif(
+    T4_SEQS_DIR is None, reason="set FLINT_SM70_T4_SEQS_DIR (m5_teacher_forced.py gen)"
+)
 needs_envelope = pytest.mark.skipif(
-    T4_SEQS is None or T4_ENVELOPE is None,
-    reason="set FLINT_SM70_T4_SEQS and FLINT_SM70_T4_ENVELOPE (fork calibration)",
+    T4_SEQS_DIR is None or T4_ENVELOPE is None,
+    reason="set FLINT_SM70_T4_SEQS_DIR and FLINT_SM70_T4_ENVELOPE (fork calibration)",
+)
+needs_fork_scores = pytest.mark.skipif(
+    FORK_SCORES_DIR is None, reason="set FLINT_SM70_FORK_SCORES_DIR (fork scores)"
 )
 
 
+@functools.lru_cache(maxsize=None)
 def _tf_module():
-    import importlib.util
-    import pathlib
+    """sm70/scripts/m5_teacher_forced.py, imported under its own name so the
+    forcing processor's FQCN resolves in the engine core and TP workers."""
+    scripts = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    mod = importlib.import_module("m5_teacher_forced")
+    mod.ensure_importable()
+    return mod
 
-    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "m5_teacher_forced.py"
-    spec = importlib.util.spec_from_file_location("m5_teacher_forced", path)
+
+@functools.lru_cache(maxsize=None)
+def _mutation_module():
+    spec = importlib.util.spec_from_file_location(
+        "m5_mutation", MUTATIONS_DIR / "m5_mutation.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def _teacher_forced_scores(seqs, **llm_kw):
-    """Per-sequence logprobs of each continuation token (prompt_logprobs)."""
-    from vllm import SamplingParams
+def _mutated(**llm_kw):
+    """LLM kwargs for the MUTATED side of T4d/T7. Hook mutations are already
+    in every process (sitecustomize); the config mutation rope_theta_1p01 is
+    applied here, to this side only."""
+    if M5_MUTATION == "rope_theta_1p01":
+        override = _mutation_module().rope_theta_override(CKPT)
+        print(f"M5_MUTATION rope_theta_1p01: hf_overrides {json.dumps(override)}")
+        llm_kw["hf_overrides"] = {**ARCH_OVERRIDE, **override}
+    return llm_kw
 
-    llm = _llm(**llm_kw)
+
+def _seq_sets():
+    return _tf_module().load_seq_sets(T4_SEQS_DIR)
+
+
+def _envelope(seq_sets):
+    """The fork envelope, checked to be calibrated on exactly these sequences."""
+    tf = _tf_module()
+    with open(T4_ENVELOPE) as f:
+        env = json.load(f)
+    want = {k: v["seqs_sha256"] for k, v in env["sets"].items()}
+    got = {str(k): tf.seqs_sha256(s) for k, s in seq_sets.items()}
+    assert got == want, (
+        "FLINT_SM70_T4_SEQS_DIR is not the sequence set the envelope was "
+        f"calibrated on: ours {got} vs envelope {want}"
+    )
+    assert len(want) >= tf.MIN_SETS, f"envelope has {len(want)} sets (< {tf.MIN_SETS})"
+    return env
+
+
+def _score_sets(seq_sets, decode=True, prefill=True, greedy_prompts=(), **llm_kw):
+    """Build one LLM with the scoring setup (forcing processor, raw logprobs,
+    max_num_seqs=1, no prefix caching), score every set, optionally run free
+    greedy (64 tokens, one prompt at a time), always shut down."""
+    tf = _tf_module()
+    llm = _llm(**{**tf.scoring_llm_kwargs(1), **llm_kw})
     try:
-        outs = llm.generate(
-            [{"prompt_token_ids": s["ids"]} for s in seqs],
-            SamplingParams(max_tokens=1, prompt_logprobs=1),
-        )
-        return [
-            [o.prompt_logprobs[i][s["ids"][i]].logprob
-             for i in range(s["start"], len(s["ids"]))]
-            for s, o in zip(seqs, outs)
-        ]
+        scores = {
+            k: tf.score_seqs(llm, seqs, decode, prefill) for k, seqs in seq_sets.items()
+        }
+        greedy = [_greedy(llm, 64, [p])[0] for p in greedy_prompts]
     finally:
         _shutdown(llm)
+    return scores, greedy
 
 
-def _assert_within_fork_envelope(pair, a, b):
-    """mean and p99 |dlogprob| <= T4_ENVELOPE_FACTOR x the fork's own."""
+def _ours_noise():
+    """Our eager-vs-eager (two engine instances) envelope from T4c, if any."""
+    if OURS_NOISE is None or not os.path.exists(OURS_NOISE):
+        print(f"ours_eager_vs_eager: not available ({OURS_NOISE!r}; run t4c first)")
+        return None
+    with open(OURS_NOISE) as f:
+        return json.load(f)
+
+
+def _noise_stats(env, metric, k=None):
+    """eager_vs_eager stats for one set (k) or the anchor (k=None)."""
+    e = ((env or {}).get("pairs", {}).get(_tf_module().NOISE_PAIR) or {}).get(metric)
+    if e is None:
+        return None
+    return e["anchor"] if k is None else e["per_set"].get(str(k))
+
+
+def _gate_sets(tag, label, anchor, metric, a_by_set, b_by_set, ours_noise=None,
+               fork_env=None):
+    """Gate every set's |dlogprob| stats (a vs b) against one anchor; print a
+    verdict line per set (count > 0.1, our instance noise and the fork's
+    included); return the breaches."""
     tf = _tf_module()
-    ours = tf.stats(a, b)
-    with open(T4_ENVELOPE) as f:
-        fork = json.load(f)[pair]
-    print(f"{pair}: ours {json.dumps(ours)} fork {json.dumps(fork)} "
-          f"(limit {T4_ENVELOPE_FACTOR}x mean and p99)")
-    for key in ("mean", "p99"):
-        assert ours[key] <= T4_ENVELOPE_FACTOR * fork[key] + 1e-6, (
-            f"{pair}: {key} {ours[key]:.4f} > {T4_ENVELOPE_FACTOR} x fork "
-            f"{fork[key]:.4f}"
+    assert tf.FACTOR == T4_ENVELOPE_FACTOR
+    failures = []
+    for k in sorted(a_by_set):
+        ours = tf.stats(tf.metric(a_by_set[k], metric), tf.metric(b_by_set[k], metric))
+        line, bad = tf.gate_line(tag, label, metric, k, ours, anchor,
+                                 _noise_stats(ours_noise, metric, k),
+                                 _noise_stats(fork_env, metric))
+        print(line)
+        failures += [f"{label} {metric} set{k}: {b}" for b in bad]
+    return failures
+
+
+def _print_top1(tag, name, scores):
+    for k, s in sorted(scores.items()):
+        bad, n = _tf_module().top1_disagreements(s)
+        print(f"{tag} info {name} set{k}: raw top-1 != forced token at {bad}/{n} steps")
+
+
+# ---- CPU checks of the harness -------------------------------------------
+def _batch(added=(), removed=(), moved=(), size=2):
+    from vllm.v1.sample.logits_processor import BatchUpdate
+
+    return BatchUpdate(batch_size=size, removed=list(removed), added=list(added),
+                       moved=list(moved))
+
+
+def test_force_processor_masks_and_tracks_state():
+    from vllm import SamplingParams
+    from vllm.v1.sample.logits_processor import MoveDirectionality
+
+    tf = _tf_module()
+    proc = tf.ForceRefLogitsProcessor(None, torch.device("cpu"), False)
+    assert proc.is_argmax_invariant() is False  # applied for greedy requests too
+    ref = [5, 2, 7]
+    out0, out1 = [], []
+    proc.update_state(_batch(added=[
+        (0, SamplingParams(temperature=0, max_tokens=3, extra_args={tf.FORCE_KEY: ref}),
+         [1, 2], out0),
+        (1, SamplingParams(temperature=0, max_tokens=3), [3], out1),
+    ]))
+    for step in range(3):
+        logits = torch.randn(2, 10)
+        logits[0, 9] = 100.0  # the model's own top-1 is never the reference
+        free = logits[1].clone()
+        res = proc.apply(logits)
+        assert int(res[0].argmax()) == ref[step]
+        assert torch.isinf(res[0]).sum() == 9 and res[0, ref[step]] == 0.0
+        assert torch.equal(res[1], free)  # unforced row untouched
+        out0.append(ref[step])  # the runner appends the sampled id
+        out1.append(int(free.argmax()))
+        proc.update_state(None)
+    logits = torch.randn(2, 10)
+    assert torch.equal(proc.apply(logits.clone()), logits)  # past the reference
+    # A swap moves the state with the request; a removal drops it.
+    out2 = [4]
+    proc.update_state(_batch(
+        added=[(1, SamplingParams(extra_args={tf.FORCE_KEY: [8, 3]}), [1], out2)],
+        removed=[0], moved=[(0, 1, MoveDirectionality.SWAP)],
+    ))
+    assert set(proc.forced) == {0}
+    assert int(proc.apply(torch.randn(2, 10))[0].argmax()) == 3  # step 1 of [8, 3]
+    proc.update_state(_batch(removed=[0], size=0))
+    assert proc.forced == {}
+
+
+def test_force_processor_validate_params():
+    from vllm import SamplingParams
+
+    tf = _tf_module()
+    tf.ForceRefLogitsProcessor.validate_params(SamplingParams())
+    tf.ForceRefLogitsProcessor.validate_params(
+        SamplingParams(max_tokens=2, extra_args={tf.FORCE_KEY: [1, 2]})
+    )
+    for bad in ([], [1, -2], "12", [1.5]):
+        with pytest.raises(ValueError):
+            tf.ForceRefLogitsProcessor.validate_params(
+                SamplingParams(max_tokens=1, extra_args={tf.FORCE_KEY: bad})
+            )
+    with pytest.raises(ValueError, match="max_tokens"):
+        tf.ForceRefLogitsProcessor.validate_params(
+            SamplingParams(max_tokens=3, extra_args={tf.FORCE_KEY: [1, 2]})
         )
+    assert tf.FORCE_FQCN.split(":") == ["m5_teacher_forced", "ForceRefLogitsProcessor"]
+    kw = tf.scoring_llm_kwargs(1)
+    assert kw["logprobs_mode"] == "raw_logprobs" and kw["max_num_seqs"] == 1
+    assert str(tf.SCRIPTS_DIR) in os.environ["PYTHONPATH"].split(os.pathsep)
 
 
-def test_envelope_gate(monkeypatch, tmp_path):
-    env = tmp_path / "env.json"
-    env.write_text(json.dumps({"eager_vs_graphs": {"mean": 0.02, "p99": 0.4}}))
-    monkeypatch.setitem(globals(), "T4_ENVELOPE", str(env))
-    base = [[-1.0] * 100]
-    near = [[-1.0 - (0.5 if i == 0 else 0.02) for i in range(100)]]  # mean ~0.0248, p99 0.02
-    _assert_within_fork_envelope("eager_vs_graphs", base, near)
-    far = [[-1.0 - 0.05 for _ in range(100)]]  # mean 0.05 > 1.5 x 0.02
-    with pytest.raises(AssertionError, match="mean"):
-        _assert_within_fork_envelope("eager_vs_graphs", base, far)
-    spiky = [[-1.0 - (0.9 if i < 3 else 0.0) for i in range(100)]]  # p99 0.9 > 0.6
-    with pytest.raises(AssertionError, match="p99"):
-        _assert_within_fork_envelope("eager_vs_graphs", base, spiky)
+class _FakeLLM:
+    """Stands in for LLM.generate: forced decode returns the reference with
+    per-step logprob dicts; prefill returns prompt_logprobs."""
+
+    def __init__(self, flip_at=None):
+        self.flip_at = flip_at
+        self.calls = 0
+
+    def generate(self, prompts, params):
+        self.calls += 1
+        params = params if isinstance(params, list) else [params] * len(prompts)
+        outs = []
+        for p, sp in zip(prompts, params):
+            ids = p["prompt_token_ids"]
+            if sp.prompt_logprobs:
+                plp = [None] + [{t: SimpleNamespace(logprob=-0.5 * i, rank=1)}
+                                for i, t in enumerate(ids[1:], 1)]
+                outs.append(SimpleNamespace(prompt_logprobs=plp, outputs=[]))
+                continue
+            ref = list(sp.extra_args["m5_force"])
+            toks = list(ref)
+            if self.flip_at is not None:
+                toks[self.flip_at] += 1
+            steps = [{t: SimpleNamespace(logprob=-1.0 - j, rank=2),
+                      99: SimpleNamespace(logprob=-0.1, rank=1)} for j, t in enumerate(toks)]
+            outs.append(SimpleNamespace(outputs=[SimpleNamespace(token_ids=toks, logprobs=steps)]))
+        return outs
+
+
+def test_score_seqs_decode_and_prefill_records():
+    tf = _tf_module()
+    seqs = [{"prompt": "a", "start": 2, "ids": [1, 2, 3, 4, 5]},
+            {"prompt": "b", "start": 1, "ids": [7, 8, 9]}]
+    llm = _FakeLLM()
+    res = tf.score_seqs(llm, seqs)
+    assert llm.calls == 3  # one generate per sequence (M=1) + one prefill call
+    assert res["seqs_sha256"] == tf.seqs_sha256(seqs)
+    assert res["seqs"][0]["decode"] == [-1.0, -2.0, -3.0]
+    assert res["seqs"][0]["decode_top1"] == [99, 99, 99]
+    assert res["seqs"][1]["prefill"] == [-0.5, -1.0]
+    assert tf.top1_disagreements(res) == (5, 5)
+    with pytest.raises(tf.ForcingError, match="first difference at 1"):
+        tf.score_seqs(_FakeLLM(flip_at=1), seqs, prefill=False)
+
+
+def _write_scores(root, k, name, decode, prefill, sha="s"):
+    d = root / f"set{k}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.json").write_text(json.dumps({
+        "seqs_sha256": sha, "seqs": [{"decode": decode, "prefill": prefill}]}))
+
+
+def test_envelope_aggregates_max_over_sets(tmp_path):
+    tf = _tf_module()
+    base = [-1.0] * 10
+    # per set k: graphs off by dg[k] at every token (decode), one 0.3 spike in
+    # prefill; unfused off by du[k] (decode) and 2*du[k] (prefill).
+    dg, du = {0: 0.01, 1: 0.04, 2: 0.02}, {0: 0.002, 1: 0.001, 2: 0.005}
+    for k in range(3):
+        _write_scores(tmp_path, k, "eager", base, base, sha=f"h{k}")
+        _write_scores(tmp_path, k, "eager2", [x - 0.2 * (k == 2) for x in base], base,
+                      sha=f"h{k}")
+        _write_scores(tmp_path, k, "graphs", [x - dg[k] for x in base],
+                      [x - (0.3 if i == k else 0.0) for i, x in enumerate(base)], sha=f"h{k}")
+        _write_scores(tmp_path, k, "unfused", [x - du[k] for x in base],
+                      [x - 2 * du[k] for x in base], sha=f"h{k}")
+    env = tf.build_envelope(tmp_path)
+    assert env["sets"] == {str(k): {"seqs_sha256": f"h{k}"} for k in range(3)}
+    eg = env["pairs"]["eager_vs_graphs"]
+    assert eg["decode"]["anchor"]["mean"] == pytest.approx(0.04)  # max over sets
+    assert eg["decode"]["anchor"]["max"] == pytest.approx(0.04)
+    assert eg["decode"]["per_set"]["0"]["mean"] == pytest.approx(0.01)
+    assert eg["prefill"]["anchor"]["max"] == pytest.approx(0.3)
+    assert eg["prefill"]["anchor"]["mean"] == pytest.approx(0.03)
+    assert eg["prefill"]["per_set"]["1"]["over_0_1"] == 1
+    fu = env["pairs"]["fused_vs_unfused"]
+    assert fu["decode"]["anchor"]["mean"] == pytest.approx(0.005)
+    assert fu["prefill"]["anchor"]["max"] == pytest.approx(0.01)
+    assert fu["decode"]["per_set"]["2"]["n"] == 10
+    ee = env["pairs"]["eager_vs_eager"]
+    assert ee["decode"]["anchor"]["max"] == pytest.approx(0.2)
+    assert ee["decode"]["per_set"]["2"]["over_0_1"] == 10
+    assert ee["prefill"]["anchor"] == {"mean": 0.0, "max": 0.0, "over_0_1": 0}
+    only = tf.build_envelope(tmp_path, pairs=["eager_vs_eager"])
+    assert list(only["pairs"]) == ["eager_vs_eager"] and only["gate"]["provisional"]
+    with pytest.raises(ValueError, match=">= 4 prompt sets"):
+        tf.build_envelope(tmp_path, min_sets=4)
+    _write_scores(tmp_path, 1, "unfused", base, base, sha="other")
+    with pytest.raises(ValueError, match="different sequences"):
+        tf.build_envelope(tmp_path)
+    (tmp_path / "set1" / "graphs.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        tf.build_envelope(tmp_path)
+    with pytest.raises(ValueError, match="unknown pairs"):
+        tf.envelope_from_scores({}, ["nope"])
+
+
+def test_stats_refuses_misaligned_and_flags_nan():
+    tf = _tf_module()
+    with pytest.raises(ValueError, match="sequence 0"):
+        tf.stats([[1.0, 2.0]], [[1.0]])
+    s = tf.stats([[-1.0, float("-inf")]], [[float("nan"), float("-inf")]])
+    assert s["max"] == float("inf") and s["over_0_1"] == 1
+
+
+def test_envelope_gate():
+    tf = _tf_module()
+    anchor = {"mean": 0.02, "max": 0.4, "over_0_1": 3}
+    assert tf.gate_failures({"mean": 0.029, "max": 0.59}, anchor) == []
+    mean_bad = tf.gate_failures({"mean": 0.05, "max": 0.1}, anchor)
+    assert len(mean_bad) == 1 and mean_bad[0].startswith("mean")
+    max_bad = tf.gate_failures({"mean": 0.01, "max": 0.61}, anchor)
+    assert len(max_bad) == 1 and max_bad[0].startswith("max")
+    assert len(tf.gate_failures({"mean": 1.0, "max": float("inf")}, anchor)) == 2
+    line, bad = tf.gate_line("T4a", "eager_vs_graphs", "decode", 0,
+                             {"n": 512, "mean": 0.01, "max": 0.2, "over_0_1": 4}, anchor)
+    assert not bad and line.startswith("T4a eager_vs_graphs decode set0: ")
+    assert ">0.1=4/512" in line and line.endswith("PASS")
+
+
+def test_gate_sets_prints_every_set_and_collects(capsys):
+    tf = _tf_module()
+    anchor = {"mean": 0.02, "max": 0.4, "over_0_1": 0}
+    a = {k: {"seqs": [{"decode": [-1.0] * 100}]} for k in range(3)}
+    b = {0: {"seqs": [{"decode": [-1.01] * 100}]},
+         1: {"seqs": [{"decode": [-1.05] * 100}]},  # mean breach
+         2: {"seqs": [{"decode": [-1.0] * 99 + [-1.7]}]}}  # max breach
+    fails = _gate_sets("T7", "fused_vs_unfused", anchor, "decode", a, b)
+    out = capsys.readouterr().out
+    assert [ln.split(":")[0] for ln in out.splitlines()] == [
+        f"T7 fused_vs_unfused decode set{k}" for k in range(3)]
+    assert len(fails) == 2 and "set1: mean" in fails[0] and "set2: max" in fails[1]
+    assert tf.FACTOR == T4_ENVELOPE_FACTOR
+
+
+def test_prompt_sets_are_disjoint():
+    tf = _tf_module()
+    sets = tf.PROMPT_SETS
+    assert len(sets) >= 3 and all(len(p) == 8 for p in sets.values())
+    assert sets[0] == PROMPTS
+    flat = [p for ps in sets.values() for p in ps]
+    assert len(flat) == len(set(flat))
+
+
+# ---- mutation hook (m5_mutations/) ----------------------------------------
+def _qk_call(n, slots=None, blocks=3):
+    qkv, qw, kw, pos = _inputs(n=n, seed=11)
+    kv = torch.zeros(blocks, HKV, PAGE, 2 * D, dtype=torch.half)
+    q = torch.empty(n, HQ * D, dtype=torch.half)
+    k = torch.empty(n, HKV * D, dtype=torch.half)
+    if slots is None:
+        slots = torch.arange(n) * 3
+    return qkv, q, k, qw, kw, pos, kv, slots
+
+
+def _run_registered_op(monkeypatch, n, slots=None):
+    """Call torch.ops.vllm.sm70_flint_qk_norm_rope_kv_cache_update on CPU (its
+    CPU kernel is the module's Python op body) with a fake attention context
+    whose layer takes the direct cache-write branch."""
+    import vllm.model_executor.layers.attention.attention as attention
+    from vllm.utils.torch_utils import _encode_layer_name
+
+    qkv, q, k, qw, kw, pos, kv, slots = _qk_call(n, slots)
+    layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
+    monkeypatch.setattr(attention, "get_attention_context",
+                        lambda name: (None, layer, kv, slots))
+    op = getattr(torch.ops.vllm, qk.OP_NAME)
+    op(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, _encode_layer_name("m5.layer"))
+    return q, k, kv, (qkv, qw, kw, pos, slots)
+
+
+def _reference(n, qkv, qw, kw, pos, slots, blocks=3):
+    kv = torch.zeros(blocks, HKV, PAGE, 2 * D, dtype=torch.half)
+    q = torch.empty(n, HQ * D, dtype=torch.half)
+    k = torch.empty(n, HKV * D, dtype=torch.half)
+    qk.qk_norm_rope_kv_reference(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6,
+                                 *qk.triton_cache_views(kv, D), slots)
+    return q, k, kv
+
+
+@pytest.mark.parametrize("n", [4, 9])
+def test_mutation_rope_pos_decode_reaches_registered_op(monkeypatch, n):
+    """The wrapper on the module global changes what the REGISTERED op
+    computes: positions + 1 at <= 8 tokens, untouched above."""
+    mm = _mutation_module()
+    monkeypatch.setattr(qk, "qk_norm_rope_kv",
+                        mm.make_wrapper(qk.qk_norm_rope_kv_reference, "rope_pos_decode"))
+    q, k, kv, (qkv, qw, kw, pos, slots) = _run_registered_op(monkeypatch, n)
+    want_pos = pos + 1 if n <= mm.DECODE_MAX_TOKENS else pos
+    rq, rk, rkv = _reference(n, qkv, qw, kw, want_pos, slots)
+    assert torch.equal(q, rq) and torch.equal(k, rk) and torch.equal(kv, rkv)
+    cq, _, _ = _reference(n, qkv, qw, kw, pos, slots)
+    assert torch.equal(q, cq) == (n > mm.DECODE_MAX_TOKENS)
+
+
+@pytest.mark.parametrize("n", [4, 9])
+def test_mutation_kv_slot_decode_reaches_registered_op(monkeypatch, n):
+    mm = _mutation_module()
+    monkeypatch.setattr(qk, "qk_norm_rope_kv",
+                        mm.make_wrapper(qk.qk_norm_rope_kv_reference, "kv_slot_decode"))
+    slots = torch.tensor([0, 17, -1, 47 if n > 8 else 30] + [20 + i for i in range(n - 4)])
+    q, k, kv, (qkv, qw, kw, pos, slots) = _run_registered_op(monkeypatch, n, slots)
+    total = 3 * PAGE
+    want = slots.where(slots < 0, (slots + 1) % total) if n <= mm.DECODE_MAX_TOKENS else slots
+    rq, rk, rkv = _reference(n, qkv, qw, kw, pos, want)
+    assert torch.equal(q, rq) and torch.equal(k, rk) and torch.equal(kv, rkv)
+    if n <= mm.DECODE_MAX_TOKENS:
+        assert kv[0, :, 0].abs().sum() == 0 and kv[0, :, 1].abs().sum() > 0  # 0 -> 1
+        assert kv[0, :, 0, :D].abs().sum() == 0
+
+
+def test_mutation_install_wraps_the_triton_function(monkeypatch):
+    mm = _mutation_module()
+    original = qk.qk_norm_rope_kv
+    monkeypatch.setattr(qk, "qk_norm_rope_kv", original)
+    mm.install(qk, "kv_slot_decode")
+    assert qk.qk_norm_rope_kv._m5_original is original
+    mm.install(qk, "rope_pos_decode")  # re-install wraps the original, not the wrapper
+    assert qk.qk_norm_rope_kv._m5_original is original
+    assert qk.qk_norm_rope_kv._m5_mutation == "rope_pos_decode"
+    # The op body resolves the name in the module globals at call time.
+    assert qk.sm70_flint_qk_norm_rope_kv_cache_update.__globals__ is vars(qk)
+    with pytest.raises(ValueError, match="known"):
+        mm.install_import_hook("no_such_bug")
+
+
+@pytest.mark.parametrize("mutation", ["kv_slot_decode", ""])
+def test_mutation_sitecustomize_in_fresh_process(tmp_path, mutation):
+    """A fresh interpreter (as a TP worker is) with the mutations dir first on
+    PYTHONPATH: the shadowed sitecustomize still runs, and importing the qk
+    module installs the wrapper iff M5_MUTATION is set."""
+    shadowed = tmp_path / "shadowed"
+    shadowed.mkdir()
+    (shadowed / "sitecustomize.py").write_text(
+        "import os\nos.environ['M5_SHADOWED_RAN'] = '1'\n")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(MUTATIONS_DIR), str(shadowed)] + [p for p in sys.path if p])
+    env["M5_MUTATION"] = mutation
+    code = (
+        "import os, json\n"
+        "from vllm_sm70.models.flint_sm70 import qk_norm_rope_kv as qk\n"
+        "print(json.dumps([os.environ.get('M5_SHADOWED_RAN'),"
+        " getattr(qk.qk_norm_rope_kv, '_m5_mutation', None),"
+        " getattr(getattr(qk.qk_norm_rope_kv, '_m5_original', None), '__name__', None)]))\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                       text=True, timeout=300, check=False)
+    assert r.returncode == 0, r.stderr[-2000:]
+    ran, installed, orig = json.loads(r.stdout.strip().splitlines()[-1])
+    assert ran == "1"
+    if mutation:
+        assert (installed, orig) == (mutation, "qk_norm_rope_kv")
+        assert f"M5_MUTATION {mutation} installed in pid" in r.stderr
+    else:
+        assert installed is None
+
+
+def test_rope_theta_override(tmp_path):
+    mm = _mutation_module()
+
+    def ov(cfg):
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+        return mm.rope_theta_override(str(tmp_path))
+
+    flat = ov({"rope_theta": 1e6, "rope_parameters": {"rope_type": "default",
+                                                      "rope_theta": 1e6, "x": 1}})
+    assert flat == {"rope_theta": pytest.approx(1.01e6),
+                    "rope_parameters": {"rope_type": "default",
+                                        "rope_theta": pytest.approx(1.01e6), "x": 1}}
+    nested = ov({"rope_parameters": {"sliding_attention": {"rope_theta": 1e4},
+                                     "full_attention": {"rope_theta": 1e6}}})
+    assert nested == {"rope_parameters": {
+        "sliding_attention": {"rope_theta": pytest.approx(1.01e4)},
+        "full_attention": {"rope_theta": pytest.approx(1.01e6)}}}
+    legacy = ov({"rope_theta": 5e5})
+    assert legacy["rope_parameters"]["rope_theta"] == pytest.approx(5.05e5)
+    assert legacy["rope_theta"] == pytest.approx(5.05e5)
+    default = ov({})
+    assert default["rope_theta"] == pytest.approx(10100.0)
+
+
+def test_skipif_markers_are_boolean():
+    for mark in (needs_seqs, needs_envelope, needs_fork_scores, needs_ckpt):
+        assert isinstance(mark.args[0], bool)
+
+
+# ---- GPU gates ---------------------------------------------------------------
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+@needs_envelope
+def test_t4a_teacher_forced_eager_vs_graphs():
+    """T4a (2 GPUs): our eager vs our compiled + CUDA graphs, teacher-forced
+    on every prompt set, decode AND prefill metrics.
+
+    Bea's t4_bisect (Nov 6): Inductor codegen accounts for all of the
+    eager/compiled prefill difference (graphs_only = 0.0), and free decode
+    under graph replay diverges too, so the decode metric (real decode steps,
+    replayed graphs) is gated as well as prefill. Gate per set and metric:
+    mean <= 1.5x and max <= 1.5x the fork's eager_vs_graphs anchor."""
+    seq_sets = _seq_sets()
+    env = _envelope(seq_sets)
+    eager, _ = _score_sets(seq_sets, enforce_eager=True)
+    graphs, _ = _score_sets(seq_sets)
+    _print_top1("T4a", "eager", eager)
+    _print_top1("T4a", "graphs", graphs)
+    tf, noise = _tf_module(), _ours_noise()
+    pair = tf.GATE_ANCHOR_PAIR["T4a"]
+    failures = []
+    for m in tf.METRICS:
+        anchor = env["pairs"][pair][m]["anchor"]
+        failures += _gate_sets("T4a", "eager_vs_graphs", anchor, m, eager, graphs,
+                               noise, env)
+    assert not failures, f"T4a outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
+
+
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+@pytest.mark.parametrize("max_num_seqs", [1, 2])
+def test_t4b_graph_replay_exact(max_num_seqs):
+    """T4b (2 GPUs): CUDA-graph replay is exact when the batch shape matches.
+
+    Mode NONE + cudagraph FULL takes Inductor out; at max_num_seqs 1 and 2
+    every decode step has M <= 2 (no capture padding beyond the batch), which
+    covers the K11/K12 M<=2 paths. Greedy tokens must equal eager's for all
+    256 tokens: any flip is a capture/replay bug, not numerics."""
+    eager = _greedy_once(256, enforce_eager=True, max_num_seqs=max_num_seqs)
+    graphs = _greedy_once(
+        256, max_num_seqs=max_num_seqs,
+        compilation_config={"mode": 0, "cudagraph_mode": "FULL"},
+    )
+    for i, (e, g) in enumerate(zip(eager, graphs)):
+        pos = next((j for j, (a, b) in enumerate(zip(e, g)) if a != b), None)
+        print(f"T4b max_num_seqs={max_num_seqs} prompt {i}: "
+              + ("identical" if pos is None else f"differs at {pos}"))
+    assert eager == graphs
+
+
+def _t4c_report(s1, s2, g1, g2, fork_env=None):
+    """T4c verdict lines and failures: forced-decode |dlogprob| stats per set
+    (vs the fork's eager_vs_eager anchor), bitwise check, free-run first
+    divergence per prompt."""
+    tf = _tf_module()
+    failures = []
+    for k in sorted(s1):
+        for m in tf.METRICS:
+            if not all(m in r for s in (s1[k], s2[k]) for r in s["seqs"]):
+                continue
+            st = tf.stats(tf.metric(s1[k], m), tf.metric(s2[k], m))
+            exact = tf.metric(s1[k], m) == tf.metric(s2[k], m)
+            print(f"T4c ours_eager_vs_eager {m} set{k}: {tf._brief('ours', st)} | "
+                  f"{tf._brief('fork_eager_vs_eager', _noise_stats(fork_env, m))} -> "
+                  + ("bitwise equal" if exact else "DIFFERS"))
+            if m == "decode" and not exact:
+                failures.append(f"set{k} decode: {st['over_0_1']}/{st['n']} > {tf.OVER}, "
+                                f"max {st['max']:.4g}")
+    for i, (x, y) in enumerate(zip(g1, g2)):
+        pos = next((j for j, (u, v) in enumerate(zip(x, y)) if u != v), None)
+        if pos is None and len(x) != len(y):
+            pos = min(len(x), len(y))
+        print(f"T4c free-run prompt {i}: "
+              + ("identical" if pos is None else f"first divergence at token {pos}"))
+    return failures
+
+
+def test_t4c_report_flags_decode_differences(capsys):
+    a = {0: {"seqs": [{"decode": [-1.0, -2.0], "prefill": [-1.0, -2.0]}]}}
+    b = {0: {"seqs": [{"decode": [-1.0, -2.5], "prefill": [-1.0, -2.0]}]}}
+    assert _t4c_report(a, a, [[1, 2]], [[1, 2]]) == []
+    fails = _t4c_report(a, b, [[1, 2, 3]], [[1, 4, 3]])
+    out = capsys.readouterr().out
+    assert len(fails) == 1 and "1/2 > 0.1" in fails[0]
+    assert "T4c ours_eager_vs_eager decode set0: ours mean=0.25 max=0.5" in out
+    assert "T4c free-run prompt 0: first divergence at token 1" in out
+
+
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+@needs_seqs
+def test_t4c_eager_repeatable_across_engine_instances():
+    """T4c (2 GPUs): eager vs eager across TWO SEPARATE ENGINE INSTANCES
+    (build, score, shut down, build again: new engine core, new workers).
+
+    Reports the forced-decode (and prefill) |dlogprob| stats per set and the
+    free-run greedy first divergence per prompt (64 tokens, one prompt at a
+    time). Gate: forced-decode logprobs bitwise identical. Bea (Nov 6): two
+    instances gave different free-run tokens on 7/8 prompts with real
+    logprob shifts (suspected startup autotuning, e.g. TurboMind kernel
+    selection by timing), so this is EXPECTED to fail on today's build: a
+    finding, not a test bug. It also writes our eager_vs_eager envelope to
+    FLINT_SM70_OURS_NOISE (before the gate), which T4a/T4d/T7 print as
+    ours_eager_vs_eager on every line."""
+    seq_sets = _seq_sets()
+    s1, g1 = _score_sets(seq_sets, greedy_prompts=PROMPTS, enforce_eager=True)
+    s2, g2 = _score_sets(seq_sets, greedy_prompts=PROMPTS, enforce_eager=True)
+    tf = _tf_module()
+    noise = tf.envelope_from_scores({"eager": s1, "eager2": s2}, [tf.NOISE_PAIR], min_sets=1)
+    if OURS_NOISE is not None:
+        with open(OURS_NOISE, "w") as f:
+            json.dump(noise, f, indent=1)
+        print(f"T4c wrote ours_eager_vs_eager -> {OURS_NOISE}")
+    fork_env = None
+    if T4_ENVELOPE is not None:
+        with open(T4_ENVELOPE) as f:
+            fork_env = json.load(f)
+    failures = _t4c_report(s1, s2, g1, g2, fork_env)
+    assert not failures, (
+        "engine-instance nondeterminism: two separate eager engine instances "
+        f"give different forced-decode logprobs: {failures}"
+    )
 
 
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
 @needs_envelope
-def test_t4a_teacher_forced_eager_vs_graphs():
-    """T4a (2 GPUs): eager vs compiled + CUDA graphs on fixed sequences.
+@needs_fork_scores
+def test_t4d_graphs_vs_fork_graphs():
+    """T4d (2 GPUs): cross-stack anchor. OUR graphs vs the FORK's graphs on
+    the same sequences, decode metric.
 
-    Bea's t4_bisect (Nov 6): Inductor codegen accounts for all of the
-    teacher-forced difference (graphs_only = 0.0), so this is the Inductor
-    numeric envelope. Gate: within 1.5x of the fork's own eager-vs-graphs
-    mean and p99 on the same sequences."""
-    with open(T4_SEQS) as f:
-        seqs = json.load(f)["seqs"]
-    eager = _teacher_forced_scores(seqs, enforce_eager=True)
-    graphs = _teacher_forced_scores(seqs)
-    _assert_within_fork_envelope("eager_vs_graphs", eager, graphs)
+    T4a compares our two modes with each other, so a bug present in both
+    (e.g. a wrong RoPE position or KV slot in the shared fused op) cancels
+    out there. T4d compares our replayed decode against the fork's (its
+    graphs.json from FLINT_SM70_FORK_SCORES_DIR, the envelope's input). Gate
+    per set: mean <= 1.5x and max <= 1.5x the fork's own eager_vs_graphs
+    decode anchor, i.e. ours may differ from the fork no more than the
+    fork's two modes differ from each other (plus 50%). Mutated side under
+    m5_mutation_check.sh: ours."""
+    seq_sets = _seq_sets()
+    env = _envelope(seq_sets)
+    tf = _tf_module()
+    fork = tf.load_scores(FORK_SCORES_DIR, "graphs")
+    assert sorted(fork) == sorted(seq_sets), f"fork sets {sorted(fork)}"
+    for k, seqs in seq_sets.items():
+        assert fork[k]["seqs_sha256"] == tf.seqs_sha256(seqs), f"fork set{k}: other sequences"
+        assert fork[k].get("mode") in (None, "graphs"), f"fork set{k}: {fork[k].get('mode')}"
+    ours, _ = _score_sets(seq_sets, prefill=False, **_mutated())
+    _print_top1("T4d", "ours graphs", ours)
+    anchor = env["pairs"][tf.GATE_ANCHOR_PAIR["T4d"]]["decode"]["anchor"]
+    failures = _gate_sets("T4d", "ours_graphs_vs_fork_graphs", anchor, "decode", ours, fork,
+                          _ours_noise(), env)
+    assert not failures, (
+        f"T4d outside {T4_ENVELOPE_FACTOR}x the fork's eager_vs_graphs anchor: {failures}")
 
-
-@pytest.mark.gpu
-@two_gpus
-@needs_ckpt
-def test_t4b_graph_replay_exact_at_one_seq():
-    """T4b (2 GPUs): CUDA-graph replay is exact when M cannot change.
-
-    max_num_seqs=1 means every decode step has M=1 in both runs (no capture
-    padding), and mode NONE + cudagraph FULL takes Inductor out. Greedy
-    tokens must then be identical to eager for all 256 tokens: any flip is a
-    capture/replay bug, not numerics."""
-    eager = _greedy_once(256, enforce_eager=True, max_num_seqs=1)
-    graphs = _greedy_once(
-        256, max_num_seqs=1,
-        compilation_config={"mode": 0, "cudagraph_mode": "FULL"},
-    )
-    for i, (e, g) in enumerate(zip(eager, graphs)):
-        pos = next((j for j, (a, b) in enumerate(zip(e, g)) if a != b), None)
-        print(f"T4b prompt {i}: " + ("identical" if pos is None else f"differs at {pos}"))
-    assert eager == graphs
 
 # Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
 GOLDEN_EXACT_TOKENS = 32
@@ -1189,12 +1755,26 @@ def test_t6_fp16_headroom_8k():
 @needs_envelope
 def test_t7_unfused_path_matches(monkeypatch):
     """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream
-    Attention) vs the fused route, both eager, teacher-forced on fixed
-    sequences. Gate: within 1.5x of the fork's own fused-vs-unfused mean and
-    p99 (pair "fused_vs_unfused" in the envelope)."""
-    with open(T4_SEQS) as f:
-        seqs = json.load(f)["seqs"]
-    fused = _teacher_forced_scores(seqs, enforce_eager=True)
+    Attention) vs the fused route, both eager, teacher-forced on every set,
+    decode and prefill. Gate per set and metric: mean <= 1.5x and max <=
+    1.5x the fork's own fused_vs_unfused anchor. Mutated side under
+    m5_mutation_check.sh: fused (hook mutations patch the fused op only)."""
+    from vllm_sm70.config import clear_cache
+
+    seq_sets = _seq_sets()
+    env = _envelope(seq_sets)
+    fused, _ = _score_sets(seq_sets, enforce_eager=True, **_mutated())
     monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", "0")
-    unfused = _teacher_forced_scores(seqs, enforce_eager=True)
-    _assert_within_fork_envelope("fused_vs_unfused", fused, unfused)
+    clear_cache()
+    try:
+        unfused, _ = _score_sets(seq_sets, enforce_eager=True)
+    finally:
+        monkeypatch.delenv("VLLM_SM70_FLINT_QK_ROPE_KV")
+        clear_cache()
+    tf, noise = _tf_module(), _ours_noise()
+    failures = []
+    for m in tf.METRICS:
+        anchor = env["pairs"][tf.GATE_ANCHOR_PAIR["T7"]][m]["anchor"]
+        failures += _gate_sets("T7", "fused_vs_unfused", anchor, m, fused, unfused,
+                               noise, env)
+    assert not failures, f"T7 outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
