@@ -20,6 +20,11 @@ Why: on cc 7.0, UP's NVFP4 MoE backend selection has no kernel (Marlin and
   (:311-335, 685-717, 994-1037), the single-token compact slots (:528-620),
   the persistent single-launch decode (:293-310), and diagnostics
   (:1688-1716).
+  M<=2 decode: at load, layers that ``vllm_sm70.ops.flint_moe.admit_layer``
+  admits (Flint TP2 only: E256, H2048, local I256, top-6) get a DecodePlan
+  and the device's shared split-K workspace; ``apply`` sends calls that
+  ``flint_moe.can_decode`` accepts (M in {1, 2}) to the K12 two-kernel
+  decode. Everything else stays on the dense-stage route.
 Kill-switch: ``Sm70Config.flint_moe_qpn_decode`` /
   ``VLLM_SM70_FLINT_MOE_QPN_DECODE=0`` turns off the M<=2 decode fast path
   (K12 ops). The dense stage then serves every M. ``VLLM_SM70_QUANT=0`` (M2)
@@ -29,20 +34,22 @@ Ops: Kai's, only through ``vllm_sm70.ops.tm`` (K03): nvfp4_sm70_prepare,
 awq_moe_build_strided_ptrs, nvfp4_moe_dense_stage_sm70_out (W13 always runs on
 the permuted input: the indexed W13 op is a Qwen3.8-only contract, hidden 2560,
 FORK nvfp4_sm70_moe.py:336-359, and its CUDA guard rejects Flint shapes).
-The K12 decode ops (nvfp4_moe_decode_w13_swiglu_sm70_out,
-nvfp4_moe_decode_w2_reduce_sm70_out) are detected with ``tm.has_op``; they
-are absent today. Dtypes per the K03 contract: topk_weights float32, topk_ids
+The K12 decode (nvfp4_moe_decode_w13_swiglu_sm70_out,
+nvfp4_moe_decode_w2_reduce_sm70_out) is used only through
+``vllm_sm70.ops.flint_moe`` (admit_layer, allocate_workspace, can_decode,
+flint_moe_decode_out; contract in sm70/csrc/flint_moe/PROVENANCE.md). Dtypes per the K03 contract: topk_weights float32, topk_ids
 int32 (copied to int32 for moe_prepare_scatter when needed). Persistent
 buffers are allocated in process_weights_after_loading, never in forward.
 """
 
 from __future__ import annotations
 
-import logging
+import os
 from typing import TYPE_CHECKING, Any, Final
 
 import torch
 from torch.nn import Parameter
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
 
@@ -57,7 +64,13 @@ if TYPE_CHECKING:
         SharedExperts,
     )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.quant.nvfp4_moe")
+
+# K12 decode switch and the one contract it serves (flint_moe.FLINT_TP2;
+# repeated here so the check works when vllm_sm70.ops.flint_moe is absent).
+_DECODE_SWITCH: Final = "VLLM_SM70_FLINT_MOE_QPN_DECODE"
+_FLINT_TP2_CONTRACT: Final = (256, 2048, 256, 6)
+_warned_decode_ops_absent = False
 
 NVFP4_GROUP_SIZE: Final = 16
 REQUIRED_OPS: Final = (
@@ -65,8 +78,6 @@ REQUIRED_OPS: Final = (
     "awq_moe_build_strided_ptrs",
     "nvfp4_moe_dense_stage_sm70_out",
 )
-DECODE_W13_OP: Final = "nvfp4_moe_decode_w13_swiglu_sm70_out"
-DECODE_W2_OP: Final = "nvfp4_moe_decode_w2_reduce_sm70_out"
 
 # ported from FORK nvfp4_sm70_moe.py:79-86 (Flint rows only)
 SUPPORTED_CONTRACTS: Final = frozenset(
@@ -77,13 +88,10 @@ SUPPORTED_CONTRACTS: Final = frozenset(
     }
 )
 SUPPORTED_TP_SIZES: Final = moe_rt.SUPPORTED_TP_SIZES  # (1, 2)
-# ported from FORK nvfp4_sm70_moe.py:120-129
-DECODE_QPN_CONTRACTS: Final = frozenset({(256, 2048, 256, 6)})  # Flint TP2
-DECODE_QPN_MAX_TOKENS: Final = 2
-DECODE_QPN_PARTIALS: Final = 98304
-DECODE_QPN_COUNTERS: Final = 96 + 32
-_FP16_MAX: Final = 65504.0
-DECODE_QPN_MAX_SHIFT: Final = 14
+# K12 split-K workspaces, one per device, shared by every admitted layer on
+# it (they run one after another on one stream). Filled only from
+# process_weights_after_loading, never from apply or under graph capture.
+_DECODE_WORKSPACES: dict[str, Any] = {}
 
 
 def validate_contract(moe: FusedMoEConfig) -> None:
@@ -143,20 +151,6 @@ def expert_scales(
     return scales.half().t().contiguous()
 
 
-def decode_scale_shift(scales: torch.Tensor) -> int | None:
-    """Power-of-two pre-shift that keeps the decode scale product finite.
-
-    ported from FORK nvfp4_sm70_moe.py:180-195.
-    """
-    peak = float(scales.detach().abs().amax().float())
-    if not peak < float("inf"):
-        return None
-    for shift in range(DECODE_QPN_MAX_SHIFT + 1):
-        if peak * 2.0 ** (14 - shift) <= _FP16_MAX:
-            return shift
-    return None
-
-
 def decode_policy_enabled(vllm_config: Any = None) -> bool:
     """Sm70Config.flint_moe_qpn_decode after VLLM_SM70_FLINT_MOE_QPN_DECODE=0."""
     if vllm_config is None:
@@ -166,13 +160,29 @@ def decode_policy_enabled(vllm_config: Any = None) -> bool:
     return bool(sm70_config(vllm_config).flint_moe_qpn_decode)
 
 
-def decode_ops_available() -> bool:
-    if not (has_tm_op(DECODE_W13_OP) and has_tm_op(DECODE_W2_OP)):
-        return False
-    tm = _tm()
-    return callable(getattr(tm, DECODE_W13_OP, None)) and callable(
-        getattr(tm, DECODE_W2_OP, None)
-    )
+def _flint_moe():
+    """Kai's K12 wrappers (vllm_sm70.ops.flint_moe), or None if not importable."""
+    try:
+        from vllm_sm70.ops import flint_moe  # type: ignore[attr-defined]
+    except ImportError:
+        return None
+    return flint_moe
+
+
+def decode_workspace(flint_moe: Any, device: torch.device) -> Any:
+    """The device's shared K12 workspace; allocates it on first use (load only).
+
+    flint_moe.allocate_workspace refuses inside CUDA graph capture.
+    """
+    key = str(device)
+    ws = _DECODE_WORKSPACES.get(key)
+    if ws is None:
+        ws = _DECODE_WORKSPACES[key] = flint_moe.allocate_workspace(device)
+    return ws
+
+
+def clear_decode_workspaces() -> None:
+    _DECODE_WORKSPACES.clear()
 
 
 class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
@@ -310,48 +320,63 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
             torch.cuda.empty_cache()
 
     def _prepare_decode(self, layer: Any, contract: tuple[int, int, int, int]) -> None:
-        """Admit the K12 M<=2 decode and give the layer its split-K workspace.
+        """Admit the K12 M<=2 decode (flint_moe.admit_layer) after the banks
+        are stacked, and give admitted layers the device's shared workspace.
 
-        ported from FORK nvfp4_sm70_moe.py:218-290 (two-kernel form only).
+        ``contract`` is (experts, hidden, local intermediate, top_k).
+        admit_layer owns the contract, op presence, bank shape/dtype and
+        scale pre-shift checks; with an explicit policy it does not read the
+        env, so the kill switch is applied here too (it can only disable).
         """
-        layer.sm70_nvfp4_decode_qpn = False
-        if not (self.decode_enabled and contract in DECODE_QPN_CONTRACTS):
+        layer.sm70_nvfp4_decode_plan = None
+        layer.sm70_nvfp4_decode_ws = None
+        flint_moe = _flint_moe()
+        ops_present = flint_moe is not None and flint_moe.available()
+        if (
+            not ops_present
+            and self.decode_enabled
+            and contract == _FLINT_TP2_CONTRACT
+        ):
+            # fork nvfp4_sm70_moe.py:240-251: an explicit request for the
+            # decode with the ops missing is an error, not a silent fallback.
+            # "1" never enables anything here; it only makes absence fatal.
+            if os.environ.get(_DECODE_SWITCH) == "1":
+                raise RuntimeError(
+                    f"{_DECODE_SWITCH}=1 requires vllm_sm70._sm70_C built with "
+                    "the K12 ops nvfp4_moe_decode_w13_swiglu_sm70_out and "
+                    "nvfp4_moe_decode_w2_reduce_sm70_out."
+                )
+            global _warned_decode_ops_absent
+            if not _warned_decode_ops_absent:
+                _warned_decode_ops_absent = True
+                logger.warning(
+                    "The SM70 NVFP4 M<=2 decode ops are absent from the loaded "
+                    "_sm70_C; keeping the dense-stage route for M<=2."
+                )
+        if flint_moe is None:
             return
-        if not decode_ops_available():
-            logger.debug("SM70 NVFP4 M<=2 decode ops absent; dense stage serves M<=2.")
-            return
-        w13_shift = decode_scale_shift(layer.w13_tm_scales)
-        w2_shift = decode_scale_shift(layer.w2_tm_scales)
-        if w13_shift is None or w2_shift is None:
-            logger.warning(
-                "SM70 NVFP4 M<=2 decode: a prepared expert scale is out of FP16 "
-                "range even after a 2^%d pre-shift; this layer keeps the dense "
-                "stage.",
-                DECODE_QPN_MAX_SHIFT,
+        plan = flint_moe.admit_layer(
+            contract,
+            layer.w13_tm_weight,
+            layer.w13_tm_scales,
+            layer.w2_tm_weight,
+            layer.w2_tm_scales,
+            policy_enabled=bool(self.decode_enabled and flint_moe.enabled()),
+        )
+        if plan is None:
+            logger.info_once(
+                "SM70 NVFP4 MoE: K12 M<=2 decode not admitted for contract %s "
+                "(policy %s, ops %s); dense-stage route serves M<=2.",
+                contract, bool(self.decode_enabled), ops_present,
             )
             return
-        device = layer.w13_tm_weight.device
-        layer.sm70_nvfp4_decode_partials = torch.empty(
-            DECODE_QPN_PARTIALS, dtype=torch.float32, device=device
+        logger.info_once(
+            "SM70 NVFP4 MoE: K12 M<=2 decode admitted for contract %s "
+            "(VLLM_SM70_FLINT_MOE_QPN_DECODE=0 disables it).", contract,
         )
-        # Arrival counters start at zero; the kernel re-arms them.
-        layer.sm70_nvfp4_decode_counters = torch.zeros(
-            DECODE_QPN_COUNTERS, dtype=torch.int32, device=device
-        )
-        layer.sm70_nvfp4_decode_w13_scale_shift = w13_shift
-        layer.sm70_nvfp4_decode_w2_scale_shift = w2_shift
-        layer.sm70_nvfp4_decode_qpn = True
-
-    @staticmethod
-    def _use_decode(layer: Any, x: torch.Tensor, topk_weights, topk_ids) -> bool:
-        # ported from FORK nvfp4_sm70_moe.py:198-215
-        tokens = x.shape[0]
-        return bool(
-            getattr(layer, "sm70_nvfp4_decode_qpn", False)
-            and 0 < tokens <= DECODE_QPN_MAX_TOKENS
-            and topk_ids.dtype == torch.int32
-            and topk_ids.is_contiguous()
-            and topk_weights.is_contiguous()
+        layer.sm70_nvfp4_decode_plan = plan
+        layer.sm70_nvfp4_decode_ws = decode_workspace(
+            flint_moe, layer.w13_tm_weight.device
         )
 
     def apply(
@@ -386,34 +411,32 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         if num_tokens == 0:
             return x.new_empty((0, hidden))
         x = x.contiguous()
-        tm = _tm()
         ws: Sm70MoEWorkspace = layer.sm70_moe_workspace
         buffers = ws.views(num_tokens)
+
+        plan = getattr(layer, "sm70_nvfp4_decode_plan", None)
+        if plan is not None:
+            flint_moe = _flint_moe()
+            if flint_moe.can_decode(x, topk_weights, topk_ids):
+                # K12: int32 or int64 IDs; out is fully overwritten; the result
+                # is the local un-reduced sum, like the dense route.
+                out = torch.empty((num_tokens, hidden), dtype=x.dtype, device=x.device)
+                return flint_moe.flint_moe_decode_out(
+                    out,
+                    buffers["intermediate"],
+                    x,
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    topk_weights,
+                    topk_ids,
+                    layer.sm70_nvfp4_decode_ws,
+                    plan,
+                )
+
+        tm = _tm()
         output = torch.zeros((num_tokens, hidden), dtype=x.dtype, device=x.device)
-
-        if self._use_decode(layer, x, topk_weights, topk_ids):
-            ids = topk_ids.view(-1)
-            getattr(tm, DECODE_W13_OP)(
-                buffers["intermediate"],
-                x,
-                layer.w13_tm_weight,
-                layer.w13_tm_scales,
-                ids,
-                layer.sm70_nvfp4_decode_partials,
-                layer.sm70_nvfp4_decode_counters,
-                layer.sm70_nvfp4_decode_w13_scale_shift,
-            )
-            getattr(tm, DECODE_W2_OP)(
-                output,
-                buffers["intermediate"],
-                layer.w2_tm_weight,
-                layer.w2_tm_scales,
-                ids,
-                topk_weights,
-                layer.sm70_nvfp4_decode_w2_scale_shift,
-            )
-            return output
-
         moe_rt.route_materialized(buffers, x, topk_ids, experts, top_k)
         tm.nvfp4_moe_dense_stage_sm70_out(
             buffers["gate_up"],

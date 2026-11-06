@@ -4,6 +4,11 @@
 Rules:
 - Kill switches: only the value "0" acts, and it turns a feature off. The
   environment can never turn a feature on; defaults are decided in code.
+- Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
+  for fork compatibility: they add a check or a memset, never a kernel.
+  Two reviewed exceptions select a kernel, both off by default until
+  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -39,6 +44,23 @@ def _debug_flag(name: str) -> Callable[[], bool]:
 
     def getter() -> bool:
         return os.environ.get(name, "") not in ("", "0")
+
+    getter.__name__ = f"env_{name}"
+    return getter
+
+
+def opt_in(name: str) -> Callable[[], bool]:
+    """Getter that is True only when `name` == "1".
+
+    For the few fork switches that default off and keep their fork meaning
+    (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
+    memset). They add work or checks; they never select a different kernel,
+    except VLLM_SM70_DFLASH2_FP16 (K18) and VLLM_SM70_FP8_QPN8_M32 (K09),
+    opt-in by review decision.
+    """
+
+    def getter() -> bool:
+        return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
     return getter
@@ -91,6 +113,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_CUTLASS_DIR",  # setup.py -> CMake: CUTLASS headers
             "VLLM_SM70_REQUIRE_CUDA",  # CMake option
             "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
+            "VLLM_SM70_FV100_FUSED_DECODE",  # CMake option / C++ define (K05/K14)
+            # CMake $ENV (K17): vLLM's patched csrc/ for csrc/custom_ar
+            "VLLM_SM70_VLLM_CSRC_DIR",
         )
     },
     "core": {
@@ -152,9 +177,58 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
+        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
+        # the other opt_in switches this one selects a kernel.
+        "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
+        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
+        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
+        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
+        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
+        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
+        # Off: get_unquantized_gemm returns None, nothing is marked or
+        # packed. Read once (selection cached) when layers are built/loaded.
+        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
     },
-    "attention": {},
-    "gdn": {},
+    "attention": {
+        # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
+        "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+        # K14 (C4): "0" -> Flint sink layers decode with the grouped
+        # partition kernel plus reducer (two launches) instead of the
+        # one-launch fused kernel. Read on every decode call
+        # (vllm_sm70/ops/fv100.py:fused_decode_enabled).
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE": kill_switch(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
+        ),
+        # K14 (C4), fork name and meaning, default off: "1" adds one memset
+        # of the arrival counters before every fused launch (captured into
+        # graphs too). Belt and braces; the kernel re-zeroes them itself.
+        "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS": opt_in(
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
+        ),
+        # K07: "0" -> verify rows take the causal paged prefill (K06) instead
+        # of the smallq -> XQA expansion; graphs then cover 1-token decode.
+        "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
+    },
+    # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
+    "gdn": {
+        # "0": GDN chunked prefill stays on upstream Triton/FLA (read when
+        # ChunkGatedDeltaRule is built, vllm_sm70/gdn/kernels.py).
+        "VLLM_SM70_GDN_FLASHQLA_PREFILL": kill_switch(
+            "VLLM_SM70_GDN_FLASHQLA_PREFILL"
+        ),
+        # "0": non-spec GDN decode stays on upstream's packed Triton decode
+        # (read on each flashqla_decode() call). Fork name kept.
+        "VLLM_SM70_GDN_DECODE_FLASHQLA": kill_switch("VLLM_SM70_GDN_DECODE_FLASHQLA"),
+        # "0": patch U2 off; the FLA recurrent kernels keep upstream's BV on
+        # sm_70 (read by vllm/third_party/flash_linear_attention/ops/
+        # fused_recurrent.py, which only checks for "0").
+        "VLLM_SM70_FLA_RECURRENT_SCHED": kill_switch("VLLM_SM70_FLA_RECURRENT_SCHED"),
+    },
     "fused_moe": {},
     # Mara (M1 sm70-config, M2 sm70-quant-gates). Kill switches only.
     "quant": {
@@ -175,12 +249,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         ),
         # "0": Sm70Config.fp8_qpn8=False.
         "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
+        # "0": Sm70Config.fp8_block_qpn8=False (M8 block QPN8 decode GEMV;
+        # the Qwen FP8 dense linears stay on M6 TurboMind).
+        "VLLM_SM70_FP8_BLOCK_QPN8": kill_switch("VLLM_SM70_FP8_BLOCK_QPN8"),
     },
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
-        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
-            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
-        ),
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".
@@ -190,7 +265,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
     },
-    "passes": {},
+    # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
+    # first runs on a graph (fork name kept).
+    "passes": {
+        # "0": the TP2 all-reduce + fused_add_rms_norm pattern is not applied;
+        # graphs keep upstream's all_reduce and fused_add_rms_norm.
+        "VLLM_SM70_FLINT_AR_RMSNORM": kill_switch("VLLM_SM70_FLINT_AR_RMSNORM"),
+    },
 }
 
 

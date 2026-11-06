@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Decode/prefill dispatch onto the K05 Flash-V100 ops (K06).
+
+Takes the place of the fork's decode/prefill executors
+(flash_v100/{decode,prefill,dense_prefill,routing}.py, ~5.9K lines) for the
+lean subset:
+
+  decode   D256, no sinks, no window, GQA 4/6/8 -> tensor-core XQA
+           otherwise (Flint D128 GQA8 sinks/window, other GQA) -> paged
+           decode, with sinks when the layer has them
+  prefill  rows grouped by query length -> paged prefill (generic, low-SMEM
+           or BM32 phase chosen in C++), with sinks when present
+
+CUDA graphs: a captured decode replays for any sequence length, so under
+capture the launch grid covers max_model_len (the "workspace envelope");
+eager decode launches only what the batch's max_seq_len needs.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from vllm_sm70.ops import fv100
+
+if TYPE_CHECKING:
+    from vllm_sm70.attention.flash_v100.metadata import FlashAttnV100Metadata
+
+FULL_WINDOW = (-1, -1)
+
+
+def split_kv_cache(
+    kv_cache: torch.Tensor, head_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V views of upstream's logical (blocks, H_kv, block_size, 2*D) cache."""
+    return fv100.split_lbnhc_kv_cache(kv_cache, head_size)
+
+
+def use_xqa(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    window: tuple[int, int],
+    sinks: torch.Tensor | None,
+) -> bool:
+    """fork routing.py:133-135 plus decode.py:776-790 (XQA has no sink term)."""
+    return (
+        sinks is None
+        and window == FULL_WINDOW
+        and fv100.xqa_supported(query, key_cache)
+    )
+
+
+def _capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # no CUDA (CPU tests)
+        return False
+
+
+def run_decode(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    metadata: FlashAttnV100Metadata,
+    *,
+    scale: float,
+    window: tuple[int, int],
+    sinks: torch.Tensor | None,
+) -> None:
+    """Decode rows [0, decode_rows), one query token each (row i <-> token i).
+
+    Without spec decode a row is a request (padding rows of a captured batch
+    have zero tokens and sit at the end). With the K07 verify expansion a
+    row is a verify token, with its own visible length and block-table row
+    (metadata.decode_seq_lens / decode_block_table, persistent buffers).
+    """
+    num = metadata.decode_rows
+    if num == 0:
+        return
+    q = query[:num]
+    out = output[:num]
+    seq_lens = metadata.decode_seq_lens
+    block_table = metadata.decode_block_table
+    if metadata.cudagraph_capture or _capturing():
+        envelope = max(metadata.max_model_len, metadata.max_seq_len, 1)
+        hints = dict(max_seq_len_hint=envelope, workspace_seq_capacity_hint=envelope)
+    else:
+        hints = dict(max_seq_len_hint=max(metadata.max_seq_len, 1))
+    if use_xqa(q, key_cache, window, sinks):
+        fv100.flash_attn_decode_paged_xqa(
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=scale,
+            out=out,
+            **hints,
+        )
+    else:
+        fv100.flash_attn_decode_paged(
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=scale,
+            out=out,
+            window_size=window,
+            sinks=sinks,
+            **hints,
+        )
+
+
+def run_prefill(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    metadata: FlashAttnV100Metadata,
+    *,
+    scale: float,
+    causal: bool,
+    window: tuple[int, int],
+    sinks: torch.Tensor | None,
+) -> None:
+    """Varlen prefill: one uniform-M launch per query-length group."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    for group in metadata.prefill_groups:
+        q = query.index_select(0, group.token_index).view(
+            group.num_rows, group.query_len, num_heads, head_size
+        )
+        out = fv100.flash_attn_prefill_paged(
+            q,
+            key_cache,
+            value_cache,
+            metadata.block_table.index_select(0, group.rows),
+            metadata.fv_seq_lens.index_select(0, group.rows),
+            softmax_scale=scale,
+            causal=causal,
+            window_size=window,
+            sinks=sinks,
+        )
+        output.index_copy_(0, group.token_index, out.view(-1, num_heads, head_size))
+
+
+# ---------------------------------------------------------------------------
+# K14 (C4): one-launch sink decode. Ported from fork cf9492a
+# vllm/v1/attention/backends/flash_v100/impl.py:49-70 (capture summary) and
+# :894-920, :942-948 (_prepare_fused_sink_decode and its call in forward).
+# ---------------------------------------------------------------------------
+
+# A sink-layer forward ran under capture since the last eager one.
+_SINK_CAPTURE_PENDING = [False]
+_SINK_CAPTURE_REPORTED: list[tuple[int, int] | None] = [None]
+
+
+def _log_sink_capture_summary() -> None:
+    totals = fv100.flash_attn_decode_paged_sinks_capture_counts()
+    previous = _SINK_CAPTURE_REPORTED[0]
+    if not any(totals) or totals == previous:
+        return
+    _SINK_CAPTURE_REPORTED[0] = totals
+    # The totals grow with every captured size, so INFO only for the first
+    # report or a new two-launch fallback; later growth goes to DEBUG. Each
+    # fallback already warned with its reason when it was captured.
+    first_or_fallback = previous is None or totals[1] != previous[1]
+    (fv100.logger.info if first_or_fallback else fv100.logger.debug)(
+        "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
+        "one-launch, %d two-launch (partition kernel plus reducer).",
+        *totals,
+    )
+
+
+def init_fused_decode(impl) -> None:
+    """At layer construction: mark sink layers the one-launch kernel takes and
+    allocate the device's counters right away (R4: eager, before any capture).
+
+    vLLM v0.33.0's profile run has no attention metadata and the decode
+    graphs are captured largest batch first, so the layer's first eager
+    forward is only the capture warmup; allocating here does not depend on
+    it. `fused_decode_hook` repeats the (idempotent) prepare on the first
+    eager forward for devices that were not ready at construction.
+    """
+    impl._fv100_fused_sinks = bool(
+        getattr(impl, "_fv100_reason", None) is None
+        and impl.sinks is not None
+        and impl.head_size == fv100.FUSED_DECODE_HEAD_DIM
+        and impl.num_heads == fv100.FUSED_DECODE_GQA * impl.num_kv_heads
+    )
+    impl._fv100_fused_ready = False
+    if not impl._fv100_fused_sinks:
+        return
+    device = impl.sinks.device
+    if device.type != "cuda":
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return
+        device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        impl._fv100_fused_ready = fv100.flash_attn_decode_paged_sinks_prepare(device)
+    except Exception:  # never fail model construction over an optimisation
+        fv100.logger.debug("Flash-V100 fused decode prepare failed", exc_info=True)
+
+
+def fused_decode_hook(impl, metadata: FlashAttnV100Metadata) -> None:
+    """Every Flash-V100 forward: keep the one-launch sink decode ready.
+
+    Sink layers only. Under capture nothing is allocated (a graph without
+    counters decodes in two launches) and the capture is noted; the first
+    eager forward after a capture reports the capture totals; the layer's
+    first eager forward asks for the device's counters once (a no-op when
+    VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 or the op is not built).
+    """
+    if not getattr(impl, "_fv100_fused_sinks", False):
+        return
+    if _capturing():
+        _SINK_CAPTURE_PENDING[0] = True
+        return
+    if _SINK_CAPTURE_PENDING[0]:
+        _SINK_CAPTURE_PENDING[0] = False
+        _log_sink_capture_summary()
+    if impl._fv100_fused_ready:
+        return
+    impl._fv100_fused_ready = True
+    device = metadata.seq_lens.device
+    if device.type == "cuda":
+        fv100.flash_attn_decode_paged_sinks_prepare(device)

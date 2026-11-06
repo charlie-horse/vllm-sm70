@@ -47,7 +47,7 @@ from vllm_sm70 import envs
 from vllm_sm70 import platform as sm70_platform
 from vllm_sm70.config import fp8_turbomind_enabled
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.sm70.quant")
 
 SM70_MIN_CAPABILITY = 70
 
