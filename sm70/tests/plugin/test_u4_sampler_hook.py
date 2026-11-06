@@ -53,3 +53,20 @@ def test_sample_tokens_uses_then_clears_platform_output(runner_cls):
     clear = src.index("self._platform_sampler_output = None", use)
     bookkeep = src.index("self._bookkeeping_sync(")
     assert use < clear < bookkeep
+
+
+def test_refuses_spec_decode_and_structured_output(runner_cls):
+    src = inspect.getsource(runner_cls.execute_model)
+    try_sample = src.index("self._hidden_state_sampler.try_sample(")
+    guard = src[src.rindex("if (", 0, try_sample) : try_sample]
+    assert "self._hidden_state_sampler is not None" in guard
+    assert "spec_decode_metadata is None" in guard
+    assert "not scheduler_output.has_structured_output_requests" in guard
+
+
+def test_grammar_never_meets_platform_output(runner_cls):
+    src = inspect.getsource(runner_cls.sample_tokens)
+    check = src.index(
+        "assert grammar_output is None or self._platform_sampler_output is None"
+    )
+    assert check < src.index("apply_grammar_bitmask(")

@@ -72,6 +72,7 @@ The two defs keep the fork schemas character for character; the namespace is
 | runner `_can_use_sm70_compact_topk20_tokens` :7698-7768 (minus the :7703-7706 delegation) | the compact route above (fixed vocab 248320, top-p 0.95, temperature 1.0 only) |
 | fork `_sm70_sampler_C` module and its CMake (`CMakeLists.txt`:762-800) | one `.so` (`_sm70_C`); C++20 instead of the fork's C++17 target properties, no separate compilation |
 | `layer_policy(...).value("flint_sampler")` on the model | kill switch is read in the platform getter instead |
+| Flint greedy `get_top_tokens` fast path (FORK `gpu_model_runner.py:6950-6962` gate, `:7176` call; `sm70_greedy_token_fastpath`, DDTree greedy sampling) | not ported. It needs a model-side `get_top_tokens` and a second runner branch; K16 rejects temperature 0, so greedy requests take upstream's sampler. Revisit only if greedy decode shows up in a Flint profile after D2 |
 
 Nothing in the kept code is TP4-only.
 

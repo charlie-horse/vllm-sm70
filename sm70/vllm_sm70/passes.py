@@ -41,7 +41,7 @@ class _Pattern:
         self.name, self.version, self.fn = name, version, fn
 
 
-# Filled by areas (e.g. K17 AR+RMSNorm) via register_pattern(). Empty in K01.
+# Filled by areas via register_pattern() from register() (K17: AR+RMSNorm).
 _PATTERNS: list[_Pattern] = []
 
 
@@ -109,4 +109,7 @@ def install_composite_pass(compilation_config: Any) -> Sm70CompositePass:
 
 
 def register() -> None:
-    """Area hook. K01 has no patterns; later patches call register_pattern()."""
+    """Area hook: each fusion area decides whether its pattern registers."""
+    from vllm_sm70 import ar_rms_fusion
+
+    ar_rms_fusion.register()  # K17; a no-op (logged once) without the kernel

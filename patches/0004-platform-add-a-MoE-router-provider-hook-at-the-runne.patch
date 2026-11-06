@@ -71,10 +71,10 @@ index dd42c8332ffd..f5f3b58826b0 100644
  
              return self._maybe_combine(
 diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
-index 765a64441505..e64bd77f9cfd 100644
+index 765a64441505..57792438b4c6 100644
 --- a/vllm/platforms/interface.py
 +++ b/vllm/platforms/interface.py
-@@ -1212,6 +1212,16 @@ class Platform:
+@@ -1212,6 +1212,19 @@ class Platform:
      def kernel_warmup(cls, worker: Any) -> None:
          """Warm up platform kernels before CUDA graph capture."""
  
@@ -83,9 +83,12 @@ index 765a64441505..e64bd77f9cfd 100644
 +        """Return provider(runner) -> route | None, or None for upstream.
 +
 +        route.try_route(hidden_states) returns (topk_weights, topk_ids) that
-+        replace the runner's gate GEMM and select_experts, or None for the
-+        upstream path. Return no route for monolithic kernels, fused shared
-+        expert gates, or EP/sequence-parallel dispatch."""
++        replace the runner's gate GEMM and router.select_experts, or None for
++        the upstream path. A precomputed route also skips the rest of
++        select_experts: capture_fn, the EPLB logical-to-physical mapping, the
++        topk_indices_dtype conversion and the routing-replay write. Return no
++        route when any of those is active, and for monolithic kernels, fused
++        shared expert gates, or EP/sequence-parallel dispatch."""
 +        return None
 +
      @classmethod

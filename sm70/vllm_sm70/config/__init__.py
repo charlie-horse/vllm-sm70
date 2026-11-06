@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """M1 sm70-config: the typed SM70 policy for the plugin.
 
-What: ``Sm70Config``, a frozen pydantic model with 9 fields (extra keys are
+What: ``Sm70Config``, a frozen pydantic model with 11 fields (extra keys are
   rejected), and ``sm70_config(vllm_config)``. The helper reads
   ``additional_config["sm70"]`` (or ``kernel_config.sm70``), applies the
   kill-only env switches from ``vllm_sm70.envs``, and caches the result per
@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import weakref
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -105,11 +106,46 @@ class Sm70Config(BaseModel):
     their own switches. Kill: VLLM_SM70_FLINT_QK_ROPE_KV=0."""
 
     fp8_qpn8: bool | None = None
-    """FP8 QPN8 projection layout. None (auto) means on only when the DFlash2
-    verifier contract qualifies and quantization == "fp8"
-    (platforms/runtime_defaults.py:497-513; SM70_DFLASH2_VERIFIER_DEFAULTS
-    sm70_dflash2.py:27). Effective values: Qwen3.8-27B True, Qwen3.6-35B-A3B
-    False. Plain default 0 (envs.py:3880). Kill: VLLM_SM70_FP8_QPN8=0."""
+    """The fork's sm70_native "qpn8" selector (kernel_config.sm70_fp8.qpn8,
+    FORK config/kernel.py:398), NOT block QPN8 (see fp8_block_qpn8). Reserved
+    for the sm70_native qpn8 selector (M9/verifier); M8 does not read it.
+    None (auto) means on only when the DFlash2 verifier contract qualifies
+    and quantization == "fp8" (platforms/runtime_defaults.py:497-513;
+    SM70_DFLASH2_VERIFIER_DEFAULTS sm70_dflash2.py:27). Effective values:
+    Qwen3.8-27B True, Qwen3.6-35B-A3B False. Plain default 0 (envs.py:3880).
+    Kill: VLLM_SM70_FP8_QPN8=0."""
+
+    fp8_block_qpn8: bool = True
+    """M8 block QPN8: weight-only FP8 decode GEMV for block-128 dense
+    linears (K09). Evidence: FORK cf9492a kernel_config.sm70_fp8.block_qpn8
+    = True (config/kernel.py:386); QPN8Fp8BlockScaledMMLinearKernel is first
+    in _POSSIBLE_FP8_BLOCK_KERNELS for CUDA (kernels/linear/__init__.py:344)
+    and its can_implement (kernels/linear/qpn/fp8_block.py:160-195) gates
+    only on this flag, fp16 in/out, static 128x128 block weights, rank 2,
+    N,K % 128 and the native ops. So it is on for both Qwen3.6-35B-A3B and
+    Qwen3.8-27B (docs/models/sm70-effective-defaults.md). No override
+    applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0.
+
+    The flag alone does not admit a layer; fp8_block_qpn8_turbomind_copy
+    does. At the c4130 prod settings (max_num_seqs 4, DFlash2 k=7, so 32
+    rows) the default copy policy admits neither Qwen model while K09's
+    block-scaled max M is 8: both stay on M6 TurboMind (signed-off
+    deviation, PR #65)."""
+
+    fp8_block_qpn8_turbomind_copy: bool | None = None
+    """Block QPN8 vs a second, TurboMind-packed weight copy. rows =
+    max_num_seqs * (num_speculative_tokens + 1); max_m = K09's
+    qpn8_max_m(block_scaled=True): 8, or 32 with VLLM_SM70_FP8_QPN8_M32=1.
+    None (default, safe): admit block QPN8 with no copy iff rows <= max_m;
+    otherwise do NOT admit it (plain M6, one copy). True: admit and keep the
+    TurboMind copy for rows above max_m (two copies; bench/explicit only).
+    False: admit with no copy; rows above max_m use K09's dense fallback.
+    None deliberately differs from the fork's auto, which kept the copy
+    when rows > 8 (FORK config/kernel.py:388 block_qpn8_volta_turbomind_prefill,
+    kernels/linear/qpn/fp8_block.py:204-213): the default must not double
+    the dense FP8 weights on 32 GB V100s (~+12 GiB per GPU on Qwen3.8-27B
+    at TP2). True reproduces the fork's two-copy behaviour. No kill switch
+    (a policy, not a feature)."""
 
     dflash2_verifier: VerifierMode = "auto"
     """The DFlash2 verifier bundle: 17 fork SM70_DFLASH2_* flags plus FP8_QPN8
@@ -133,6 +169,8 @@ GRAPH_FIELDS: tuple[str, ...] = (
     "quant_backend",
     "flint_qk_rope_kv",
     "fp8_qpn8",
+    "fp8_block_qpn8",
+    "fp8_block_qpn8_turbomind_copy",
     "dflash2_verifier",
     "flint_moe_qpn_decode",
     "fp8_moe_decode",
@@ -154,6 +192,7 @@ KILL_SWITCHES: dict[str, tuple[str, Any]] = {
     "VLLM_SM70_FP8_MOE_COMPACT_DECODE": ("fp8_moe_compact_decode", False),
     "VLLM_SM70_FLINT_QK_ROPE_KV": ("flint_qk_rope_kv", False),
     "VLLM_SM70_FP8_QPN8": ("fp8_qpn8", False),
+    "VLLM_SM70_FP8_BLOCK_QPN8": ("fp8_block_qpn8", False),
     "VLLM_SM70_DFLASH2_VERIFIER": ("dflash2_verifier", "off"),
     "VLLM_SM70_SHARED_MOE_OVERLAP": ("shared_moe_overlap", False),
 }
@@ -264,6 +303,45 @@ def dflash2_verifier_enabled(cfg: Sm70Config, *, verifier_qualified: bool) -> bo
     return cfg.dflash2_verifier == "on"
 
 
+def dflash2_verifier_qualified(
+    model_config: Any, speculative_config: Any, parallel_config: Any
+) -> bool:
+    """The fork's DFlash2 verifier contract (FORK models/config.py:1087-1134,
+    sm70_dflash2_verifier_qualified): Qwen3_5 arch, fp16, hidden 5120, 24/4
+    heads x 256, method dflash with k=7, draft selector_top_k 16, PP1, no
+    DBO/ubatching. Target quantization and TP are not part of it (fork
+    docstring). Only getattr on the three configs, so no vllm import.
+    Reserved for the sm70_native qpn8 selector / DFlash2 verifier (M9);
+    M8's block QPN8 does not use it."""
+    if model_config is None or speculative_config is None or parallel_config is None:
+        return False
+    import torch
+
+    draft = getattr(speculative_config, "draft_model_config", None)
+    dflash_config = getattr(getattr(draft, "hf_config", None), "dflash_config", None)
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
+    text = getattr(model_config, "hf_text_config", None)
+    archs = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        archs & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(text, "hidden_size", None) == 5120
+        and getattr(text, "num_attention_heads", None) == 24
+        and getattr(text, "num_key_value_heads", None) == 4
+        and getattr(text, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "dflash"
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
 # --------------------------------------------------------------------------
 # Frozen constants: the effective cf9492a values of the knobs that are no
 # longer configurable. "override" marks values the cc=7.0 platform defaults
@@ -351,6 +429,7 @@ __all__ = [
     "clear_cache",
     "compute_hash",
     "dflash2_verifier_enabled",
+    "dflash2_verifier_qualified",
     "fp8_qpn8_enabled",
     "fp8_turbomind_enabled",
     "require_fp8_turbomind",

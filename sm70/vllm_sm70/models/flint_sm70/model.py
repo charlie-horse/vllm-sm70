@@ -15,12 +15,11 @@ FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
                                        92). RoutedExperts.load_weights builds
                                        its own mapping (UP fused_moe/
                                        routed_experts.py:1004-1008)
-runner.router_provider :229            K13 via U3's platform getter (M10;
+runner.router_provider :229            K13 via U3's platform getter (M10a;
                                        no model hook)
-Attention.forward(kv_cache_updated=)   op returns a dummy dep, then
-  :386                                 torch.ops.vllm.unified_attention_with_
-                                       output(kv_cache_dummy_dep=) (UP
-                                       attention/attention.py:772-800)
+Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
+  :386                                 OP_NAME>), then K15's attention_after_
+                                       fused_write (vllm_sm70/flint/)
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
 layer_policy(...).value("flint_        supports_sm70_topk_sampler = True
@@ -37,7 +36,7 @@ Not ported (fork cf9492a model.py): ``_expert_params_mapping`` :117-126 (UP
 RoutedExperts builds the mapping), ``get_expert_mapping`` :616-617, the
 sampler hooks ``_get_top_tokens`` :597-603 and ``_sample_topk_candidates``
 :605-614 (K16's U4 hook samples instead; M10 opts in), and the
-fused-router hook :227-229 (K13 binds through U3's platform getter).
+fused-router hook :227-229 (K13 binds through U3's platform getter, M10a).
 
 Quantization isn't special-cased here: dense ModelOpt W4A16 linears go to
 M3 (vllm_sm70/quant/nvfp4_linear.py) and routed experts to M4
@@ -93,10 +92,19 @@ from vllm.utils.torch_utils import _encode_layer_name
 
 from vllm_sm70.config import sm70_config
 
-from . import fp16_rescale
-from .qk_norm_rope_kv import fused_route_rejection
+# K15 (#54). Importing qk_norm_rope_kv registers the op in torch.ops.vllm.
+from vllm_sm70.flint import QK_ROPE_KV_OP_NAME
+from vllm_sm70.flint.qk_norm_rope_kv import (
+    attention_after_fused_write,
+    fused_route_rejection,
+)
 
-logger = init_logger(__name__)
+from . import fp16_rescale
+
+logger = init_logger("vllm.sm70.flint")
+
+# K15's fused q/k norm + RoPE + KV-write op, torch.ops.vllm.<QK_ROPE_KV_OP_NAME>.
+_QK_ROPE_KV_OP = getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
 
 # Shards that one fused linear loads. A fused NVFP4 linear keeps a single
 # global scale, so the shards' weight_scale_2 must agree (fork :76-84).
@@ -219,7 +227,7 @@ class FlintSm70SparseMoeBlock(nn.Module):
         # (vllm/model_executor/layers/fused_moe/routed_experts.py:1007) from the
         # default ckpt_names=("gate_proj","down_proj","up_proj")
         # (vllm/model_executor/layers/fused_moe/layer.py:125); and the fork's
-        # runner.router_provider (:229; in M10, K13 binds through U3's
+        # runner.router_provider (:229; in M10a, K13 binds through U3's
         # platform getter instead).
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
@@ -293,8 +301,8 @@ class FlintSm70Attention(nn.Module):
 
         self.rotary_emb = None
         if layer_idx not in config.no_rope_layer_indices:
-            # fp16 cos/sin (default dtype), which the fused kernel requires.
-            # UP Flint uses fp32 (UP :287-292).
+            # fp16 cos/sin (default dtype), as the fork built it. K15 also
+            # admits fp32, which UP Flint uses (UP :287-292).
             self.rotary_emb = get_rope(
                 self.head_dim,
                 max_position=config.max_position_embeddings,
@@ -335,6 +343,11 @@ class FlintSm70Attention(nn.Module):
             rotary_emb=self.rotary_emb,
             kv_cache_dtype=self.attn.kv_cache_dtype,
             attn_type=self.attn.attn_type,
+            # UP v0.33.0 Attention computes no KV scales at run time (no
+            # such attribute); the getattr keeps K15's gate if it returns.
+            calculate_kv_scales=bool(
+                getattr(self.attn, "calculate_kv_scales", False)
+            ),
             kv_sharing=self.attn.kv_sharing_target_layer_name is not None,
             backend_writes_kv_in_forward=(
                 self.attn.attn_backend.forward_includes_kv_cache_update
@@ -369,23 +382,22 @@ class FlintSm70Attention(nn.Module):
     def _forward_fused(
         self, positions: torch.Tensor, qkv: torch.Tensor
     ) -> torch.Tensor:
-        """fork :368-388, re-plumbed on UP's attention ops.
+        """fork :368-388, on K15 (vllm_sm70/flint/qk_norm_rope_kv.py).
 
-        Our op writes the KV cache and returns a dummy. Then
-        ``unified_attention_with_output`` runs with ``kv_cache_dummy_dep`` set,
-        exactly like UP ``Attention.forward``
-        (UP vllm/model_executor/layers/attention/attention.py:560-583). UP
-        Flint calls the Python function (UP vllm/models/flint/model.py:365)
-        because it isn't compiled; we are (@support_torch_compile), so we call
-        the registered op, which is in ``_attention_ops``
-        (UP vllm/config/compilation.py:769).
+        K15's registered op normalizes q/k, applies RoPE and writes the KV
+        cache (or hands the write to the backend's writer). We are compiled
+        (@support_torch_compile), so we call the registered op; the platform
+        hook makes it a splitting op next to ``unified_kv_cache_update``
+        (vllm_sm70/flint/__init__.py ``install_splitting_op``). Then
+        ``attention_after_fused_write`` runs ``unified_attention_with_output``
+        without a second KV write; it consumes the op's q/k outputs, which
+        orders it after the op.
         """
         num_tokens = qkv.shape[0]
         q = torch.empty((num_tokens, self.q_size), dtype=qkv.dtype, device=qkv.device)
         k = torch.empty((num_tokens, self.kv_size), dtype=qkv.dtype, device=qkv.device)
         v = qkv[:, self.q_size + self.kv_size :]
-        layer_name = _encode_layer_name(self.attn.layer_name)
-        kv_dep = torch.ops.vllm.sm70_flint_qk_norm_rope_kv_cache_update(
+        _QK_ROPE_KV_OP(
             qkv,
             q,
             k,
@@ -394,22 +406,10 @@ class FlintSm70Attention(nn.Module):
             positions,
             None if self.rotary_emb is None else self.rotary_emb.cos_sin_cache,
             self.q_norm.variance_epsilon,
-            layer_name,
+            _encode_layer_name(self.attn.layer_name),
         )
-        output = torch.empty(
-            (num_tokens, self.num_heads, self.head_dim),
-            dtype=qkv.dtype,
-            device=qkv.device,
-        )
-        torch.ops.vllm.unified_attention_with_output(
-            q.view(-1, self.num_heads, self.head_dim),
-            k.view(-1, self.num_kv_heads, self.head_dim),
-            v.view(-1, self.num_kv_heads, self.head_dim),
-            output,
-            layer_name,
-            kv_cache_dummy_dep=kv_dep,
-        )
-        out, _ = self.o_proj(output.view(num_tokens, self.q_size))
+        output = attention_after_fused_write(self.attn, q, k, v)
+        out, _ = self.o_proj(output)
         return out
 
 
@@ -565,16 +565,12 @@ class FlintSm70Model(nn.Module):
 class FlintSm70ForCausalLM(nn.Module, SupportsPP):
     """fork :527-668. The fork's sampler hooks (:570-577, :597-614) are
     replaced by the K16 opt-in below; the fused router (:227-229) needs no
-    hook here (M10)."""
+    hook here (M10a)."""
 
     # M10: opt in to Kai's K16 top-k candidate sampler (vllm_sm70/sample_v1.py
     # MODEL_OPT_IN, replacing fork :570-577, :605-614). It samples from
     # self.lm_head and self.logits_processor. VLLM_SM70_FLINT_SAMPLER=0 is
-    # read in Sm70CudaPlatform.get_hidden_state_sampler. K13 (the fused
-    # router, replacing fork :227-229) needs no declaration: U3's platform
-    # getter admits each MoE runner by structure, and the FP32 GateLinear in
-    # FlintSm70SparseMoeBlock is what it needs (VLLM_SM70_FLINT_FUSED_ROUTER=0
-    # is read in vllm_sm70/router.py).
+    # read in Sm70CudaPlatform.get_hidden_state_sampler.
     supports_sm70_topk_sampler = True
 
     # fork :528-542 == UP models/flint/model.py:600-614

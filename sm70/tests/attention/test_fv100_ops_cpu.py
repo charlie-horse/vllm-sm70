@@ -5,7 +5,7 @@ What: every `_sm70_C::fv100_*` schema is an out op with a CUDA impl and a
   register_fake in vllm_sm70/ops/fv100.py whose parameters match the
   schema; the fakes run on meta tensors; nothing references the fork's
   pybind module, `_C` namespace or env policy; the fused one-launch decode
-  stays behind its #ifdef; the KV-view helpers accept upstream's LBNHC
+  (K14) and its op stay behind their #ifdef, which the build turns on; the KV-view helpers accept upstream's LBNHC
   interleave; the decode plan and workspace logic; the wrappers thread their
   arguments in schema order; the SDPA reference used by the GPU tests
   agrees with a direct softmax reference.
@@ -39,7 +39,9 @@ EXPECTED_OPS = {
     "fv100_decode_paged_xqa",
     "fv100_prefill_paged",
     "fv100_prefill_paged_sinks",
+    "fv100_decode_paged_sinks_fused",  # K14, under FUSED_GUARD
 }
+FUSED_OP = "fv100_decode_paged_sinks_fused"
 FUSED_GUARD = "VLLM_SM70_FV100_FUSED_DECODE"
 
 
@@ -76,8 +78,19 @@ def test_schema_is_an_out_op(name):
         "Tensor v_cache, Tensor block_table, Tensor seq_lens"
     )
     assert schema.endswith("-> ()")
-    for word in ("policy", "anchor", "counters", "fused"):
+    banned = ("policy", "anchor")
+    if name != FUSED_OP:
+        banned += ("counters", "fused")
+    for word in banned:
         assert word not in schema, (name, word)
+
+
+def test_fused_schema_takes_sinks_and_mutable_counters():
+    schema = sm70_schemas(area=AREA)[FUSED_OP]
+    sinks_schema = sm70_schemas(area=AREA)["fv100_decode_paged_sinks"]
+    start = len("fv100_decode_paged_sinks")
+    prefix = sinks_schema[start : sinks_schema.index(", Tensor? sinks")]
+    assert schema == f"{FUSED_OP}{prefix}, Tensor sinks, Tensor(e!) counters) -> ()"
 
 
 def test_every_op_has_a_cuda_impl_only():
@@ -143,8 +156,38 @@ def test_no_fork_namespace_pybind_or_policy_left():
     assert not bad, bad
 
 
-def test_fused_decode_is_compiled_out_by_default():
-    """The C4/K14 one-launch path exists only under its #ifdef."""
+def _guarded_lines(text: str) -> list[str]:
+    out, depth = [], 0
+    for line in text.splitlines():
+        if line.startswith(f"#ifdef {FUSED_GUARD}"):
+            depth += 1
+        elif line.startswith("#endif") and FUSED_GUARD in line:
+            depth -= 1
+        elif depth:
+            out.append(line)
+    assert depth == 0
+    return out
+
+
+def test_fused_decode_is_guarded_and_built_by_default():
+    """The C4/K14 one-launch path and its op exist only under the #ifdef,
+    and sources.cmake defines it unless configured OFF."""
+    cmake = (CSRC / "sources.cmake").read_text()
+    assert re.search(
+        r"option\(VLLM_SM70_FV100_FUSED_DECODE\s+\"[^\"]*\"\s+ON\)", cmake
+    )
+    assert "COMPILE_DEFINITIONS VLLM_SM70_FV100_FUSED_DECODE=1" in cmake
+    ops_cpp = (CSRC / "fv100_ops.cpp").read_text()
+    guarded_ops = "\n".join(_guarded_lines(ops_cpp))
+    assert FUSED_OP in guarded_ops and "decode_paged_sinks_fused" in guarded_ops
+    unguarded = [
+        line
+        for line in ops_cpp.splitlines()
+        if "sinks_fused" in line
+        and not line.lstrip().startswith("//")
+        and line not in _guarded_lines(ops_cpp)
+    ]
+    assert not unguarded, unguarded
     text = (CSRC / "flash_decode_paged.cu").read_text()
     guarded = set()
     depth = 0
@@ -175,7 +218,6 @@ def test_fused_decode_is_compiled_out_by_default():
         elif not depth and "gqa8_d128_fused_kernel" in line:
             unguarded.append(line)
     assert not unguarded, unguarded
-    assert FUSED_GUARD not in (CSRC / "fv100_ops.cpp").read_text()
 
 
 def test_sources_cmake_builds_the_lean_files_only():
@@ -195,7 +237,11 @@ def test_sources_cmake_builds_the_lean_files_only():
 def test_provenance_check_passes():
     script = SM70 / "tools" / "check_flash_v100_provenance.py"
     result = subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, check=False
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -267,6 +313,12 @@ def test_fakes_return_none_on_meta(fv100):
     assert ops.fv100_decode_paged(*common) is None
     assert ops.fv100_decode_paged_sinks(*common, _meta(16, dtype=torch.float32)) is None
     assert ops.fv100_decode_paged_sinks(*common, None) is None
+    assert (
+        ops.fv100_decode_paged_sinks_fused(
+            *common, _meta(16, dtype=torch.float32), _meta(64, dtype=torch.int32)
+        )
+        is None
+    )
     assert ops.fv100_decode_paged_xqa(*common, 0) is None
     qp = _meta(1, 16, 40, 128)
     prefill = (
@@ -394,6 +446,9 @@ class _Recorder:
 
 
 def test_decode_wrapper_threads_schema_order(fv100, monkeypatch):
+    # The two-launch sink op; the fused one (K14) is covered in
+    # test_fv100_fused_decode_cpu.py.
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     rec = _Recorder()
     monkeypatch.setattr(fv100, "_op", rec)
     fv100.clear_workspaces()

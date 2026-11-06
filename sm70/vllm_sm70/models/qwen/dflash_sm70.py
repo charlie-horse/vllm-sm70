@@ -48,15 +48,15 @@ Upstream hooks this rests on (UP = vllm 4ba787e), with no upstream edit:
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm_sm70 import envs
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.dflash2")
 
 try:  # vllm.triton_utils gives placeholders when Triton is missing.
     from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -565,6 +565,11 @@ def _build_classes() -> dict[str, type]:
             self.use_sm70_bf16_emulation = emulation_enabled(config, dtype)
             if self.use_sm70_bf16_emulation:
                 apply_layer_emulation(self, config, dtype)
+                # K18: flag the draft projections for the M<=8 FP16 GEMM
+                # (packed in load_weights below). FORK qwen3_dflash2.py:280-298.
+                from vllm_sm70.ops import dflash2
+
+                dflash2.mark_draft_linears(self)
 
     class DFlash2SM70Qwen3Model(DFlash2Qwen3Model):
         decoder_layer_cls = DFlash2SM70Qwen3DecoderLayer
@@ -613,6 +618,16 @@ def _build_classes() -> dict[str, type]:
     class DFlash2SM70Qwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
         # UP factory: DFlashQwen3ForCausalLM.model_cls (qwen3_dflash.py:737, :748)
         model_cls = DFlash2SM70Qwen3Model
+
+        def load_weights(self, weights):
+            # UP qwen3_dflash.py:851. K18: pack the flagged projections once
+            # the weights are final, before profiling and graph capture, so
+            # the packed copies count in the model's memory.
+            loaded = super().load_weights(weights)
+            from vllm_sm70.ops import dflash2
+
+            dflash2.prepare_marked(self)
+            return loaded
 
     return {
         "DFlash2SM70Qwen3DecoderLayer": DFlash2SM70Qwen3DecoderLayer,

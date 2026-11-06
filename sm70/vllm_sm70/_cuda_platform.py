@@ -150,43 +150,68 @@ class Sm70CudaPlatform(CudaPlatform):
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
+        # K15: split the fused Flint q/k-norm + RoPE + KV-write op out of the
+        # compiled graph next to unified_kv_cache_update (FORK
+        # config/compilation.py:1172-1174). Off with VLLM_SM70_FLINT_QK_ROPE_KV=0.
+        from vllm_sm70.config import sm70_config
+        from vllm_sm70.flint import install_splitting_op
 
-    # U1 hooks (patches/0001): defaults keep upstream behaviour.
+        install_splitting_op(
+            vllm_config.compilation_config,
+            enabled=sm70_config(vllm_config).flint_qk_rope_kv,
+        )
+
+    # U1 hooks (patches/0001): None keeps upstream behaviour.
     @classmethod
     def get_unquantized_gemm(
         cls, linear_backend: str = "auto"
     ) -> Callable[..., Any] | None:
-        return None
+        # K18: DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
+        # other layer and M falls through to F.linear (UP
+        # default_unquantized_gemm). None (upstream dispatch) unless
+        # VLLM_SM70_DFLASH2_FP16=1 (opt-in) and the ops are built. Cached:
+        # UP calls this per forward for lm_head and the router gate.
+        from vllm_sm70.ops import dflash2
+
+        return dflash2.select_unquantized_gemm(linear_backend)
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        # K13 (risk R4): admit the fused router and allocate its per-layer
-        # workspace before CUDA graph capture.
+        # U1 (patches/0002): after model load and the compile warmup, before
+        # capture_model. Three steps, always in this order and none skipped
+        # because an earlier one had nothing to do; each has its own kill
+        # switch. A step whose module is not in this build is skipped.
+        # (1) TurboMind pre-capture tuning, TP-coordinated (vllm_sm70/warmup).
+        #     Off with VLLM_SM70_TM_PRECAPTURE_WARMUP=0 (read inside run()).
+        if _has_module("vllm_sm70.warmup"):
+            from vllm_sm70 import warmup
+
+            warmup.run(worker)
+        # (2) K13 (R4): admit the fused router and allocate its per-layer
+        #     workspace. A worker without get_model skips only this step.
+        #     Off with VLLM_SM70_FLINT_FUSED_ROUTER=0 (read inside the module).
         get_model = getattr(worker, "get_model", None)
-        if get_model is not None:
+        if get_model is not None and _has_module("vllm_sm70.router"):
             from vllm_sm70 import router
 
             router.prepare_model(get_model())
-        # Runs after model load and before CUDA graph capture (U1). K16:
-        # bind the V1 hidden-state sampler and create its device counter
-        # here, never lazily during capture (R4).
+        # (3) K16: bind the V1 hidden-state sampler and create its device
+        #     counter here, never lazily during capture (R4).
+        #     A failure raises: if one TP rank silently fell back to upstream
+        #     sampling while the other used K16, their collectives would no
+        #     longer match and the engine would hang.
+        #     VLLM_SM70_FLINT_SAMPLER=0 is the way to run without it.
         if _flint_sampler_enabled():
+            from vllm_sm70 import sample_v1
+
             try:
-                from vllm_sm70 import sample_v1
-
                 sample_v1.prepare_worker(worker)
-            except Exception:
-                # Unprepared, the sampler returns None: upstream sampling.
-                logger.exception("vllm_sm70: preparing the K16 sampler failed")
+            except Exception as e:
+                raise RuntimeError(
+                    "vllm_sm70: preparing the K16 top-k sampler failed; set "
+                    "VLLM_SM70_FLINT_SAMPLER=0 to use upstream sampling"
+                ) from e
         return None
-
-    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
-    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
-    @classmethod
-    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
-        from vllm_sm70 import router
-
-        return router.provider()
 
     # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
     @classmethod
@@ -199,6 +224,96 @@ class Sm70CudaPlatform(CudaPlatform):
 
         return Sm70HiddenStateSampler()
 
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()
+
+    # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
+    # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
+    # KernelConfig.ir_op_priority at config/kernel.py:461-478; a user-set
+    # priority stays first). Under Inductor upstream picks ["native"], whose
+    # fused_add_rms_norm keeps the residual sum in FP32 before rounding
+    # (UP ir/ops/layernorm.py:44-62). On SM70 pin the C kernel (FP16
+    # residual, __hadd2), so the unfused graph, the kill-switched path and
+    # the fused TP2 all-reduce + RMSNorm collective (K17) share one rounding.
+    # "native" stays as the fallback for args vllm_c does not support (a
+    # weight dtype other than the input's, variance_size).
+    SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> Any:
+        import dataclasses
+
+        priority = super().get_default_ir_op_priority(vllm_config)
+        # Flint only (K17 admission): there the fused AR kernel keeps the
+        # residual in fp16, so the unfused path (switch off) must too. Other
+        # models keep upstream's priority (fork parity).
+        reason = _k17_rejection(vllm_config)
+        if reason is not None:
+            _log_pin_once(
+                "vllm_sm70: fused_add_rms_norm IR priority not pinned (%s); "
+                "using upstream's %s",
+                reason,
+                list(priority.fused_add_rms_norm),
+            )
+            return priority
+        pinned = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
+        _log_pin_once(
+            "vllm_sm70: fused_add_rms_norm IR priority pinned to %s "
+            "(K17 admits this model; was %s)",
+            pinned,
+            list(priority.fused_add_rms_norm),
+        )
+        return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+
 
 def _flint_sampler_enabled() -> bool:
-    return os.environ.get("VLLM_SM70_FLINT_SAMPLER") != "0"
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_FLINT_SAMPLER)
+
+
+def _has_module(name: str) -> bool:
+    """True if `name` is importable in this build (kernel_warmup steps whose
+    module a branch does not have yet are skipped, not failed)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_PIN_LOGGED: set[str] = set()
+
+
+def _log_pin_once(fmt: str, *args: Any) -> None:
+    # INFO, once per distinct message: the hook runs for every VllmConfig,
+    # but a silent "off" is what this line exists to rule out.
+    msg = fmt % args
+    if msg not in _PIN_LOGGED:
+        _PIN_LOGGED.add(msg)
+        logger.info(msg)
+
+
+def _k17_rejection(vllm_config: Any) -> str | None:
+    """K17's rejection() for this engine config: None when it admits."""
+    if getattr(vllm_config, "model_config", None) is None:
+        return "no model config yet"
+    try:
+        from vllm_sm70 import ar_rms_fusion
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        return ar_rms_fusion.rejection(vllm_config, tp)
+    except Exception as e:
+        logger.debug("vllm_sm70: K17 admission check failed", exc_info=True)
+        return f"K17 admission check failed: {type(e).__name__}: {e}"
+
+
+def _k17_admits(vllm_config: Any) -> bool:
+    """True when K17's rejection() is None for this engine config."""
+    return _k17_rejection(vllm_config) is None

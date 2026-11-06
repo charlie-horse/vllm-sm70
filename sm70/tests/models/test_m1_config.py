@@ -41,6 +41,8 @@ EFFECTIVE_DEFAULTS = {
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,
     "fp8_qpn8": None,
+    "fp8_block_qpn8": True,
+    "fp8_block_qpn8_turbomind_copy": None,
     "dflash2_verifier": "auto",
     "shared_moe_overlap": False,
 }
@@ -120,7 +122,7 @@ def test_config_imports_no_vllm():
         "bad = [m for m in sys.modules if m == 'vllm' or m.startswith('vllm.')]; "
         "assert not bad, bad"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 # --- kill switches -------------------------------------------------------
@@ -134,6 +136,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_FP8_MOE_DECODE",
         "VLLM_SM70_FP8_MOE_COMPACT_DECODE",
         "VLLM_SM70_FP8_QPN8",
+        "VLLM_SM70_FP8_BLOCK_QPN8",
     }
     assert set(envs._SECTIONS["models"]) == {
         "VLLM_SM70_FLINT_MOE_QPN_DECODE",
@@ -142,9 +145,11 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_DFLASH2_EMULATION",
         "VLLM_SM70_SHARED_MOE_OVERLAP",
     }
-    # one kill per field, except quant_backend (env-only refusal)
+    # one kill per field, except quant_backend (env-only refusal) and the
+    # TurboMind copy policy (a policy, not a feature)
     assert {f for f, _ in KILL_SWITCHES.values()} == set(Sm70Config.model_fields) - {
-        "quant_backend"
+        "quant_backend",
+        "fp8_block_qpn8_turbomind_copy",
     }
     assert set(KILL_SWITCHES) <= set(OURS)
     for name in (  # M10 and Kai own these; they must not be ours
@@ -302,12 +307,12 @@ def _getter_only(name):
 
 def _flint_qk_rope_kv_off():
     """M5 path: with the switch at "0", FlintSm70Attention's fused-route
-    admission (vllm_sm70/models/flint_sm70/qk_norm_rope_kv.py) refuses an
+    admission (K15, vllm_sm70/flint/qk_norm_rope_kv.py) refuses an
     otherwise eligible layer, so the layer runs the unfused q/k norm + RoPE
     and upstream's Attention.forward."""
     import torch
 
-    from vllm_sm70.models.flint_sm70.qk_norm_rope_kv import fused_route_rejection
+    from vllm_sm70.flint.qk_norm_rope_kv import fused_route_rejection
 
     def reason(enabled):
         return fused_route_rejection(
@@ -320,6 +325,7 @@ def _flint_qk_rope_kv_off():
             rotary_emb=None,  # a Flint full-attention (no-RoPE) layer
             kv_cache_dtype="auto",
             attn_type="decoder",
+            calculate_kv_scales=False,
             kv_sharing=False,
             backend_writes_kv_in_forward=False,
         )
@@ -387,6 +393,8 @@ def test_env_cannot_enable(monkeypatch, value):
         "fp8_moe_compact_decode": False,
         "flint_qk_rope_kv": False,
         "fp8_qpn8": False,
+        "fp8_block_qpn8": False,
+        "fp8_block_qpn8_turbomind_copy": False,
         "dflash2_verifier": "off",
         "shared_moe_overlap": False,
         "quant_backend": "turbomind",
@@ -437,6 +445,8 @@ def test_hash_changes_for_every_graph_field():
         "quant_backend": "turbomind",
         "flint_qk_rope_kv": False,
         "fp8_qpn8": True,
+        "fp8_block_qpn8": False,
+        "fp8_block_qpn8_turbomind_copy": True,
         "dflash2_verifier": "off",
         "flint_moe_qpn_decode": False,
         "fp8_moe_decode": False,
@@ -464,6 +474,7 @@ _ENABLED = {
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,
     "fp8_qpn8": True,
+    "fp8_block_qpn8": True,
     "dflash2_verifier": "on",
     "shared_moe_overlap": True,
 }
