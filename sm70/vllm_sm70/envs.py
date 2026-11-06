@@ -301,7 +301,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # Optional TurboMind dispatch-cache file (fork name) to pin specs.
         # Imported on every TP rank; the warmup calls its manifest
         # (<path>.plan.json) covers are not measured, the others are tuned
-        # (with a WARNING) before the import. "{device}", "{rank}" and
+        # (with a WARNING) before the import. A manifest written for another
+        # _sm70_C build, GPU or "ops" knob setting refuses the file (WARNING,
+        # not loaded, tuned as without it). "{device}", "{rank}" and
         # "{arch}" are substituted. Unset: no file.
         "VLLM_SM70_GEMM_LUT_PATH": _path("VLLM_SM70_GEMM_LUT_PATH"),
         # Optional: after the warmup the source rank writes its whole

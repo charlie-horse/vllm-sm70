@@ -519,13 +519,53 @@ def test_plan_failure_on_one_rank_does_not_deadlock():
 
 
 def test_missing_export_falls_back_without_deadlock():
+    # No payload: each rank tunes locally (fallback), so the ranks cannot be
+    # shown to agree; that is a digest mismatch and raises on every rank.
     fakes = [FakeTM(0, 1), FakeTM(1, 2)]
     for f in fakes:
         f.export = lambda: None
-    results, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
-    assert errors == [None, None]
-    assert results[1].mode == "fallback" and fakes[1].measured == FLINT_CALLS
-    assert not results[0].agree
+    _, errors, calls = _run_ranks([flint_model(), flint_model()], fakes)
+    assert fakes[1].measured == FLINT_CALLS  # the follower tuned locally
+    assert calls == ["all_gather", "broadcast", "all_gather"]
+    for e in errors:
+        assert isinstance(e, RuntimeError) and "mode fallback" in str(e)
+
+
+class DriftTM(FakeTM):
+    """A rank whose import does not take the source's specs (e.g. a C++
+    import that silently drops records): its final cache differs."""
+
+    def import_(self, payload):
+        n = super().import_(payload)
+        key = min(self.cache)
+        self.cache[key] = "drifted"
+        return n
+
+
+def test_digest_mismatch_raises_on_every_rank(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        warmup.logger, "info", lambda msg, *a: seen.append(msg % a if a else msg)
+    )
+    fakes = [FakeTM(0, 1), DriftTM(1, 2)]
+    _, errors, calls = _run_ranks([flint_model(), flint_model()], fakes)
+    assert calls == ["all_gather", "broadcast", "all_gather"]  # no extra wait
+    for e in errors:
+        assert isinstance(e, RuntimeError) and not isinstance(e, coord.WarmupError)
+        msg = str(e)
+        assert "different TurboMind dispatch caches" in msg
+        assert "VLLM_SM70_TM_PRECAPTURE_WARMUP=0" in msg
+    # The summary is still logged first, with the verdict.
+    assert any("ranks DISAGREE" in m for m in seen), seen
+
+
+def test_digest_mismatch_writes_no_lut(tmp_path, monkeypatch):
+    path = tmp_path / "tm-{arch}.bin"
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH", str(path))
+    fakes = [FakeTM(0, 1), DriftTM(1, 2)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert all(isinstance(e, RuntimeError) for e in errors)
+    assert list(tmp_path.iterdir()) == []
 
 
 # --------------------------------------------------------------------------
@@ -566,6 +606,108 @@ def test_export_writes_source_cache_atomically(tmp_path, monkeypatch):
         "tm-sm70.bin",
         "tm-sm70.bin.plan.json",
     ]
+
+
+def test_lut_files_are_0644_whatever_the_umask(tmp_path, monkeypatch):
+    old = os.umask(0o077)
+    try:
+        lut, _ = _export_run(tmp_path, monkeypatch)
+    finally:
+        os.umask(old)
+    for p in (lut, pathlib.Path(cache.manifest_path(str(lut)))):
+        assert (p.stat().st_mode & 0o777) == 0o644, p
+    # And with a permissive umask: still exactly 0644, not 0666.
+    old = os.umask(0)
+    try:
+        cache.write_atomic(str(tmp_path / "x.bin"), b"x")
+    finally:
+        os.umask(old)
+    assert ((tmp_path / "x.bin").stat().st_mode & 0o777) == 0o644
+
+
+def test_manifest_records_identity(tmp_path, monkeypatch):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    manifest = json.loads(pathlib.Path(cache.manifest_path(str(lut))).read_bytes())
+    assert manifest["version"] == 2
+    ident = manifest["identity"]
+    assert ident["ext"] == envs.VLLM_SM70_EXT_FINGERPRINT
+    assert ident["gpu"] is None  # CPU device in this test
+    tuning = ident["tuning"]
+    assert tuning["VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES"] == "1"
+    assert tuning["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] == "1"
+    assert tuning["VLLM_SM70_AWQ_TUNE_SMALL_SHAPES"] == "1"
+    assert "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M" in tuning
+    assert "VLLM_SM70_PROFILE_TRACE" not in tuning  # diagnostics only
+    # Every registered dispatch knob is snapshotted (a new knob in the "ops"
+    # section is picked up without touching cache.py).
+    assert set(tuning) == set(envs._SECTIONS["ops"]) - {"VLLM_SM70_PROFILE_TRACE"}
+
+
+def _refuse(kind, monkeypatch, tmp_path):
+    if kind == "knob":  # a dispatch knob the warmup plan does not read
+        monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "0")
+        return "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL"
+    if kind == "small_shapes":
+        monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "0")
+        return "VLLM_SM70_FP8_TUNE_SMALL_SHAPES"
+    if kind == "ext":
+        monkeypatch.setattr(cache, "ext_fingerprint", lambda: "abi=9;so=feed")
+        return "extension"
+    if kind == "gpu":
+        monkeypatch.setattr(cache, "gpu_name", lambda device: "Other GPU")
+        return "GPU"
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["knob", "small_shapes", "ext", "gpu"])
+def test_lut_with_foreign_identity_is_refused(
+    tmp_path, monkeypatch, warnings_seen, kind
+):
+    lut, first = _export_run(tmp_path, monkeypatch)
+    what = _refuse(kind, monkeypatch, tmp_path)
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    results, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]  # skipped, not fatal
+    refusals = [w for w in warnings_seen if "refusing TurboMind LUT" in w]
+    assert len(refusals) == 2 and what in refusals[0]  # once per rank
+    # Not loaded: nothing imported from it, the source tuned everything.
+    assert [r.lut_records for r in results] == [0, 0]
+    if kind != "small_shapes":  # tuning off for FP8 only; Flint is NVFP4
+        assert fakes[0].measured == FLINT_CALLS
+        assert fakes[0].cache != first[0].cache
+    assert fakes[0].cache == fakes[1].cache  # ranks still agree
+
+
+def test_v1_manifest_without_identity_is_refused(tmp_path, monkeypatch, warnings_seen):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    mp = pathlib.Path(cache.manifest_path(str(lut)))
+    manifest = json.loads(mp.read_bytes())
+    manifest.pop("identity")
+    manifest["version"] = 1
+    mp.write_text(json.dumps(manifest))
+    expected = cache.identity(torch.device("cpu"))
+    assert cache.load_lut(str(lut), expected) is None
+    assert any("before v2" in w for w in warnings_seen)
+    # Without an expected identity (direct callers) it still loads.
+    assert cache.load_lut(str(lut)) is not None
+
+
+def test_lut_summary_says_not_loaded_when_refused(tmp_path, monkeypatch):
+    lut, _ = _export_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "32")
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    seen = []
+    monkeypatch.setattr(
+        warmup.logger, "info", lambda msg, *a: seen.append(msg % a if a else msg)
+    )
+    _, errors, _ = _run_ranks(
+        [flint_model(), flint_model()], [FakeTM(0, 3), FakeTM(1, 4)]
+    )
+    assert errors == [None, None]
+    summary = [m for m in seen if "pre-capture warmup done" in m]
+    assert summary and all(f"LUT {lut}: not loaded" in m for m in summary)
+    assert all("ranks agree" in m for m in summary)
 
 
 def test_lut_pins_specs_on_every_rank_without_measuring(tmp_path, monkeypatch):

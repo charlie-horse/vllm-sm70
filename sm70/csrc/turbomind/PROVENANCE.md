@@ -512,7 +512,7 @@ only the dense routes, and each rank tuned MoE on its own.
 | `_warmup_fp8_dense_layers` :620-718 (plain TM :666-677 and :680-696; block-QPN8 copy :635-640 and :683-684) | `kinds.py: run` | `tm.fp8_gemm_sm70_out` with the operands M6/M8 pass |
 | `_warmup_nvfp4_moe_decode_layers` :952-1051, `_warmup_moe_dense_stage_layers` :796-878 | `kinds.py: run` | calls the layer's own `quant_method.apply` (M4/M6), so the dispatch keys at each M match the runtime's (batched; FP8 compact M == 1; decomposed) |
 | `_resolve_lut_path` :79-88, `_load_lut_cache` :124-144 | `warmup/cache.py: resolve_path, load_lut`; `warmup/__init__.py: run` | env `VLLM_SM70_GEMM_LUT_PATH` (fork name; unset = no file); imported on every rank; calls the manifest covers are not measured (see "Pinning specs"); `{rank}` is the TP rank |
-| `_save_lut_cache` :147-165, `sm70_native_cache.export_cache` :98-122 | `warmup/cache.py: write_lut, write_atomic`; `warmup/__init__.py: _export_lut` | env `VLLM_SM70_GEMM_LUT_EXPORT_PATH`; the source rank writes after coordination, temp file + `os.replace`; raw table only (no `.policy-v1`), plus a `<path>.plan.json` manifest (table sha256, warmup calls) |
+| `_save_lut_cache` :147-165, `sm70_native_cache.export_cache` :98-122 | `warmup/cache.py: write_lut, write_atomic`; `warmup/__init__.py: _export_lut` | env `VLLM_SM70_GEMM_LUT_EXPORT_PATH`; the source rank writes after coordination, temp file + `os.replace`; raw table only (no `.policy-v1`), plus a `<path>.plan.json` manifest (table sha256, warmup calls, identity: `_sm70_C` fingerprint, GPU name, `ops` knob snapshot); both files mode 0644 whatever the umask |
 | `_export_lut_bytes` :168-177, `_import_lut_bytes` :180-187 | `cache.py: export_bytes, import_bytes` | raw table only (no policy partitions) |
 | `sm70_native_cache.py: import_cache` :64-95, `packed_cache_bytes` :125-127, `_MAGIC` :16, `_key(())` :55-57 | `cache.py: legacy_table, load_lut` | the only partition is "legacy": a raw file is imported as is, and an `SM70POLICY1` file gives its "legacy" entry |
 | `vllm/_sm70/linear.py` op wrappers | `vllm_sm70/ops/tm.py` (K03) | unchanged, used as is |
@@ -560,8 +560,12 @@ can diverge even with their TP ranks agreeing. To pin the specs:
 
 1. Start once with `VLLM_SM70_GEMM_LUT_EXPORT_PATH=/path/tm-{arch}.bin`. After
    the warmup the source rank writes its whole dispatch cache there atomically
-   (temp file + rename), plus `/path/tm-sm70.bin.plan.json` (table sha256 and
-   the warmup calls it covers). The path and sha256 are logged at INFO.
+   (temp file + rename, mode 0644), plus `/path/tm-sm70.bin.plan.json` (table
+   sha256, the warmup calls it covers, and its identity: the `_sm70_C`
+   fingerprint `abi=<n>;so=<sha256>` as in `VLLM_SM70_EXT_FINGERPRINT`, the GPU
+   name, and every knob of the `ops` env section except
+   `VLLM_SM70_PROFILE_TRACE`). The path and sha256 are logged at INFO. Nothing
+   is exported when the TP ranks disagree.
 2. Serve with `VLLM_SM70_GEMM_LUT_PATH=/path/tm-{arch}.bin`. Every rank imports
    it, and no call the manifest covers is measured, so those specs are the same
    on every start. Calls it lacks (a new capture size, spec count or model) are
@@ -569,7 +573,17 @@ can diverge even with their TP ranks agreeing. To pin the specs:
    the import matters: an import makes uncovered NVFP4/FP8 dense calls take
    kReuse (LowerBound) instead of measuring. Without a manifest (e.g. a fork
    file) every call is tuned first, and the LUT then overrides the shapes it
-   holds.
+   holds. A manifest whose identity differs from this process (another
+   `_sm70_C` build, GPU, or knob value; or a v1 manifest without one) refuses
+   the LUT: a WARNING ("refusing TurboMind LUT ...") names each difference,
+   nothing is imported, and the warmup tunes as without a LUT (the summary
+   says "LUT <path>: not loaded"). That is a stale cache, not an error, so it
+   does not stop startup.
+
+After the warmup the TP ranks compare sha256 digests of their caches. A
+mismatch raises RuntimeError on every rank (they all hold the same digests),
+naming `VLLM_SM70_TM_PRECAPTURE_WARMUP=0`: graph replay would differ between
+ranks.
 
 One file per arch is enough: every rank imports it, and the TP ranks share the
 source's cache anyway. Use `{arch}` in the path. `{rank}` and `{device}` are
@@ -616,7 +630,7 @@ The INFO summary reports the LUT path, records imported or exported, and the
 calls measured on this rank.
 
 Re-export after a change to the build, model, TP size, capture sizes or tuning
-knobs. A table whose kernels are missing from the build drops those records on
+knobs (a build, GPU or knob change is refused on import, see above). A table whose kernels are missing from the build drops those records on
 import ("No kernel found"); those calls then fall back as uncovered.
 
 ### Env
@@ -636,7 +650,7 @@ source and follower failures; missing export); kill switch; refusal under captur
 platform hook; cache-file format; LUT export (source rank only, atomic, no temp
 file left, old file kept on failure) and import (pinned specs with no
 measurement on any rank; uncovered calls tuned before the import with a WARNING;
-no-manifest and absent-file cases); a policy-faithful fake asserting tuning on +
+no-manifest and absent-file cases; files mode 0644 under umask 077; a manifest from another build, GPU or knob setting, or a v1 manifest, is refused and everything is tuned); a digest mismatch between ranks raises on every rank; a policy-faithful fake asserting tuning on +
 LUT gives no timed kMeasure on two fresh instances (also with the FP8 reuse knob
 at 0), and tuning off needs no LUT. GPU: `test_lut_pins_specs_across_processes`
 (run 1 exports; runs 2-3 import, trace shows no `measure`, outputs bitwise equal). `test_tm_precapture_warmup_gpu.py` (gpu): with

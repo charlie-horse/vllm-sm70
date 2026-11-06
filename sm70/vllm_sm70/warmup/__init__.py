@@ -102,7 +102,8 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
 
     Raises:
         RuntimeError: called during CUDA graph capture (it would tune inside
-            the graph), or the warmup failed on some TP rank.
+            the graph), the warmup failed on some TP rank, or the TP ranks
+            ended with different dispatch caches (digest mismatch).
     """
     if is_capturing():
         raise RuntimeError(
@@ -157,7 +158,8 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
     rank = 0 if group is None else group.rank
     lut_path, export_path = _paths(device, rank)
     calls = _calls(plan)
-    lut = cache.load_lut(lut_path) if (has_work and lut_path) else None
+    ident = cache.identity(device) if has_work and (lut_path or export_path) else None
+    lut = cache.load_lut(lut_path, ident) if (has_work and lut_path) else None
     missing = lut.missing(calls) if lut is not None else []
     if lut is not None and missing:
         _warn_missing(lut, missing, len(calls))
@@ -204,9 +206,24 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
             if lut is not None
             else f"LUT {lut_path}: not loaded"
         )
+    disagree = result.mode != "local" and not result.agree
     if export_path and has_work and rank == result.source:
-        lut_parts.append(_export_lut(export, export_path, calls, exported_records))
+        lut_parts.append(
+            f"LUT export {export_path}: not written (ranks disagree)"
+            if disagree
+            else _export_lut(export, export_path, calls, exported_records, ident)
+        )
     _log_summary(plan, result, seconds, group, lut_parts)
+    if disagree:
+        # Every rank holds the same gathered digests, so every rank raises
+        # here; none is left waiting in a collective.
+        raise RuntimeError(
+            "vllm_sm70: TP ranks hold different TurboMind dispatch caches after "
+            "the pre-capture warmup (digests "
+            f"{[d[:12] if d else None for d in result.digests]}, mode "
+            f"{result.mode}); CUDA graph replay would differ between ranks. "
+            f"{KILL_SWITCH}=0 skips the warmup."
+        )
     return result
 
 
@@ -249,7 +266,13 @@ def _warn_missing(lut: Any, missing: list[tuple], total: int) -> None:
     )
 
 
-def _export_lut(export: Any, path: str, calls: list[tuple], records: list[int]) -> str:
+def _export_lut(
+    export: Any,
+    path: str,
+    calls: list[tuple],
+    records: list[int],
+    ident: dict[str, Any] | None = None,
+) -> str:
     """Write the source rank's whole dispatch cache for a later run's
     VLLM_SM70_GEMM_LUT_PATH (fork _save_lut_cache, atomic here). Returns the
     summary fragment; failures are a WARNING, never fatal."""
@@ -263,7 +286,7 @@ def _export_lut(export: Any, path: str, calls: list[tuple], records: list[int]) 
             )
             return f"LUT export {path}: not written (empty cache)"
         n = records[0] if records else None
-        sha = cache.write_lut(path, table, calls, n)
+        sha = cache.write_lut(path, table, calls, n, ident)
     except Exception as exc:
         logger.warning("vllm_sm70: TurboMind LUT export to %s failed (%s).", path, exc)
         return f"LUT export {path}: failed"
@@ -345,12 +368,6 @@ def _log_summary(
         tp,
         "; ".join(extra or []),
     )
-    if res.mode != "local" and not res.agree:
-        logger.warning(
-            "vllm_sm70: TP ranks hold different TurboMind dispatch caches after "
-            "the warmup (digests %s); graph replay may differ between ranks.",
-            [d[:12] if d else None for d in res.digests],
-        )
 
 
 def _ranges(ms: list[int]) -> str:
