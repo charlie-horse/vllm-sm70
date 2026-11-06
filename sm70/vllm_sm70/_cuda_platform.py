@@ -189,12 +189,21 @@ class Sm70CudaPlatform(CudaPlatform):
             warmup.run(worker)
         # (2) K13 (R4): admit the fused router and allocate its per-layer
         #     workspace. A worker without get_model skips only this step.
-        #     Off with VLLM_SM70_FLINT_FUSED_ROUTER=0 (read inside the module).
+        #     A failure raises, as in (3): one rank admitting the fused
+        #     router while another fell back would diverge. Off with
+        #     VLLM_SM70_FLINT_FUSED_ROUTER=0 (read inside the module).
         get_model = getattr(worker, "get_model", None)
         if get_model is not None and _has_module("vllm_sm70.router"):
             from vllm_sm70 import router
 
-            router.prepare_model(get_model())
+            try:
+                router.prepare_model(get_model())
+            except Exception as e:
+                raise RuntimeError(
+                    "vllm_sm70: preparing the K13 fused router failed; set "
+                    "VLLM_SM70_FLINT_FUSED_ROUTER=0 to use the upstream gate "
+                    "and select_experts"
+                ) from e
         # (3) K16: bind the V1 hidden-state sampler and create its device
         #     counter here, never lazily during capture (R4).
         #     A failure raises: if one TP rank silently fell back to upstream

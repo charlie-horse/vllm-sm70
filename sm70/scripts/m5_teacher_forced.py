@@ -895,8 +895,28 @@ def _deterministic_kernels() -> None:
     if os.environ.get("M5_ALLOW_TUNING") != "1":
         for var in TUNE_SMALL_SHAPES_VARS:
             os.environ[var] = "0"
+    problem = lut_strict_problem(os.environ)
+    if problem:
+        raise SystemExit(problem)
     print("tuning: " + " ".join(f"{v}={os.environ.get(v, '<unset>')}"
-                                for v in TUNE_SMALL_SHAPES_VARS), flush=True)
+                                for v in TUNE_SMALL_SHAPES_VARS)
+          + f" LUT: path={os.environ.get(LUT_PATH_ENV, '<unset>')} "
+          f"strict={os.environ.get(LUT_STRICT_ENV, '<unset>')}", flush=True)
+
+
+LUT_PATH_ENV = "VLLM_SM70_GEMM_LUT_PATH"
+LUT_STRICT_ENV = "VLLM_SM70_GEMM_LUT_STRICT"
+
+
+def lut_strict_problem(env) -> str | None:
+    """Quinn (Nov 7, after #87): tuning on (M5_ALLOW_TUNING=1) with a persisted
+    LUT must run in strict mode, so a stale or missing LUT fails instead of
+    re-tuning per engine instance. None when the setting is acceptable."""
+    if (env.get("M5_ALLOW_TUNING") == "1" and env.get(LUT_PATH_ENV)
+            and env.get(LUT_STRICT_ENV) != "1"):
+        return (f"M5_ALLOW_TUNING=1 with {LUT_PATH_ENV} set needs {LUT_STRICT_ENV}=1 "
+                "(Quinn, Nov 7)")
+    return None
 
 
 def main(argv=None):
