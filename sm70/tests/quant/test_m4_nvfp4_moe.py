@@ -281,9 +281,12 @@ def mods(monkeypatch):
         ops.tm = tm
         monkeypatch.setitem(sys.modules, "vllm_sm70.ops", ops)
         monkeypatch.setitem(sys.modules, "vllm_sm70.ops.tm", tm)
+        # None -> absent: a None entry in sys.modules makes the import raise
+        # ImportError even when the real flint_moe (built _sm70_C) was already
+        # imported by an earlier test or by the plugin.
         if flint is not None:
             ops.flint_moe = flint
-            monkeypatch.setitem(sys.modules, "vllm_sm70.ops.flint_moe", flint)
+        monkeypatch.setitem(sys.modules, "vllm_sm70.ops.flint_moe", flint)
         monkeypatch.setattr(moe_rt, "OPS", TorchMoeOps)
         monkeypatch.setattr(moe_rt, "max_batched_tokens", lambda: 64)
         import vllm_sm70.quant.nvfp4_moe as m4
@@ -566,6 +569,15 @@ def test_decode_admission_is_logged(mods, monkeypatch, admit):
     _build(m4)
     want = "decode admitted" if admit else "decode not admitted"
     assert any(want in m for m in seen), seen
+
+
+def test_absent_flint_moe_hides_an_already_imported_module(mods, monkeypatch):
+    """Regression (Felix, c4130 with the built _sm70_C): flint=None must hide
+    a vllm_sm70.ops.flint_moe that is already in sys.modules."""
+    real = make_fake_flint_moe()
+    monkeypatch.setitem(sys.modules, "vllm_sm70.ops.flint_moe", real)
+    m4, _tm = mods(flint=None)
+    assert m4._flint_moe() is None
 
 
 def test_decode_off_when_flint_moe_absent(mods):
