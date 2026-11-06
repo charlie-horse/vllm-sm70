@@ -291,10 +291,16 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_TM_PRECAPTURE_WARMUP": kill_switch(
             "VLLM_SM70_TM_PRECAPTURE_WARMUP"
         ),
-        # Optional TurboMind dispatch-cache file (fork name), imported on the
-        # plan's source rank before tuning and so shared with every TP rank.
-        # "{device}", "{rank}" and "{arch}" are substituted. Unset: no file.
+        # Optional TurboMind dispatch-cache file (fork name) to pin specs.
+        # Imported on every TP rank; the warmup calls its manifest
+        # (<path>.plan.json) covers are not measured, the others are tuned
+        # (with a WARNING) before the import. "{device}", "{rank}" and
+        # "{arch}" are substituted. Unset: no file.
         "VLLM_SM70_GEMM_LUT_PATH": _path("VLLM_SM70_GEMM_LUT_PATH"),
+        # Optional: after the warmup the source rank writes its whole
+        # dispatch cache here (atomically, plus <path>.plan.json), for a
+        # later run's VLLM_SM70_GEMM_LUT_PATH. Same substitutions. Unset: none.
+        "VLLM_SM70_GEMM_LUT_EXPORT_PATH": _path("VLLM_SM70_GEMM_LUT_EXPORT_PATH"),
     },
 }
 

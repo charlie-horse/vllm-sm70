@@ -9,7 +9,10 @@ kill switch, the capture guard, and the cache-file format.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
+import pathlib
 import random
 import threading
 from types import SimpleNamespace
@@ -39,6 +42,7 @@ TUNE_VARS = (
     "VLLM_SM70_FP8_QPN8_M32",
     "VLLM_SM70_TM_PRECAPTURE_WARMUP",
     "VLLM_SM70_GEMM_LUT_PATH",
+    "VLLM_SM70_GEMM_LUT_EXPORT_PATH",
 )
 
 
@@ -179,6 +183,8 @@ def qwen38_model(copy=True):
 # Shape enumeration
 # --------------------------------------------------------------------------
 FLINT_CAPTURE = [1, 2, 4, 8, 16, 24, 32, 40]
+# 6 dense shapes x 8 M + MoE tokens 3..21 (19)
+FLINT_CALLS = 6 * 8 + 19
 
 
 def test_flint_tp2_m_values_cover_capture_verify_and_fork_set():
@@ -200,9 +206,10 @@ def test_flint_tp2_plan():
         assert item.ms == (4, 5, 8, 16, 24, 32, 40, 64)
     (moe,) = by_kind[P.NVFP4_MOE]
     assert moe.key == (256, 2048, 256, 6, True)
-    # K12 owns M <= 2; the MoE gate counts slots: 21 * 6 = 126 <= 128.
-    assert moe.ms == (4, 5, 8, 16)
-    assert plan.calls() == 6 * 8 + 4
+    # K12 owns M <= 2; the MoE gate counts slots: 21 * 6 = 126 <= 128. MoE
+    # warms every token count (eager MoE has no imported-cache reuse).
+    assert moe.ms == tuple(range(3, 22))
+    assert plan.calls() == FLINT_CALLS
     # Every capture size within the limits is warmed for every dense shape.
     for size in FLINT_CAPTURE:
         if size > 2:
@@ -214,7 +221,7 @@ def test_flint_without_k12_and_gemv_warms_small_m():
     plan = P.build([model], vcfg(FLINT_CAPTURE, max_seqs=8, spec=4))
     dense, moe = plan.items
     assert dense.ms[:3] == (1, 2, 4)
-    assert moe.ms == (1, 2, 4, 5, 8, 16)
+    assert moe.ms == tuple(range(1, 22))
 
 
 def test_qwen38_plan_capture_and_eager_sizes():
@@ -242,7 +249,7 @@ def test_qwen38_qpn8_without_copy_has_nothing_to_warm():
 def test_qwen36_fp8_moe_slots_limit():
     plan = P.build([Model([fp8_moe(top_k=8)])], vcfg([1, 2, 4, 8, 16, 32], 16))
     (moe,) = plan.items
-    assert moe.ms == (1, 2, 4, 8, 16)  # 16 * 8 = 128 slots; 32 * 8 > 128
+    assert moe.ms == tuple(range(1, 17))  # 16 * 8 = 128 slots
 
 
 def test_eager_and_mixed_none_cover_every_decode_m():
@@ -355,13 +362,19 @@ class FakeTM:
 
     A call measures (a random, rank-specific spec) on its first sight of a
     shape, as kMeasure does; import is authoritative; Measure returns early
-    on an exact cache hit.
+    on an exact cache hit. After an import the device is "imported": an
+    uncovered NVFP4/FP8 dense call then takes kReuse (LowerBound) and is not
+    measured, as in gemm_runtime.cpp.
     """
+
+    DENSE = (P.NVFP4_DENSE, P.FP8_DENSE, P.FP8_QPN8_TM)
 
     def __init__(self, rank, seed, fail_on=None):
         self.rank = rank
         self.cache = {}
         self.measured = 0
+        self.lowerbound = 0
+        self.imported = False
         self.rng = random.Random(seed)
         self.fail_on = fail_on
 
@@ -369,9 +382,13 @@ class FakeTM:
         if self.fail_on == "warm":
             raise ValueError(f"boom on rank {self.rank}")
         key = f"{item.kind}:{item.key}:{m}"
-        if key not in self.cache:
-            self.cache[key] = f"r{self.rank}-split{self.rng.randint(1, 16)}"
-            self.measured += 1
+        if key in self.cache:
+            return
+        if self.imported and item.kind in self.DENSE:
+            self.lowerbound += 1  # kReuse on a miss: nearest entry, no measure
+            return
+        self.cache[key] = f"r{self.rank}-split{self.rng.randint(1, 16)}"
+        self.measured += 1
 
     def export(self):
         return json.dumps(self.cache, sort_keys=True).encode() if self.cache else None
@@ -381,10 +398,8 @@ class FakeTM:
             raise OSError("import failed")
         table = json.loads(payload)
         self.cache.update(table)
+        self.imported = True
         return len(table)
-
-    def import_file(self):
-        return 0
 
 
 def _worker(model, cfg):
@@ -424,11 +439,11 @@ def test_coordinated_ranks_end_with_rank0_specs():
     assert fakes[0].cache == fakes[1].cache
     assert all(v.startswith("r0-") for v in fakes[1].cache.values())
     assert fakes[1].measured == 0  # the follower only replays cache hits
-    assert fakes[0].measured == 6 * 8 + 4
+    assert fakes[0].measured == FLINT_CALLS
     for res in results:
         assert res.mode == "coordinated" and res.source == 0 and res.agree
-        assert res.counts[P.NVFP4_DENSE] == 48 and res.counts[P.NVFP4_MOE] == 4
-    assert results[1].imported == 52
+        assert res.counts[P.NVFP4_DENSE] == 48 and res.counts[P.NVFP4_MOE] == 19
+    assert results[1].imported == FLINT_CALLS
     assert calls == ["all_gather", "broadcast", "all_gather"]
 
 
@@ -500,18 +515,232 @@ def test_missing_export_falls_back_without_deadlock():
         f.export = lambda: None
     results, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
     assert errors == [None, None]
-    assert results[1].mode == "fallback" and fakes[1].measured == 52
+    assert results[1].mode == "fallback" and fakes[1].measured == FLINT_CALLS
     assert not results[0].agree
 
 
-def test_source_imports_cache_file_before_tuning():
+# --------------------------------------------------------------------------
+# Pinning specs: LUT export and import
+# --------------------------------------------------------------------------
+@pytest.fixture
+def warnings_seen(monkeypatch):
     seen = []
-    fakes = [FakeTM(0, 1), FakeTM(1, 2)]
-    fakes[0].import_file = lambda: seen.append(0) or 7
-    fakes[1].import_file = lambda: seen.append(1) or 7
+    monkeypatch.setattr(
+        warmup.logger, "warning", lambda fmt, *a, **k: seen.append(fmt % a)
+    )
+    return seen
+
+
+def _export_run(tmp_path, monkeypatch, model=None, seeds=(1, 2)):
+    path = tmp_path / "lut" / "tm-{arch}.bin"
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH", str(path))
+    fakes = [FakeTM(0, seeds[0]), FakeTM(1, seeds[1])]
+    model = model or flint_model
+    _, errors, _ = _run_ranks([model(), model()], fakes)
+    assert errors == [None, None]
+    monkeypatch.delenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH")
+    return tmp_path / "lut" / "tm-sm70.bin", fakes
+
+
+def test_export_writes_source_cache_atomically(tmp_path, monkeypatch):
+    writes = []
+    real = cache.write_lut
+    monkeypatch.setattr(cache, "write_lut", lambda *a: writes.append(a) or real(*a))
+    lut, fakes = _export_run(tmp_path, monkeypatch)
+    assert len(writes) == 1  # the source rank only
+    assert lut.read_bytes() == fakes[0].export()
+    manifest = json.loads(pathlib.Path(cache.manifest_path(str(lut))).read_bytes())
+    assert manifest["sha256"] == hashlib.sha256(lut.read_bytes()).hexdigest()
+    assert len(manifest["calls"]) == FLINT_CALLS
+    # Temp files were renamed into place, none left behind.
+    assert sorted(p.name for p in lut.parent.iterdir()) == [
+        "tm-sm70.bin",
+        "tm-sm70.bin.plan.json",
+    ]
+
+
+def test_lut_pins_specs_on_every_rank_without_measuring(tmp_path, monkeypatch):
+    lut, first = _export_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]  # other seeds: tuning would differ
     results, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
-    assert errors == [None, None] and seen == [0]
-    assert results[0].imported == 7 + 52
+    assert errors == [None, None]
+    assert fakes[0].measured == fakes[1].measured == 0
+    assert fakes[0].cache == fakes[1].cache == first[0].cache
+    assert [r.lut_records for r in results] == [
+        FLINT_CALLS
+    ] * 2  # imported on every rank
+    assert all(r.agree for r in results)
+
+
+def test_lut_missing_shapes_are_tuned_before_import_and_warned(
+    tmp_path, monkeypatch, warnings_seen
+):
+    def partial():  # five of the six dense shapes, no MoE
+        return Model([nvfp4_dense(k, n, True) for k, n in FLINT_DENSE[:5]])
+
+    lut, first = _export_run(tmp_path, monkeypatch, model=partial)
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    # The 8 calls of the sixth dense shape and the 19 MoE calls are measured
+    # on the source, before the import, so none falls back to LowerBound.
+    assert fakes[0].measured == 27 and fakes[0].lowerbound == 0
+    assert fakes[1].measured == 0
+    assert fakes[0].cache == fakes[1].cache
+    for key, spec in first[0].cache.items():
+        assert fakes[1].cache[key] == spec  # covered shapes keep the LUT spec
+    msgs = [w for w in warnings_seen if "does not cover" in w]
+    assert len(msgs) == 2 and msgs[0] == msgs[1]  # once per rank
+    msg = msgs[0]
+    assert f"27 of {FLINT_CALLS}" in msg and "nvfp4_moe" in msg and "[3072, 2048" in msg
+
+
+def test_lut_without_manifest_tunes_everything_then_lut_wins(
+    tmp_path, monkeypatch, warnings_seen
+):
+    lut, first = _export_run(tmp_path, monkeypatch)
+    pathlib.Path(cache.manifest_path(str(lut))).unlink()
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(lut))
+    fakes = [FakeTM(0, 3), FakeTM(1, 4)]
+    _, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None]
+    assert fakes[0].measured == FLINT_CALLS  # coverage unknown: all tuned first
+    assert fakes[0].cache == fakes[1].cache == first[0].cache  # then the LUT wins
+    assert any("no manifest" in w for w in warnings_seen)
+
+
+class PolicyTM(FakeTM):
+    """FakeTM that picks the dispatch policy as gemm_runtime.cpp does (eager):
+
+    dense: imported device and reuse_imported (NVFP4 always,
+    FP8 per VLLM_SM70_FP8_REUSE_IMPORTED_CACHE, default 1) -> reuse; tuning
+    off -> default; already tuned -> reuse; else measure. MoE: tuning off ->
+    default; tuned -> reuse; else measure (no imported check). A "measure"
+    times kernels only on a cache miss (Gemm::Impl::Measure returns early on
+    an exact hit); `timed` counts those.
+    """
+
+    def __init__(self, rank, seed):
+        super().__init__(rank, seed)
+        self.tuned = set()
+        self.policies = []
+        self.timed = 0
+
+    def __call__(self, item, m):
+        key = f"{item.kind}:{item.key}:{m}"
+        tune_on = P.limits()[item.kind].enabled
+        if item.kind in self.DENSE:
+            reuse_imported = item.kind == P.NVFP4_DENSE or (
+                P.knob("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", 1) != 0
+            )
+            if self.imported and reuse_imported:
+                policy = "reuse"
+            elif not tune_on:
+                policy = "default"
+            elif key in self.tuned:
+                policy = "reuse"
+            else:
+                policy = "measure"
+        elif not tune_on:
+            policy = "default"
+        elif key in self.tuned:
+            policy = "reuse"
+        else:
+            policy = "measure"
+        if policy == "measure":
+            self.tuned.add(key)
+        self.policies.append((key, policy))
+        if key in self.cache:
+            return  # exact hit: reuse/measure/default all take the entry
+        if policy == "measure":
+            self.timed += 1
+            self.cache[key] = f"r{self.rank}-split{self.rng.randint(1, 16)}"
+        elif policy == "reuse":
+            self.lowerbound += 1
+        else:
+            self.cache[key] = "heuristic"
+
+
+def qwen_mixed_model():
+    return Model([*qwen38_model().layers, fp8_moe(top_k=8)])
+
+
+@pytest.mark.parametrize("fp8_reuse", [None, "0"])
+def test_tuning_on_with_lut_never_times_covered_shapes(
+    tmp_path, monkeypatch, fp8_reuse
+):
+    """Prod mode for T4c: small-shape tuning on + a LUT -> no timed kMeasure on
+    any rank, and both instances hold the exported specs."""
+    for name in (
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+    ):
+        monkeypatch.setenv(name, "1")
+    if fp8_reuse is not None:
+        monkeypatch.setenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", fp8_reuse)
+
+    def model():
+        return Model([*flint_model().layers, *qwen_mixed_model().layers])
+
+    path = tmp_path / "tm-{arch}.bin"
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH", str(path))
+    first = [PolicyTM(0, 1), PolicyTM(1, 2)]
+    _, errors, _ = _run_ranks([model(), model()], first)
+    assert errors == [None, None] and first[0].timed > 0  # run 1 tunes
+    monkeypatch.delenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH")
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(path))
+    for seeds in ((3, 4), (5, 6)):  # two fresh instances
+        fakes = [PolicyTM(0, seeds[0]), PolicyTM(1, seeds[1])]
+        results, errors, _ = _run_ranks([model(), model()], fakes)
+        assert errors == [None, None]
+        assert [f.timed for f in fakes] == [0, 0]
+        assert fakes[0].cache == fakes[1].cache == first[0].cache
+        # Covered dense calls take kReuse after the import, never kMeasure.
+        dense_measure = [
+            k
+            for f in fakes
+            for k, p in f.policies
+            if p == "measure" and k.split(":")[0] in PolicyTM.DENSE
+        ]
+        if fp8_reuse is None:
+            assert dense_measure == []
+        assert all(r.lut_records > 0 for r in results)
+
+
+def test_tuning_off_needs_no_lut(tmp_path, monkeypatch):
+    """#77 mode: tuning off -> nothing to warm, LUT not read, kDefault."""
+    for name in (
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+    ):
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(tmp_path / "absent.bin"))
+    fakes = [PolicyTM(0, 1), PolicyTM(1, 2)]
+    results, errors, calls = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None] and calls == ["all_gather"]
+    assert results[0].mode == "none" and [f.policies for f in fakes] == [[], []]
+
+
+def test_absent_lut_tunes_as_usual(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", str(tmp_path / "none.bin"))
+    fakes = [FakeTM(0, 1), FakeTM(1, 2)]
+    results, errors, _ = _run_ranks([flint_model(), flint_model()], fakes)
+    assert errors == [None, None] and fakes[0].measured == FLINT_CALLS
+    assert results[0].lut_records == 0
+
+
+def test_failed_export_warns_and_serves(tmp_path, monkeypatch, warnings_seen):
+    path = tmp_path / "x.bin"
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_EXPORT_PATH", str(path))
+    fake = FakeTM(0, 1)
+    fake.export = lambda: None
+    res = warmup.run(
+        _worker(flint_model(), vcfg(FLINT_CAPTURE, 8, 4)), group=None, executor=fake
+    )
+    assert res.mode == "local" and not path.exists()
+    assert any("not written" in w for w in warnings_seen)
 
 
 def test_tp1_runs_locally_without_collectives():
@@ -519,7 +748,7 @@ def test_tp1_runs_locally_without_collectives():
     res = warmup.run(
         _worker(flint_model(), vcfg(FLINT_CAPTURE, 8, 4)), group=None, executor=fake
     )
-    assert res.mode == "local" and fake.measured == 52
+    assert res.mode == "local" and fake.measured == FLINT_CALLS
 
 
 # --------------------------------------------------------------------------
@@ -602,6 +831,8 @@ def test_env_vars_registered_with_defaults():
     assert "VLLM_SM70_GEMM_LUT_PATH" in names
     assert envs.VLLM_SM70_TM_PRECAPTURE_WARMUP is True
     assert envs.VLLM_SM70_GEMM_LUT_PATH is None
+    assert "VLLM_SM70_GEMM_LUT_EXPORT_PATH" in envs._SECTIONS["warmup"]
+    assert envs.VLLM_SM70_GEMM_LUT_EXPORT_PATH is None
 
 
 # --------------------------------------------------------------------------
@@ -626,13 +857,31 @@ def test_resolve_path_template():
     )
 
 
-def test_import_file_missing_and_bad(tmp_path, monkeypatch):
-    assert cache.import_file("cpu", str(tmp_path / "absent.bin")) == 0
+def test_write_atomic_keeps_old_file_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "lut.bin"
+    cache.write_atomic(str(target), b"old")
+    assert target.read_bytes() == b"old"
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        cache.write_atomic(str(target), b"new")
+    assert target.read_bytes() == b"old"
+    assert [p.name for p in tmp_path.iterdir()] == ["lut.bin"]  # tmp removed
+
+
+def test_load_lut_absent_bad_and_stale_manifest(tmp_path):
+    assert cache.load_lut(str(tmp_path / "absent.bin")) is None
     bad = tmp_path / "bad.bin"
     bad.write_bytes(cache.MAGIC + b"{not json")
-    assert cache.import_file("cpu", str(bad)) == 0  # warning, not an error
+    assert cache.load_lut(str(bad)) is None  # warning, not an error
     good = tmp_path / "good.bin"
-    good.write_bytes(b"table")
-    got = []
-    monkeypatch.setattr(cache, "import_bytes", lambda dev, t: got.append(t) or 3)
-    assert cache.import_file("cpu", str(good)) == 3 and got == [b"table"]
+    calls = [cache.call_id(P.NVFP4_DENSE, (2048, 2048, 16, True), 4)]
+    cache.write_lut(str(good), b"table", calls)
+    lut = cache.load_lut(str(good))
+    assert lut.table == b"table" and lut.covers == set(calls)
+    assert lut.missing(calls + [("x", (1,), 1)]) == [("x", (1,), 1)]
+    good.write_bytes(b"other table")  # manifest no longer matches
+    assert cache.load_lut(str(good)).covers is None

@@ -10,6 +10,9 @@ included, are read once per process, so each case gets a fresh one).
     python _warmup_gpu_probe.py tp2 <rank> <store file>
         One of two gloo ranks on cuda:<rank>: same layers (same seed), the
         coordinated warmup, then prints a JSON result line.
+    python _warmup_gpu_probe.py lut
+        TP 1 warmup under the caller's VLLM_SM70_GEMM_LUT_{EXPORT_,}PATH, then
+        a sha256 of fixed-input outputs at several M.
 """
 
 from __future__ import annotations
@@ -108,8 +111,31 @@ def tp2_case(rank: int, store: str) -> None:
     dist.destroy_process_group()
 
 
+def lut_case() -> None:
+    """TP 1 warmup (LUT env set by the caller), then hash fixed-input outputs
+    at every warmed M: the same LUT must give the same bits in every process."""
+    import hashlib
+
+    from vllm_sm70 import warmup
+    from vllm_sm70.quant.nvfp4_linear import apply_prepared_linear
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    layer = nvfp4_layer(device)
+    res = warmup.run(worker(device, [layer], [1, 2, 4, 8, 16, 32]), group=None)
+    g = torch.Generator().manual_seed(1)
+    sha = hashlib.sha256()
+    for m in (1, 2, 3, 4, 8, 16, 32, 48, 64):
+        x = (torch.randn(m, K, generator=g) * 0.1).half().to(device)
+        sha.update(apply_prepared_linear(layer, x, None).cpu().numpy().tobytes())
+    torch.cuda.synchronize()
+    print(json.dumps({"lut_records": res.lut_records, "out_sha": sha.hexdigest()}))
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "capture":
         capture_case()
+    elif sys.argv[1] == "lut":
+        lut_case()
     else:
         tp2_case(int(sys.argv[2]), sys.argv[3])

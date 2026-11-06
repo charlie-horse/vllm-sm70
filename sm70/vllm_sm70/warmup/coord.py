@@ -98,7 +98,8 @@ class Result:
     counts: dict[str, int] = field(default_factory=dict)  # kind -> calls run
     mode: str = "local"  # "local" (TP 1), "coordinated", "fallback", "none"
     source: int = 0
-    imported: int = 0
+    imported: int = 0  # records imported (payload and LUT file)
+    lut_records: int = 0  # of which from the LUT file
     digests: list[str | None] = field(default_factory=list)
     agree: bool = True
 
@@ -122,20 +123,29 @@ def coordinate(
     warm: Callable[[], dict[str, int]],
     export_bytes: Callable[[], bytes | None],
     import_bytes: Callable[[bytes], int],
-    before_source_warm: Callable[[], int] | None = None,
+    source_tune: Callable[[], Any] | None = None,
+    import_lut: Callable[[], int] | None = None,
 ) -> Result:
     """Run ``warm`` so that every rank ends with the same dispatch cache.
 
     ``warm`` makes this rank's TurboMind calls and returns calls per kind.
     ``export_bytes``/``import_bytes`` move the whole dispatch cache.
-    ``before_source_warm`` (optional cache-file import) runs on the source
-    rank only, before it tunes; its records reach the others via the payload.
+    ``source_tune`` is what the source runs to tune (default ``warm``); with a
+    LUT file it runs only the calls the LUT does not cover. ``import_lut``
+    (a LUT file is set and loaded) runs on every rank with work: on the
+    source after ``source_tune`` and before the export, elsewhere before the
+    payload import. Tuning before the LUT import matters: an import marks the
+    device "imported", after which NVFP4/FP8 dense calls take kReuse
+    (LowerBound) and no longer measure.
     """
+    tune = source_tune if source_tune is not None else warm
     if group is None or group.world_size <= 1:
         res = Result(mode="local")
         if has_work:
-            if before_source_warm is not None:
-                res.imported = int(before_source_warm())
+            tune()
+            if import_lut is not None:
+                res.lut_records = int(import_lut())
+                res.imported = res.lut_records
             res.counts = warm()
             res.digests = [digest(_safe_export(export_bytes))]
         return res
@@ -151,9 +161,10 @@ def coordinate(
     sent: tuple[bytes | None, str | None] = (None, None)
     if rank == src:
         try:
-            if before_source_warm is not None:
-                res.imported += int(before_source_warm())
-            warm()
+            tune()
+            if import_lut is not None:
+                res.lut_records = int(import_lut())
+                res.imported += res.lut_records
             sent = (export_bytes(), None)
         except Exception as exc:  # shared below, then raised on every rank
             sent = (None, _err(exc))
@@ -168,6 +179,9 @@ def coordinate(
     mine: str | None = None
     if has_work:
         try:
+            if import_lut is not None and rank != src:
+                res.lut_records = int(import_lut())
+                res.imported += res.lut_records
             if payload:
                 res.imported += int(import_bytes(payload))
             else:

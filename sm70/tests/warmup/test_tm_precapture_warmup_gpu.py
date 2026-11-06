@@ -84,3 +84,40 @@ def test_tp2_ranks_share_rank0_dispatch_cache(warmup_gpu, tmp_path):
         assert r["counts"]["nvfp4_dense"] > 0
     assert r0["digests"] == r1["digests"] and r0["digests"][0] is not None
     assert r1["imported"] > 0
+
+
+def test_lut_pins_specs_across_processes(warmup_gpu, tmp_path):
+    """Run 1 exports a LUT; runs 2 and 3 (fresh processes) import it, time no
+    kernel and give bitwise-identical outputs (T4c at op level)."""
+    lut = tmp_path / "tm-{arch}.bin"
+
+    def probe(**env):
+        proc = subprocess.run(
+            [sys.executable, str(PROBE), "lut"],
+            env=_env(TM_GEMM_TRACE="1", TM_GEMM_TRACE_LIMIT="0", **env),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr[-4000:]
+        policies = [p for _, p in TRACE.findall(proc.stderr)]
+        return json.loads(proc.stdout.strip().splitlines()[-1]), policies
+
+    _, first_policies = probe(
+        VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES="1",
+        VLLM_SM70_GEMM_LUT_EXPORT_PATH=str(lut),
+    )
+    assert any(p.startswith("measure") for p in first_policies)
+    written = tmp_path / "tm-sm70.bin"
+    assert written.exists() and pathlib.Path(str(written) + ".plan.json").exists()
+    runs = [
+        probe(VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES="1", VLLM_SM70_GEMM_LUT_PATH=str(lut))
+        for _ in range(2)
+    ]
+    for out, policies in runs:
+        assert out["lut_records"] > 0
+        assert not any(p.startswith("measure") for p in policies), policies
+    # Runs 2 and 3 only: run 1 times M=3 and M=48 after its export (they are
+    # not in the plan); with the LUT those take the imported LowerBound spec.
+    assert runs[0][0]["out_sha"] == runs[1][0]["out_sha"]

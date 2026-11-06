@@ -501,7 +501,7 @@ only the dense routes, and each rank tuned MoE on its own.
 | `_run_coordinated_dense_warmup` :190-252 | `warmup/coord.py: coordinate` | covers every kind; source = lowest rank with work (agreed by all-gather); errors shared; cache digests compared; gloo `cpu_group` used directly, not `GroupCoordinator.broadcast_object` (which may use the message-queue broadcaster) |
 | `_warmup_dense_quantized_layers_coordinated` :274-294 | `warmup/__init__.py: _warm` + `coordinate` | AWQ dense dropped; MoE added to the same phase |
 | `_spec_decode_query_len` :306-310, `_get_decode_m_values` :313-333 | `warmup/plan.py: decode_m_values` | adds every eager-only decode M above the largest capture size (every M from 1 when graphs or the mixed mode are off) and caps at `max_num_batched_tokens`; keeps the fork set {1,2,4,8,16,32,64} (c4130 `awq_warmup_max_m`=64) |
-| `_get_moe_token_counts` :336-346, `_get_nvfp4_moe_token_counts` :1054-1090 | `plan.py: item_ms` | the same M set as dense, bounded by the C++ MoE slot limit (tokens × top_k ≤ 128); the fork's MoE cap was 8 tokens, plus compact widths we do not ship |
+| `_get_moe_token_counts` :336-346, `_get_nvfp4_moe_token_counts` :1054-1090 | `plan.py: build, item_ms` | every token count up to the C++ MoE slot limit (tokens × top_k ≤ 128), not just the decode M set: eager MoE dispatch has no imported-cache reuse, so an unwarmed count would be timed on first use. The fork's cap was 8 tokens, plus compact widths we do not ship |
 | `_build_balanced_offsets` :349-363 | `warmup/kinds.py: moe_routing` | balanced synthetic top-k ids fed through the layer's own routing |
 | `_iter_unique_fp4_dense_layers` :452-470 | `plan.py: _classify` (NVFP4 dense) | NVFP4 only; key adds `tm_gemv` (K11 owns M ≤ 2) |
 | `_iter_unique_fp8_dense_layers` :381-449 | `plan.py: _classify` (FP8 dense, FP8 QPN8 TM copy) | plain TM and block-QPN8 TM-copy branches only |
@@ -510,9 +510,10 @@ only the dense routes, and each rank tuned MoE on its own.
 | `_warmup_fp4_dense_layers` :721-793 (nvfp4, non-prescaled, non-scale-code) | `kinds.py: run` | through M3's `apply_prepared_linear`, so the K11 GEMV operator choice and the output padding match forward |
 | `_warmup_fp8_dense_layers` :620-718 (plain TM :666-677 and :680-696; block-QPN8 copy :635-640 and :683-684) | `kinds.py: run` | `tm.fp8_gemm_sm70_out` with the operands M6/M8 pass |
 | `_warmup_nvfp4_moe_decode_layers` :952-1051, `_warmup_moe_dense_stage_layers` :796-878 | `kinds.py: run` | calls the layer's own `quant_method.apply` (M4/M6), so the dispatch keys at each M match the runtime's (batched; FP8 compact M == 1; decomposed) |
-| `_resolve_lut_path` :79-88, `_load_lut_cache` :124-144 | `warmup/cache.py: resolve_path, import_file` | env `VLLM_SM70_GEMM_LUT_PATH` (fork name; unset = no file); imported on the source rank only, before it tunes, and reaches the other ranks in the payload; `{rank}` is the TP rank |
+| `_resolve_lut_path` :79-88, `_load_lut_cache` :124-144 | `warmup/cache.py: resolve_path, load_lut`; `warmup/__init__.py: run` | env `VLLM_SM70_GEMM_LUT_PATH` (fork name; unset = no file); imported on every rank; calls the manifest covers are not measured (see "Pinning specs"); `{rank}` is the TP rank |
+| `_save_lut_cache` :147-165, `sm70_native_cache.export_cache` :98-122 | `warmup/cache.py: write_lut, write_atomic`; `warmup/__init__.py: _export_lut` | env `VLLM_SM70_GEMM_LUT_EXPORT_PATH`; the source rank writes after coordination, temp file + `os.replace`; raw table only (no `.policy-v1`), plus a `<path>.plan.json` manifest (table sha256, warmup calls) |
 | `_export_lut_bytes` :168-177, `_import_lut_bytes` :180-187 | `cache.py: export_bytes, import_bytes` | raw table only (no policy partitions) |
-| `sm70_native_cache.py: import_cache` :64-95, `packed_cache_bytes` :125-127, `_MAGIC` :16, `_key(())` :55-57 | `cache.py: legacy_table, import_file` | the only partition is "legacy": a raw file is imported as is, and an `SM70POLICY1` file gives its "legacy" entry |
+| `sm70_native_cache.py: import_cache` :64-95, `packed_cache_bytes` :125-127, `_MAGIC` :16, `_key(())` :55-57 | `cache.py: legacy_table, load_lut` | the only partition is "legacy": a raw file is imported as is, and an `SM70POLICY1` file gives its "legacy" entry |
 | `vllm/_sm70/linear.py` op wrappers | `vllm_sm70/ops/tm.py` (K03) | unchanged, used as is |
 
 ### Dropped
@@ -525,8 +526,7 @@ only the dense routes, and each rank tuned MoE on its own.
 | NVFP4 prescaled / scale-code (`nvfp4_qpn2_compact_tm_gemm_sm70_out`) branches of `_warmup_fp4_dense_layers`; compact grouped NVFP4 MoE (`_prepare_compact_slot_groups`, `_use_compact_grouped`) | M3 never prescales or interleaves; M4 has no compact grouped route (QPN2/Qwen3.8 lanes dropped in M4) |
 | FP8 batch-QPN8 (`sm70_fp8_batch_tm`), grouped BMM (`sm70_fp8_bmm*`, `fp8_moe_gemm_sm70_per_expert_dispatch_out`), ModelOpt FP8, gated-SiLU and prescaled-prefill branches of `_warmup_fp8_dense_layers` / `_iter_unique_fp8_dense_layers` | not on main: DeepSeek grouped BMM, PP2/TP4 batch layouts, ModelOpt FP8 and gated SiLU were dropped in M6/M8 |
 | `_warmup_fp8_dense_layers_coordinated` :255-271 | replaced by the single coordinated phase |
-| `_lut_cache_disabled_for_dynamic_quant_dispatch` :91-121 | the fork skipped the file import whenever NVFP4/FP8 tuning was on (always, on c4130). Here the file is opt-in and only the source rank imports it, so all ranks still agree |
-| `_save_lut_cache` :147-165, `sm70_native_cache.export_cache` :98-122 | no file writer was asked for; the in-memory export used for TP coordination is kept |
+| `_lut_cache_disabled_for_dynamic_quant_dispatch` :91-121 | **intentional difference.** The fork skipped LUT import and export whenever dispatch was "dynamic" (NVFP4/FP8 small-shape tuning on, its default), so fork Flint never used a LUT and two instances could differ. We do the opposite: with a LUT, every rank imports it and the calls it covers are not measured. Uncovered calls are tuned before the import (see "Pinning specs") |
 | `_warmup_policy` :41-52, `_warmup_native` :55-58, `_native_number` :61-71, `sm70_native_cache._prepared_policies/_policies/_accepts_legacy_seed` :19-52, `vllm/_sm70/policy.py NativeBindings` | no policy tokens: knobs are env-read in C++ (tm_config.h), and `plan.py: limits/knob` mirrors the C++ defaults |
 | F16 dense (`sm70_f16_gemm*`) | no layer routes there on main (K18 DFlash2 FP16 uses its own M≤8 kernel and `F.linear`, not TurboMind) |
 | TP4-only paths (e.g. the `nvfp4_qwen38_tp4_m1` selector shapes) | TP 1/2 only; those calls would be kDefault anyway |
@@ -545,19 +545,86 @@ capture alike, so the result is deterministic.
 | `nvfp4_dense` | M3 ModelOpt W4A16 NVFP4 linears | M ≤ 64; M ≤ 2 skipped for K11-admitted Flint shapes (2048×2560, 2048×2048, 2048×1024, 512×2048, 2048×6144, 3072×2048) | `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES`, `VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M` (64) |
 | `fp8_dense` | M6 block-FP8 TurboMind linears | M ≤ 64 | `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, `VLLM_SM70_FP8_DENSE_TUNE_MAX_M` (64); the 0dot3 selector → generic gate (16) |
 | `fp8_qpn8_tm` | M8 QPN8 linears that keep a TurboMind copy | qpn8_max_m < M ≤ 64 (8, or 32 with `VLLM_SM70_FP8_QPN8_M32=1`); no copy → nothing to warm | as `fp8_dense` |
-| `nvfp4_moe` | M4 Flint experts (E256 H2048 I256/rank top-6) | tokens × 6 ≤ 128 → M ≤ 21; M ≤ 2 skipped when K12 is admitted | `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` (128 slots) |
-| `fp8_moe` | M6 Qwen3.6 experts (top-8) | tokens × 8 ≤ 128 → M ≤ 16 | `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, `VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS` (128 slots) |
+| `nvfp4_moe` | M4 Flint experts (E256 H2048 I256/rank top-6) | every token count with tokens × 6 ≤ 128 (1..21); M ≤ 2 skipped when K12 is admitted | `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` (128 slots) |
+| `fp8_moe` | M6 Qwen3.6 experts (top-8) | every token count with tokens × 8 ≤ 128 (1..16) | `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, `VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS` (128 slots) |
 
 Example (test): Flint TP2, capture [1,2,4,8,16,24,32,40], max_num_seqs 8,
 4 spec tokens → NVFP4 dense M {4,5,8,16,24,32,40,64} for each of the 6 shapes,
-NVFP4 MoE M {4,5,8,16}: 52 calls.
+NVFP4 MoE tokens 3..21: 67 calls.
+
+### Pinning specs
+
+Timed tuning can pick differently on every start, so two instances of one model
+can diverge even with their TP ranks agreeing. To pin the specs:
+
+1. Start once with `VLLM_SM70_GEMM_LUT_EXPORT_PATH=/path/tm-{arch}.bin`. After
+   the warmup the source rank writes its whole dispatch cache there atomically
+   (temp file + rename), plus `/path/tm-sm70.bin.plan.json` (table sha256 and
+   the warmup calls it covers). The path and sha256 are logged at INFO.
+2. Serve with `VLLM_SM70_GEMM_LUT_PATH=/path/tm-{arch}.bin`. Every rank imports
+   it, and no call the manifest covers is measured, so those specs are the same
+   on every start. Calls it lacks (a new capture size, spec count or model) are
+   tuned on the source before the import and listed in a WARNING. Tuning before
+   the import matters: an import makes uncovered NVFP4/FP8 dense calls take
+   kReuse (LowerBound) instead of measuring. Without a manifest (e.g. a fork
+   file) every call is tuned first, and the LUT then overrides the shapes it
+   holds.
+
+One file per arch is enough: every rank imports it, and the TP ranks share the
+source's cache anyway. Use `{arch}` in the path. `{rank}` and `{device}` are
+still substituted (fork `_resolve_lut_path` semantics, with `{rank}` the TP
+rank), but a per-rank import path that is missing on a follower just means that
+follower receives the LUT through the source's payload. We use two variables
+(import, export) rather than one "import if present, else export" path, so a
+serving run can never overwrite its pin by accident.
+
+Why imported entries are used without C++ changes (gemm_runtime.cpp, gemm.cu,
+dispatch_cache.cu):
+- An import marks the device imported. NVFP4 dense then always takes kReuse
+  (`reuse_imported_cache=true`), and FP8 dense does too while
+  `VLLM_SM70_FP8_REUSE_IMPORTED_CACHE` is unset or 1. kReuse looks up with
+  `LowerBound`, which returns the exact entry when one exists.
+- MoE (`select_moe_dispatch_policy_impl`) has no imported check in eager. It
+  returns kMeasure for a shape not yet in `moe_tuned_shapes`, and so does FP8
+  dense with the reuse knob at 0. But `Gemm::Impl::Measure` returns at once on an
+  exact cache hit (`cache_.Find(desc)`), and `Dispatch` then takes that entry.
+  So a covered call never times a kernel, whatever the policy. `GemmDesc` holds
+  only shape and type fields, no pointers, so the exported keys match.
+- Under capture, an imported device gives kReuse for every kind.
+- Gap closed in Python: an MoE token count missing from the LUT would be timed
+  in eager on first use, so the plan warms (and so exports) every MoE token
+  count up to the slot limit.
+
+Interaction with small-shape tuning off by default (#77). With tuning off every
+call is kDefault: deterministic, but slower, and no LUT is needed. The warmup
+then has nothing to tune and does not read the LUT. `plan.py`
+`TUNE_SMALL_SHAPES_DEFAULT` mirrors the C++ default, and #77 must set it to 0.
+The intended production mode is tuning on plus a LUT, which is deterministic and
+fast: `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1` with
+`VLLM_SM70_GEMM_LUT_PATH`.
+
+T4c (two fresh instances bitwise-identical at full tuned speed):
+1. Run 1 with tuning on and `VLLM_SM70_GEMM_LUT_EXPORT_PATH=<dir>/tm-{arch}.bin`
+   writes the LUT.
+2. Runs 2 and 3 start fresh with tuning on and `VLLM_SM70_GEMM_LUT_PATH` set to
+   the same template. Each logs "tuned (measured) 0 calls on this rank" and
+   "N/N calls covered", and graph replay and eager use the same specs on every
+   rank.
+
+The INFO summary reports the LUT path, records imported or exported, and the
+calls measured on this rank.
+
+Re-export after a change to the build, model, TP size, capture sizes or tuning
+knobs. A table whose kernels are missing from the build drops those records on
+import ("No kernel found"); those calls then fall back as uncovered.
 
 ### Env
 
-`VLLM_SM70_TM_PRECAPTURE_WARMUP` (kill switch, default on; read before the first
-collective, so every TP rank must see the same value) and
-`VLLM_SM70_GEMM_LUT_PATH` (optional cache file, default none). Both are in the
-`warmup` section of `vllm_sm70/envs.py`.
+In the `warmup` section of `vllm_sm70/envs.py`:
+- `VLLM_SM70_TM_PRECAPTURE_WARMUP`: kill switch, default on. It is read before
+  the first collective, so every TP rank must see the same value.
+- `VLLM_SM70_GEMM_LUT_PATH`: LUT to import, default none.
+- `VLLM_SM70_GEMM_LUT_EXPORT_PATH`: LUT to write, default none.
 
 ### Tests
 
@@ -565,14 +632,20 @@ collective, so every TP rank must see the same value) and
 TP2 and Qwen3.8/3.6 configs; limits; a 2-rank threaded group with a fake per-rank
 cache (identical specs; no deadlock when a rank lacks a kind or has no layers;
 source and follower failures; missing export); kill switch; refusal under capture;
-platform hook; cache-file format. `test_tm_precapture_warmup_gpu.py` (gpu): with
+platform hook; cache-file format; LUT export (source rank only, atomic, no temp
+file left, old file kept on failure) and import (pinned specs with no
+measurement on any rank; uncovered calls tuned before the import with a WARNING;
+no-manifest and absent-file cases); a policy-faithful fake asserting tuning on +
+LUT gives no timed kMeasure on two fresh instances (also with the FP8 reuse knob
+at 0), and tuning off needs no LUT. GPU: `test_lut_pins_specs_across_processes`
+(run 1 exports; runs 2-3 import, trace shows no `measure`, outputs bitwise equal). `test_tm_precapture_warmup_gpu.py` (gpu): with
 `TM_GEMM_TRACE`, a warmed M is `reuse` and an unwarmed M is `default` inside
 capture; with 2 GPUs over gloo, both ranks end with the same cache digest.
 
 ### Open risks
 
-- Measurement is still timed, so specs can differ between runs (TP ranks now
-  agree). `VLLM_SM70_GEMM_LUT_PATH` pins them, but nothing on main writes that file yet.
+- Without a LUT, measurement is timed, so specs can differ between runs (TP
+  ranks agree). Pin them with an exported LUT (above).
 - Eager calls outside the plan still measure per rank: prefill chunks within
   the tune limits that are not decode M values, and MoE above the plan. NVFP4/FP8
   dense get kReuse once a device holds an imported cache (TP ≥ 2).

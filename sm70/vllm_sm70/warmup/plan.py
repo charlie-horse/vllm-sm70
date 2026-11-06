@@ -58,6 +58,14 @@ def _atoi(raw: str) -> int:
     return sign * int(digits) if digits else 0
 
 
+# The C++ default of the three *_TUNE_SMALL_SHAPES knobs (gemm_runtime.cpp
+# tune_small_shapes_enabled and friends). Main: 1. Keep in step with C++: if
+# small-shape tuning defaults off there (#77), set this to 0. Then the warmup
+# has nothing to tune unless a knob is set to 1, and every call is kDefault
+# (deterministic, no LUT needed).
+TUNE_SMALL_SHAPES_DEFAULT = 1
+
+
 def knob(name: str, default: int) -> int:
     """tm_config.h policy_atoi(): set (even to "") -> atoi(value), else default."""
     raw = os.environ.get(name)
@@ -87,11 +95,11 @@ def limits() -> dict[str, Limit]:
     - FP8 MoE: select_fp8_moe_dispatch_policy (:578-590),
       fp8_tune_small_shapes (1), awq_moe_tune_max_tokens (128 slots).
     """
-    nvfp4_on = knob("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", 1) != 0
-    fp8_on = knob("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", 1) != 0
+    nvfp4_on = knob("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
+    fp8_on = knob("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
     if knob("VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR", 0) != 0:
         fp8_dense = Limit(
-            knob("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", 1) != 0,
+            knob("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0,
             max(knob("VLLM_SM70_F16_DENSE_TUNE_MAX_M", 16), 0),
             "generic (0dot3 selector)",
         )
@@ -333,7 +341,15 @@ def build(models: Iterable[Any], vllm_config: Any) -> Plan:
             if not lims[kind].enabled:
                 skipped[kind] = f"tuning off ({lims[kind].source} tune_small_shapes=0)"
                 continue
-            ms = item_ms(kind, key, m_values.all, lims[kind])
+            # MoE: every token count up to the slot limit, not just the
+            # decode M set. Eager MoE dispatch has no imported-cache reuse
+            # (select_moe_dispatch_policy_impl), so an unwarmed count would be
+            # timed on first use, differently per instance. That is cheap:
+            # <= 128 / top_k counts.
+            pool = m_values.all
+            if kind in MOE_KINDS:
+                pool = range(1, lims[kind].max_m // max(key[3], 1) + 1)
+            ms = item_ms(kind, key, pool, lims[kind])
             if ms:
                 items.append(Item(kind, key, ms, layer))
     return Plan(items=items, m_values=m_values, limits=lims, skipped=skipped)

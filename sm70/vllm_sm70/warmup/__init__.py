@@ -14,7 +14,9 @@ Why: TurboMind picks a launch spec per shape. In eager, a shape's first call
   (kReuse) and both ranks hold the same specs.
 How: plan.py (shapes and M values), kinds.py (one call per shape and M),
   coord.py (source rank tunes, cache broadcast, all ranks import and replay),
-  cache.py (cache bytes and the optional VLLM_SM70_GEMM_LUT_PATH file).
+  cache.py (cache bytes; VLLM_SM70_GEMM_LUT_EXPORT_PATH writes a LUT and
+  VLLM_SM70_GEMM_LUT_PATH imports one on every rank, so the calls it covers
+  are not measured and their specs are the same on every start).
   Called from upstream's kernel_warmup via U1 (patches/0002), after the
   compile warmup and before capture_model (UP v1/worker/gpu_worker.py:982-994).
 Kill-switch: VLLM_SM70_TM_PRECAPTURE_WARMUP=0 skips all of it (main's
@@ -39,6 +41,7 @@ logger = logging.getLogger("vllm.sm70.warmup")
 
 KILL_SWITCH = "VLLM_SM70_TM_PRECAPTURE_WARMUP"
 CACHE_PATH = "VLLM_SM70_GEMM_LUT_PATH"
+EXPORT_PATH = "VLLM_SM70_GEMM_LUT_EXPORT_PATH"
 # Ops whose presence means the build has TurboMind (K03).
 REQUIRED_OPS = ("sm70_gemm_import_cache", "sm70_gemm_export_cache")
 
@@ -132,30 +135,49 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
         build_error = exc
     has_work = bool(plan and plan.items)
 
+    from vllm_sm70.warmup import cache
+
+    exported_records: list[int] = []  # filled by the real export op
     if executor is None:
-        from vllm_sm70.warmup import cache, kinds
+        from vllm_sm70.warmup import kinds
 
         executor = kinds.run
 
         def export() -> bytes | None:
-            return cache.export_bytes(device)
+            table, records = cache.export_table(device)
+            exported_records[:] = [records]
+            return table
 
         def import_(payload: bytes) -> int:
             return cache.import_bytes(device, payload)
-
-        def import_file() -> int:
-            from vllm_sm70 import envs
-
-            rank = 0 if group is None else group.rank
-            path = cache.resolve_path(getattr(envs, CACHE_PATH), _index(device), rank)
-            return cache.import_file(device, path) if path else 0
     else:
         export = getattr(executor, "export", lambda: None)
         import_ = getattr(executor, "import_", lambda payload: 0)
-        import_file = getattr(executor, "import_file", lambda: 0)
+
+    rank = 0 if group is None else group.rank
+    lut_path, export_path = _paths(device, rank)
+    calls = _calls(plan)
+    lut = cache.load_lut(lut_path) if (has_work and lut_path) else None
+    missing = lut.missing(calls) if lut is not None else []
+    if lut is not None and missing:
+        _warn_missing(lut, missing, len(calls))
+
+    tuned: list[int] = [0]  # calls this rank ran to tune (source only)
 
     def warm() -> dict[str, int]:
         return _warm(plan, executor, device)
+
+    def tune_all() -> dict[str, int]:
+        counts = warm()
+        tuned[0] = sum(counts.values())
+        return counts
+
+    def tune_uncovered() -> dict[str, int]:
+        # With a LUT only the calls it does not cover are measured, and before
+        # the import (see coord.coordinate). The rest come from the LUT.
+        counts = _warm(plan, executor, device, only=set(missing))
+        tuned[0] = sum(counts.values())
+        return counts
 
     t0 = time.perf_counter()
     result = coordinate(
@@ -164,7 +186,8 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
         warm=warm,
         export_bytes=export,
         import_bytes=import_,
-        before_source_warm=import_file,
+        source_tune=tune_uncovered if lut is not None else tune_all,
+        import_lut=(lambda: import_(lut.table)) if lut is not None else None,
     )
     if build_error is not None:
         raise RuntimeError(
@@ -172,8 +195,82 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
             f"layers ({type(build_error).__name__}: {build_error}). "
             f"{KILL_SWITCH}=0 skips the warmup."
         ) from build_error
-    _log_summary(plan, result, time.perf_counter() - t0, group)
+    seconds = time.perf_counter() - t0
+    lut_parts = [f"tuned (measured) {tuned[0]} calls on this rank"]
+    if lut_path:
+        lut_parts.append(
+            f"LUT {lut.path}: {result.lut_records} records imported, "
+            f"{len(calls) - len(missing)}/{len(calls)} calls covered"
+            if lut is not None
+            else f"LUT {lut_path}: not loaded"
+        )
+    if export_path and has_work and rank == result.source:
+        lut_parts.append(_export_lut(export, export_path, calls, exported_records))
+    _log_summary(plan, result, seconds, group, lut_parts)
     return result
+
+
+def _paths(device: Any, rank: int) -> tuple[str | None, str | None]:
+    from vllm_sm70 import envs
+    from vllm_sm70.warmup import cache
+
+    idx = _index(device)
+    return (
+        cache.resolve_path(getattr(envs, CACHE_PATH), idx, rank),
+        cache.resolve_path(getattr(envs, EXPORT_PATH), idx, rank),
+    )
+
+
+def _calls(plan: P.Plan | None) -> list[tuple]:
+    from vllm_sm70.warmup.cache import call_id
+
+    if plan is None:
+        return []
+    return [call_id(i.kind, i.key, m) for i in plan.items for m in i.ms]
+
+
+def _warn_missing(lut: Any, missing: list[tuple], total: int) -> None:
+    by_shape: dict[tuple, list[int]] = {}
+    for kind, key, m in missing:
+        by_shape.setdefault((kind, key), []).append(m)
+    shapes = "; ".join(
+        f"{kind} {list(key)} M{_ranges(sorted(ms))}"
+        for (kind, key), ms in by_shape.items()
+    )
+    why = "it has no manifest" if lut.covers is None else "its manifest lacks them"
+    logger.warning(
+        "vllm_sm70: TurboMind LUT %s does not cover %d of %d warmup calls (%s); "
+        "tuning them now, so they are not pinned: %s",
+        lut.path,
+        len(missing),
+        total,
+        why,
+        shapes,
+    )
+
+
+def _export_lut(export: Any, path: str, calls: list[tuple], records: list[int]) -> str:
+    """Write the source rank's whole dispatch cache for a later run's
+    VLLM_SM70_GEMM_LUT_PATH (fork _save_lut_cache, atomic here). Returns the
+    summary fragment; failures are a WARNING, never fatal."""
+    from vllm_sm70.warmup import cache
+
+    try:
+        table = export()
+        if not table:
+            logger.warning(
+                "vllm_sm70: empty TurboMind dispatch cache; %s not written.", path
+            )
+            return f"LUT export {path}: not written (empty cache)"
+        n = records[0] if records else None
+        sha = cache.write_lut(path, table, calls, n)
+    except Exception as exc:
+        logger.warning("vllm_sm70: TurboMind LUT export to %s failed (%s).", path, exc)
+        return f"LUT export {path}: failed"
+    return (
+        f"LUT exported to {path}: {'?' if n is None else n} records, "
+        f"{len(table)} bytes, sha256 {sha}, manifest {cache.manifest_path(path)}"
+    )
 
 
 def _index(device: Any) -> int:
@@ -181,15 +278,21 @@ def _index(device: Any) -> int:
     return 0 if idx is None else int(idx)
 
 
-def _warm(plan: P.Plan | None, executor: Any, device: Any) -> dict[str, int]:
+def _warm(
+    plan: P.Plan | None, executor: Any, device: Any, only: set | None = None
+) -> dict[str, int]:
     counts = {kind: 0 for kind in P.KINDS}
     if plan is None:
         return counts
     import torch
 
+    from vllm_sm70.warmup.cache import call_id
+
     with torch.inference_mode():
         for item in plan.items:
             for m in item.ms:
+                if only is not None and call_id(item.kind, item.key, m) not in only:
+                    continue
                 executor(item, m)
                 counts[item.kind] += 1
     if device is not None and getattr(device, "type", None) == "cuda":
@@ -197,7 +300,13 @@ def _warm(plan: P.Plan | None, executor: Any, device: Any) -> dict[str, int]:
     return counts
 
 
-def _log_summary(plan: P.Plan | None, res: Result, seconds: float, group: Any) -> None:
+def _log_summary(
+    plan: P.Plan | None,
+    res: Result,
+    seconds: float,
+    group: Any,
+    extra: list[str] | None = None,
+) -> None:
     if plan is None or not plan.items:
         logger.info(
             "vllm_sm70: TurboMind pre-capture warmup: no TurboMind layers to "
@@ -227,13 +336,14 @@ def _log_summary(plan: P.Plan | None, res: Result, seconds: float, group: Any) -
         )
     logger.info(
         "vllm_sm70: TurboMind pre-capture warmup done in %.1f s: %s; capture "
-        "sizes %s, verify M %d, eager decode M%s; %s.",
+        "sizes %s, verify M %d, eager decode M%s; %s; %s.",
         seconds,
         "; ".join(parts),
         list(mv.capture),
         mv.verify_m,
         _ranges(list(mv.eager)) if mv.eager else " none",
         tp,
+        "; ".join(extra or []),
     )
     if res.mode != "local" and not res.agree:
         logger.warning(
