@@ -177,13 +177,30 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        # Runs after model load and before CUDA graph capture (U1). K16:
-        # bind the V1 hidden-state sampler and create its device counter
-        # here, never lazily during capture (R4).
-        # A failure raises: if one TP rank silently fell back to upstream
-        # sampling while the other used K16, their collectives would no
-        # longer match and the engine would hang. VLLM_SM70_FLINT_SAMPLER=0
-        # is the way to run without it.
+        # U1 (patches/0002): after model load and the compile warmup, before
+        # capture_model. Three steps, always in this order and none skipped
+        # because an earlier one had nothing to do; each has its own kill
+        # switch. A step whose module is not in this build is skipped.
+        # (1) TurboMind pre-capture tuning, TP-coordinated (vllm_sm70/warmup).
+        #     Off with VLLM_SM70_TM_PRECAPTURE_WARMUP=0 (read inside run()).
+        if _has_module("vllm_sm70.warmup"):
+            from vllm_sm70 import warmup
+
+            warmup.run(worker)
+        # (2) K13 (R4): admit the fused router and allocate its per-layer
+        #     workspace. A worker without get_model skips only this step.
+        #     Off with VLLM_SM70_FLINT_FUSED_ROUTER=0 (read inside the module).
+        get_model = getattr(worker, "get_model", None)
+        if get_model is not None and _has_module("vllm_sm70.router"):
+            from vllm_sm70 import router
+
+            router.prepare_model(get_model())
+        # (3) K16: bind the V1 hidden-state sampler and create its device
+        #     counter here, never lazily during capture (R4).
+        #     A failure raises: if one TP rank silently fell back to upstream
+        #     sampling while the other used K16, their collectives would no
+        #     longer match and the engine would hang.
+        #     VLLM_SM70_FLINT_SAMPLER=0 is the way to run without it.
         if _flint_sampler_enabled():
             from vllm_sm70 import sample_v1
 
@@ -250,6 +267,17 @@ def _flint_sampler_enabled() -> bool:
     from vllm_sm70 import envs
 
     return bool(envs.VLLM_SM70_FLINT_SAMPLER)
+
+
+def _has_module(name: str) -> bool:
+    """True if `name` is importable in this build (kernel_warmup steps whose
+    module a branch does not have yet are skipped, not failed)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 _PIN_LOGGED: set[str] = set()

@@ -24,6 +24,7 @@ def test_names_and_sections():
         "models",
         "sampler",
         "passes",
+        "warmup",
     ]
 
 
