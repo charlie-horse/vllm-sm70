@@ -6,6 +6,9 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
+  Two reviewed exceptions select a kernel, both off by default until
+  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -51,7 +54,9 @@ def opt_in(name: str) -> Callable[[], bool]:
 
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
-    memset). They add work or checks; they never select a different kernel.
+    memset). They add work or checks; they never select a different kernel,
+    except VLLM_SM70_DFLASH2_FP16 (K18) and VLLM_SM70_FP8_QPN8_M32 (K09),
+    opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -109,6 +114,8 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_REQUIRE_CUDA",  # CMake option
             "VLLM_SM70_ABI_VERSION",  # CMake variable / C++ define
             "VLLM_SM70_FV100_FUSED_DECODE",  # CMake option / C++ define (K05/K14)
+            # CMake $ENV (K17): vLLM's patched csrc/ for csrc/custom_ar
+            "VLLM_SM70_VLLM_CSRC_DIR",
         )
     },
     "core": {
@@ -170,6 +177,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
             "VLLM_SM70_PROFILE_TRACE",
         )
+    }
+    | {
+        # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
+        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
+        # the other opt_in switches this one selects a kernel.
+        "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
+        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
+        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
+        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
+        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
+        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
+        # Off: get_unquantized_gemm returns None, nothing is marked or
+        # packed. Read once (selection cached) when layers are built/loaded.
+        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
@@ -229,12 +252,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         ),
         # "0": Sm70Config.fp8_qpn8=False.
         "VLLM_SM70_FP8_QPN8": kill_switch("VLLM_SM70_FP8_QPN8"),
+        # "0": Sm70Config.fp8_block_qpn8=False (M8 block QPN8 decode GEMV;
+        # the Qwen FP8 dense linears stay on M6 TurboMind).
+        "VLLM_SM70_FP8_BLOCK_QPN8": kill_switch("VLLM_SM70_FP8_BLOCK_QPN8"),
     },
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
-        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch(
-            "VLLM_SM70_FLINT_MOE_QPN_DECODE"
-        ),
+        "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".
@@ -244,7 +268,20 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
     },
-    "passes": {},
+    # Kai (K16 top-k candidate sampler). Kill switch only.
+    "sampler": {
+        # "0": Sm70CudaPlatform.get_hidden_state_sampler() returns None, so
+        # the V1 runner keeps compute_logits + the upstream Sampler (read
+        # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
+        "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
+    },
+    # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
+    # first runs on a graph (fork name kept).
+    "passes": {
+        # "0": the TP2 all-reduce + fused_add_rms_norm pattern is not applied;
+        # graphs keep upstream's all_reduce and fused_add_rms_norm.
+        "VLLM_SM70_FLINT_AR_RMSNORM": kill_switch("VLLM_SM70_FLINT_AR_RMSNORM"),
+    },
 }
 
 

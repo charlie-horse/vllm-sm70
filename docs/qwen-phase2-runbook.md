@@ -32,6 +32,7 @@ sm70/scripts/qwen_phase2/qwen_matrix.sh all   # rows 1-4 in order
 # or one row at a time: qwen_matrix.sh 1 | 2 | 3 | 4
 sm70/scripts/qwen_phase2/qwen_matrix.sh 4-noemu   # M7 A/B (optional, INFO only)
 sm70/scripts/qwen_phase2/qwen_matrix.sh summary   # reprint all rows in $OUT
+sm70/scripts/qwen_phase2/m8_qpn8_ab.sh        # M8 QPN8 A/B (section below)
 ```
 Optional overrides: `MAX_MODEL_LEN` (default 32768; lower it if startup says
 "estimated maximum model length is N", the needle test then scales down with
@@ -107,3 +108,67 @@ row2 PASS math 10/10 code 5/5 needle 3/3 gibberish 0/20 decode4k 98.3 tok/s acce
 ```
 Send Mara the summary lines and the `$OUT` directory (server logs included).
 On a FAIL, the bracketed reasons at the end of the line name the failed gates.
+
+## M8 QPN8 A/B
+Run this after the M8 GPU tests pass, in this order:
+```sh
+cd <repo checkout>   # PR #65 head
+$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/qpn8 -v                      # K09 ops
+$VLLM_PY -m pytest -q -p no:cacheprovider -m gpu sm70/tests/quant/test_m8_qpn8_wiring.py -v  # M8 wiring (23)
+sm70/scripts/qwen_phase2/m8_qpn8_ab.sh
+```
+`m8_qpn8_ab.sh` serves row 4 (Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2, `dflash`
+k=7 probabilistic) with `--max-num-seqs 4`, twice, with the same server
+settings and teardown as `qwen_matrix.sh`:
+
+| arm | env | expected M8 route |
+|---|---|---|
+| `on` | `VLLM_SM70_FP8_BLOCK_QPN8=1 VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32` (default 1) | block QPN8 for M ≤ max_m (32 with M32=1) |
+| `off` | `VLLM_SM70_FP8_BLOCK_QPN8=0 VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32` | M6 TurboMind |
+
+Both env values and the copy policy are recorded in each arm's `cmd.txt`.
+`VLLM_SM70_FP8_QPN8` / `fp8_qpn8` is the fork's separate sm70_native selector,
+and M8 does not read it. max_m is K09's `qpn8_max_m(block_scaled=True)`:
+8 by default, and 32 with `VLLM_SM70_FP8_QPN8_M32=1` (K09's opt-in for
+block-scaled M9–32, not yet validated on V100). The script sets it to 1 by
+default so that the `on` arm measures that path.
+
+**Copy policy.** `QP2_QPN8_COPY=auto|true|false` (default `auto`, which is
+`None`) passes
+`--additional-config '{"sm70": {"fp8_block_qpn8_turbomind_copy": ...}}'` to
+both arms. Here rows = 4 × (7 + 1) = 32.
+- `auto` (safe default): admits QPN8 with no copy iff rows ≤ max_m.
+  Otherwise the model stays on M6, so it never holds two weight copies.
+  With `QP2_QPN8_M32=1` (default), 32 ≤ 32 and QPN8 is admitted with no copy.
+  **With `QP2_QPN8_M32=0`, auto leaves the `on` arm on M6 (no QPN8).** Use
+  M32=1, or set the copy policy explicitly.
+- `true`: admits QPN8 and keeps a second, TurboMind-packed copy for rows above
+  max_m. That is about 2× the dense FP8 bytes per GPU, roughly +12 GiB on
+  Qwen3.8-27B at TP2. With `QP2_QPN8_M32=0` and max_num_seqs 4 it may OOM;
+  use `QP2_QPN8_COPY=false` then.
+- `false`: admits QPN8 with no copy. Rows above max_m dequantize to fp16 and
+  run torch.mm.
+
+Record which settings the PASS used.
+
+`probe.py ab-run` sends a fixed ~1K-token prompt at concurrency 1, 2, 3 and 4.
+Each stream decodes 256 tokens (`ignore_eos`, temperature 0), and each
+concurrency runs 3 rounds. The aggregate decode tok/s (the sum of the
+per-stream rates) is recorded as the median of those rounds. The probe also
+records the greedy first 32 tokens of 5 fixed prompts.
+`probe.py ab-compare` prints one line per concurrency
+(`c=N qpn8 X m6 Y tok/s ratio R`) plus the greedy match count.
+**PASS** = ratio ≥ 0.98 (noise band) at every concurrency, and all 5 greedy outputs match.
+
+The script also greps `server.log` for `SM70 FP8 QPN8` into
+`$OUT/m8/<arm>/m8_log.txt`. In `on`, expect
+"SM70 FP8 QPN8 decode (M<=N) enabled ...: rows=32, max_m=N, keep_copy=...",
+and, with a copy, "TurboMind copy on cuda:X: G GiB so far" warnings (one per GiB).
+"SM70 FP8 QPN8 not used: ... rows=32 ... > max_m=8" means auto refused, so
+the A/B compared M6 with M6.
+`off` has no line, because the kill switch stops M8 before it logs.
+
+Results: `$OUT/m8/{on,off}/` hold `ab.json`, `server.log`, `probe.log`,
+`cmd.txt`, `nvidia-smi.csv` and `m8_log.txt`. `$OUT/m8/summary.txt` and
+`ab_summary.json` hold the comparison. Duration: about 2 × (10 min load + 5 min probe).
+Exit codes: 0 PASS, 1 FAIL, 2 refused (same refusals as above).

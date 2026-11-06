@@ -237,7 +237,11 @@ def test_sources_cmake_builds_the_lean_files_only():
 def test_provenance_check_passes():
     script = SM70 / "tools" / "check_flash_v100_provenance.py"
     result = subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, check=False
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

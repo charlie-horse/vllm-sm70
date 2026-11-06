@@ -234,9 +234,16 @@ TurboMindRuntime& runtime() {
 
 }  // namespace
 
+// Small-shape autotuning (kMeasure) is OFF by default on SM70. Measuring picks
+// the fastest spec by timing, which can differ run to run and between TP
+// ranks, and a CUDA graph capture of an untuned shape falls back to kDefault
+// (select_dense_dispatch_policy_impl). Eager and captured decode then run
+// different kernels and diverge. With tuning off, both use kDefault. Set
+// VLLM_SM70_{AWQ,FP8,NVFP4}_TUNE_SMALL_SHAPES=1 to tune again; the
+// pre-capture warmup (vllm_sm70.warmup) makes tuning graph-safe.
 bool tune_small_shapes_enabled() {
   return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::awq_tune_small_shapes,
-                                 1) != 0;
+                                 0) != 0;
 }
 
 bool awq_tune_small_shapes_enabled() {
@@ -246,12 +253,12 @@ bool awq_tune_small_shapes_enabled() {
 
 bool fp8_tune_small_shapes_enabled() {
   return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_tune_small_shapes,
-                                 1) != 0;
+                                 0) != 0;
 }
 
 bool nvfp4_tune_small_shapes_enabled() {
   return vllm::sm70::policy_atoi(
-             vllm::sm70::PolicyField::nvfp4_tune_small_shapes, 1) != 0;
+             vllm::sm70::PolicyField::nvfp4_tune_small_shapes, 0) != 0;
 }
 
 bool nvfp4_moe_grouped_prefill_enabled() {

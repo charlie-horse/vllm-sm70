@@ -118,6 +118,27 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
 endif()
 
+# Hook for K16 (Flint top-k candidate sampler). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/sampler/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/sampler/sources.cmake")
+endif()
+
+# Hook for K17 (TP2 all-reduce + RMSNorm). Same contract; needs
+# $ENV{VLLM_SM70_VLLM_CSRC_DIR} (vLLM's csrc headers) for its one source.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
+endif()
+
+# Hook for K09 (QPN8 block-FP8 decode GEMV). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
+endif()
+
+# Hook for K18 (DFlash2 draft FP16 M<=8 GEMM). Same contract.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
+endif()
+
 # Hook for K12 (Flint NVFP4 MoE M<=2 QPN decode). Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
