@@ -197,9 +197,6 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
         "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
-        # "0": Flint (FlintSm70ForCausalLM) stays on TRITON_ATTN instead of
-        # Flash-V100 with sinks (vllm_sm70/attention/flint_route.py).
-        "VLLM_SM70_FLINT_FLASH_V100": kill_switch("VLLM_SM70_FLINT_FLASH_V100"),
         # K14 (C4): "0" -> Flint sink layers decode with the grouped
         # partition kernel plus reducer (two launches) instead of the
         # one-launch fused kernel. Read on every decode call
