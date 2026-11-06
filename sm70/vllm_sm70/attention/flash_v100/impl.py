@@ -42,6 +42,20 @@ def _log_fallback_once(reason: str) -> None:
         logger.info("vllm_sm70 Flash-V100: using the Triton forward (%s)", reason)
 
 
+def symmetric_window(window: tuple[int, int], causal: bool) -> tuple[int, int]:
+    """A left-only window is two-sided for non-causal attention.
+
+    vLLM stores sliding windows as (w - 1, 0). Non-causal rows (the DFlash
+    draft) must see w - 1 keys on both sides, as Triton unified attention
+    (|dist| < w) and FlashAttention (_maybe_symmetrize_window) do; (w - 1, 0)
+    would silently drop the draft's future keys.
+    """
+    left, right = window
+    if not causal and left >= 0 and right == 0:
+        return (left, left)
+    return window
+
+
 class FlashAttnV100Impl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -157,6 +171,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             sinks=sinks,
         )
         if attn_metadata.prefill_groups:
+            causal = bool(attn_metadata.causal)
             dispatch.run_prefill(
                 query,
                 key_cache,
@@ -164,8 +179,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 out,
                 attn_metadata,
                 scale=self.scale,
-                causal=bool(attn_metadata.causal),
-                window=window,
+                causal=causal,
+                window=symmetric_window(window, causal),
                 sinks=sinks,
             )
         return output

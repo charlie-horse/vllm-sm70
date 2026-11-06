@@ -174,10 +174,10 @@ def _builder(monkeypatch, heads=(12, 2), head_size=256, spec_tokens=SPEC_TOKENS)
     )
 
 
-def _cm(query_lens, seq_lens, causal=True, block_size=16):
+def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None):
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
-    width = -(-max(seq_lens) // block_size)
+    width = width or -(-max(seq_lens) // block_size)
     qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
     qsl[1:] = torch.tensor(query_lens).cumsum(0)
     n = int(qsl[-1])
@@ -307,7 +307,7 @@ def _run_case(
 ):
     from _fv100_ref import prefill_reference
 
-    from vllm_sm70.attention.flash_v100.impl import FlashAttnV100Impl
+    from vllm_sm70.attention.flash_v100.impl import FlashAttnV100Impl, symmetric_window
 
     b = _builder(monkeypatch, heads=heads, head_size=head_size)
     cm = _cm(query_lens, seq_lens, causal=causal)
@@ -339,7 +339,7 @@ def _run_case(
             cm.seq_lens[r : r + 1],
             scale=impl.scale,
             causal=causal,
-            window=tuple(impl.sliding_window),
+            window=symmetric_window(tuple(impl.sliding_window), causal),
             sinks=sinks,
         )[0]
         torch.testing.assert_close(out[a:z].float(), ref, atol=2e-3, rtol=2e-3)
@@ -426,3 +426,61 @@ def test_noncausal_draft_forward(monkeypatch, cpu_ops):
     )
     assert names == ["fv100_prefill_paged"]
     assert cpu_ops.calls[0][1]["causal"] is False
+
+
+@requires_vllm
+def test_noncausal_draft_window_is_two_sided(monkeypatch, cpu_ops):
+    # DFlash drafts are non-causal with a sliding window: every draft token
+    # sees w - 1 keys on each side, like Triton (|dist| < w) and upstream
+    # FlashAttention's _maybe_symmetrize_window. A left-only (w - 1, 0)
+    # window would drop the draft's future keys (Bea's c4130 GPU run).
+    from vllm_sm70.attention.flash_v100.impl import symmetric_window
+
+    assert symmetric_window((2047, 0), False) == (2047, 2047)
+    assert symmetric_window((2047, 0), True) == (2047, 0)
+    assert symmetric_window((-1, -1), False) == (-1, -1)
+    names = _run_case(
+        monkeypatch,
+        cpu_ops,
+        heads=(8, 2),
+        head_size=128,
+        window=64,
+        sinks=None,
+        query_lens=[L, L],
+        seq_lens=[300, 40],
+        causal=False,
+    )
+    assert names == ["fv100_prefill_paged"]
+    assert cpu_ops.calls[0][1]["window"] == (63, 63)
+
+
+@requires_vllm
+@pytest.mark.parametrize("spec_tokens", [SPEC_TOKENS, 0], ids=["verify", "decode"])
+def test_rebuild_refreshes_captured_buffers_in_place(monkeypatch, spec_tokens):
+    # A captured graph keeps reading the tensors bound at capture. The V1
+    # runner rebuilds metadata every step before replay, so each rebuild must
+    # write the new lengths/tables into those same buffers (Bea's c4130 run:
+    # replay without a rebuild read the capture-time seq_lens of 1).
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    from vllm_sm70.attention.flash_v100.spec.verify import expand_reference
+
+    q = spec_tokens + 1
+    b = _builder(monkeypatch, spec_tokens=spec_tokens)
+    # The runner's block table has a fixed width (max_model_len / block).
+    width = 4096 // 16
+    cap = b.build_for_cudagraph_capture(_cm([q] * 4, [q] * 4, width=width))
+    assert cap.cudagraph_capture and cap.decode_rows == 4 * q
+    for lens in ([600, 50, 4096, 9], [3000, 8, 2049, 700]):
+        cm = _cm([q] * 4, lens, width=width)
+        md = b.build(0, cm)
+        assert md.decode_rows == cap.decode_rows
+        assert md.fv_seq_lens.data_ptr() == cap.fv_seq_lens.data_ptr()
+        assert md.fv_seq_lens.tolist() == lens
+        assert md.decode_seq_lens.data_ptr() == cap.decode_seq_lens.data_ptr()
+        rows, want = expand_reference([q] * 4, lens)
+        assert md.decode_seq_lens.tolist() == want
+        assert cap.decode_seq_lens.tolist() == want  # the captured view sees it
+        if spec_tokens:
+            assert md.spec_verify
+            assert md.decode_block_table.data_ptr() == cap.decode_block_table.data_ptr()
+            assert torch.equal(cap.decode_block_table, cm.block_table_tensor[rows])
