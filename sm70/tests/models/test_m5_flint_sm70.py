@@ -51,6 +51,7 @@ from vllm_sm70 import _ext
 from vllm_sm70 import platform as sm70_platform
 from vllm_sm70.models import flint_sm70
 from vllm_sm70.models.flint_sm70 import fp16_rescale as fr
+from vllm_sm70.flint import QK_ROPE_KV_OP_NAME, QK_ROPE_KV_SPLITTING_OP
 from vllm_sm70.flint import qk_norm_rope_kv as qk  # K15 (#54)
 
 # --------------------------------------------------------------------------
@@ -530,8 +531,9 @@ def test_kill_switch_disables_fusion(monkeypatch):
 
 
 def test_op_registered_under_sm70_name():
-    assert qk.OP_NAME == "sm70_qk_norm_rope_kv_cache_update"
-    assert hasattr(torch.ops.vllm, qk.OP_NAME)
+    assert qk.OP_NAME == QK_ROPE_KV_OP_NAME
+    assert QK_ROPE_KV_OP_NAME.startswith("sm70_")
+    assert hasattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
 
 
 def test_fused_route_runs_k15_op_and_attention():
@@ -540,13 +542,13 @@ def test_fused_route_runs_k15_op_and_attention():
     attention_after_fused_write; M5 keeps no copy of either."""
     import inspect
 
-    from vllm_sm70.flint import QK_ROPE_KV_SPLITTING_OP
     from vllm_sm70.models.flint_sm70 import model as m
 
     src = inspect.getsource(m.FlintSm70Attention._forward_fused)
-    assert f"torch.ops.vllm.{qk.OP_NAME}(" in src
+    assert "_QK_ROPE_KV_OP(" in src
+    assert m._QK_ROPE_KV_OP is getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
     assert "attention_after_fused_write(self.attn, q, k, v)" in src
-    assert QK_ROPE_KV_SPLITTING_OP == f"vllm::{qk.OP_NAME}"
+    assert QK_ROPE_KV_SPLITTING_OP == f"vllm::{QK_ROPE_KV_OP_NAME}"
     assert m.fused_route_rejection is qk.fused_route_rejection
     assert m.attention_after_fused_write is qk.attention_after_fused_write
     assert _mutation_module().TARGET == qk.__name__
@@ -1520,7 +1522,7 @@ def _qk_call(n, slots=None, blocks=3):
 
 
 def _run_registered_op(monkeypatch, n, slots=None):
-    """Call K15's torch.ops.vllm.sm70_qk_norm_rope_kv_cache_update on CPU (its
+    """Call K15's torch.ops.vllm.<QK_ROPE_KV_OP_NAME> on CPU (its
     CPU kernel is the module's Python op body) with a fake attention context
     whose layer takes the direct cache-write branch."""
     import vllm.model_executor.layers.attention.attention as attention
@@ -1530,7 +1532,7 @@ def _run_registered_op(monkeypatch, n, slots=None):
     layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
     monkeypatch.setattr(attention, "get_attention_context",
                         lambda name: (None, layer, kv, slots))
-    op = getattr(torch.ops.vllm, qk.OP_NAME)
+    op = getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
     op(qkv, q, k, qw, kw, pos, _cos_sin(), 1e-6, _encode_layer_name("m5.layer"))
     return q, k, kv, (qkv, qw, kw, pos, slots)
 

@@ -10,7 +10,7 @@ PYTHONPATH).
 Hook mutations patch ``qk_norm_rope_kv`` in K15's module
 ``vllm_sm70.flint.qk_norm_rope_kv`` (#54), the one the model's fused route
 runs. That is the patch point because the registered op
-``torch.ops.vllm.sm70_qk_norm_rope_kv_cache_update`` dispatches to the module
+``torch.ops.vllm.<QK_ROPE_KV_OP_NAME>`` (vllm_sm70/flint) dispatches to the module
 function ``qk_norm_rope_kv_cache_update``, whose body looks
 ``qk_norm_rope_kv`` up in the module globals at call time (both the
 direct-cache-write branch and the fallback branch), with the same argument

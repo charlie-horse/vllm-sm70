@@ -16,10 +16,9 @@ FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
                                        its own mapping (UP fused_moe/
                                        routed_experts.py:1004-1008)
 runner.router_provider :229            dropped in v1 (fused router deferred)
-Attention.forward(kv_cache_updated=)   K15's op torch.ops.vllm.sm70_qk_norm_
-  :386                                 rope_kv_cache_update, then K15's
-                                       attention_after_fused_write (vllm_sm70/
-                                       flint/qk_norm_rope_kv.py)
+Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
+  :386                                 OP_NAME>), then K15's attention_after_
+                                       fused_write (vllm_sm70/flint/)
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
 layer_policy(...).value("flint_        dropped in v1 (sampler deferred)
@@ -91,7 +90,8 @@ from vllm.utils.torch_utils import _encode_layer_name
 
 from vllm_sm70.config import sm70_config
 
-# K15 (#54). Importing it registers torch.ops.vllm.sm70_qk_norm_rope_kv_cache_update.
+# K15 (#54). Importing qk_norm_rope_kv registers the op in torch.ops.vllm.
+from vllm_sm70.flint import QK_ROPE_KV_OP_NAME
 from vllm_sm70.flint.qk_norm_rope_kv import (
     attention_after_fused_write,
     fused_route_rejection,
@@ -100,6 +100,9 @@ from vllm_sm70.flint.qk_norm_rope_kv import (
 from . import fp16_rescale
 
 logger = init_logger("vllm.sm70.flint")
+
+# K15's fused q/k norm + RoPE + KV-write op, torch.ops.vllm.<QK_ROPE_KV_OP_NAME>.
+_QK_ROPE_KV_OP = getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
 
 # Shards that one fused linear loads. A fused NVFP4 linear keeps a single
 # global scale, so the shards' weight_scale_2 must agree (fork :76-84).
@@ -391,7 +394,7 @@ class FlintSm70Attention(nn.Module):
         q = torch.empty((num_tokens, self.q_size), dtype=qkv.dtype, device=qkv.device)
         k = torch.empty((num_tokens, self.kv_size), dtype=qkv.dtype, device=qkv.device)
         v = qkv[:, self.q_size + self.kv_size :]
-        torch.ops.vllm.sm70_qk_norm_rope_kv_cache_update(
+        _QK_ROPE_KV_OP(
             qkv,
             q,
             k,
