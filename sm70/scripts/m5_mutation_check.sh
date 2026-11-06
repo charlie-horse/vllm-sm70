@@ -39,7 +39,15 @@ set -uo pipefail
 if [[ "${M5_ALLOW_TUNING:-0}" != 1 ]]; then
   for q in NVFP4 FP8 AWQ MXFP4; do export "VLLM_SM70_${q}_TUNE_SMALL_SHAPES=0"; done
 fi
-echo "tuning: $(env | grep -E '^VLLM_SM70_[A-Z0-9]+_TUNE_SMALL_SHAPES=' | sort | tr '\n' ' ')"
+# Quinn (Nov 7, after #87): a gate may run with tuning on only against a
+# persisted TurboMind LUT in strict mode, so a missing or stale LUT fails
+# instead of silently re-tuning per engine.
+if [[ "${M5_ALLOW_TUNING:-0}" == 1 && -n "${VLLM_SM70_GEMM_LUT_PATH:-}" \
+      && "${VLLM_SM70_GEMM_LUT_STRICT:-}" != 1 ]]; then
+  echo "M5_ALLOW_TUNING=1 with VLLM_SM70_GEMM_LUT_PATH set needs VLLM_SM70_GEMM_LUT_STRICT=1"
+  exit 2
+fi
+echo "tuning: $(env | grep -E '^VLLM_SM70_[A-Z0-9]+_TUNE_SMALL_SHAPES=' | sort | tr '\n' ' ')LUT: path=${VLLM_SM70_GEMM_LUT_PATH:-<unset>} strict=${VLLM_SM70_GEMM_LUT_STRICT:-<unset>}"
 
 : "${VLLM_PY:?set VLLM_PY to the venv python}"
 : "${FLINT_SM70_CHECKPOINT:?set FLINT_SM70_CHECKPOINT}"
