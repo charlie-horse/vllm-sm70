@@ -122,7 +122,7 @@ def test_config_imports_no_vllm():
         "bad = [m for m in sys.modules if m == 'vllm' or m.startswith('vllm.')]; "
         "assert not bad, bad"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 # --- kill switches -------------------------------------------------------

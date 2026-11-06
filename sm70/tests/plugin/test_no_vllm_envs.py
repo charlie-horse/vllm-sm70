@@ -22,6 +22,7 @@ def test_names_and_sections():
         "fused_moe",
         "quant",
         "models",
+        "sampler",
         "passes",
         "warmup",
     ]
@@ -65,7 +66,7 @@ def test_import_pulls_in_no_vllm():
         "bad = [m for m in sys.modules if m == 'vllm' or m.startswith('vllm.')]; "
         "assert not bad, bad"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 def test_every_referenced_var_is_registered():

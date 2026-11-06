@@ -27,7 +27,12 @@ if TYPE_CHECKING:
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
+# Human-readable name for logs. get_name() must return the enum member name
+# ("CUSTOM"): every upstream Attention layer does
+# AttentionBackendEnum[backend.get_name()] (UP attention.py:433), and
+# FLASH_ATTN_V100 is not a member.
 BACKEND_NAME = "FLASH_ATTN_V100"
+ENUM_NAME = "CUSTOM"
 SUPPORTED_HEAD_SIZES = (128, 256)
 
 
@@ -43,7 +48,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return BACKEND_NAME
+        return ENUM_NAME
 
     @staticmethod
     def get_impl_cls():
