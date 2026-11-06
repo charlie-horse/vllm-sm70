@@ -9,7 +9,9 @@
 #   - the failure message is the gate's ("outside ... the fork");
 #   - the mutation demonstrably took effect: hook mutations print
 #     "M5_MUTATION <name> installed in pid N" from >= 3 processes (pytest +
-#     2 TP workers); rope_theta_1p01 prints its hf_overrides line.
+#     2 TP workers; 2 for moe_decode_scale) AND "M5_MUTATION <name> fired in
+#     pid N" at least once (it actually changed a call); rope_theta_1p01
+#     prints its hf_overrides line.
 # Mutations (sm70/tests/models/m5_mutations/m5_mutation.py) and the nodes
 # that MUST catch them (Quinn/Astro, Nov 6):
 #   rope_pos_decode  positions + 1 on <= 8-token fused-op calls   -> t4d t7
@@ -135,8 +137,19 @@ for mut in "${MUTS[@]}"; do
       need=3
     fi
     tag=""; [[ $info -eq 1 ]] && tag="INFO "
+    # Fired, not just installed (Quinn): the wrapper prints "fired" the first
+    # time it changes a call in a process; the TP workers run the op.
+    fired=1
+    if [[ $mut != rope_theta_1p01 ]]; then
+      fired=$(grep -oE "M5_MUTATION $mut fired in pid [0-9]+" "$log" | sort -u | wc -l)
+    fi
     if [[ $applied -lt $need ]]; then
       VERDICT[$name.$mut]="${tag}NOT APPLIED (marker seen $applied, need >= $need)"
+    elif [[ $fired -lt 1 ]]; then
+      extra=""
+      [[ $mut == moe_decode_scale ]] && ! grep -q "K12 M<=2 decode admitted" "$log" \
+        && extra=" (no 'K12 M<=2 decode admitted' line: decode not admitted in this build/config)"
+      VERDICT[$name.$mut]="${tag}NOT FIRED (installed but never changed a call)$extra"
     elif [[ $RUN_RC -ne 0 && $n -gt 0 && $f -gt 0 && $e -eq 0 && $k -eq 0 \
             && $msg == *outside*fork* ]]; then
       VERDICT[$name.$mut]="${tag}CAUGHT: $msg"; continue

@@ -1396,12 +1396,39 @@ def _reference(n, qkv, qw, kw, pos, slots, blocks=3):
                                  *qk.triton_cache_views(kv, D), slots)
     return q, k, kv
 
+def test_mutation_fired_marker_only_when_a_call_changes(capfd):
+    """Quinn: a mutation must be shown to have FIRED. The qk wrapper marks
+    fired only on a call it changed (<= 8 tokens), once per process."""
+    import inspect
+
+    mm = _mutation_module()
+    mm._FIRED.clear()
+    calls = []
+
+    def fake_op(qkv, q_out, k_out, q_weight, k_weight, positions, cos_sin_cache,
+                epsilon, key_cache=None, value_cache=None, slot_mapping=None):
+        calls.append(positions.clone())
+
+    wrapped = mm.make_wrapper(fake_op, "rope_pos_decode")
+    cs = torch.zeros(64, 8)
+    big = torch.zeros(9, 4)
+    wrapped(big, None, None, None, None, torch.arange(9), cs, 1e-6)
+    assert "fired" not in capfd.readouterr().err  # prefill-sized call: untouched
+    small = torch.zeros(2, 4)
+    wrapped(small, None, None, None, None, torch.tensor([3, 4]), cs, 1e-6)
+    wrapped(small, None, None, None, None, torch.tensor([5, 6]), cs, 1e-6)
+    err = capfd.readouterr().err
+    assert err.count("M5_MUTATION rope_pos_decode fired in pid") == 1
+    assert calls[1].tolist() == [4, 5] and calls[0].tolist() == list(range(9))
+
+
 def test_mutation_moe_decode_scale_scales_k12_output():
     """moe_decode_scale wraps flint_moe_decode_out (looked up by M4 as a
     module attribute at call time) and scales its output by 1.01."""
     import types
 
     mm = _mutation_module()
+    mm._FIRED.discard("moe_decode_scale")
     fake = types.ModuleType(mm.MOE_TARGET)
 
     def flint_moe_decode_out(out, *rest):

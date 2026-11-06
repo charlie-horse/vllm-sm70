@@ -53,24 +53,40 @@ DECODE_MAX_TOKENS = 8
 ROPE_THETA_FACTOR = 1.01
 
 
-def mutate_call(mutation: str, bound: inspect.BoundArguments) -> None:
-    """Apply a hook mutation in place to the bound qk_norm_rope_kv args."""
+_FIRED: set = set()
+
+
+def _mark_fired(mutation: str) -> None:
+    """Print once per process the first time a mutation actually changes a
+    call (Quinn: installed is not enough; it must be shown to have fired)."""
+    if mutation in _FIRED:
+        return
+    _FIRED.add(mutation)
+    print(f"M5_MUTATION {mutation} fired in pid {os.getpid()}", file=sys.stderr, flush=True)
+
+
+def mutate_call(mutation: str, bound: inspect.BoundArguments) -> bool:
+    """Apply a hook mutation in place to the bound qk_norm_rope_kv args;
+    True if the call was changed."""
     a = bound.arguments
     if a["qkv"].shape[0] > DECODE_MAX_TOKENS:
-        return
+        return False
     if mutation == "rope_pos_decode":
         cs = a.get("cos_sin_cache")
         if cs is not None:
             pos = a["positions"]
             bumped = (pos + 1).clamp(max=cs.shape[0] - 1)
             a["positions"] = pos.where(pos < 0, bumped)
+            return True
     elif mutation == "kv_slot_decode":
         slots, kc = a.get("slot_mapping"), a.get("key_cache")
         if slots is not None and kc is not None:
             total = kc.shape[0] * kc.shape[1]
             a["slot_mapping"] = slots.where(slots < 0, (slots + 1) % total)
+            return True
     else:
         raise ValueError(f"not a hook mutation: {mutation!r}")
+    return False
 
 
 def make_wrapper(orig, mutation: str):
@@ -80,7 +96,8 @@ def make_wrapper(orig, mutation: str):
     def wrapper(*args, **kwargs):
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        mutate_call(mutation, bound)
+        if mutate_call(mutation, bound):
+            _mark_fired(mutation)
         return orig(*bound.args, **bound.kwargs)
 
     wrapper._m5_mutation = mutation
@@ -95,6 +112,7 @@ def make_moe_wrapper(orig, mutation: str):
     def wrapper(*args, **kwargs):
         out = orig(*args, **kwargs)
         out.mul_(MOE_DECODE_SCALE)
+        _mark_fired(mutation)
         return out
 
     wrapper._m5_mutation = mutation

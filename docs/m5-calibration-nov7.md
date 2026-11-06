@@ -203,7 +203,11 @@ crash, not a skip) and shows the mutation applied: `M5_MUTATION <name>
 installed in pid N` from at least 3 processes (2 for `moe_decode_scale`,
 which only the TP workers import), or the `hf_overrides` line for
 rope_theta. INFO runs are reported with an `INFO` prefix and never fail the
-check. `moe_decode_scale` only bites if the build has K12 and M4 admits the
+check. Hook mutations must also print `M5_MUTATION <name> fired in pid N`
+(the first call they actually changed); a run that installed but never
+fired is reported `NOT FIRED`, not "not caught". For `moe_decode_scale`
+that usually means K12 was not admitted: look for the "K12 M<=2 decode
+admitted" line (#76). `moe_decode_scale` only bites if the build has K12 and M4 admits the
 decode: with forced decode at max_num_seqs=1 every step is M=1, and
 since #76 the engine log shows "K12 M<=2 decode admitted".
 `m5_mutations/sitecustomize.py` runs any shadowed sitecustomize first (the
