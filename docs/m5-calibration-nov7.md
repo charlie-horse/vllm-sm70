@@ -213,7 +213,46 @@ since #76 the engine log shows "K12 M<=2 decode admitted".
 `m5_mutations/sitecustomize.py` runs any shadowed sitecustomize first (the
 Nix wrapper ships one), so the environment stays intact.
 
+## 6. Flash-V100 for Flint (Kai's checks; 2 loads + GPU tests + bench, ~25 min)
+Since this branch, Flint picks Flash-V100 (`AttentionBackendEnum.CUSTOM`,
+sink prefill and decode) when no backend is given; `VLLM_SM70_FLASH_V100=0`
+selects TRITON_ATTN. Every M5 run above already uses it, so check the route
+before trusting their numbers.
+
+1. **Route, from any engine log of steps 1–5.** Expect
+   `Flint SM70: using FLASH_ATTN_V100 (CUSTOM)` and, in graphs mode,
+   `Flash-V100 grouped sink decode in captured CUDA graphs so far: N
+   one-launch, 0 two-launch` (K14 fused decode). FAIL on
+   `Flint SM70: using TRITON_ATTN ... because <reason>`, on
+   `vllm_sm70 Flash-V100: using the Triton forward`, or on
+   `one-launch sink decode is off`.
+   ```sh
+   grep -h "Flint SM70: using\|Triton forward\|grouped sink decode\|sink decode is off" "$W"/window/*.log
+   ```
+2. **Kernel tests.**
+   ```sh
+   $VLLM_PY -m pytest -m gpu -q sm70/tests/attention/test_fv100_fused_decode_gpu.py \
+     sm70/tests/attention/test_fv100_decode_sinks_gpu.py \
+     sm70/tests/attention/test_fv100_prefill_sinks_gpu.py
+   ```
+3. **Batched greedy, Flash-V100 vs Triton** (graphs mode, max_num_seqs 20,
+   batches of 2/3/4/8/20, each run twice):
+   ```sh
+   FV=sm70/scripts/m5_fv100_check.py
+   $VLLM_PY $FV gen --model "$CKPT" --hf-overrides "$OURS_ARCH" --backend fv100  --out "$W/fv100.json"
+   $VLLM_PY $FV gen --model "$CKPT" --hf-overrides "$OURS_ARCH" --backend triton --out "$W/triton.json"
+   $VLLM_PY $FV compare "$W/fv100.json" "$W/triton.json" --show
+   ```
+   Divergence after a shared prefix is expected (MoE routing flips on last
+   bits). FAIL on run-to-run differences, a degenerate or first-token
+   divergence (the script flags these), or text that reads as gibberish.
+4. **Bench.** Start `vllm serve` on the window stack with prod flags (no
+   `--attention-backend`) and run `~/archive/scripts/bench_vllm.py` at 4K
+   and 32K. Fork today: 177 tok/s (4K), 163 tok/s (32K). Ours on
+   TRITON_ATTN was 47 tok/s at 32K, TTFT 31.5 s. Report decode tok/s and
+   TTFT next to the fork's.
+
 ## Total
-About 1 h 45 min of GPU time with no retries: step 1 ~5 min, step 2 ~25 min,
-step 4 ~60 min, step 5 ~35 min. If the window is short, run steps 1–3 and
+About 2 h 10 min of GPU time with no retries: step 1 ~5 min, step 2 ~25 min,
+step 4 ~60 min, step 5 ~35 min, step 6 ~25 min. If the window is short, run steps 1–3 and
 then `M5_NODES="t4c t4a t4d t7"` (7 loads) before the full runner.

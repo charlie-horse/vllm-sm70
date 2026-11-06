@@ -503,13 +503,15 @@ def device(monkeypatch):
     sm70_platform.is_sm70_ready.cache_clear()
 
 
-def _vllm_config(dtype=torch.float16, backend=None, kv="auto", head_dim=128, spec=None):
+def _vllm_config(
+    dtype=torch.float16, backend=None, kv="auto", head_dim=128, spec=None, block_size=16
+):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=dtype, hf_text_config=SimpleNamespace(head_dim=head_dim)
         ),
         attention_config=SimpleNamespace(backend=backend),
-        cache_config=SimpleNamespace(cache_dtype=kv),
+        cache_config=SimpleNamespace(cache_dtype=kv, block_size=block_size),
         speculative_config=spec,
     )
 
@@ -519,8 +521,13 @@ def fv100_ops(monkeypatch):
     """Control whether the Flash-V100 ops count as built (CPU tests)."""
     from vllm_sm70 import attention
 
-    state = {"ok": True}
+    from vllm_sm70.attention.flash_v100 import BACKEND_PATH
+    from vllm_sm70.models.flint_sm70 import config as fcfg
+
+    state = {"ok": True, "sinks": True, "custom": BACKEND_PATH}
     monkeypatch.setattr(attention, "_ops_available", lambda: state["ok"])
+    monkeypatch.setattr(fcfg, "flash_v100_supports_sinks", lambda: state["sinks"])
+    monkeypatch.setattr(attention, "custom_backend_path", lambda: state["custom"])
     monkeypatch.delenv(attention.KILL_SWITCH, raising=False)
     return state
 
@@ -560,6 +567,9 @@ def test_config_selects_flash_v100_with_sinks(device, fv100_ops):
         ("ops missing", {}, "ops are missing"),
         ("head 256", {"head_dim": 256}, "head_dim=256"),
         ("spec decode", {"spec": object()}, "speculative"),
+        ("sink ops missing", {}, "sink ops are missing"),
+        ("custom overridden", {}, "CUSTOM is overridden"),
+        ("block size 8", {"block_size": 8}, "multiple of 16"),
     ],
 )
 def test_config_falls_back_to_triton(device, fv100_ops, monkeypatch, case, kw, why):
@@ -573,6 +583,10 @@ def test_config_falls_back_to_triton(device, fv100_ops, monkeypatch, case, kw, w
         monkeypatch.setenv("VLLM_SM70_FLASH_V100", "0")
     if case == "ops missing":
         fv100_ops["ok"] = False
+    if case == "sink ops missing":
+        fv100_ops["sinks"] = False
+    if case == "custom overridden":
+        fv100_ops["custom"] = "somebody.else.Backend"
     vc = _vllm_config(**kw)
     assert why in fcfg.flash_v100_sink_route_rejection(vc)
     fcfg.FlintSm70ModelConfig.verify_and_update_config(vc)
