@@ -133,7 +133,7 @@ def make_mock_tm(indexed=True):
     return tm
 
 
-def make_fake_flint_moe(admit=True, ops_present=True):
+def make_fake_flint_moe(admit=True, ops_present=True, reject_reason=None):
     """Fake vllm_sm70.ops.flint_moe (K12): records every call.
 
     admit_layer admits iff the policy is on and ``admit``; can_decode takes
@@ -164,9 +164,17 @@ def make_fake_flint_moe(admit=True, ops_present=True):
         fm.allocations.append(torch.device(device))
         return SimpleNamespace(device=torch.device(device))
 
+    def _reason(x):
+        if not 0 < x.shape[0] <= 2:
+            return f"x shape {tuple(x.shape)} is not [M<=2, H]"
+        return reject_reason
+
+    def call_rejection(x, topk_weights, topk_ids):
+        return _reason(x)
+
     def can_decode(x, topk_weights, topk_ids):
         fm.calls.append(("can_decode", x.shape[0], topk_ids.dtype))
-        return 0 < x.shape[0] <= 2
+        return _reason(x) is None
 
     def flint_moe_decode_out(
         out, inter, x, w13_w, w13_s, w2_w, w2_s, weights, ids, ws, plan
@@ -189,6 +197,7 @@ def make_fake_flint_moe(admit=True, ops_present=True):
         enabled,
         admit_layer,
         allocate_workspace,
+        call_rejection,
         can_decode,
         flint_moe_decode_out,
     ):
@@ -714,6 +723,27 @@ def test_decode_route_exact_args_and_no_dense(mods, monkeypatch, m, ids_dtype):
     torch.testing.assert_close(
         out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
     )
+
+
+def test_decode_skip_reason_is_logged_per_layer(mods, monkeypatch):
+    """An admitted layer refused at call time (M<=2) logs the layer and the
+    C++ guard's reason; prefill-sized calls (M>2) stay silent."""
+    fm = make_fake_flint_moe(reject_reason="x is not 16-byte aligned")
+    m4, tm = mods(flint=fm)
+    method, layer, _w = _build(m4)
+    layer.layer_name = "model.layers.7.mlp.experts"
+    seen = []
+    monkeypatch.setattr(m4.logger, "info_once", lambda msg, *a, **k: seen.append(msg % a))
+    for m in (1, 3):
+        x = torch.randn(m, SMALL[0]).half()
+        weights, ids = _routing(m, SMALL[2], SMALL[3])
+        tm.calls.clear()
+        method.apply(layer, x, weights, ids, None, None)
+        assert [c[0] for c in tm.calls] == ["dense", "dense"]  # dense route both times
+    skipped = [s for s in seen if "decode skipped" in s]
+    assert len(skipped) == 1, seen
+    assert "model.layers.7.mlp.experts" in skipped[0]
+    assert "M=1" in skipped[0] and "16-byte aligned" in skipped[0]
 
 
 def test_can_decode_false_takes_dense(mods):
