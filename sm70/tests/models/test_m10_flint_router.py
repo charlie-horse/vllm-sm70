@@ -12,17 +12,28 @@ CPU: the gate M5's FlintSm70SparseMoeBlock builds, with the router M5's
   MoERunner M5's block builds through UP's FusedMoEFactory on a mocked SM70
   CUDA platform; the kill switch ("0" only) makes the platform getter return
   None, and kernel_warmup then decides no route.
-GPU (``-m gpu``): greedy tokens identical with VLLM_SM70_FLINT_FUSED_ROUTER
-  on and off, on a tiny random Flint (TP1, router-shaped: hidden 2048,
-  E256/K6) and on the checkpoint at TP2 (FLINT_SM70_CHECKPOINT; both V100s,
-  ``vllm`` stopped). Each "on" run also checks the worker log shows K13 was
-  admitted. Skipped without SM70 GPUs.
+GPU (``-m gpu``), VLLM_SM70_FLINT_FUSED_ROUTER on vs off:
+  G1  tiny random Flint (TP1, router-shaped: hidden 2048, E256/K6): K13 is
+      admitted on its one MoE layer and generation completes; greedy tokens
+      are reported, not gated.
+  G2  checkpoint at TP2 (FLINT_SM70_CHECKPOINT; both V100s, ``vllm``
+      stopped): K13 admitted on all 47 MoE layers per rank, and the
+      teacher-forced decode logprobs (M5 harness, sm70/scripts/
+      m5_teacher_forced.py) of "on" vs "off" stay within 1.5x the fork's
+      eager_vs_graphs anchor (FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE).
+  Not exact greedy tokens (Quinn, #86): K13 changes only the FP32 summation
+  order of the router logits, which flips MoE top-6 near-ties, so free-running
+  token equality is not a correctness signal; the envelope is.
+  Skipped without SM70 GPUs.
 """
 
 from __future__ import annotations
 
+import functools
 import gc
+import importlib.util
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -478,10 +489,7 @@ def _tiny_prompts():
     return [{"prompt_token_ids": p} for p in TINY_IDS]
 
 
-def _router_on_off(make_llm, prompts, n, monkeypatch, capfd, *, moe_layers, tp):
-    reqs = [(prompts, _greedy_params(n))]
-    on, on_logs = _run(make_llm, {ROUTER_SWITCH: None}, reqs, monkeypatch, capfd)
-    off, off_logs = _run(make_llm, {ROUTER_SWITCH: "0"}, reqs, monkeypatch, capfd)
+def _check_admission(on_logs, off_logs, *, moe_layers, tp):
     assert on_logs.count(ROUTER_ON_LOG) == tp, "K13 enabled line not once per rank"
     admitted = [int(m) for m in ROUTER_ADMITTED_LOG.findall(on_logs)]
     assert admitted == [moe_layers] * tp, (
@@ -489,15 +497,37 @@ def _router_on_off(make_llm, prompts, n, monkeypatch, capfd, *, moe_layers, tp):
     )
     assert ROUTER_ON_LOG not in off_logs
     assert not ROUTER_ADMITTED_LOG.search(off_logs)
+
+
+def _router_on_off(make_llm, prompts, n, monkeypatch, capfd, *, moe_layers, tp):
+    """Admission gate; greedy tokens on vs off are INFO (near-tie flips)."""
+    reqs = [(prompts, _greedy_params(n))]
+    on, on_logs = _run(make_llm, {ROUTER_SWITCH: None}, reqs, monkeypatch, capfd)
+    off, off_logs = _run(make_llm, {ROUTER_SWITCH: "0"}, reqs, monkeypatch, capfd)
+    _check_admission(on_logs, off_logs, moe_layers=moe_layers, tp=tp)
     assert all(len(t) == n for t in on[0])
-    assert on == off
+    for i, (a, b) in enumerate(zip(on[0], off[0])):
+        common = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), len(a))
+        print(f"G info request {i}: on vs off greedy common prefix {common}/{n}")
+
+
+@functools.cache
+def _m5_tests():
+    """M5's test module (T4 harness helpers: sequence sets, fork envelope,
+    scoring LLM, per-set gate), loaded by path under a private name."""
+    path = pathlib.Path(__file__).with_name("test_m5_flint_sm70.py")
+    spec = importlib.util.spec_from_file_location("_m5_t4_harness", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 @pytest.mark.gpu
 @one_gpu
-def test_g1_tiny_router_on_off_greedy_identical(tmp_path, monkeypatch, capfd):
-    """G1 (1 GPU, #66's G1): tiny Flint TP1, CUDA graphs: K13 on vs
-    VLLM_SM70_FLINT_FUSED_ROUTER=0, greedy."""
+def test_g1_tiny_router_admitted(tmp_path, monkeypatch, capfd):
+    """G1 (1 GPU, #66's G1): tiny Flint TP1, CUDA graphs: K13 admitted with
+    the switch on, absent with VLLM_SM70_FLINT_FUSED_ROUTER=0; greedy tokens
+    reported only (no fork envelope for random weights)."""
     path = _tiny_flint_dir(tmp_path)
     # 2 layers, mlp_only_layers=[0]: one MoE layer.
     _router_on_off(
@@ -511,12 +541,54 @@ def test_g1_tiny_router_on_off_greedy_identical(tmp_path, monkeypatch, capfd):
     )
 
 
+T4_READY = bool(
+    os.environ.get("FLINT_SM70_T4_SEQS_DIR")
+    and os.environ.get("FLINT_SM70_T4_ENVELOPE")
+)
+
+
 @pytest.mark.gpu
 @two_gpus
 @needs_ckpt
-def test_g2_ckpt_tp2_router_on_off_greedy_identical(monkeypatch, capfd):
-    """G2 (2 GPUs, #66's G4): checkpoint TP2, CUDA graphs: K13 on vs off,
-    greedy."""
-    _router_on_off(
-        _ckpt_llm, PROMPTS, 64, monkeypatch, capfd, moe_layers=CKPT_MOE_LAYERS, tp=2
+@pytest.mark.skipif(
+    not T4_READY,
+    reason="set FLINT_SM70_T4_SEQS_DIR and FLINT_SM70_T4_ENVELOPE (fork calibration)",
+)
+def test_g2_ckpt_tp2_router_on_off_within_envelope(monkeypatch, capfd):
+    """G2 (2 GPUs, #66's G4): checkpoint TP2, CUDA graphs, K13 on vs off.
+
+    Gate 1: K13 admitted on all 47 MoE layers on each rank, and absent off.
+    Gate 2 (Quinn, #86): teacher-forced decode (forced sequences, real decode
+    steps under graph replay, max_num_seqs 1) of "on" vs "off" within 1.5x
+    the fork's eager_vs_graphs anchor per set (mean and max), the same gate
+    as M5's T4a. Both arms run graphs mode with tuning off (the harness
+    default)."""
+    m5 = _m5_tests()
+    tf = m5._tf_module()
+    seq_sets = m5._seq_sets()
+    env = m5._envelope(seq_sets)
+    arms = {}
+    for name, value in (("on", None), ("off", "0")):
+        if value is None:
+            monkeypatch.delenv(ROUTER_SWITCH, raising=False)
+        else:
+            monkeypatch.setenv(ROUTER_SWITCH, value)
+        capfd.readouterr()
+        scores, _ = m5._score_sets(seq_sets, prefill=False)
+        out, err = capfd.readouterr()
+        sys.stdout.write(out + err)
+        arms[name] = (scores, out + err)
+    _check_admission(arms["on"][1], arms["off"][1], moe_layers=CKPT_MOE_LAYERS, tp=2)
+    pair = tf.GATE_ANCHOR_PAIR["T4a"]
+    anchor = env["pairs"][pair]["decode"]["anchor"]
+    failures = m5._gate_sets(
+        "G2",
+        "router_on_vs_off",
+        anchor,
+        "decode",
+        arms["on"][0],
+        arms["off"][0],
+        None,
+        env,
     )
+    assert not failures, f"G2 outside 1.5x the fork {pair} anchor: {failures}"
