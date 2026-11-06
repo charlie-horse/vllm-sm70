@@ -24,8 +24,15 @@ into the graph.
   kv_slot_decode   slot_mapping + 1 (padding -1 kept, wrapped in range) on
                    calls with <= DECODE_MAX_TOKENS tokens: the token's K/V
                    lands in the wrong cache slot
+  moe_decode_scale the K12 M<=2 MoE decode output x 1.01: patches
+                   flint_moe_decode_out in vllm_sm70.ops.flint_moe, which M4
+                   (quant/nvfp4_moe.py) looks up as a module attribute at
+                   call time. Catchable by T4d (ours vs fork) only: both T7
+                   arms run the same MoE.
 Config mutation (applied by the tests themselves, on the mutated side only):
-  rope_theta_1p01  hf_overrides with rope_theta x 1.01 (rope_parameters too)
+  rope_theta_1p01  hf_overrides with rope_theta x 1.01 (rope_parameters too);
+                   INFO only (Quinn): too weak at ~70-token positions to be
+                   a required catch.
 """
 
 import functools
@@ -35,7 +42,11 @@ import os
 import sys
 
 TARGET = "vllm_sm70.models.flint_sm70.qk_norm_rope_kv"
-HOOK_MUTATIONS = ("rope_pos_decode", "kv_slot_decode")
+MOE_TARGET = "vllm_sm70.ops.flint_moe"
+MOE_DECODE_SCALE = 1.01
+QK_MUTATIONS = ("rope_pos_decode", "kv_slot_decode")
+MOE_MUTATIONS = ("moe_decode_scale",)
+HOOK_MUTATIONS = QK_MUTATIONS + MOE_MUTATIONS
 CONFIG_MUTATIONS = ("rope_theta_1p01",)
 MUTATIONS = HOOK_MUTATIONS + CONFIG_MUTATIONS
 DECODE_MAX_TOKENS = 8
@@ -77,12 +88,35 @@ def make_wrapper(orig, mutation: str):
     return wrapper
 
 
+def make_moe_wrapper(orig, mutation: str):
+    """flint_moe_decode_out returns its ``out`` buffer; scale it in place."""
+
+    @functools.wraps(orig)
+    def wrapper(*args, **kwargs):
+        out = orig(*args, **kwargs)
+        out.mul_(MOE_DECODE_SCALE)
+        return out
+
+    wrapper._m5_mutation = mutation
+    wrapper._m5_original = orig
+    return wrapper
+
+
+def _target_for(mutation: str) -> tuple[str, str]:
+    if mutation in MOE_MUTATIONS:
+        return MOE_TARGET, "flint_moe_decode_out"
+    return TARGET, "qk_norm_rope_kv"
+
+
 def install(module, mutation: str) -> None:
-    """Patch module.qk_norm_rope_kv (idempotent)."""
-    cur = module.qk_norm_rope_kv
+    """Patch the mutation's target function on ``module`` (idempotent)."""
+    _, attr = _target_for(mutation)
+    cur = getattr(module, attr)
     if getattr(cur, "_m5_mutation", None) == mutation:
         return
-    module.qk_norm_rope_kv = make_wrapper(getattr(cur, "_m5_original", cur), mutation)
+    orig = getattr(cur, "_m5_original", cur)
+    wrap = make_moe_wrapper if mutation in MOE_MUTATIONS else make_wrapper
+    setattr(module, attr, wrap(orig, mutation))
     print(f"M5_MUTATION {mutation} installed in pid {os.getpid()}", file=sys.stderr, flush=True)
 
 
@@ -109,7 +143,7 @@ class _Finder:
         self.mutation = mutation
 
     def find_spec(self, name, path=None, target=None):
-        if name != TARGET:
+        if name != _target_for(self.mutation)[0]:
             return None
         import importlib.machinery
 
@@ -125,8 +159,9 @@ def install_import_hook(mutation: str) -> None:
         raise ValueError(f"M5_MUTATION={mutation!r}; known: {', '.join(MUTATIONS)}")
     if mutation not in HOOK_MUTATIONS:
         return  # config mutation: the tests apply it
-    if TARGET in sys.modules:
-        install(sys.modules[TARGET], mutation)
+    target = _target_for(mutation)[0]
+    if target in sys.modules:
+        install(sys.modules[target], mutation)
         return
     if not any(isinstance(f, _Finder) for f in sys.meta_path):
         sys.meta_path.insert(0, _Finder(mutation))

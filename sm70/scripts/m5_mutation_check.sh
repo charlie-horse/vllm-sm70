@@ -3,17 +3,21 @@
 # Runs each GPU gate node with each mutation (one pytest process per run,
 # M5_MUTATION set, sm70/tests/models/m5_mutations first on PYTHONPATH so its
 # sitecustomize patches the fused q/k-norm+RoPE+KV op in every process) and
-# PASSes only if EVERY mutated run fails the GATE:
+# PASSes only if every REQUIRED mutated run fails the GATE:
 #   - pytest exit != 0, junit: tests > 0, failures > 0, errors == 0,
 #     skipped == 0 (a crash or a skip does not count as catching the bug);
 #   - the failure message is the gate's ("outside ... the fork");
 #   - the mutation demonstrably took effect: hook mutations print
 #     "M5_MUTATION <name> installed in pid N" from >= 3 processes (pytest +
 #     2 TP workers); rope_theta_1p01 prints its hf_overrides line.
-# Mutations (sm70/tests/models/m5_mutations/m5_mutation.py):
-#   rope_pos_decode  positions + 1 on <= 8-token calls of the fused op
-#   kv_slot_decode   slot_mapping + 1 on <= 8-token calls of the fused op
-#   rope_theta_1p01  rope_theta x 1.01 via hf_overrides on the mutated side
+# Mutations (sm70/tests/models/m5_mutations/m5_mutation.py) and the nodes
+# that MUST catch them (Quinn/Astro, Nov 6):
+#   rope_pos_decode  positions + 1 on <= 8-token fused-op calls   -> t4d t7
+#   kv_slot_decode   slot_mapping + 1 on <= 8-token fused-op calls -> t4d t7
+#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> t4d
+#                    (both T7 arms run the same MoE, so T7 cannot see it)
+#   rope_theta_1p01  rope_theta x 1.01 via hf_overrides            -> INFO only
+#                    (too weak at ~70-token positions; reported, not gated)
 # The unmutated T4d/T7 must PASS first (m5_window.sh, or M5_BASELINE=1 here).
 #
 # Required env: as m5_window.sh (VLLM_PY, FLINT_SM70_CHECKPOINT,
@@ -38,7 +42,14 @@ declare -A NODE=(
   [t4d]="$F::test_t4d_graphs_vs_fork_graphs"
   [t7]="$F::test_t7_unfused_path_matches"
 )
-read -r -a MUTS <<< "${M5_MUTATIONS:-rope_pos_decode kv_slot_decode rope_theta_1p01}"
+declare -A MUST=(
+  [rope_pos_decode]="t4d t7"
+  [kv_slot_decode]="t4d t7"
+  [moe_decode_scale]="t4d"
+  [rope_theta_1p01]=""
+)
+declare -A INFO_ONLY=([rope_theta_1p01]="t4d t7")
+read -r -a MUTS <<< "${M5_MUTATIONS:-rope_pos_decode kv_slot_decode moe_decode_scale rope_theta_1p01}"
 read -r -a NODES <<< "${M5_MUTATION_NODES:-t4d t7}"
 
 used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; }
@@ -89,10 +100,13 @@ if [[ "${M5_BASELINE:-0}" == 1 ]]; then
 fi
 
 for mut in "${MUTS[@]}"; do
-  case $mut in rope_pos_decode|kv_slot_decode|rope_theta_1p01) ;;
-    *) echo "unknown mutation: $mut"; exit 2 ;; esac
+  [[ -v "MUST[$mut]" ]] || { echo "unknown mutation: $mut"; exit 2; }
+  read -r -a targets <<< "${MUST[$mut]} ${INFO_ONLY[$mut]:-}"
   for name in "${NODES[@]}"; do
     [[ -n "${NODE[$name]:-}" ]] || { echo "unknown node name: $name"; exit 2; }
+    [[ " ${targets[*]} " == *" $name "* ]] || continue
+    info=0
+    [[ " ${MUST[$mut]} " == *" $name "* ]] || info=1
     run_node "$name" "$mut"
     log="$OUT/$name.$mut.log" xml="$OUT/$name.$mut.junit.xml"
     if [[ ! -f $xml ]]; then
@@ -102,19 +116,24 @@ for mut in "${MUTS[@]}"; do
     if [[ $mut == rope_theta_1p01 ]]; then
       applied=$(grep -c '^M5_MUTATION rope_theta_1p01: hf_overrides' "$log")
       need=1
+    elif [[ $mut == moe_decode_scale ]]; then
+      # the two TP workers run the MoE; the pytest process may not import it
+      applied=$(grep -oE "M5_MUTATION $mut installed in pid [0-9]+" "$log" | sort -u | wc -l)
+      need=2
     else
       applied=$(grep -oE "M5_MUTATION $mut installed in pid [0-9]+" "$log" | sort -u | wc -l)
       need=3
     fi
+    tag=""; [[ $info -eq 1 ]] && tag="INFO "
     if [[ $applied -lt $need ]]; then
-      VERDICT[$name.$mut]="NOT APPLIED (marker seen $applied, need >= $need)"; rc=1
+      VERDICT[$name.$mut]="${tag}NOT APPLIED (marker seen $applied, need >= $need)"
     elif [[ $RUN_RC -ne 0 && $n -gt 0 && $f -gt 0 && $e -eq 0 && $k -eq 0 \
             && $msg == *outside*fork* ]]; then
-      VERDICT[$name.$mut]="CAUGHT: $msg"
+      VERDICT[$name.$mut]="${tag}CAUGHT: $msg"; continue
     else
-      VERDICT[$name.$mut]="NOT CAUGHT (rc $RUN_RC, tests=$n failures=$f errors=$e skipped=$k): $msg"
-      rc=1
+      VERDICT[$name.$mut]="${tag}NOT CAUGHT (rc $RUN_RC, tests=$n failures=$f errors=$e skipped=$k): $msg"
     fi
+    [[ $info -eq 1 ]] || rc=1
   done
 done
 

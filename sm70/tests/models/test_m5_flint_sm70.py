@@ -1389,6 +1389,28 @@ def _reference(n, qkv, qw, kw, pos, slots, blocks=3):
                                  *qk.triton_cache_views(kv, D), slots)
     return q, k, kv
 
+def test_mutation_moe_decode_scale_scales_k12_output():
+    """moe_decode_scale wraps flint_moe_decode_out (looked up by M4 as a
+    module attribute at call time) and scales its output by 1.01."""
+    import types
+
+    mm = _mutation_module()
+    fake = types.ModuleType(mm.MOE_TARGET)
+
+    def flint_moe_decode_out(out, *rest):
+        out.fill_(2.0)
+        return out
+
+    fake.flint_moe_decode_out = flint_moe_decode_out
+    mm.install(fake, "moe_decode_scale")
+    out = fake.flint_moe_decode_out(torch.zeros(2, 4), None)
+    assert torch.allclose(out, torch.full((2, 4), 2.0 * mm.MOE_DECODE_SCALE))
+    mm.install(fake, "moe_decode_scale")  # idempotent: no double scaling
+    out = fake.flint_moe_decode_out(torch.zeros(1, 4))
+    assert torch.allclose(out, torch.full((1, 4), 2.0 * mm.MOE_DECODE_SCALE))
+    assert mm._target_for("moe_decode_scale") == (mm.MOE_TARGET, "flint_moe_decode_out")
+    assert mm._target_for("kv_slot_decode")[0] == mm.TARGET
+
 
 @pytest.mark.parametrize("n", [4, 9])
 def test_mutation_rope_pos_decode_reaches_registered_op(monkeypatch, n):

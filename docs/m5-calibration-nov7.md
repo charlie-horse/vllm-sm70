@@ -175,22 +175,33 @@ T4a eager_vs_graphs decode set1: ours mean=… max=… >0.1=3/512 | ours_eager_v
 Expected today: t4c FAIL (engine-instance nondeterminism, see above). Report
 every other FAIL.
 
-## 5. Mutation check (9 loads, ~25–35 min)
+## 5. Mutation check (11 loads, ~30–40 min)
 Run this only after T4d and T7 have passed unmutated in step 4, or add
 `M5_BASELINE=1`, which costs 3 more loads.
 ```sh
 bash sm70/scripts/m5_mutation_check.sh       # same env as step 4; OUT defaults under m5-mutation/
 ```
-It runs T4d and T7 with each planted bug: `rope_pos_decode` (positions + 1),
-`kv_slot_decode` (slot_mapping + 1) and `rope_theta_1p01` (rope_theta x
-1.01). The first two apply to fused-op calls of 8 or fewer tokens. The check
-PASSes only if every run fails the gate (not a crash, not a skip), and only
-if each run shows the mutation applied: `M5_MUTATION <name> installed in pid
-N` from at least 3 processes, or the `hf_overrides` line for rope_theta.
+Planted bugs and the gates that MUST catch them (Quinn/Astro, Nov 6):
+
+| mutation | what it breaks | must FAIL |
+|---|---|---|
+| `rope_pos_decode` | positions + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
+| `kv_slot_decode` | slot_mapping + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
+| `moe_decode_scale` | K12 M≤2 MoE decode output × 1.01 | T4d (T7 can't see it: both arms run the same MoE) |
+| `rope_theta_1p01` | rope_theta × 1.01 via hf_overrides | INFO only (too weak at ~70-token positions) |
+
+The check PASSes only if every required run fails the gate itself (not a
+crash, not a skip) and shows the mutation applied: `M5_MUTATION <name>
+installed in pid N` from at least 3 processes (2 for `moe_decode_scale`,
+which only the TP workers import), or the `hf_overrides` line for
+rope_theta. INFO runs are reported with an `INFO` prefix and never fail the
+check. `moe_decode_scale` only bites if the build has K12 and M4 admits the
+decode: with forced decode at max_num_seqs=1 every step is M=1, and
+since #76 the engine log shows "K12 M<=2 decode admitted".
 `m5_mutations/sitecustomize.py` runs any shadowed sitecustomize first (the
 Nix wrapper ships one), so the environment stays intact.
 
 ## Total
 About 1 h 45 min of GPU time with no retries: step 1 ~5 min, step 2 ~25 min,
-step 4 ~60 min, step 5 ~30 min. If the window is short, run steps 1–3 and
+step 4 ~60 min, step 5 ~35 min. If the window is short, run steps 1–3 and
 then `M5_NODES="t4c t4a t4d t7"` (7 loads) before the full runner.
