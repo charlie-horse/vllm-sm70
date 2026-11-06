@@ -195,7 +195,11 @@ def test_out_op_fakes_return_none(qpn8_stub):
 def test_provenance_check_passes():
     script = SM70 / "tools" / "check_qpn8_provenance.py"
     result = subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, check=False
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

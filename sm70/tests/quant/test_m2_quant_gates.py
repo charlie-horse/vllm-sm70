@@ -352,7 +352,7 @@ def test_platform_module_does_not_import_quant():
         "assert 'vllm_sm70.quant.configs' not in sys.modules; "
         "assert 'vllm.model_executor.layers.quantization' not in sys.modules"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
 
 
 def test_fp8_turbomind_kill_restores_upstream_fp8_gate(device, load_configs, monkeypatch):
