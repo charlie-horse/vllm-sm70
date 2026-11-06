@@ -50,6 +50,15 @@ TUNE_VARS = (
 def _clean_env(monkeypatch):
     for name in TUNE_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Prod's tuned mode: small-shape tuning on (the C++ default is 0 since
+    # #77, so the warmup and LUT only matter with these set). Tests that need
+    # the default or a mix set them again.
+    for name in (
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES",
+    ):
+        monkeypatch.setenv(name, "1")
     # K09's bound without importing vllm_sm70.ops.qpn8 (default 8).
     monkeypatch.setattr(P, "_qpn8_max_m", lambda: 8)
 
@@ -885,3 +894,17 @@ def test_load_lut_absent_bad_and_stale_manifest(tmp_path):
     assert lut.missing(calls + [("x", (1,), 1)]) == [("x", (1,), 1)]
     good.write_bytes(b"other table")  # manifest no longer matches
     assert cache.load_lut(str(good)).covers is None
+
+
+def test_default_tuning_off_plans_nothing(monkeypatch):
+    """#77: with the C++ default (tuning off) the warmup has nothing to tune;
+    every call is kDefault, deterministic without a LUT."""
+    for name in (
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+        "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert P.TUNE_SMALL_SHAPES_DEFAULT == 0
+    limits = P.limits()
+    assert not any(lim.enabled for lim in limits.values())

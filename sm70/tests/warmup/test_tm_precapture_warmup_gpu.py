@@ -30,6 +30,10 @@ def _env(**extra):
     for name in [k for k in env if k.startswith(("TM_GEMM_", "VLLM_SM70_"))]:
         if name != "VLLM_SM70_PLUGIN_STRICT":
             env.pop(name)
+    # Small-shape tuning defaults off since #77; these tests exercise the
+    # tuned mode (warmup + LUT), so turn it on unless a test overrides it.
+    env["VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES"] = "1"
+    env["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "1"
     env.update(extra)
     return env
 

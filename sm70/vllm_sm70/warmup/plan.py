@@ -59,11 +59,11 @@ def _atoi(raw: str) -> int:
 
 
 # The C++ default of the three *_TUNE_SMALL_SHAPES knobs (gemm_runtime.cpp
-# tune_small_shapes_enabled and friends). Main: 1. Keep in step with C++: if
-# small-shape tuning defaults off there (#77), set this to 0. Then the warmup
-# has nothing to tune unless a knob is set to 1, and every call is kDefault
-# (deterministic, no LUT needed).
-TUNE_SMALL_SHAPES_DEFAULT = 1
+# tune_small_shapes_enabled and friends): 0 since #77. Keep in step with C++.
+# With the default, the warmup has nothing to tune and every call is kDefault
+# (deterministic, no LUT needed). Prod's tuned mode sets
+# VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1 together with a LUT.
+TUNE_SMALL_SHAPES_DEFAULT = 0
 
 
 def knob(name: str, default: int) -> int:
@@ -85,15 +85,15 @@ def limits() -> dict[str, Limit]:
     """Per-kind tuning limits, mirroring gemm_runtime.cpp.
 
     - NVFP4 dense: select_nvfp4_dense_dispatch_policy (:525-535),
-      nvfp4_tune_small_shapes (default 1), nvfp4_dense_tune_max_m (64).
+      nvfp4_tune_small_shapes (default 0 since #77), nvfp4_dense_tune_max_m (64).
     - FP8 dense (TM and the QPN8 TM copy): select_fp8_dense_dispatch_policy
-      (:509-523), fp8_tune_small_shapes (1) and fp8_dense_tune_max_m (64);
+      (:509-523), fp8_tune_small_shapes (default 0 since #77) and fp8_dense_tune_max_m (64);
       with VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR=1 the generic gate instead
       (awq_tune_small_shapes 1, f16_dense_tune_max_m 16).
     - NVFP4 MoE: select_nvfp4_moe_dispatch_policy (:592-599),
-      nvfp4_tune_small_shapes (1), nvfp4_moe_tune_max_tokens (128 slots).
+      nvfp4_tune_small_shapes (default 0 since #77), nvfp4_moe_tune_max_tokens (128 slots).
     - FP8 MoE: select_fp8_moe_dispatch_policy (:578-590),
-      fp8_tune_small_shapes (1), awq_moe_tune_max_tokens (128 slots).
+      fp8_tune_small_shapes (default 0 since #77), awq_moe_tune_max_tokens (128 slots).
     """
     nvfp4_on = knob("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
     fp8_on = knob("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
