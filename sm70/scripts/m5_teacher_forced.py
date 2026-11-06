@@ -31,16 +31,29 @@ work happens under the __main__ guard):
            --mode eager|graphs [--decode] [--prefill] [--max-num-seqs 1]
            [--env K=V ...] [--llm-kwargs JSON] [--hf-overrides JSON]
            -> O/setK/N.json (per sequence: decode and/or prefill logprobs)
-  compare  A.json B.json [--metric decode|prefill]   n/mean/max/count>0.1
+  compare  A.json B.json [--metric decode|prefill]
+           n/mean/max/count>0.1/count>1.0
   envelope --scores-dir O --out env.json [--pairs P ...]   per pair and
-           metric: mean, max, count>0.1 per set, anchor = max over sets
+           metric: mean, max, count>0.1, count>1.0 per set, anchor = max
+           over sets
+  greedy, compare-greedy, seqs-from-golden: free-run evidence (T4b, T5)
 
 Envelope layout (fork calibration): O/setK/{eager,eager2,graphs,unfused}.json,
 all scored with --decode --prefill, EACH FROM ITS OWN ENGINE INSTANCE (one
-`score` run = one LLM build = one name). Pairs: eager_vs_graphs = eager vs
-graphs, fused_vs_unfused = eager vs unfused (unfused = eager with
-VLLM_SM70_FLINT_QK_ROPE_KV=0), eager_vs_eager = eager vs eager2 (a second,
-separate eager instance: the stack's engine-instance nondeterminism).
+`score` run = one LLM build = one name), plus the optional
+O/setK/graphsonly.json (mode NONE + FULL CUDA graphs, see T4e). Pairs:
+eager_vs_graphs = eager vs graphs, fused_vs_unfused = eager vs unfused
+(unfused = eager with VLLM_SM70_FLINT_QK_ROPE_KV=0), eager_vs_eager = eager vs
+eager2 (a second, separate eager instance: the stack's engine-instance
+nondeterminism), eager_vs_graphsonly = eager vs graphsonly (only when the
+graphsonly files exist).
+
+Gate (Quinn, Nov 7), per (pair, set, metric), via effective_anchor():
+ours mean <= GATE_MEAN_FACTOR x that metric's anchor mean; ours max <=
+GATE_MAX_FACTOR x the pair's anchor max over BOTH metrics (decode and
+prefill); ours count > OVER_1_0 nats <= max(1, ceil(GATE_COUNT_FACTOR x the
+pair's anchor count over both metrics)). An envelope without the over_1_0
+counts (built before Nov 7) fails closed: rebuild it with `envelope`.
 
 Common LLM args match the M5 tests: TP2, fp16, max_model_len 8192,
 gpu_memory_utilization 0.85, prefix caching off, max_num_seqs 1 (M=1 at every
@@ -112,29 +125,41 @@ METRICS = ("decode", "prefill")
 # pair -> (score name A, score name B) inside O/setK/
 # eager_vs_eager: two separate eager engine instances (engine-instance
 # nondeterminism, e.g. startup autotuning); reported, not used by any gate.
+# eager_vs_graphsonly: eager vs mode NONE + FULL CUDA graphs (no Inductor),
+# the anchor of T4e; optional, built only when its graphsonly files exist.
 PAIRS = {
     "eager_vs_graphs": ("eager", "graphs"),
     "fused_vs_unfused": ("eager", "unfused"),
     "eager_vs_eager": ("eager", "eager2"),
+    "eager_vs_graphsonly": ("eager", "graphsonly"),
 }
+OPTIONAL_PAIRS = ("eager_vs_graphsonly",)
 # ---- Gate constants. PROVISIONAL: Astro holds the final thresholds until
 # Bea's no-autotune run reports. Change them here; the tests and `envelope`
 # read these module globals at call time.
 GATE_MEAN_FACTOR = 1.5  # ours mean <= GATE_MEAN_FACTOR x anchor mean
-GATE_MAX_FACTOR = 1.5  # ours max <= GATE_MAX_FACTOR x anchor max
+GATE_MAX_FACTOR = 1.5  # ours max <= GATE_MAX_FACTOR x anchor max (both metrics)
+# ours count > OVER_1_0 <= max(1, ceil(GATE_COUNT_FACTOR x anchor count))
+GATE_COUNT_FACTOR = 1.5
 FACTOR = GATE_MEAN_FACTOR  # the T4_ENVELOPE_FACTOR the tests assert on
 ANCHOR_REDUCE = max  # anchor = ANCHOR_REDUCE over the per-set mean / max
-# Which fork pair anchors each gate (T4d: ours graphs vs fork graphs).
+# Which fork pair anchors each gate (T4d: ours graphs vs fork graphs; T5's
+# near-tie rule reuses T4d's).
 GATE_ANCHOR_PAIR = {"T4a": "eager_vs_graphs", "T4d": "eager_vs_graphs",
-                    "T7": "fused_vs_unfused"}
+                    "T4e": "eager_vs_graphsonly", "T7": "fused_vs_unfused"}
 NOISE_PAIR = "eager_vs_eager"  # engine-instance noise, printed on every line
 OVER = 0.1  # nats; count of tokens above this is always reported
+OVER_1_0 = 1.0  # nats; count of tokens above this is gated (GATE_COUNT_FACTOR)
 EPS = 1e-6  # absolute slack on the gate
 MIN_SETS = 3
 
 
 class ForcingError(RuntimeError):
     """The generated tokens are not the reference: forcing did not work."""
+
+
+class EnvelopeError(ValueError):
+    """The envelope cannot anchor this gate (missing pair or fields)."""
 
 
 # --------------------------------------------------------------------------
@@ -294,7 +319,8 @@ def prefill_scores(llm, seqs: list[dict]) -> list[list[float]]:
 
 def score_seqs(llm, seqs: list[dict], decode=True, prefill=True, one_at_a_time=True) -> dict:
     """Score one prompt set with an already built LLM."""
-    recs = [dict() for _ in seqs]
+    # The prompt rides along so a score file can be matched by prompt (T5).
+    recs = [{"prompt": s["prompt"]} if "prompt" in s else {} for s in seqs]
     if decode:
         for r, d in zip(recs, forced_decode(llm, seqs, one_at_a_time)):
             r.update(d)
@@ -326,7 +352,7 @@ def top1_disagreements(score: dict) -> tuple[int, int]:
 # Statistics, envelope and gate
 # --------------------------------------------------------------------------
 def stats(sa: list[list[float]], sb: list[list[float]]) -> dict:
-    """n / mean / max |dlogprob| and the count above OVER nats."""
+    """n / mean / max |dlogprob| and the counts above OVER and OVER_1_0 nats."""
     if len(sa) != len(sb):
         raise ValueError(f"different sequence counts: {len(sa)} vs {len(sb)}")
     d = []
@@ -339,7 +365,7 @@ def stats(sa: list[list[float]], sb: list[list[float]]) -> dict:
     if not d:
         raise ValueError("no scored tokens to compare")
     return {"n": len(d), "mean": sum(d) / len(d), "max": max(d),
-            "over_0_1": sum(x > OVER for x in d)}
+            "over_0_1": sum(x > OVER for x in d), "over_1_0": sum(x > OVER_1_0 for x in d)}
 
 
 def _set_id(path: pathlib.Path) -> int:
@@ -371,18 +397,22 @@ def load_scores(scores_dir, name: str) -> dict[int, dict]:
 
 
 def anchor_of(per_set: dict) -> dict:
-    """Anchor = ANCHOR_REDUCE (max) over sets of the per-set mean and max."""
+    """Anchor = ANCHOR_REDUCE (max) over sets of the per-set mean and max;
+    the counts above OVER and OVER_1_0 are the max over sets."""
     vals = list(per_set.values())
     return {"mean": ANCHOR_REDUCE(v["mean"] for v in vals),
             "max": ANCHOR_REDUCE(v["max"] for v in vals),
-            "over_0_1": max(v["over_0_1"] for v in vals)}
+            "over_0_1": max(v["over_0_1"] for v in vals),
+            "over_1_0": max(v["over_1_0"] for v in vals)}
 
 
 def envelope_from_scores(scores: dict, pairs=None, min_sets: int = MIN_SETS) -> dict:
     """scores: {name: {set id: score}} -> envelope dict for `pairs`
-    (default: all PAIRS). Per pair and metric: per-set n/mean/max/count>0.1
-    and the anchor."""
-    pairs = list(pairs or PAIRS)
+    (default: all PAIRS, the OPTIONAL_PAIRS only when their scores are
+    there). Per pair and metric: per-set n/mean/max/count>0.1/count>1.0 and
+    the anchor."""
+    pairs = list(pairs or [p for p in PAIRS if p not in OPTIONAL_PAIRS
+                           or all(n in scores for n in PAIRS[p])])
     unknown = [p for p in pairs if p not in PAIRS]
     if unknown:
         raise ValueError(f"unknown pairs {unknown}; have {sorted(PAIRS)}")
@@ -397,8 +427,11 @@ def envelope_from_scores(scores: dict, pairs=None, min_sets: int = MIN_SETS) -> 
     if len(sets) < min_sets:
         raise ValueError(f"calibrate over >= {min_sets} prompt sets, found {sets}")
     env = {"gate": {"mean_factor": GATE_MEAN_FACTOR, "max_factor": GATE_MAX_FACTOR,
-                    "anchor": f"{ANCHOR_REDUCE.__name__} over sets", "provisional": True},
-           "over": OVER, "sets": {}, "pairs": {}}
+                    "count_factor": GATE_COUNT_FACTOR,
+                    "anchor": f"{ANCHOR_REDUCE.__name__} over sets; max and count>1.0 "
+                              "also over metrics (effective_anchor)",
+                    "provisional": True},
+           "over": OVER, "over_1_0": OVER_1_0, "sets": {}, "pairs": {}}
     for k in sets:
         shas = {scores[n][k].get("seqs_sha256") for n in names}
         if len(shas) != 1 or None in shas:
@@ -416,18 +449,90 @@ def envelope_from_scores(scores: dict, pairs=None, min_sets: int = MIN_SETS) -> 
     return env
 
 
+def default_pairs(scores_dir) -> list[str]:
+    """PAIRS to build from DIR: every required pair, plus each optional pair
+    whose B scores exist in any set (then every set must have them)."""
+    root = pathlib.Path(scores_dir)
+    return [p for p in PAIRS if p not in OPTIONAL_PAIRS
+            or any(root.glob(f"set*/{PAIRS[p][1]}.json"))]
+
+
 def build_envelope(scores_dir, min_sets: int = MIN_SETS, pairs=None) -> dict:
     """Envelope from DIR/setK/NAME.json (NAME per PAIRS)."""
-    pairs = list(pairs or PAIRS)
+    pairs = list(pairs or default_pairs(scores_dir))
     names = sorted({n for p in pairs if p in PAIRS for n in PAIRS[p]})
     return envelope_from_scores({n: load_scores(scores_dir, n) for n in names},
                                 pairs, min_sets)
 
 
-def gate_failures(ours: dict, anchor: dict, mean_factor=None, max_factor=None) -> list[str]:
-    """Gate: ours mean <= mean_factor x anchor mean AND ours max <=
-    max_factor x anchor max (defaults: the GATE_* constants). Returns the
-    breaches (empty = pass)."""
+REBUILD_HINT = ("rebuild it from the fork scores (CPU only, seconds): "
+                "`m5_teacher_forced.py envelope --scores-dir <fork scores> --out <envelope>`")
+
+
+def effective_anchor(env: dict, pair: str, metric: str, scores_dir=None) -> dict:
+    """The gate anchor for (pair, metric) (Quinn, Nov 7): mean and the count
+    above OVER from this metric's anchor; max and the count above OVER_1_0
+    over ALL the pair's metrics (decode and prefill), because the single
+    fragile MoE routing position lands in whichever metric it happens to hit.
+
+    Fails closed (EnvelopeError) when the envelope lacks the pair or metric,
+    or predates the over_1_0 counts. scores_dir (the fork scores) only makes
+    the missing-pair message name the missing files."""
+    by_metric = (env.get("pairs") or {}).get(pair)
+    if not by_metric:
+        a, b = PAIRS.get(pair, ("?", "?"))
+        msg = (f"the envelope has no {pair!r} pair; it needs the fork scores "
+               f"setK/{a}.json and setK/{b}.json for every set")
+        if scores_dir is not None:
+            root = pathlib.Path(scores_dir)
+            sets = sorted(root.glob("set*"), key=_set_id) if root.is_dir() else []
+            gone = [str(d / f"{n}.json") for d in sets for n in (a, b)
+                    if not (d / f"{n}.json").is_file()]
+            msg += f"; missing: {', '.join(gone) or 'none (envelope is stale)'}"
+        raise EnvelopeError(f"{msg}. Score them (docs/m5-calibration-nov7.md), then "
+                            + REBUILD_HINT)
+    if metric not in by_metric:
+        raise EnvelopeError(f"the envelope's {pair!r} pair has no {metric!r} metric "
+                            f"(has {sorted(by_metric)})")
+    anchors = {m: e["anchor"] for m, e in by_metric.items()}
+    stale = sorted(m for m, an in anchors.items() if "over_1_0" not in an)
+    if stale:
+        raise EnvelopeError(
+            f"the envelope predates the >{OVER_1_0}-nat count gate (no over_1_0 in the "
+            f"{pair} {'/'.join(stale)} anchor): " + REBUILD_HINT)
+    return {"mean": anchors[metric]["mean"],
+            "max": max(an["max"] for an in anchors.values()),
+            "over_0_1": anchors[metric]["over_0_1"],
+            "over_1_0": max(an["over_1_0"] for an in anchors.values()),
+            "max_over": sorted(anchors)}
+
+
+def count_limit(anchor_count: int, factor=None) -> int:
+    """Allowed count of tokens above OVER_1_0: max(1, ceil(factor x anchor))."""
+    f = GATE_COUNT_FACTOR if factor is None else factor
+    return max(1, math.ceil(f * anchor_count - 1e-9))
+
+
+def gate_limits(anchor: dict) -> dict:
+    """The effective limits of gate_failures for this anchor."""
+    return {"mean": GATE_MEAN_FACTOR * anchor["mean"] + EPS,
+            "max": GATE_MAX_FACTOR * anchor["max"] + EPS,
+            "over_1_0": count_limit(anchor["over_1_0"])}
+
+
+def gate_failures(ours: dict, anchor: dict, mean_factor=None, max_factor=None,
+                  count_factor=None) -> list[str]:
+    """Gate (defaults: the GATE_* constants): ours mean <= mean_factor x
+    anchor mean, ours max <= max_factor x anchor max, and ours count above
+    OVER_1_0 <= max(1, ceil(count_factor x anchor count)). `anchor` must come
+    from effective_anchor(); any other anchor (an old envelope's, or one
+    metric's raw anchor) fails closed. Returns the breaches (empty = pass)."""
+    if "over_1_0" not in anchor:
+        return [f"anchor has no over_1_0 count (envelope built before the "
+                f">{OVER_1_0}-nat count gate): " + REBUILD_HINT]
+    if "max_over" not in anchor:
+        return [("anchor is one metric's raw envelope anchor: build the gate anchor with "
+                 "m5_teacher_forced.effective_anchor(env, pair, metric)")]
     factors = {"mean": GATE_MEAN_FACTOR if mean_factor is None else mean_factor,
                "max": GATE_MAX_FACTOR if max_factor is None else max_factor}
     bad = []
@@ -435,6 +540,12 @@ def gate_failures(ours: dict, anchor: dict, mean_factor=None, max_factor=None) -
         limit = f * anchor[key] + EPS
         if not ours[key] <= limit:
             bad.append(f"{key} {ours[key]:.4g} > {f} x anchor {anchor[key]:.4g}")
+    over = ours.get("over_1_0")
+    limit = count_limit(anchor["over_1_0"], count_factor)
+    if over is None or not over <= limit:
+        bad.append(f">{OVER_1_0} count {over} > {limit} = max(1, ceil("
+                   f"{GATE_COUNT_FACTOR if count_factor is None else count_factor} x "
+                   f"anchor {anchor['over_1_0']}))")
     return bad
 
 
@@ -442,25 +553,83 @@ def _brief(name: str, s: dict | None) -> str:
     if s is None:
         return f"{name} n/a"
     n = f"/{s['n']}" if "n" in s else ""
+    over = f" >{OVER_1_0}={s['over_1_0']}" if "over_1_0" in s else ""
     return (f"{name} mean={s['mean']:.4g} max={s['max']:.4g} "
-            f">{OVER}={s['over_0_1']}{n}")
+            f">{OVER}={s['over_0_1']}{n}{over}")
+
+
+def limits_text(anchor: dict) -> str:
+    """The effective limits, spelled out for a verdict line."""
+    if "over_1_0" not in anchor or "max_over" not in anchor:
+        return "limits n/a (not an effective anchor)"
+    lim = gate_limits(anchor)
+    return (f"limits mean<={lim['mean']:.4g} ({GATE_MEAN_FACTOR}x), "
+            f"max<={lim['max']:.4g} ({GATE_MAX_FACTOR}x max over "
+            f"{'+'.join(anchor['max_over'])}), >{OVER_1_0}<={lim['over_1_0']} "
+            f"(max(1, ceil({GATE_COUNT_FACTOR}x{anchor['over_1_0']})))")
 
 
 def gate_line(tag: str, label: str, m: str, k, ours: dict, anchor: dict,
               ours_noise: dict | None = None, fork_noise: dict | None = None,
               ) -> tuple[str, list[str]]:
     """One verdict line: ours, ours-instance-noise (ours_eager_vs_eager, this
-    set), the fork's instance noise (fork_eager_vs_eager anchor) and the gate
-    anchor, always with the count above OVER nats."""
+    set), the fork's instance noise (fork_eager_vs_eager anchor), the gate
+    anchor and the effective limits, with the counts above OVER and OVER_1_0
+    nats."""
     bad = gate_failures(ours, anchor)
     line = (
         f"{tag} {label} {m} set{k}: {_brief('ours', ours)} | "
         f"{_brief('ours_eager_vs_eager', ours_noise)} | "
         f"{_brief('fork_eager_vs_eager', fork_noise)} | {_brief('anchor', anchor)} | "
-        f"limit {GATE_MEAN_FACTOR}x mean, {GATE_MAX_FACTOR}x max -> "
+        f"{limits_text(anchor)} -> "
         + ("PASS" if not bad else "FAIL: " + "; ".join(bad))
     )
     return line, bad
+
+
+# --------------------------------------------------------------------------
+# Golden sequences (T5 near-tie rule)
+# --------------------------------------------------------------------------
+def golden_seqs(golden: list[dict], match: str | None = None) -> list[dict]:
+    """Golden greedy records -> scorable seqs (prompt ids + golden tokens),
+    in golden order; `match` keeps prompts containing that substring."""
+    seqs = []
+    for g in golden:
+        if match and match not in g["prompt"]:
+            continue
+        ids = list(g["prompt_token_ids"])
+        seqs.append({"prompt": g["prompt"], "start": len(ids),
+                     "ids": ids + list(g["token_ids"])})
+    return seqs
+
+
+MATCH_MAX_SUBSETS = 200_000
+
+
+def match_scored_seqs(seqs: list[dict], score: dict) -> dict[str, dict]:
+    """{prompt: score record} for a score file made from a subset of `seqs`
+    (in order, e.g. seqs-from-golden --match), matched by prompt when the
+    records carry one, else by seqs_sha256 over order-preserving subsets.
+    The subset's seqs_sha256 must equal the file's either way, so the ids
+    are the same; {} when nothing matches."""
+    import itertools
+
+    recs, want = score.get("seqs") or [], score.get("seqs_sha256")
+    if not recs or want is None:
+        return {}
+    if all("prompt" in r for r in recs):
+        by_prompt = {s["prompt"]: s for s in seqs}
+        sub = [by_prompt.get(r["prompt"]) for r in recs]
+        if None in sub or seqs_sha256(sub) != want:
+            return {}
+        return {r["prompt"]: r for r in recs}
+    if len(recs) > len(seqs) or math.comb(len(seqs), len(recs)) > MATCH_MAX_SUBSETS:
+        return {}
+    for idx in itertools.combinations(range(len(seqs)), len(recs)):
+        sub = [seqs[i] for i in idx]
+        if seqs_sha256(sub) == want:
+            return {s["prompt"]: r for s, r in zip(sub, recs)}
+    return {}
 
 
 # --------------------------------------------------------------------------
@@ -601,14 +770,7 @@ def cmd_compare_greedy(a):
 def cmd_seqs_from_golden(a):
     """Golden greedy records (T5's FLINT_SM70_GOLDEN) -> a scorable seqs
     file, for forced decode of the golden continuation (T5 near-tie rule)."""
-    golden = json.loads(pathlib.Path(a.golden).read_text())
-    seqs = []
-    for g in golden:
-        if a.match and a.match not in g["prompt"]:
-            continue
-        ids = list(g["prompt_token_ids"])
-        seqs.append({"prompt": g["prompt"], "start": len(ids),
-                     "ids": ids + list(g["token_ids"])})
+    seqs = golden_seqs(json.loads(pathlib.Path(a.golden).read_text()), a.match)
     if not seqs:
         raise SystemExit(f"no golden prompt contains {a.match!r}")
     out = pathlib.Path(a.out)
@@ -627,14 +789,23 @@ def cmd_compare(a):
 def cmd_envelope(a):
     env = build_envelope(a.scores_dir, a.min_sets, a.pairs)
     pathlib.Path(a.out).write_text(json.dumps(env, indent=1))
+    for pair in OPTIONAL_PAIRS:
+        if not a.pairs and pair not in env["pairs"]:
+            print(f"{pair}: skipped, no setK/{PAIRS[pair][1]}.json in {a.scores_dir} "
+                  f"(its gate fails until they are scored)")
     for pair, by_metric in env["pairs"].items():
         for m, e in by_metric.items():
             for k, s in e["per_set"].items():
                 print(f"{pair} {m} set{k}: mean={s['mean']:.4g} max={s['max']:.4g} "
-                      f">{OVER}={s['over_0_1']}/{s['n']}")
+                      f">{OVER}={s['over_0_1']}/{s['n']} >{OVER_1_0}={s['over_1_0']}")
             an = e["anchor"]
             print(f"{pair} {m} ANCHOR: mean={an['mean']:.4g} max={an['max']:.4g} "
-                  f">{OVER}<={an['over_0_1']}")
+                  f">{OVER}<={an['over_0_1']} >{OVER_1_0}<={an['over_1_0']}")
+        if by_metric:
+            ea = effective_anchor(env, pair, next(iter(by_metric)))
+            print(f"{pair} GATE: max over {'+'.join(ea['max_over'])} = {ea['max']:.4g}, "
+                  f">{OVER_1_0} anchor {ea['over_1_0']} -> "
+                  f"{limits_text(ea).split(', ', 1)[1]}")
     print(f"-> {a.out}")
 
 

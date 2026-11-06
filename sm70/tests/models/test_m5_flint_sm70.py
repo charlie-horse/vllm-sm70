@@ -14,8 +14,11 @@ GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
     FLINT_SM70_GOLDEN      JSON of fork cf9492a greedy records (T5); c4130:
                            ~/vllm-sm70-work/bea/golden/flint_cf9492a_greedy64.json
     FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR,
-    FLINT_SM70_OURS_NOISE  teacher-forced T4a-T4d/T7 inputs (see the T4 section
+    FLINT_SM70_OURS_NOISE  teacher-forced T4a-T4e/T7 inputs (see the T4 section
                            and docs/m5-calibration-nov7.md)
+    FLINT_SM70_T5_FORK_GOLDEN_SCORES
+                           the fork's forced-decode scores of the golden
+                           sequences (T5 near-tie rule)
     M5_MUTATION            planted bug for sm70/scripts/m5_mutation_check.sh
 """
 
@@ -1146,7 +1149,7 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     assert all(len(t) == 64 for t in toks)
 
 
-# T4a-T4d/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6-7).
+# T4a-T4e/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6-7).
 # All scoring goes through sm70/scripts/m5_teacher_forced.py (the same code
 # calibrates the fork), one sequence at a time (M=1 in eager and in replay).
 # Metrics per continuation token: "decode" (forced decode: every token is a
@@ -1156,16 +1159,21 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
 #   FLINT_SM70_T4_ENVELOPE      `m5_teacher_forced.py envelope` over the fork's
 #                               scores: per pair/metric, anchor = max over sets
 #   FLINT_SM70_FORK_SCORES_DIR  the fork's scores,
-#                               setK/{eager,eager2,graphs,unfused}.json (the
-#                               envelope's input; T4d reads graphs.json)
+#                               setK/{eager,eager2,graphs,unfused,graphsonly}.json
+#                               (the envelope's input; T4d reads graphs.json;
+#                               graphsonly.json makes the T4e pair)
 #   FLINT_SM70_OURS_NOISE       optional: ours_eager_vs_eager envelope JSON.
 #                               T4c writes it (two separate eager instances);
 #                               T4a/T4d/T7 print it on every gate line.
 # Every score comes from its own engine instance (one LLM build per score).
-# Gate (Quinn; factors PROVISIONAL, constants at the top of
-# m5_teacher_forced.py): per set, ours mean <= 1.5x anchor mean AND ours max
-# <= 1.5x anchor max; each line also shows count > 0.1 nats, our own
-# eager-vs-eager instance noise and the fork's. docs/m5-calibration-nov7.md
+# Gate (Quinn, Nov 7; factors PROVISIONAL, constants at the top of
+# m5_teacher_forced.py), per set and metric, against tf.effective_anchor():
+# ours mean <= 1.5x that metric's anchor mean; ours max <= 1.5x the pair's
+# anchor max over decode AND prefill; ours count > 1.0 nats <= max(1,
+# ceil(1.5x the pair's anchor count over both metrics)). An envelope built
+# before Nov 7 (no over_1_0) fails closed: rebuild it (`envelope`, CPU only).
+# Each line also shows count > 0.1 nats, our own eager-vs-eager instance
+# noise, the fork's, and the effective limits. docs/m5-calibration-nov7.md
 # has the commands.
 T4_SEQS_DIR = os.environ.get("FLINT_SM70_T4_SEQS_DIR")
 T4_ENVELOPE = os.environ.get("FLINT_SM70_T4_ENVELOPE")
@@ -1272,13 +1280,42 @@ def _noise_stats(env, metric, k=None):
     return e["anchor"] if k is None else e["per_set"].get(str(k))
 
 
+def _gate_anchors(env, tag, metrics):
+    """{metric: tf.effective_anchor} for a gate's GATE_ANCHOR_PAIR, built
+    before any model load, so a stale or incomplete envelope fails in
+    seconds, with the rebuild (or missing-file) message."""
+    tf = _tf_module()
+    pair = tf.GATE_ANCHOR_PAIR[tag]
+    try:
+        return {m: tf.effective_anchor(env, pair, m, FORK_SCORES_DIR) for m in metrics}
+    except tf.EnvelopeError as e:
+        pytest.fail(f"{tag}: envelope {T4_ENVELOPE}: {e}")
+
+
+def _effective(anchor, fork_env):
+    """An anchor fit for tf.gate_failures. Effective anchors pass through. A
+    raw per-metric anchor taken from fork_env (#86's G2 passes
+    env["pairs"][pair][metric]["anchor"] and env) is resolved, by identity,
+    to tf.effective_anchor(fork_env, pair, metric); an old envelope raises
+    there. Anything else passes through and tf.gate_failures fails it."""
+    if "max_over" in anchor or fork_env is None:
+        return anchor
+    for pair, by_metric in (fork_env.get("pairs") or {}).items():
+        for m, e in by_metric.items():
+            if e.get("anchor") is anchor:
+                return _tf_module().effective_anchor(fork_env, pair, m)
+    return anchor
+
+
 def _gate_sets(tag, label, anchor, metric, a_by_set, b_by_set, ours_noise=None,
                fork_env=None):
-    """Gate every set's |dlogprob| stats (a vs b) against one anchor; print a
-    verdict line per set (count > 0.1, our instance noise and the fork's
+    """Gate every set's |dlogprob| stats (a vs b) against one effective
+    anchor (see _effective); print a verdict line per set (counts > 0.1 and
+    > 1.0, our instance noise, the fork's and the effective limits
     included); return the breaches."""
     tf = _tf_module()
     assert tf.FACTOR == T4_ENVELOPE_FACTOR
+    anchor = _effective(anchor, fork_env)
     failures = []
     for k in sorted(a_by_set):
         ours = tf.stats(tf.metric(a_by_set[k], metric), tf.metric(b_by_set[k], metric))
@@ -1406,6 +1443,7 @@ def test_score_seqs_decode_and_prefill_records():
     assert res["seqs"][0]["decode"] == [-1.0, -2.0, -3.0]
     assert res["seqs"][0]["decode_top1"] == [99, 99, 99]
     assert res["seqs"][1]["prefill"] == [-0.5, -1.0]
+    assert [r["prompt"] for r in res["seqs"]] == ["a", "b"]  # matchable by prompt (T5)
     assert tf.top1_disagreements(res) == (5, 5)
     with pytest.raises(tf.ForcingError, match="first difference at 1"):
         tf.score_seqs(_FakeLLM(flip_at=1), seqs, prefill=False)
@@ -1448,7 +1486,9 @@ def test_envelope_aggregates_max_over_sets(tmp_path):
     ee = env["pairs"]["eager_vs_eager"]
     assert ee["decode"]["anchor"]["max"] == pytest.approx(0.2)
     assert ee["decode"]["per_set"]["2"]["over_0_1"] == 10
-    assert ee["prefill"]["anchor"] == {"mean": 0.0, "max": 0.0, "over_0_1": 0}
+    assert ee["prefill"]["anchor"] == {"mean": 0.0, "max": 0.0, "over_0_1": 0,
+                                       "over_1_0": 0}
+    assert "eager_vs_graphsonly" not in env["pairs"]  # no graphsonly files
     only = tf.build_envelope(tmp_path, pairs=["eager_vs_eager"])
     assert list(only["pairs"]) == ["eager_vs_eager"] and only["gate"]["provisional"]
     with pytest.raises(ValueError, match=">= 4 prompt sets"):
@@ -1468,27 +1508,127 @@ def test_stats_refuses_misaligned_and_flags_nan():
     with pytest.raises(ValueError, match="sequence 0"):
         tf.stats([[1.0, 2.0]], [[1.0]])
     s = tf.stats([[-1.0, float("-inf")]], [[float("nan"), float("-inf")]])
-    assert s["max"] == float("inf") and s["over_0_1"] == 1
+    assert s["max"] == float("inf") and s["over_0_1"] == 1 and s["over_1_0"] == 1
+    s = tf.stats([[0.0, 0.0, 0.0, 0.0]], [[0.05, 0.5, 1.0, 1.5]])
+    assert (s["over_0_1"], s["over_1_0"]) == (3, 1)  # strictly above 0.1 / 1.0
+
+
+def _anchor(mean, mx, over_0_1=0, over_1_0=0):
+    return {"mean": mean, "max": mx, "over_0_1": over_0_1, "over_1_0": over_1_0}
+
+
+def _env(pairs):
+    """An envelope with {pair: {metric: anchor}} (per_set omitted)."""
+    return {"pairs": {p: {m: {"anchor": a} for m, a in by.items()}
+                      for p, by in pairs.items()}}
+
+
+def _eff(mean=0.02, mx=0.4, over_0_1=3, over_1_0=0):
+    """An effective anchor (both metrics alike)."""
+    tf = _tf_module()
+    a = _anchor(mean, mx, over_0_1, over_1_0)
+    return tf.effective_anchor(_env({"p": {"decode": a, "prefill": a}}), "p", "decode")
 
 
 def test_envelope_gate():
     tf = _tf_module()
-    anchor = {"mean": 0.02, "max": 0.4, "over_0_1": 3}
-    assert tf.gate_failures({"mean": 0.029, "max": 0.59}, anchor) == []
-    mean_bad = tf.gate_failures({"mean": 0.05, "max": 0.1}, anchor)
+    anchor = _eff()
+    assert tf.gate_failures({"mean": 0.029, "max": 0.59, "over_1_0": 0}, anchor) == []
+    mean_bad = tf.gate_failures({"mean": 0.05, "max": 0.1, "over_1_0": 0}, anchor)
     assert len(mean_bad) == 1 and mean_bad[0].startswith("mean")
-    max_bad = tf.gate_failures({"mean": 0.01, "max": 0.61}, anchor)
+    max_bad = tf.gate_failures({"mean": 0.01, "max": 0.61, "over_1_0": 0}, anchor)
     assert len(max_bad) == 1 and max_bad[0].startswith("max")
-    assert len(tf.gate_failures({"mean": 1.0, "max": float("inf")}, anchor)) == 2
+    assert len(tf.gate_failures({"mean": 1.0, "max": float("inf"), "over_1_0": 0},
+                                anchor)) == 2
     line, bad = tf.gate_line("T4a", "eager_vs_graphs", "decode", 0,
-                             {"n": 512, "mean": 0.01, "max": 0.2, "over_0_1": 4}, anchor)
+                             {"n": 512, "mean": 0.01, "max": 0.2, "over_0_1": 4,
+                              "over_1_0": 0}, anchor)
     assert not bad and line.startswith("T4a eager_vs_graphs decode set0: ")
-    assert ">0.1=4/512" in line and line.endswith("PASS")
+    assert ">0.1=4/512 >1.0=0" in line and line.endswith("PASS")
+    # The effective limits are spelled out.
+    assert "mean<=0.03 (1.5x)" in line and "max<=0.6 (1.5x max over decode+prefill)" in line
+    assert ">1.0<=1 (max(1, ceil(1.5x0)))" in line
+
+
+def test_effective_anchor_max_is_union_over_metrics():
+    """Quinn, Nov 7: the max gate uses the pair's anchor max over decode AND
+    prefill (the fork's set1 decode max 2.616 sat at one token while its
+    prefill max was 0.895; ours had a prefill max of 2.394); the mean stays
+    per metric; the >1.0 count anchor is the max over metrics too."""
+    tf = _tf_module()
+    env = _env({"eager_vs_graphs": {"decode": _anchor(0.02, 2.616, 9, 2),
+                                    "prefill": _anchor(0.03, 0.895, 4, 0)}})
+    dec = tf.effective_anchor(env, "eager_vs_graphs", "decode")
+    pre = tf.effective_anchor(env, "eager_vs_graphs", "prefill")
+    assert dec == {"mean": 0.02, "max": 2.616, "over_0_1": 9, "over_1_0": 2,
+                   "max_over": ["decode", "prefill"]}
+    assert pre == {"mean": 0.03, "max": 2.616, "over_0_1": 4, "over_1_0": 2,
+                   "max_over": ["decode", "prefill"]}
+    ours_prefill = {"mean": 0.03, "max": 2.394, "over_0_1": 5, "over_1_0": 3}
+    assert tf.gate_failures(ours_prefill, pre) == []  # old per-metric rule: 2.394 > 1.34
+    assert tf.gate_failures(ours_prefill, _anchor(0.03, 0.895) | {"max_over": ["x"]})
+    # A decode-only pair (e.g. a decode-only graphsonly score) unions over what it has.
+    one = tf.effective_anchor(_env({"p": {"decode": _anchor(0.1, 0.5, 1, 1)}}), "p", "decode")
+    assert one["max_over"] == ["decode"] and one["max"] == 0.5
+    with pytest.raises(tf.EnvelopeError, match="no 'prefill' metric"):
+        tf.effective_anchor(_env({"p": {"decode": _anchor(0.1, 0.5)}}), "p", "prefill")
+
+
+@pytest.mark.parametrize("anchor_count, ours, ok", [
+    (0, 0, True), (0, 1, True), (0, 2, False),  # floor of 1
+    (1, 2, True), (1, 3, False),  # ceil(1.5) = 2
+    (2, 3, True), (2, 4, False),
+    (3, 5, True), (3, 6, False),  # ceil(4.5) = 5
+])
+def test_over_1_0_count_gate(anchor_count, ours, ok):
+    tf = _tf_module()
+    anchor = _eff(over_1_0=anchor_count)
+    bad = tf.gate_failures({"mean": 0.0, "max": 0.0, "over_1_0": ours}, anchor)
+    assert (bad == []) == ok
+    if not ok:
+        assert len(bad) == 1 and bad[0].startswith(f">1.0 count {ours} > ")
+    assert tf.count_limit(anchor_count) == max(1, -(-3 * anchor_count // 2))
+    # Ours without the count (stats from before Nov 7) never passes.
+    assert tf.gate_failures({"mean": 0.0, "max": 0.0}, anchor)
+
+
+def test_old_envelope_fails_closed(tmp_path):
+    """An envelope built before the over_1_0 counts never gates silently:
+    effective_anchor raises with the rebuild command, gate_failures fails on
+    any anchor without the count or the union, and _gate_anchors turns the
+    error into a test FAIL before any model load."""
+    tf = _tf_module()
+    old = {"mean": 0.02, "max": 0.4, "over_0_1": 3}
+    env = _env({"eager_vs_graphs": {"decode": old, "prefill": dict(old)}})
+    with pytest.raises(tf.EnvelopeError, match="predates the >1.0-nat count gate") as e:
+        tf.effective_anchor(env, "eager_vs_graphs", "decode")
+    assert "m5_teacher_forced.py envelope" in str(e.value)
+    assert "rebuild" in str(e.value)
+    bad = tf.gate_failures({"mean": 0.0, "max": 0.0, "over_1_0": 0}, old)
+    assert len(bad) == 1 and "m5_teacher_forced.py envelope" in bad[0]
+    raw = _anchor(0.02, 0.4)  # a new envelope's raw per-metric anchor
+    assert "effective_anchor" in tf.gate_failures({"mean": 0, "max": 0, "over_1_0": 0},
+                                                  raw)[0]
+    with pytest.raises(pytest.fail.Exception, match="T4a: envelope .*rebuild"):
+        _gate_anchors(env, "T4a", tf.METRICS)
+    # #86's G2 passes env["pairs"][pair]["decode"]["anchor"] and env to
+    # _gate_sets: resolved to the effective anchor, or fails closed.
+    sets = {0: {"seqs": [{"decode": [-1.0] * 4}]}}
+    with pytest.raises(tf.EnvelopeError, match="predates"):
+        _gate_sets("G2", "router_on_vs_off", env["pairs"]["eager_vs_graphs"]["decode"]["anchor"],
+                   "decode", sets, sets, None, env)
+    new = _env({"eager_vs_graphs": {"decode": _anchor(0.5, 0.1), "prefill": _anchor(0.0, 1.0)}})
+    b = {0: {"seqs": [{"decode": [-1.0, -1.0, -1.0, -2.2]}]}}  # max 1.2 <= 1.5 x 1.0
+    assert _gate_sets("G2", "router_on_vs_off",
+                      new["pairs"]["eager_vs_graphs"]["decode"]["anchor"], "decode",
+                      sets, b, None, new) == []
+    # The same raw anchor without its env is not resolvable: FAIL.
+    assert _gate_sets("G2", "x", _anchor(0.0, 0.1), "decode", sets, b, None, None)
 
 
 def test_gate_sets_prints_every_set_and_collects(capsys):
     tf = _tf_module()
-    anchor = {"mean": 0.02, "max": 0.4, "over_0_1": 0}
+    anchor = _eff(mx=0.4, over_0_1=0)
     a = {k: {"seqs": [{"decode": [-1.0] * 100}]} for k in range(3)}
     b = {0: {"seqs": [{"decode": [-1.01] * 100}]},
          1: {"seqs": [{"decode": [-1.05] * 100}]},  # mean breach
@@ -1499,6 +1639,179 @@ def test_gate_sets_prints_every_set_and_collects(capsys):
         f"T7 fused_vs_unfused decode set{k}" for k in range(3)]
     assert len(fails) == 2 and "set1: mean" in fails[0] and "set2: max" in fails[1]
     assert tf.FACTOR == T4_ENVELOPE_FACTOR
+    # set3: two tokens above 1.0 nats with a 0-count anchor (limit 1).
+    b[3] = {"seqs": [{"decode": [-1.0] * 98 + [-2.1, -2.1]}]}
+    a[3] = a[0]
+    fails = _gate_sets("T7", "x", _eff(mx=10.0), "decode", {3: a[3]}, {3: b[3]})
+    assert len(fails) == 1 and "set3: >1.0 count 2 > 1" in fails[0]
+
+
+@pytest.fixture
+def tf_main(monkeypatch):
+    """tf.main, with the tuning env vars it sets restored afterwards."""
+    tf = _tf_module()
+    for var in tf.TUNE_SMALL_SHAPES_VARS:
+        monkeypatch.setenv(var, os.environ.get(var, "0"))
+    return tf.main
+
+
+def test_envelope_includes_graphsonly_pair_when_scored(tmp_path, capsys, tf_main):
+    """T4e's fork pair: eager_vs_graphsonly = setK/eager.json vs
+    setK/graphsonly.json, built by default iff graphsonly files exist (all
+    sets, or a missing-file error); T4e anchors on it."""
+    tf = _tf_module()
+    assert tf.PAIRS["eager_vs_graphsonly"] == ("eager", "graphsonly")
+    assert tf.GATE_ANCHOR_PAIR["T4e"] == "eager_vs_graphsonly"
+    base = [-1.0] * 8
+    for k in range(3):
+        for name in ("eager", "eager2", "graphs", "unfused"):
+            _write_scores(tmp_path, k, name, base, base, sha=f"h{k}")
+    assert "eager_vs_graphsonly" not in tf.build_envelope(tmp_path)["pairs"]
+    env_path = tmp_path / "env.json"
+    tf_main(["envelope", "--scores-dir", str(tmp_path), "--out", str(env_path)])
+    assert "eager_vs_graphsonly: skipped, no setK/graphsonly.json" in capsys.readouterr().out
+    with pytest.raises(tf.EnvelopeError, match=r"set\d/graphsonly.json") as e:
+        tf.effective_anchor(json.loads(env_path.read_text()), "eager_vs_graphsonly",
+                            "decode", tmp_path)
+    assert "set0/eager.json" not in str(e.value)  # names only the missing file
+    with pytest.raises(pytest.fail.Exception, match="graphsonly.json"):
+        _gate_anchors(json.loads(env_path.read_text()), "T4e", ["decode"])
+    for k in range(2):
+        _write_scores(tmp_path, k, "graphsonly", [x - 0.01 * (k + 1) for x in base],
+                      base, sha=f"h{k}")
+    with pytest.raises(FileNotFoundError, match="set2/graphsonly.json"):
+        tf.build_envelope(tmp_path)  # partial: fail, never drop the pair
+    _write_scores(tmp_path, 2, "graphsonly", [x - 1.5 * (i == 0) for i, x in enumerate(base)],
+                  base, sha="h2")
+    tf_main(["envelope", "--scores-dir", str(tmp_path), "--out", str(env_path)])
+    out = capsys.readouterr().out
+    assert "eager_vs_graphsonly decode set2: " in out and ">1.0=1" in out
+    assert "eager_vs_graphsonly GATE: max over decode+prefill = 1.5" in out
+    env = json.loads(env_path.read_text())
+    go = tf.effective_anchor(env, tf.GATE_ANCHOR_PAIR["T4e"], "decode")
+    assert go["mean"] == pytest.approx(1.5 / 8) and go["max"] == pytest.approx(1.5)
+    assert go["over_1_0"] == 1 and env["gate"]["count_factor"] == tf.GATE_COUNT_FACTOR
+    # envelope_from_scores' default also skips the optional pair if unscored.
+    scores = {n: tf.load_scores(tmp_path, n) for n in ("eager", "eager2", "graphs", "unfused")}
+    assert "eager_vs_graphsonly" not in tf.envelope_from_scores(scores)["pairs"]
+
+
+def test_t4b_exact_runs_only_on_triton(monkeypatch):
+    """Quinn, Nov 7: exact T4b only with VLLM_SM70_FLASH_V100=0 (TRITON);
+    under Flash-V100 it skips, pointing at T4e."""
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100", "0")
+    assert _t4b_exact_skip_reason() is None
+    for value in (None, "1"):
+        if value is None:
+            monkeypatch.delenv("VLLM_SM70_FLASH_V100")
+        else:
+            monkeypatch.setenv("VLLM_SM70_FLASH_V100", value)
+        reason = _t4b_exact_skip_reason()
+        # m5_window.sh accepts t4b's skip only with this marker.
+        assert "covered by T4e" in reason and "VLLM_SM70_FLASH_V100=0" in reason
+
+
+def _golden(n=3):
+    return [{"prompt": f"p{i}", "prompt_token_ids": [1, 2, i],
+             "token_ids": [10 + i, 20 + i, 30 + i], "stable_across_2_runs": True}
+            for i in range(n)]
+
+
+def _fork_golden_scores(path, seqs, decode, with_prompt=True, **extra):
+    tf = _tf_module()
+    recs = [{"decode": d, **({"prompt": s["prompt"]} if with_prompt else {})}
+            for s, d in zip(seqs, decode)]
+    path.write_text(json.dumps({"seqs_sha256": tf.seqs_sha256(seqs), "seqs": recs,
+                                "mode": "graphs", "max_num_seqs": 1, **extra}))
+    return str(path)
+
+
+def test_t5_near_tie_inputs(tmp_path):
+    """Rule (b)'s inputs: the T4d effective anchor and the fork's record
+    per near-tie prompt, matched by prompt or by seqs_sha256; anything
+    missing is a reason (a FAIL), naming what to run."""
+    tf = _tf_module()
+    golden = _golden()
+    seqs = tf.golden_seqs(golden)
+    env_path = tmp_path / "env.json"
+    env_path.write_text(json.dumps(_env({"eager_vs_graphs": {
+        "decode": _anchor(0.02, 0.5, 1, 1), "prefill": _anchor(0.03, 0.9, 1, 0)}})))
+    fork = _fork_golden_scores(tmp_path / "f.json", seqs, [[-1.0] * 3] * 3)
+    anchor, ready, why = _t5_near_tie_inputs(golden, ["p1"], str(env_path), fork)
+    assert anchor["max"] == 0.9 and anchor["mean"] == 0.02 and why == {}
+    assert ready["p1"][0] == seqs[1] and ready["p1"][1]["decode"] == [-1.0] * 3
+    # By seqs_sha256 (records without prompts), e.g. seqs-from-golden --match p2.
+    fork2 = _fork_golden_scores(tmp_path / "f2.json", seqs[2:], [[-2.0] * 3], with_prompt=False)
+    _, ready, why = _t5_near_tie_inputs(golden, ["p1", "p2"], str(env_path), fork2)
+    assert list(ready) == ["p2"] and ready["p2"][1]["decode"] == [-2.0] * 3
+    assert "prompt not in" in why["p1"] and "seqs-from-golden" in why["p1"]
+    # Unset env var / envelope, wrong mode, old envelope: every prompt FAILs.
+    _, ready, why = _t5_near_tie_inputs(golden, ["p0"], str(env_path), None)
+    assert not ready and "FLINT_SM70_T5_FORK_GOLDEN_SCORES is not set" in why["p0"]
+    assert "--mode graphs --decode" in why["p0"]
+    _, _, why = _t5_near_tie_inputs(golden, ["p0"], None, fork)
+    assert "FLINT_SM70_T4_ENVELOPE" in why["p0"]
+    eager = _fork_golden_scores(tmp_path / "e.json", seqs, [[-1.0] * 3] * 3, mode="eager")
+    _, _, why = _t5_near_tie_inputs(golden, ["p0"], str(env_path), eager)
+    assert "mode=eager" in why["p0"]
+    env_path.write_text(json.dumps(_env({"eager_vs_graphs": {
+        "decode": {"mean": 0.1, "max": 0.1, "over_0_1": 0}}})))
+    anchor, _, why = _t5_near_tie_inputs(golden, ["p0"], str(env_path), fork)
+    assert anchor is None and "rebuild" in why["p0"]
+    # A file of other sequences matches nothing.
+    other = [dict(seqs[0], ids=seqs[0]["ids"][:-1] + [99])]
+    assert tf.match_scored_seqs(seqs, {"seqs_sha256": tf.seqs_sha256(other),
+                                       "seqs": [{"prompt": "p0", "decode": [0.0]}]}) == {}
+
+
+def test_t5_near_tie_verdict():
+    """T5 (Quinn, Nov 7): an early divergence passes only if (a) the golden
+    token is our #2 within T4_NEAR_TIE AND (b) forced decode of the golden
+    sequence passes the T4d gate vs the fork."""
+    tf = _tf_module()
+    anchor = _eff(mean=0.3, mx=0.5, over_1_0=0)
+    good = tf.stats([[-1.0, -1.0, -1.0]], [[-1.0, -1.01, -1.6]])
+    ok, line = _t5_near_tie_verdict("Why is the sky blue?", 0.03, good, anchor)
+    assert ok and line.startswith("T5 near-tie 'Why is the sky blue?': golden #2 gap 0.0300; "
+                                  "forced decode ours vs fork mean=")
+    assert ">1.0=0" in line and line.endswith("-> PASS")
+    ok, line = _t5_near_tie_verdict("p", 0.3, good, anchor)  # (a) fails
+    assert not ok and "not within 0.1 nats -> FAIL" in line
+    assert not _t5_near_tie_verdict("p", None, good, anchor)[0]  # golden not our #2
+    spike = tf.stats([[-1.0, -1.0]], [[-1.0, -2.2]])  # (b) fails: max and >1.0 count
+    ok, line = _t5_near_tie_verdict("p", 0.01, spike, anchor)
+    assert not ok and "-> FAIL: " in line and ">1.0 count 1" not in line
+    assert "max 1.2 > 1.5 x anchor 0.5" in line
+    ok, line = _t5_near_tie_verdict("p", 0.01, None, None, "set FLINT_SM70_T5_FORK_GOLDEN_SCORES")
+    assert not ok and line.endswith("n/a -> FAIL: set FLINT_SM70_T5_FORK_GOLDEN_SCORES")
+    assert not _t5_near_tie_verdict("p", 0.01, good, None)[0]
+
+
+def test_teacher_forced_cli_keeps_handed_out_commands(tmp_path, monkeypatch, capsys, tf_main):
+    """Bea's commands (greedy, compare-greedy, seqs-from-golden, score,
+    envelope) still parse with the flags already handed out; the CPU ones
+    run end to end."""
+    tf = _tf_module()
+    seen = {}
+    for cmd in ("cmd_greedy", "cmd_score"):
+        monkeypatch.setattr(tf, cmd, lambda a, cmd=cmd: seen.setdefault(cmd, a))
+    tf_main(["greedy", "--model", "m", "--mode", "graphs", "--set", "1", "--n", "8",
+             "--max-num-seqs", "2", "--llm-kwargs", json.dumps({"compilation_config": GRAPHS_ONLY}),
+             "--out", "x.json"])
+    tf_main(["score", "--model", "m", "--seqs", "s.json", "--out-dir", "o", "--name",
+             "fork_graphs", "--mode", "graphs", "--decode", "--llm-kwargs", "{}"])
+    assert seen["cmd_greedy"].max_num_seqs == 2 and seen["cmd_score"].decode
+    golden = tmp_path / "golden.json"
+    golden.write_text(json.dumps(_golden()))
+    out = tmp_path / "g" / "set9.json"
+    tf_main(["seqs-from-golden", "--golden", str(golden), "--match", "p1", "--out", str(out)])
+    doc = json.loads(out.read_text())
+    assert doc["set"] == 9 and [s["prompt"] for s in doc["seqs"]] == ["p1"]
+    assert doc["seqs_sha256"] == tf.seqs_sha256(tf.golden_seqs(_golden(), "p1"))
+    for name, toks in (("a", [[1, 2, 3], [4, 5]]), ("b", [[1, 2, 9], [4, 5]])):
+        (tmp_path / f"{name}.json").write_text(json.dumps({"tokens": toks}))
+    tf_main(["compare-greedy", str(tmp_path / "a.json"), str(tmp_path / "b.json")])
+    assert "prompt 0: differs at 2" in capsys.readouterr().out
 
 
 def test_prompt_sets_are_disjoint():
@@ -1728,22 +2041,41 @@ def test_t4a_teacher_forced_eager_vs_graphs():
     Bea's t4_bisect (Nov 6): Inductor codegen accounts for all of the
     eager/compiled prefill difference (graphs_only = 0.0), and free decode
     under graph replay diverges too, so the decode metric (real decode steps,
-    replayed graphs) is gated as well as prefill. Gate per set and metric:
-    mean <= 1.5x and max <= 1.5x the fork's eager_vs_graphs anchor."""
+    replayed graphs) is gated as well as prefill. Gate per set and metric
+    (Quinn, Nov 7): mean <= 1.5x that metric's anchor mean, max <= 1.5x the
+    fork's eager_vs_graphs anchor max over decode and prefill, count > 1.0
+    nats <= max(1, ceil(1.5x the anchor count))."""
     seq_sets = _seq_sets()
     env = _envelope(seq_sets)
+    tf = _tf_module()
+    anchors = _gate_anchors(env, "T4a", tf.METRICS)
     eager, _ = _score_sets(seq_sets, enforce_eager=True)
     graphs, _ = _score_sets(seq_sets)
     _print_top1("T4a", "eager", eager)
     _print_top1("T4a", "graphs", graphs)
-    tf, noise = _tf_module(), _ours_noise()
-    pair = tf.GATE_ANCHOR_PAIR["T4a"]
+    noise = _ours_noise()
     failures = []
     for m in tf.METRICS:
-        anchor = env["pairs"][pair][m]["anchor"]
-        failures += _gate_sets("T4a", "eager_vs_graphs", anchor, m, eager, graphs,
+        failures += _gate_sets("T4a", "eager_vs_graphs", anchors[m], m, eager, graphs,
                                noise, env)
     assert not failures, f"T4a outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
+
+
+# Mode NONE + FULL CUDA graphs: no Inductor, only capture and replay (T4b, T4e).
+GRAPHS_ONLY = {"mode": 0, "cudagraph_mode": "FULL"}
+
+
+def _t4b_exact_skip_reason():
+    """Why exact T4b does not apply here (None: it does). Quinn, Nov 7: it
+    needs identical kernels in both arms, i.e. TRITON attention."""
+    from vllm_sm70 import attention as sm70_attention
+
+    if not sm70_attention.flash_v100_enabled():
+        return None
+    return (f"exact T4b needs TRITON attention ({sm70_attention.KILL_SWITCH}=0): under "
+            "Flash-V100 the capture path uses envelope decode hints and the K14 "
+            "one-launch decode, so eager and replay run different kernels; this is "
+            "covered by T4e (forced decode, eager vs graphs-only, fork envelope)")
 
 
 @pytest.mark.gpu
@@ -1756,17 +2088,52 @@ def test_t4b_graph_replay_exact(max_num_seqs):
     Mode NONE + cudagraph FULL takes Inductor out; at max_num_seqs 1 and 2
     every decode step has M <= 2 (no capture padding beyond the batch), which
     covers the K11/K12 M<=2 paths. Greedy tokens must equal eager's for all
-    256 tokens: any flip is a capture/replay bug, not numerics."""
+    256 tokens: any flip is a capture/replay bug, not numerics.
+
+    Premise (Quinn, Nov 7): exactness holds only if both arms run identical
+    kernels. That is true on TRITON attention, so this runs only with
+    VLLM_SM70_FLASH_V100=0. Under Flash-V100 (the default) the capture path
+    uses envelope decode hints and the K14 one-launch decode, which eager
+    does not, so the test is skipped there and T4e gates replay against the
+    fork's own eager-vs-graphs-only envelope instead. Mara is confirming the
+    premise with data (the fork's own eager vs graphs-only greedy run)."""
+    reason = _t4b_exact_skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
     eager = _greedy_once(256, enforce_eager=True, max_num_seqs=max_num_seqs)
-    graphs = _greedy_once(
-        256, max_num_seqs=max_num_seqs,
-        compilation_config={"mode": 0, "cudagraph_mode": "FULL"},
-    )
+    graphs = _greedy_once(256, max_num_seqs=max_num_seqs, compilation_config=GRAPHS_ONLY)
     for i, (e, g) in enumerate(zip(eager, graphs)):
         pos = next((j for j, (a, b) in enumerate(zip(e, g)) if a != b), None)
         print(f"T4b max_num_seqs={max_num_seqs} prompt {i}: "
               + ("identical" if pos is None else f"differs at {pos}"))
     assert eager == graphs
+
+
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+@needs_envelope
+def test_t4e_forced_decode_eager_vs_graphs_only():
+    """T4e (2 GPUs; Quinn, Nov 7): T4b's replacement under Flash-V100.
+
+    Forced decode (decode metric, max_num_seqs 1) of our eager vs our
+    graphs-only (mode NONE + FULL CUDA graphs: no Inductor, so the arms differ
+    only by capture/replay and the decode kernels it selects), per set, gated
+    like T4a against the fork's eager_vs_graphsonly pair (its
+    setK/eager.json vs setK/graphsonly.json, scored the same way). With the
+    T4 env vars set, an envelope without that pair is a FAIL naming the
+    missing graphsonly.json, never a skip."""
+    seq_sets = _seq_sets()
+    env = _envelope(seq_sets)
+    anchor = _gate_anchors(env, "T4e", ["decode"])["decode"]
+    eager, _ = _score_sets(seq_sets, prefill=False, enforce_eager=True)
+    graphs, _ = _score_sets(seq_sets, prefill=False, compilation_config=GRAPHS_ONLY)
+    _print_top1("T4e", "eager", eager)
+    _print_top1("T4e", "graphs-only", graphs)
+    failures = _gate_sets("T4e", "eager_vs_graphsonly", anchor, "decode", eager, graphs,
+                          _ours_noise(), env)
+    assert not failures, (
+        f"T4e outside {T4_ENVELOPE_FACTOR}x the fork's eager_vs_graphsonly anchor: {failures}")
 
 
 def _t4c_report(s1, s2, g1, g2, fork_env=None):
@@ -1857,13 +2224,16 @@ def test_t4d_graphs_vs_fork_graphs():
     (e.g. a wrong RoPE position or KV slot in the shared fused op) cancels
     out there. T4d compares our replayed decode against the fork's (its
     graphs.json from FLINT_SM70_FORK_SCORES_DIR, the envelope's input). Gate
-    per set: mean <= 1.5x and max <= 1.5x the fork's own eager_vs_graphs
-    decode anchor, i.e. ours may differ from the fork no more than the
-    fork's two modes differ from each other (plus 50%). Mutated side under
+    per set against the fork's own eager_vs_graphs effective anchor: mean
+    <= 1.5x the decode anchor mean, max <= 1.5x the anchor max over decode
+    and prefill, count > 1.0 nats <= max(1, ceil(1.5x the anchor count)),
+    i.e. ours may differ from the fork no more than the fork's two modes
+    differ from each other (plus 50%). Mutated side under
     m5_mutation_check.sh: ours."""
     seq_sets = _seq_sets()
     env = _envelope(seq_sets)
     tf = _tf_module()
+    anchor = _gate_anchors(env, "T4d", ["decode"])["decode"]
     fork = tf.load_scores(FORK_SCORES_DIR, "graphs")
     assert sorted(fork) == sorted(seq_sets), f"fork sets {sorted(fork)}"
     for k, seqs in seq_sets.items():
@@ -1871,7 +2241,6 @@ def test_t4d_graphs_vs_fork_graphs():
         assert fork[k].get("mode") in (None, "graphs"), f"fork set{k}: {fork[k].get('mode')}"
     ours, _ = _score_sets(seq_sets, prefill=False, **_mutated())
     _print_top1("T4d", "ours graphs", ours)
-    anchor = env["pairs"][tf.GATE_ANCHOR_PAIR["T4d"]]["decode"]["anchor"]
     failures = _gate_sets("T4d", "ours_graphs_vs_fork_graphs", anchor, "decode", ours, fork,
                           _ours_noise(), env)
     assert not failures, (
@@ -1880,6 +2249,110 @@ def test_t4d_graphs_vs_fork_graphs():
 
 # Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
 GOLDEN_EXACT_TOKENS = 32
+# T5 near-tie rule (b): the fork's forced decode of the golden sequences.
+T5_FORK_GOLDEN_SCORES = os.environ.get("FLINT_SM70_T5_FORK_GOLDEN_SCORES")
+T5_SEQS_SET = 9  # seqs-from-golden's default --set
+T5_FORK_HOWTO = (
+    "on the fork, `m5_teacher_forced.py seqs-from-golden --golden $FLINT_SM70_GOLDEN "
+    "--out G/set9.json`, then `m5_teacher_forced.py score --model $CKPT --seqs "
+    "G/set9.json --out-dir G/fork --name fork_graphs --mode graphs --decode "
+    "--llm-kwargs \"$FORK_KW\"`, and set "
+    "FLINT_SM70_T5_FORK_GOLDEN_SCORES=G/fork/set9/fork_graphs.json "
+    "(docs/m5-calibration-nov7.md)"
+)
+
+
+def _t5_near_tie_inputs(golden, prompts, envelope_path, fork_scores_path):
+    """CPU half of T5 rule (b) for the near-tie `prompts`: (anchor, ready,
+    why). anchor is the T4d (eager_vs_graphs) effective decode anchor;
+    ready maps prompt -> (our golden seq, the fork's score record); why maps
+    every other prompt to what is missing (each is a FAIL)."""
+    tf = _tf_module()
+    problem, anchor, fork = None, None, None
+    if envelope_path is None:
+        problem = ("set FLINT_SM70_T4_ENVELOPE (rule (b) gates at the T4d "
+                   "eager_vs_graphs anchor)")
+    else:
+        try:
+            with open(envelope_path) as f:
+                anchor = tf.effective_anchor(json.load(f), tf.GATE_ANCHOR_PAIR["T4d"],
+                                             "decode")
+        except (OSError, ValueError) as e:
+            problem = f"envelope {envelope_path}: {e}"
+    if problem is None and fork_scores_path is None:
+        problem = "FLINT_SM70_T5_FORK_GOLDEN_SCORES is not set: " + T5_FORK_HOWTO
+    if problem is None:
+        try:
+            with open(fork_scores_path) as f:
+                fork = json.load(f)
+        except (OSError, ValueError) as e:
+            problem = f"{fork_scores_path}: {e}; " + T5_FORK_HOWTO
+    if problem is None and (fork.get("mode") not in (None, "graphs")
+                            or fork.get("max_num_seqs", 1) != 1):
+        problem = (f"{fork_scores_path} is mode={fork.get('mode')} max_num_seqs="
+                   f"{fork.get('max_num_seqs')}; rule (b) needs --mode graphs at "
+                   "max_num_seqs 1: " + T5_FORK_HOWTO)
+    if problem is not None:
+        return None, {}, {p: problem for p in prompts}
+    seqs = {s["prompt"]: s for s in tf.golden_seqs(golden)}
+    recs = tf.match_scored_seqs(list(seqs.values()), fork)
+    ready, why = {}, {}
+    for p in prompts:
+        r = recs.get(p)
+        if r is None:
+            why[p] = (f"prompt not in {fork_scores_path} (no match by prompt or "
+                      "seqs_sha256): " + T5_FORK_HOWTO)
+        elif "decode" not in r:
+            why[p] = f"{fork_scores_path} has no decode metric (score with --decode)"
+        else:
+            ready[p] = (seqs[p], r)
+    return anchor, ready, why
+
+
+def _t5_near_tie_verdict(prompt, gap, forced, anchor, missing=None):
+    """Quinn, Nov 7: a golden-stable prompt may diverge before
+    GOLDEN_EXACT_TOKENS only if (a) the golden token at the first mismatch
+    is our #2 within T4_NEAR_TIE nats (gap; None if it is not our #2) and
+    (b) forced decode of the golden sequence, our graphs vs the fork's
+    (forced: their stats), passes the T4d gate (anchor: the eager_vs_graphs
+    effective anchor). missing: why (b) could not be checked. Returns
+    (ok, the verdict line)."""
+    tf = _tf_module()
+    head = f"T5 near-tie {prompt[:40]!r}: golden #2 gap " + (
+        "n/a (golden is not our #2)" if gap is None else f"{gap:.4f}")
+    if gap is None or not gap <= T4_NEAR_TIE:
+        return False, f"{head}; not within {T4_NEAR_TIE} nats -> FAIL"
+    if forced is None or anchor is None:
+        return False, (f"{head}; forced decode ours vs fork n/a -> FAIL: "
+                       f"{missing or 'no forced-decode result'}")
+    bad = tf.gate_failures(forced, anchor)
+    return not bad, (
+        f"{head}; forced decode ours vs fork mean={forced['mean']:.4g} "
+        f"max={forced['max']:.4g} >{tf.OVER_1_0}={forced['over_1_0']} "
+        f"({tf.limits_text(anchor)}) -> " + ("PASS" if not bad else "FAIL: " + "; ".join(bad)))
+
+
+def _t5_near_tie_gate(golden, near):
+    """Rule (b) for near: {prompt: gap}. Scores only the near-tie golden
+    sequences that have a fork record, with our graphs (decode, max_num_seqs
+    1, one extra load only if any); prints one verdict line per prompt;
+    returns the failures."""
+    tf = _tf_module()
+    anchor, ready, why = _t5_near_tie_inputs(golden, list(near), T4_ENVELOPE,
+                                             T5_FORK_GOLDEN_SCORES)
+    forced = {}
+    if ready:
+        ours, _ = _score_sets({T5_SEQS_SET: [s for s, _ in ready.values()]}, prefill=False)
+        _print_top1("T5", "ours graphs (golden)", ours)
+        for (p, (_, fork_rec)), rec in zip(ready.items(), ours[T5_SEQS_SET]["seqs"]):
+            forced[p] = tf.stats([rec["decode"]], [fork_rec["decode"]])
+    failures = []
+    for p, gap in near.items():
+        ok, line = _t5_near_tie_verdict(p, gap, forced.get(p), anchor, why.get(p))
+        print(line)
+        if not ok:
+            failures.append((p[:40], line.split(" -> ", 1)[-1]))
+    return failures
 
 
 @pytest.mark.gpu
@@ -1898,11 +2371,17 @@ def test_t5_golden_tokens_vs_fork():
     Each prompt is generated alone (as the golden was captured).
 
     Gate: prompts whose golden was stable across the fork's own two runs
-    must match the first GOLDEN_EXACT_TOKENS tokens exactly. Prompts the
-    fork itself could not reproduce are INFO only: we print the common
-    prefix and, at the first mismatch, whether the golden token is our #2
-    and our top-2 gap (one-sided near-tie check; the golden has no
-    logprobs). There must be at least one stable prompt."""
+    must match the first GOLDEN_EXACT_TOKENS tokens exactly, with one
+    exception (Quinn, Nov 7): an earlier divergence passes only if (a) the
+    golden token at the first mismatch is our #2 within T4_NEAR_TIE nats
+    and (b) forced decode of the golden sequence (prompt + golden
+    continuation) with our graphs passes the T4d gate against the fork's
+    forced decode of the same sequence (FLINT_SM70_T5_FORK_GOLDEN_SCORES; see
+    _t5_near_tie_verdict). (a) without the fork file is a FAIL saying what
+    to run. Prompts the fork itself could not reproduce are INFO only: we
+    print the common prefix and, at the first mismatch, whether the golden
+    token is our #2 and our top-2 gap (one-sided near-tie check; the golden
+    has no logprobs). There must be at least one stable prompt."""
     from vllm import SamplingParams
 
     with open(os.environ["FLINT_SM70_GOLDEN"]) as f:
@@ -1922,7 +2401,7 @@ def test_t5_golden_tokens_vs_fork():
         ]
     finally:
         _shutdown(llm)
-    failures = []
+    failures, near = [], {}
     for g, o in zip(golden, outs):
         c = o.outputs[0]
         ours, ref = list(c.token_ids), g["token_ids"]
@@ -1931,7 +2410,7 @@ def test_t5_golden_tokens_vs_fork():
             min(len(ours), len(ref)),
         )
         stable = bool(g.get("stable_across_2_runs"))
-        note = ""
+        note, gap = "", None
         if common < min(len(ours), len(ref)):
             lp = {t: x.logprob for t, x in c.logprobs[common].items()}
             top2 = sorted(lp, key=lp.get, reverse=True)[:2]
@@ -1947,7 +2426,12 @@ def test_t5_golden_tokens_vs_fork():
             f"common prefix {common}/64 (fork stable={stable}){note}"
         )
         if stable and common < GOLDEN_EXACT_TOKENS:
-            failures.append((g["prompt"][:40], common))
+            if gap is not None and gap <= T4_NEAR_TIE:
+                near[g["prompt"]] = gap  # rule (a) holds; (b) decides below
+            else:
+                failures.append((g["prompt"][:40], common))
+    if near:
+        failures += _t5_near_tie_gate(golden, near)
     assert not failures, f"diverged before {GOLDEN_EXACT_TOKENS} tokens: {failures}"
 
 
@@ -1975,13 +2459,16 @@ def test_t6_fp16_headroom_8k():
 def test_t7_unfused_path_matches(monkeypatch):
     """T7 (2 GPUs): VLLM_SM70_FLINT_QK_ROPE_KV=0 (unfused + upstream
     Attention) vs the fused route, both eager, teacher-forced on every set,
-    decode and prefill. Gate per set and metric: mean <= 1.5x and max <=
-    1.5x the fork's own fused_vs_unfused anchor. Mutated side under
+    decode and prefill. Gate per set and metric against the fork's own
+    fused_vs_unfused effective anchor (mean per metric, max over both
+    metrics, count > 1.0 nats), as T4a. Mutated side under
     m5_mutation_check.sh: fused (hook mutations patch the fused op only)."""
     from vllm_sm70.config import clear_cache
 
     seq_sets = _seq_sets()
     env = _envelope(seq_sets)
+    tf = _tf_module()
+    anchors = _gate_anchors(env, "T7", tf.METRICS)
     fused, _ = _score_sets(seq_sets, enforce_eager=True, **_mutated())
     monkeypatch.setenv("VLLM_SM70_FLINT_QK_ROPE_KV", "0")
     clear_cache()
@@ -1990,10 +2477,9 @@ def test_t7_unfused_path_matches(monkeypatch):
     finally:
         monkeypatch.delenv("VLLM_SM70_FLINT_QK_ROPE_KV")
         clear_cache()
-    tf, noise = _tf_module(), _ours_noise()
+    noise = _ours_noise()
     failures = []
     for m in tf.METRICS:
-        anchor = env["pairs"][tf.GATE_ANCHOR_PAIR["T7"]][m]["anchor"]
-        failures += _gate_sets("T7", "fused_vs_unfused", anchor, m, fused, unfused,
+        failures += _gate_sets("T7", "fused_vs_unfused", anchors[m], m, fused, unfused,
                                noise, env)
     assert not failures, f"T7 outside {T4_ENVELOPE_FACTOR}x the fork anchor: {failures}"
