@@ -769,9 +769,17 @@ def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
         _shutdown(llm)
 
 
-# Fork contract for qk_norm_rope_kv: bitwise at decode sizes, <=1 FP16 ulp
-# on q/k (and the cached K) at prefill sizes; cached V and unwritten slots exact.
+# T2 contract for qk_norm_rope_kv (Astro, Nov 5, from Bea's t2_diag):
+# bitwise at decode sizes; at prefill sizes q/k/cached K within atol+rtol of
+# the torch-GPU oracle and no less accurate than torch-GPU vs a CPU FP32
+# oracle; cached V and unwritten slots exact.
 T2_BITWISE_MAX_N = 17
+T2_ATOL = 2e-3
+T2_RTOL = 1e-3
+# Mean-error slack vs torch-GPU: Bea's diag had the kernel at 287 vs 281 (q)
+# and 120 vs 117 (k) mismatches against the CPU oracle, i.e. equal within
+# noise; a strict <= on the mean would fail on that noise alone.
+T2_MEAN_SLACK = 1.25
 
 
 def _max_ulp(a: torch.Tensor, b: torch.Tensor) -> int:
@@ -801,16 +809,22 @@ def test_max_ulp_helper():
 @pytest.mark.parametrize("rope", [True, False])
 @pytest.mark.parametrize("n", [1, 2, 17, 8192])
 def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
-    """T2 (1 GPU): the Triton kernel vs the torch oracle, under the fork's
-    contract for this kernel: "q and k within 1 FP16 ulp, KV cache layout
-    unchanged".
+    """T2 (1 GPU): the Triton kernel vs the torch oracle.
 
-    Decode sizes (n <= T2_BITWISE_MAX_N) must be bitwise equal on q, k and
-    the whole UP-layout K/V cache. At prefill sizes the oracle's CUDA
-    ``mean(-1)`` may reduce in a different order than the kernel's per-row
-    sum, so q, k and the cache's K half may differ by at most 1 ulp. The
-    cache's V half (a plain copy) and every slot not written (padded
-    tokens, unused slots) must still be bitwise equal."""
+    Decode sizes (n <= T2_BITWISE_MAX_N): bitwise equal on q, k and the
+    whole UP-layout K/V cache.
+
+    Prefill sizes: the oracle's CUDA ``mean(-1)`` reduces in a different
+    order than the kernel's per-row sum, and with RoPE that shows up as a
+    few large-ulp differences on near-zero outputs (Bea's diag, Nov 5:
+    |delta| <= 1.95e-3 on 28 of 4.2M q values at n=8192). Contract (Astro):
+    - q, k and the cached K within T2_ATOL + T2_RTOL of the torch-GPU oracle;
+    - the kernel is no less accurate than torch-GPU itself: against a CPU
+      FP32 oracle (same math and rounding points), the kernel's max abs
+      error <= torch-GPU's, and its mean abs error <= T2_MEAN_SLACK x
+      torch-GPU's;
+    - the cached V half (a plain copy) and every unwritten slot (padded
+      tokens, unused slots) bitwise equal, and unwritten slots still zero."""
     g = torch.Generator().manual_seed(n)
     qkv = torch.randn(n, (HQ + 2 * HKV) * D, generator=g).half().cuda()
     qw = (torch.rand(D, generator=g) + 0.5).half().cuda()
@@ -820,28 +834,49 @@ def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
     blocks = n // PAGE + 2
     slots = torch.randperm(blocks * PAGE, generator=g)[:n].cuda()
     slots[::5] = -1
-    res = []
-    for fn in (qk.qk_norm_rope_kv, qk.qk_norm_rope_kv_reference):
-        kv = torch.zeros(blocks, HKV, PAGE, 2 * D, dtype=torch.half, device="cuda")
-        q = torch.empty(n, HQ * D, dtype=torch.half, device="cuda")
-        k = torch.empty(n, HKV * D, dtype=torch.half, device="cuda")
-        fn(qkv, q, k, qw, kw, pos, cs, 1e-6, *qk.triton_cache_views(kv, D), slots)
-        res.append((q, k, kv))
-    (tq, tk, tkv), (rq, rk, rkv) = res
+
+    def run(fn, device):
+        to = (lambda t: None if t is None else t.to(device))
+        kv = torch.zeros(blocks, HKV, PAGE, 2 * D, dtype=torch.half, device=device)
+        q = torch.empty(n, HQ * D, dtype=torch.half, device=device)
+        k = torch.empty(n, HKV * D, dtype=torch.half, device=device)
+        fn(to(qkv), q, k, to(qw), to(kw), to(pos), to(cs), 1e-6,
+           *qk.triton_cache_views(kv, D), to(slots))
+        return q, k, kv
+
+    tq, tk, tkv = run(qk.qk_norm_rope_kv, "cuda")
+    rq, rk, rkv = run(qk.qk_norm_rope_kv_reference, "cuda")
     if n <= T2_BITWISE_MAX_N:
         for a, b in zip((tq, tk, tkv), (rq, rk, rkv)):
             assert torch.equal(a, b)
         return
-    assert _max_ulp(tq, rq) <= 1, "q differs by more than 1 FP16 ulp"
-    assert _max_ulp(tk, rk) <= 1, "k differs by more than 1 FP16 ulp"
-    assert _max_ulp(tkv[..., :D], rkv[..., :D]) <= 1, "cached K > 1 ulp"
+    cq, ck, ckv = run(qk.qk_norm_rope_kv_reference, "cpu")
+    pairs = {
+        "q": (tq, rq, cq),
+        "k": (tk, rk, ck),
+        "cached K": (tkv[..., :D], rkv[..., :D], ckv[..., :D]),
+    }
+    for name, (tri, gpu, cpu) in pairs.items():
+        torch.testing.assert_close(
+            tri, gpu, atol=T2_ATOL, rtol=T2_RTOL, msg=f"{name} vs torch-GPU oracle"
+        )
+        e_tri = (tri.float().cpu() - cpu.float()).abs()
+        e_gpu = (gpu.float().cpu() - cpu.float()).abs()
+        print(
+            f"T2 n={n} rope={rope} {name}: vs CPU oracle max {e_tri.max():.3e} "
+            f"(torch-GPU {e_gpu.max():.3e}), mean {e_tri.mean():.3e} "
+            f"(torch-GPU {e_gpu.mean():.3e}), ulp vs GPU {_max_ulp(tri, gpu)}"
+        )
+        assert e_tri.max() <= e_gpu.max(), f"{name}: kernel max error > torch-GPU's"
+        assert e_tri.mean() <= T2_MEAN_SLACK * e_gpu.mean() + 1e-12, (
+            f"{name}: kernel mean error > {T2_MEAN_SLACK} x torch-GPU's"
+        )
     assert torch.equal(tkv[..., D:], rkv[..., D:]), "cached V must be exact"
     written = torch.zeros(blocks * PAGE, dtype=torch.bool, device="cuda")
     written[slots[slots >= 0]] = True
     untouched = ~written.view(blocks, PAGE)[:, None, :].expand(blocks, HKV, PAGE)
     assert torch.equal(tkv[untouched], rkv[untouched]), "unwritten slots changed"
     assert not tkv[untouched].any(), "kernel wrote to a padded/unused slot"
-
 
 @pytest.mark.gpu
 @one_gpu
