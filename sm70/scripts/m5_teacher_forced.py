@@ -141,6 +141,13 @@ GATE_MEAN_FACTOR = 1.5  # ours mean <= GATE_MEAN_FACTOR x anchor mean
 GATE_MAX_FACTOR = 1.5  # ours max <= GATE_MAX_FACTOR x anchor max (both metrics)
 # ours count > OVER_1_0 <= max(1, ceil(GATE_COUNT_FACTOR x anchor count))
 GATE_COUNT_FACTOR = 1.5
+# Pooled-mean gate (Quinn, Nov 7; T4a/T4d/T7, on top of the per-set gates):
+# ours n-weighted mean over all sets <= POOLED_FACTOR x the fork's pooled
+# mean for the pair and metric. Catches a 1% MoE decode bias (Nov 7: 1.57x)
+# that the per-set gates miss. NEVER raise it: a build that trips it below
+# POOLED_INVESTIGATE (1.30x) is a real numeric change to investigate.
+POOLED_FACTOR = 1.25
+POOLED_INVESTIGATE = 1.30
 FACTOR = GATE_MEAN_FACTOR  # the T4_ENVELOPE_FACTOR the tests assert on
 ANCHOR_REDUCE = max  # anchor = ANCHOR_REDUCE over the per-set mean / max
 # Which fork pair anchors each gate (T4d: ours graphs vs fork graphs; T5's
@@ -413,7 +420,39 @@ def anchor_of(per_set: dict) -> dict:
               "over_1_0": max(v["over_1_0"] for v in vals)}
     if all("seq_mean_max" in v for v in vals):
         anchor["seq_mean_max"] = max(v["seq_mean_max"] for v in vals)
+    if all("n" in v for v in vals):
+        anchor["pooled_mean"] = pooled_mean(vals)
     return anchor
+
+
+def pooled_mean(per_set_stats) -> float:
+    """The n-weighted mean |dlogprob| over sets (all scored tokens pooled)."""
+    vals = list(per_set_stats)
+    return sum(v["mean"] * v["n"] for v in vals) / sum(v["n"] for v in vals)
+
+
+def pooled_gate(ours_by_set: dict, anchor: dict, factor=None) -> tuple[str, list[str]]:
+    """The pooled-mean gate: (verdict text, failures). anchor is an effective
+    anchor (carries pooled_mean, or the gate fails closed)."""
+    f = POOLED_FACTOR if factor is None else factor
+    if "pooled_mean" not in anchor:
+        msg = ("pooled: the envelope predates the pooled-mean gate (no pooled_mean): "
+               + REBUILD_HINT)
+        return msg + " -> FAIL", [msg]
+    ours = pooled_mean(ours_by_set.values())
+    fork = anchor["pooled_mean"]
+    ratio = ours / fork if fork > 0 else (0.0 if ours == 0 else math.inf)
+    limit = f * fork + EPS
+    ok = ours <= limit
+    text = (f"pooled over {len(ours_by_set)} sets: ours mean={ours:.4g} | fork pooled "
+            f"mean={fork:.4g} | ratio {ratio:.3f} | limit {f}x = {limit:.4g}")
+    if ok:
+        return text + " -> PASS", []
+    bad = f"pooled mean {ours:.4g} > {f} x fork pooled {fork:.4g} (ratio {ratio:.3f})"
+    if ratio < POOLED_INVESTIGATE:
+        bad += (f"; under {POOLED_INVESTIGATE}x: investigate as a real numeric change, "
+                "never raise POOLED_FACTOR")
+    return text + " -> FAIL: " + bad, [bad]
 
 
 def envelope_from_scores(scores: dict, pairs=None, min_sets: int = MIN_SETS) -> dict:
@@ -510,14 +549,17 @@ def effective_anchor(env: dict, pair: str, metric: str, scores_dir=None) -> dict
         raise EnvelopeError(
             f"the envelope predates the >{OVER_1_0}-nat count gate (no over_1_0 in the "
             f"{pair} {'/'.join(stale)} anchor): " + REBUILD_HINT)
-    return {"mean": anchors[metric]["mean"],
-            "max": max(an["max"] for an in anchors.values()),
-            "over_0_1": anchors[metric]["over_0_1"],
-            "over_1_0": max(an["over_1_0"] for an in anchors.values()),
-            "max_over": sorted(anchors),
-            # Each metric's own anchor max, printed so the union is visible
-            # (Quinn: e.g. T4e shows the fork graphs-only prefill value).
-            "max_by_metric": {m: an["max"] for m, an in sorted(anchors.items())}}
+    eff = {"mean": anchors[metric]["mean"],
+           "max": max(an["max"] for an in anchors.values()),
+           "over_0_1": anchors[metric]["over_0_1"],
+           "over_1_0": max(an["over_1_0"] for an in anchors.values()),
+           "max_over": sorted(anchors),
+           # Each metric's own anchor max, printed so the union is visible
+           # (Quinn: e.g. T4e shows the fork graphs-only prefill value).
+           "max_by_metric": {m: an["max"] for m, an in sorted(anchors.items())}}
+    if "pooled_mean" in anchors[metric]:
+        eff["pooled_mean"] = anchors[metric]["pooled_mean"]
+    return eff
 
 
 def sequence_anchor(env: dict, pair: str, metric: str) -> dict:

@@ -261,24 +261,42 @@ T4a eager_vs_graphs decode set1: ours mean=… max=… >0.1=3/512 >1.0=0 | ours_
 Expected today: t4c FAIL (engine-instance nondeterminism, see above). Report
 every other FAIL.
 
-### Sensitivity floor (Quinn, Nov 7)
-The envelope gates cannot detect a **1% bias in the MoE decode output**.
-`moe_decode_scale` (K12 output x 1.01) fired, yet T4d stayed under
-1.5x the fork anchor: per-set means 0.029/0.033/0.031 vs 0.014/0.010/0.024
-unmutated, limit 0.0363. That is about 2x our unmutated distance from the
-fork, but within the fork's own eager-vs-graphs scale. A pooled-mean gate
-at 1.25x would have caught it (1.57x vs <= 1.10x on the unmutated runs);
-it was not adopted because that margin is too thin. Treat any change below
-this floor as invisible to T4a/T4d/T4e/T7.
+### Pooled-mean gate and sensitivity floor (Quinn/Astro, Nov 7)
+The per-set gates cannot see a **1% bias in the MoE decode output**:
+`moe_decode_scale` (K12 output x 1.01) fired on Nov 7, yet every T4d set
+stayed under 1.5x the fork anchor (means 0.029/0.033/0.031 vs
+0.014/0.010/0.024 unmutated; limit 0.0363).
+
+T4a, T4d and T7 therefore add a **pooled-mean gate** on top of the per-set
+gates: our n-weighted mean over all sets <= 1.25x the fork's pooled mean
+for the same pair and metric (`tf.pooled_gate`, `POOLED_FACTOR`). One more
+verdict line per gate and metric:
+```
+T4d ours_graphs_vs_fork_graphs decode pooled over 3 sets: ours mean=… | fork pooled mean=… | ratio … | limit 1.25x = … -> PASS
+```
+Nov 7 numbers: T4d unmutated 0.82x, `moe_decode_scale` 1.57x (CAUGHT);
+T4a decode 1.05x, prefill 1.04x; T7 decode 1.10x, prefill 0.77x.
+
+Guards:
+- **Never raise `POOLED_FACTOR`.** A build that trips the pooled gate below
+  1.30x (`POOLED_INVESTIGATE`) is a real numeric change to investigate;
+  the failure message says so.
+- `moe_decode_scale` (x1.01) is a **required** catch for T4d.
+  `moe_decode_scale_half` (x1.005) is an INFO probe of the floor. It is not
+  required to be caught, but it must still be applied and fire.
+- Floor: a bias below roughly 1% in the MoE decode output may pass every
+  envelope gate.
+
+An envelope without `pooled_mean` fails the pooled gate closed (rebuild,
+step 3).
 
 Planned follow-up (not part of #36): a **self-regression check** that
 pins our own forced-decode scores on the M5 sequence sets as a baseline and
 requires bitwise equality (0 tolerance) on later builds with tuning off.
-T4c showed two engine instances are bitwise identical, so any change,
-including a 1% MoE bias, shows up. An intended numeric change re-pins the
-baseline in the same PR, with a reason.
+T4c showed two engine instances are bitwise identical, so any change shows
+up. A PR that intends a numeric change re-pins the baseline, with a reason.
 
-## 5. Mutation check (11 loads, ~30–40 min)
+## 5. Mutation check (12 loads, ~35–45 min)
 Run this only after T4d and T7 have passed unmutated in step 4, or add
 `M5_BASELINE=1`, which costs 3 more loads.
 ```sh
@@ -290,7 +308,8 @@ Planted bugs and the gates that MUST catch them (Quinn/Astro, Nov 6):
 |---|---|---|
 | `rope_pos_decode` | positions + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
 | `kv_slot_decode` | slot_mapping + 1 on fused-op calls of ≤ 8 tokens | T4d and T7 |
-| `moe_decode_scale` | K12 M≤2 MoE decode output × 1.01 | INFO only, on T4d: below the sensitivity floor (Nov 7: not caught; see above). Still must FIRE. |
+| `moe_decode_scale` | K12 M≤2 MoE decode output × 1.01 | T4d (pooled-mean gate; T7 can't see it: both arms run the same MoE) |
+| `moe_decode_scale_half` | the same × 1.005 | INFO only (floor probe), on T4d; must still be applied and FIRE |
 | `rope_theta_1p01` | rope_theta × 1.01 via hf_overrides | INFO only (too weak at ~70-token positions) |
 
 The check PASSes only if every required run fails the gate itself (not a
