@@ -364,10 +364,13 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
             policy_enabled=bool(self.decode_enabled and flint_moe.enabled()),
         )
         if plan is None:
+            # Per layer (the layer name is part of the message key), so a
+            # single rejected layer is visible among the admitted ones.
             logger.info_once(
-                "SM70 NVFP4 MoE: K12 M<=2 decode not admitted for contract %s "
-                "(policy %s, ops %s); dense-stage route serves M<=2.",
-                contract, bool(self.decode_enabled), ops_present,
+                "SM70 NVFP4 MoE %s: K12 M<=2 decode not admitted for contract "
+                "%s (policy %s, ops %s); dense-stage route serves M<=2.",
+                getattr(layer, "layer_name", "?"), contract,
+                bool(self.decode_enabled), ops_present,
             )
             return
         logger.info_once(
@@ -433,6 +436,16 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
                     topk_ids,
                     layer.sm70_nvfp4_decode_ws,
                     plan,
+                )
+
+            if num_tokens <= 2:
+                # Admitted at load but refused for this decode call: name the
+                # layer and the C++ guard's reason (once per layer and reason).
+                logger.info_once(
+                    "SM70 NVFP4 MoE %s: K12 decode skipped for an M=%d call "
+                    "(%s); dense-stage route used.",
+                    getattr(layer, "layer_name", "?"), num_tokens,
+                    flint_moe.call_rejection(x, topk_weights, topk_ids),
                 )
 
         tm = _tm()
