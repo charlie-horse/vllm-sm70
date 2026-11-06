@@ -134,6 +134,15 @@ grep -hE '^(T2 n=|T4[abcde] |T5 |T7 |ours_eager_vs_eager|M5_MUTATION |junit: )' 
 echo
 echo "== summary"
 rc=0
+# Quinn (Nov 7): exact T4b may only be skipped by design when T4e gates
+# replay in the same run; otherwise replay would pass with nothing gating it.
+if [[ -v "SKIPPED[t4b]" ]]; then
+  if [[ ! -v "RC[t4e]" ]]; then
+    echo "t4b skipped by design but t4e is not in this run (M5_NODES): FAIL"; rc=1
+  elif [[ ${RC[t4e]} -ne 0 || -v "SKIPPED[t4e]" ]]; then
+    echo "t4b skipped by design but t4e did not pass: replay is ungated: FAIL"; rc=1
+  fi
+fi
 t4c_ok=1
 [[ -v "RC[t4c]" && ${RC[t4c]} -ne 0 ]] && t4c_ok=0
 for name in "${ORDER[@]}"; do

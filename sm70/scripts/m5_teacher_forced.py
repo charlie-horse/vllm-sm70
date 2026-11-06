@@ -504,7 +504,10 @@ def effective_anchor(env: dict, pair: str, metric: str, scores_dir=None) -> dict
             "max": max(an["max"] for an in anchors.values()),
             "over_0_1": anchors[metric]["over_0_1"],
             "over_1_0": max(an["over_1_0"] for an in anchors.values()),
-            "max_over": sorted(anchors)}
+            "max_over": sorted(anchors),
+            # Each metric's own anchor max, printed so the union is visible
+            # (Quinn: e.g. T4e shows the fork graphs-only prefill value).
+            "max_by_metric": {m: an["max"] for m, an in sorted(anchors.items())}}
 
 
 def count_limit(anchor_count: int, factor=None) -> int:
@@ -563,9 +566,12 @@ def limits_text(anchor: dict) -> str:
     if "over_1_0" not in anchor or "max_over" not in anchor:
         return "limits n/a (not an effective anchor)"
     lim = gate_limits(anchor)
+    by = anchor.get("max_by_metric") or {}
+    over = (", ".join(f"{m} {v:.4g}" for m, v in by.items())
+            if by else "+".join(anchor["max_over"]))
     return (f"limits mean<={lim['mean']:.4g} ({GATE_MEAN_FACTOR}x), "
-            f"max<={lim['max']:.4g} ({GATE_MAX_FACTOR}x max over "
-            f"{'+'.join(anchor['max_over'])}), >{OVER_1_0}<={lim['over_1_0']} "
+            f"max<={lim['max']:.4g} ({GATE_MAX_FACTOR}x max over {over}), "
+            f">{OVER_1_0}<={lim['over_1_0']} "
             f"(max(1, ceil({GATE_COUNT_FACTOR}x{anchor['over_1_0']})))")
 
 

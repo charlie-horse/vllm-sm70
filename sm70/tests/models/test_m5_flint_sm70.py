@@ -1546,7 +1546,11 @@ def test_envelope_gate():
     assert not bad and line.startswith("T4a eager_vs_graphs decode set0: ")
     assert ">0.1=4/512 >1.0=0" in line and line.endswith("PASS")
     # The effective limits are spelled out.
-    assert "mean<=0.03 (1.5x)" in line and "max<=0.6 (1.5x max over decode+prefill)" in line
+    assert "mean<=0.03 (1.5x)" in line and "max<=0.6 (1.5x max over decode " in line
+    # Each metric's own max is printed, so the union's source is visible.
+    by = anchor["max_by_metric"]
+    assert set(by) == {"decode", "prefill"} and max(by.values()) == anchor["max"]
+    assert f"prefill {by['prefill']:.4g}" in line
     assert ">1.0<=1 (max(1, ceil(1.5x0)))" in line
 
 
@@ -1561,9 +1565,11 @@ def test_effective_anchor_max_is_union_over_metrics():
     dec = tf.effective_anchor(env, "eager_vs_graphs", "decode")
     pre = tf.effective_anchor(env, "eager_vs_graphs", "prefill")
     assert dec == {"mean": 0.02, "max": 2.616, "over_0_1": 9, "over_1_0": 2,
-                   "max_over": ["decode", "prefill"]}
+                   "max_over": ["decode", "prefill"],
+                   "max_by_metric": {"decode": 2.616, "prefill": 0.895}}
     assert pre == {"mean": 0.03, "max": 2.616, "over_0_1": 4, "over_1_0": 2,
-                   "max_over": ["decode", "prefill"]}
+                   "max_over": ["decode", "prefill"],
+                   "max_by_metric": {"decode": 2.616, "prefill": 0.895}}
     ours_prefill = {"mean": 0.03, "max": 2.394, "over_0_1": 5, "over_1_0": 3}
     assert tf.gate_failures(ours_prefill, pre) == []  # old per-metric rule: 2.394 > 1.34
     assert tf.gate_failures(ours_prefill, _anchor(0.03, 0.895) | {"max_over": ["x"]})
