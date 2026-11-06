@@ -44,12 +44,12 @@ buffers are allocated in process_weights_after_loading, never in forward.
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import TYPE_CHECKING, Any, Final
 
 import torch
 from torch.nn import Parameter
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
 
@@ -64,7 +64,7 @@ if TYPE_CHECKING:
         SharedExperts,
     )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm.sm70.quant.nvfp4_moe")
 
 # K12 decode switch and the one contract it serves (flint_moe.FLINT_TP2;
 # repeated here so the check works when vllm_sm70.ops.flint_moe is absent).
@@ -364,7 +364,16 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
             policy_enabled=bool(self.decode_enabled and flint_moe.enabled()),
         )
         if plan is None:
+            logger.info_once(
+                "SM70 NVFP4 MoE: K12 M<=2 decode not admitted for contract %s "
+                "(policy %s, ops %s); dense-stage route serves M<=2.",
+                contract, bool(self.decode_enabled), ops_present,
+            )
             return
+        logger.info_once(
+            "SM70 NVFP4 MoE: K12 M<=2 decode admitted for contract %s "
+            "(VLLM_SM70_FLINT_MOE_QPN_DECODE=0 disables it).", contract,
+        )
         layer.sm70_nvfp4_decode_plan = plan
         layer.sm70_nvfp4_decode_ws = decode_workspace(
             flint_moe, layer.w13_tm_weight.device

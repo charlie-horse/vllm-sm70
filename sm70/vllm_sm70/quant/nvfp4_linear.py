@@ -78,7 +78,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Stat
 
 from vllm_sm70.config import sm70_config
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.sm70.quant.nvfp4")
 
 ALGO = "W4A16_NVFP4"
 NVFP4_GROUP_SIZE = 16
@@ -481,6 +481,15 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
             logger.info_once(
                 "SM70 ModelOpt NVFP4 W4A16 single-token GEMV enabled for the "
                 "Flint dense shapes (VLLM_SM70_MODELOPT_NVFP4_GEMV=0 disables it)."
+            )
+        else:
+            logger.info_once(
+                "SM70 ModelOpt NVFP4 single-token GEMV not admitted for K=%d N=%d "
+                "(switch %s, K11 op %s); M<=2 uses the TurboMind GEMM.",
+                int(state.weight.shape[0]),
+                int(state.weight.shape[1]) * 8,
+                "on" if self.gemv_enabled else "off",
+                "present" if has_tm_op(GEMV_OP) else "absent",
             )
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind dense path enabled "

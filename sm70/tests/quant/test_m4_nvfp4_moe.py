@@ -555,6 +555,19 @@ def _decode_calls(fm, kind):
     return [c for c in fm.calls if c[0] == kind]
 
 
+@pytest.mark.parametrize("admit", [True, False])
+def test_decode_admission_is_logged(mods, monkeypatch, admit):
+    """The K12 decision is visible in the engine log (vllm.sm70.* logger)."""
+    fm = make_fake_flint_moe(admit=admit)
+    m4, _tm = mods(flint=fm)
+    assert m4.logger.name.startswith("vllm.sm70")
+    seen = []
+    monkeypatch.setattr(m4.logger, "info_once", lambda msg, *a, **k: seen.append(msg % a))
+    _build(m4)
+    want = "decode admitted" if admit else "decode not admitted"
+    assert any(want in m for m in seen), seen
+
+
 def test_decode_off_when_flint_moe_absent(mods):
     m4, tm = mods(flint=None)
     method, layer, _w = _build(m4)
