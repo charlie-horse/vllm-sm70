@@ -14,12 +14,22 @@
 #   FLINT_SM70_FORK_SCORES_DIR  the fork's setK/{eager,eager2,graphs,unfused}.json
 # FLINT_SM70_OURS_NOISE defaults to $OUT/ours_eager_vs_eager.json: T4c (two
 # separate eager engine instances) writes it and T4a/T4d/T7 print it on every
-# gate line, so t4c runs first. T4c is EXPECTED to FAIL on today's build
-# (engine-instance nondeterminism, Bea Nov 6); it still writes the file.
+# gate line, so t4c runs first. T4c must PASS (with the tuning-off setting
+# below) before T4a/T4d/T7 count; if it fails they are reported NOT COUNTED.
 # Optional: OUT (log dir), M5_NODES (space-separated subset of the names
 # below, default: all, in this order), M5_MUTATION (mutation check only; see
 # m5_mutation_check.sh).
 set -uo pipefail
+
+# Deterministic kernel choice (Quinn/Astro, Nov 6): TurboMind's small-shape
+# autotune times kernels at engine start, so each instance may pick different
+# kernels (Bea: 7/8 prompts split between two eager instances; identical with
+# tuning off). Until Kai's persisted tuning table lands, every M5 gate runs
+# with it off, on both stacks. M5_ALLOW_TUNING=1 opts out (diagnostics only).
+if [[ "${M5_ALLOW_TUNING:-0}" != 1 ]]; then
+  for q in NVFP4 FP8 AWQ MXFP4; do export "VLLM_SM70_${q}_TUNE_SMALL_SHAPES=0"; done
+fi
+echo "tuning: $(env | grep -E '^VLLM_SM70_[A-Z0-9]+_TUNE_SMALL_SHAPES=' | sort | tr '\n' ' ')"
 
 : "${VLLM_PY:?set VLLM_PY to the venv python}"
 : "${FLINT_SM70_CHECKPOINT:?set FLINT_SM70_CHECKPOINT}"
@@ -94,7 +104,16 @@ grep -hE '^(T2 n=|T4[abcd] |T5 |T7 |ours_eager_vs_eager|M5_MUTATION |junit: )' "
 echo
 echo "== summary"
 rc=0
+t4c_ok=1
+[[ -v "RC[t4c]" && ${RC[t4c]} -ne 0 ]] && t4c_ok=0
 for name in "${ORDER[@]}"; do
-  if [[ ${RC[$name]} -eq 0 ]]; then echo "$name PASS"; else echo "$name FAIL (rc ${RC[$name]})"; rc=1; fi
+  if [[ ${RC[$name]} -ne 0 ]]; then
+    echo "$name FAIL (rc ${RC[$name]})"; rc=1
+  elif [[ $t4c_ok -eq 0 && " t4a t4d t7 " == *" $name "* ]]; then
+    # Teacher-forced gates only count when eager is reproducible (T4c).
+    echo "$name NOT COUNTED (t4c failed: engine instances not reproducible)"; rc=1
+  else
+    echo "$name PASS"
+  fi
 done
 exit "$rc"

@@ -580,7 +580,24 @@ def cmd_envelope(a):
     print(f"-> {a.out}")
 
 
+TUNE_SMALL_SHAPES_VARS = tuple(
+    f"VLLM_SM70_{q}_TUNE_SMALL_SHAPES" for q in ("NVFP4", "FP8", "AWQ", "MXFP4")
+)
+
+
+def _deterministic_kernels() -> None:
+    """Turn TurboMind's per-instance small-shape autotune off (both stacks use
+    the same env names) unless M5_ALLOW_TUNING=1; print the setting. Must run
+    before vllm/vllm_sm70 import (the extension reads it at load)."""
+    if os.environ.get("M5_ALLOW_TUNING") != "1":
+        for var in TUNE_SMALL_SHAPES_VARS:
+            os.environ[var] = "0"
+    print("tuning: " + " ".join(f"{v}={os.environ.get(v, '<unset>')}"
+                                for v in TUNE_SMALL_SHAPES_VARS), flush=True)
+
+
 def main(argv=None):
+    _deterministic_kernels()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

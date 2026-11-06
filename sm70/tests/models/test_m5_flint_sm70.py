@@ -33,6 +33,13 @@ from types import SimpleNamespace
 
 import pytest
 
+# Deterministic TurboMind kernel choice for every engine these tests start
+# (Quinn/Astro, Nov 6): small-shape autotune picks kernels per instance by
+# timing. Set before any engine spawns; M5_ALLOW_TUNING=1 opts out.
+if os.environ.get("M5_ALLOW_TUNING") != "1":
+    for _q in ("NVFP4", "FP8", "AWQ", "MXFP4"):
+        os.environ.setdefault(f"VLLM_SM70_{_q}_TUNE_SMALL_SHAPES", "0")
+
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
 import torch

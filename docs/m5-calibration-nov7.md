@@ -103,15 +103,23 @@ the same name, `VLLM_SM70_FLINT_QK_ROPE_KV=0`. `sm70_skinny_moe` is a field
 of the fork's `KernelConfig` (vllm/config/kernel.py), and `LLM(kernel_config={...})`
 turns the dict into a `KernelConfig` in `EngineArgs.__post_init__`.
 
-Optional autotune-off knob (Kai; name TBD). If Kai provides it, set it in
-the shell **and** record it with `--env` on every `score` command:
+**Deterministic kernels (REQUIRED, both stacks; Quinn/Astro Nov 6).**
+TurboMind's small-shape autotune times kernels at engine start, so each
+engine instance may pick different kernels and produce different bits (Bea:
+two eager instances split on 7/8 prompts; identical with tuning off). Until
+Kai's persisted tuning table lands, every step below runs with it off. The
+fork reads the same variable names. `m5_teacher_forced.py`,
+`m5_window.sh`, `m5_mutation_check.sh` and the test module all set these to
+0 themselves (and print a `tuning:` line). Exporting them in the shell as
+well makes it explicit:
 ```sh
-AUTOTUNE_OFF_ENV=<from Kai>                  # e.g. NAME=0
-# then:  env "$AUTOTUNE_OFF_ENV" $PY $TF score ... --env "$AUTOTUNE_OFF_ENV"
+export VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0 VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0 \
+       VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0 VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES=0
 ```
-`--env K=V` sets the variable in the script process before the LLM is built
-(engine core and workers inherit it) and records it in the score JSON.
-Exporting it in the shell as well covers anything read at import time.
+`M5_ALLOW_TUNING=1` turns the scripts' default off (diagnostics only, never
+for gates). **T4c must PASS under this setting before T4a/T4d/T7 count.**
+The runner reports them `NOT COUNTED` if T4c fails. Check that every log
+has the `tuning: ...=0` line, the fork's included.
 
 ## 1. Sequences, on ours (1 load, ~5 min)
 ```sh

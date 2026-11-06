@@ -26,6 +26,16 @@
 # (default "t4d t7"), M5_BASELINE=1 (also run both nodes unmutated, must PASS).
 set -uo pipefail
 
+# Deterministic kernel choice (Quinn/Astro, Nov 6): TurboMind's small-shape
+# autotune times kernels at engine start, so each instance may pick different
+# kernels (Bea: 7/8 prompts split between two eager instances; identical with
+# tuning off). Until Kai's persisted tuning table lands, every M5 gate runs
+# with it off, on both stacks. M5_ALLOW_TUNING=1 opts out (diagnostics only).
+if [[ "${M5_ALLOW_TUNING:-0}" != 1 ]]; then
+  for q in NVFP4 FP8 AWQ MXFP4; do export "VLLM_SM70_${q}_TUNE_SMALL_SHAPES=0"; done
+fi
+echo "tuning: $(env | grep -E '^VLLM_SM70_[A-Z0-9]+_TUNE_SMALL_SHAPES=' | sort | tr '\n' ' ')"
+
 : "${VLLM_PY:?set VLLM_PY to the venv python}"
 : "${FLINT_SM70_CHECKPOINT:?set FLINT_SM70_CHECKPOINT}"
 : "${FLINT_SM70_T4_SEQS_DIR:?set FLINT_SM70_T4_SEQS_DIR}"
