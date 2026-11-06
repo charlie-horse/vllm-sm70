@@ -177,7 +177,60 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
+        # U1 (patches/0002): after model load and the compile warmup, before
+        # capture_model. Three steps, always in this order and none skipped
+        # because an earlier one had nothing to do; each has its own kill
+        # switch. A step whose module is not in this build is skipped.
+        # (1) TurboMind pre-capture tuning, TP-coordinated (vllm_sm70/warmup).
+        #     Off with VLLM_SM70_TM_PRECAPTURE_WARMUP=0 (read inside run()).
+        if _has_module("vllm_sm70.warmup"):
+            from vllm_sm70 import warmup
+
+            warmup.run(worker)
+        # (2) K13 (R4): admit the fused router and allocate its per-layer
+        #     workspace. A worker without get_model skips only this step.
+        #     Off with VLLM_SM70_FLINT_FUSED_ROUTER=0 (read inside the module).
+        get_model = getattr(worker, "get_model", None)
+        if get_model is not None and _has_module("vllm_sm70.router"):
+            from vllm_sm70 import router
+
+            router.prepare_model(get_model())
+        # (3) K16: bind the V1 hidden-state sampler and create its device
+        #     counter here, never lazily during capture (R4).
+        #     A failure raises: if one TP rank silently fell back to upstream
+        #     sampling while the other used K16, their collectives would no
+        #     longer match and the engine would hang.
+        #     VLLM_SM70_FLINT_SAMPLER=0 is the way to run without it.
+        if _flint_sampler_enabled():
+            from vllm_sm70 import sample_v1
+
+            try:
+                sample_v1.prepare_worker(worker)
+            except Exception as e:
+                raise RuntimeError(
+                    "vllm_sm70: preparing the K16 top-k sampler failed; set "
+                    "VLLM_SM70_FLINT_SAMPLER=0 to use upstream sampling"
+                ) from e
         return None
+
+    # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
+    @classmethod
+    def get_hidden_state_sampler(cls) -> Any:
+        # K16: TP-local exact top-k (k <= 20) sampling for models that opt in
+        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 -> upstream.
+        if not _flint_sampler_enabled():
+            return None
+        from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
+
+        return Sm70HiddenStateSampler()
+
+    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # the gate; the provider caches its route per layer (vllm_sm70/router.py).
+    @classmethod
+    def get_moe_router_provider(cls) -> Callable[..., Any] | None:
+        from vllm_sm70 import router
+
+        return router.provider()
 
     # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
     # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
@@ -216,6 +269,23 @@ class Sm70CudaPlatform(CudaPlatform):
             list(priority.fused_add_rms_norm),
         )
         return dataclasses.replace(priority, fused_add_rms_norm=pinned)
+
+
+def _flint_sampler_enabled() -> bool:
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_FLINT_SAMPLER)
+
+
+def _has_module(name: str) -> bool:
+    """True if `name` is importable in this build (kernel_warmup steps whose
+    module a branch does not have yet are skipped, not failed)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 _PIN_LOGGED: set[str] = set()

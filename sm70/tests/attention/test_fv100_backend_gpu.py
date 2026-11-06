@@ -7,7 +7,8 @@ the new tokens' K/V are written with upstream's do_kv_cache_update
 TritonAttentionImpl run the same mixed batch (decode rows first, then
 prefill rows of several query lengths, fresh and chunked). Max |diff| must
 stay below 2e-2. A second test captures a uniform decode batch in a CUDA
-graph (UNIFORM_BATCH) and replays it with new queries and sequence lengths.
+graph (UNIFORM_BATCH) and replays it with new queries and sequence lengths,
+rebuilding the metadata before each replay as the V1 runner does.
 
 Shapes: Flint D128 GQA8 (16q/2kv) with sliding window 513 and sinks, and full
 attention with sinks; Qwen3.8/3.6 D256 GQA6 (12q/2kv) and GQA8 (8q/1kv).
@@ -223,9 +224,14 @@ def test_uniform_decode_cuda_graph_replay(fv100_gpu, monkeypatch, name):
         new_q, _, _ = _qkv(batch, case, device, seed=10 + step)
         query.copy_(new_q)
         cm.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        tcm = cm.replace(max_seq_len=max(lens))
+        # The V1 runner rebuilds attention metadata eagerly every step before
+        # replaying a FULL graph; the rebuild refreshes the persistent
+        # fv_seq_lens / decode buffers the captured kernels read.
+        step_md = ours_builder.build(0, tcm)
+        assert step_md.decode_seq_lens.data_ptr() == md.decode_seq_lens.data_ptr()
         graph.replay()
         ref = torch.empty_like(query)
-        tcm = cm.replace(max_seq_len=max(lens))
         triton.forward(layer, query, None, None, kv, triton_builder.build(0, tcm), ref)
         torch.cuda.synchronize()
         diff = (out.float() - ref.float()).abs().max().item()
