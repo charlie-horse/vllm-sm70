@@ -307,12 +307,12 @@ def _getter_only(name):
 
 def _flint_qk_rope_kv_off():
     """M5 path: with the switch at "0", FlintSm70Attention's fused-route
-    admission (vllm_sm70/models/flint_sm70/qk_norm_rope_kv.py) refuses an
+    admission (K15, vllm_sm70/flint/qk_norm_rope_kv.py) refuses an
     otherwise eligible layer, so the layer runs the unfused q/k norm + RoPE
     and upstream's Attention.forward."""
     import torch
 
-    from vllm_sm70.models.flint_sm70.qk_norm_rope_kv import fused_route_rejection
+    from vllm_sm70.flint.qk_norm_rope_kv import fused_route_rejection
 
     def reason(enabled):
         return fused_route_rejection(
@@ -325,6 +325,7 @@ def _flint_qk_rope_kv_off():
             rotary_emb=None,  # a Flint full-attention (no-RoPE) layer
             kv_cache_dtype="auto",
             attn_type="decoder",
+            calculate_kv_scales=False,
             kv_sharing=False,
             backend_writes_kv_in_forward=False,
         )

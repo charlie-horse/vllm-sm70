@@ -7,14 +7,17 @@ M5_MUTATION=<name> and put this directory first on PYTHONPATH; the
 pytest process, the engine core and each TP worker inherit env and
 PYTHONPATH).
 
-Hook mutations patch ``qk_norm_rope_kv`` in
-``vllm_sm70.models.flint_sm70.qk_norm_rope_kv``. That is the patch point
-because the registered op ``torch.ops.vllm.sm70_flint_qk_norm_rope_kv_cache_update``
-dispatches to the module function ``sm70_flint_qk_norm_rope_kv_cache_update``,
-whose body looks ``qk_norm_rope_kv`` up in the module globals at call time
-(both the direct-cache-write branch and the fallback branch). Nothing else in
-the model imports it by name (model.py imports only fused_route_rejection),
-and the unfused route (VLLM_SM70_FLINT_QK_ROPE_KV=0) never calls it.
+Hook mutations patch ``qk_norm_rope_kv`` in K15's module
+``vllm_sm70.flint.qk_norm_rope_kv`` (#54), the one the model's fused route
+runs. That is the patch point because the registered op
+``torch.ops.vllm.<QK_ROPE_KV_OP_NAME>`` (vllm_sm70/flint) dispatches to the module
+function ``qk_norm_rope_kv_cache_update``, whose body looks
+``qk_norm_rope_kv`` up in the module globals at call time (both the
+direct-cache-write branch and the fallback branch), with the same argument
+names (positions, cos_sin_cache, key_cache, slot_mapping). Nothing else in
+the model imports it by name (model.py imports only fused_route_rejection
+and attention_after_fused_write), and the unfused route
+(VLLM_SM70_FLINT_QK_ROPE_KV=0) never calls it.
 Under torch.compile the op is opaque, so the Python body (and this wrapper)
 runs at run time, or at CUDA-graph capture, where its tensor ops are recorded
 into the graph.
@@ -41,7 +44,7 @@ import json
 import os
 import sys
 
-TARGET = "vllm_sm70.models.flint_sm70.qk_norm_rope_kv"
+TARGET = "vllm_sm70.flint.qk_norm_rope_kv"
 MOE_TARGET = "vllm_sm70.ops.flint_moe"
 MOE_DECODE_SCALE = 1.01
 QK_MUTATIONS = ("rope_pos_decode", "kv_slot_decode")

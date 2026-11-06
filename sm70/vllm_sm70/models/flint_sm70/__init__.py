@@ -3,9 +3,10 @@
 
 What: ``FlintSm70ForCausalLM`` (model.py), a port of the fork's Flint model
   (FORK cf9492a vllm/models/flint/) on upstream v0.33.0 layers, with FP16
-  rescaling (fp16_rescale.py), the fused q/k norm + RoPE + KV write
-  (qk_norm_rope_kv.py) and the engine-config hook (config.py). It reuses
-  upstream's ``vllm.models.flint.configs.FlintConfig``.
+  rescaling (fp16_rescale.py) and the engine-config hook (config.py). The
+  fused q/k norm + RoPE + KV write is K15's (vllm_sm70/flint/
+  qk_norm_rope_kv.py, #54), which the model calls. It reuses upstream's
+  ``vllm.models.flint.configs.FlintConfig``.
 Why: upstream's FlintForCausalLM asserts bf16 + FlashInfer (UP 4ba787e
   models/flint/model.py:318, 321), and V100 has neither. A separate
   architecture name keeps upstream's class untouched; the c4130 serve args
