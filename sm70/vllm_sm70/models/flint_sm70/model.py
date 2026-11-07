@@ -15,7 +15,8 @@ FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
                                        92). RoutedExperts.load_weights builds
                                        its own mapping (UP fused_moe/
                                        routed_experts.py:1004-1008)
-runner.router_provider :229            dropped in v1 (fused router deferred)
+runner.router_provider :229            K13 via U3's platform getter (M10a;
+                                       no model hook)
 Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
   :386                                 OP_NAME>), then K15's attention_after_
                                        fused_write (vllm_sm70/flint/)
@@ -34,7 +35,8 @@ FP16 rescale :87-107, :402-447, :623-  fp16_rescale.py
 Not ported (fork cf9492a model.py): ``_expert_params_mapping`` :117-126 (UP
 RoutedExperts builds the mapping), ``get_expert_mapping`` :616-617, the
 sampler hooks ``_get_top_tokens`` :597-603 and ``_sample_topk_candidates``
-:605-614 (deferred to M10), and the fused-router hook :227-229 (M10).
+:605-614 (deferred to M10), and the fused-router hook :227-229 (K13 binds
+through U3's platform getter, M10a).
 
 Quantization isn't special-cased here: dense ModelOpt W4A16 linears go to
 M3 (vllm_sm70/quant/nvfp4_linear.py) and routed experts to M4
@@ -225,7 +227,8 @@ class FlintSm70SparseMoeBlock(nn.Module):
         # (vllm/model_executor/layers/fused_moe/routed_experts.py:1007) from the
         # default ckpt_names=("gate_proj","down_proj","up_proj")
         # (vllm/model_executor/layers/fused_moe/layer.py:125); and the fork's
-        # runner.router_provider (:229, fused router deferred).
+        # runner.router_provider (:229; in M10a, K13 binds through U3's
+        # platform getter instead).
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
             gate=self.gate,
