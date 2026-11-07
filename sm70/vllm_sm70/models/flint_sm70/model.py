@@ -22,8 +22,8 @@ Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
                                        fused_write (vllm_sm70/flint/)
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
-layer_policy(...).value("flint_        dropped in v1 (sampler deferred)
-  sampler") :570-577
+layer_policy(...).value("flint_        supports_sm70_topk_sampler = True
+  sampler") :570-577                  (K16 on U4, M10)
 AutoWeightsLoader(skip_prefixes=)      filter lm_head.* when tied (UP
   :629-632                             AutoWeightsLoader has no skip_prefixes,
                                        vllm/model_executor/models/
@@ -35,8 +35,8 @@ FP16 rescale :87-107, :402-447, :623-  fp16_rescale.py
 Not ported (fork cf9492a model.py): ``_expert_params_mapping`` :117-126 (UP
 RoutedExperts builds the mapping), ``get_expert_mapping`` :616-617, the
 sampler hooks ``_get_top_tokens`` :597-603 and ``_sample_topk_candidates``
-:605-614 (deferred to M10), and the fused-router hook :227-229 (K13 binds
-through U3's platform getter, M10a).
+:605-614 (K16's U4 hook samples instead; M10 opts in), and the
+fused-router hook :227-229 (K13 binds through U3's platform getter, M10a).
 
 Quantization isn't special-cased here: dense ModelOpt W4A16 linears go to
 M3 (vllm_sm70/quant/nvfp4_linear.py) and routed experts to M4
@@ -563,7 +563,15 @@ class FlintSm70Model(nn.Module):
 
 # ported from FORK vllm/models/flint/model.py:527-668
 class FlintSm70ForCausalLM(nn.Module, SupportsPP):
-    """fork :527-668, minus the sampler hooks (:570-577, :597-614, deferred)."""
+    """fork :527-668. The fork's sampler hooks (:570-577, :597-614) are
+    replaced by the K16 opt-in below; the fused router (:227-229) needs no
+    hook here (M10a)."""
+
+    # M10: opt in to Kai's K16 top-k candidate sampler (vllm_sm70/sample_v1.py
+    # MODEL_OPT_IN, replacing fork :570-577, :605-614). It samples from
+    # self.lm_head and self.logits_processor. VLLM_SM70_FLINT_SAMPLER=0 is
+    # read in Sm70CudaPlatform.get_hidden_state_sampler.
+    supports_sm70_topk_sampler = True
 
     # fork :528-542 == UP models/flint/model.py:600-614
     hf_to_vllm_mapper = WeightsMapper(
