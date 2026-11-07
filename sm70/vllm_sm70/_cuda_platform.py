@@ -247,8 +247,12 @@ class Sm70CudaPlatform(CudaPlatform):
     # priority stays first). Under Inductor upstream picks ["native"], whose
     # fused_add_rms_norm keeps the residual sum in FP32 before rounding
     # (UP ir/ops/layernorm.py:44-62). On SM70 pin the C kernel (FP16
-    # residual, __hadd2), so the unfused graph, the kill-switched path and
+    # residual, __hadd2), so the unfused graph, the switched-off path and
     # the fused TP2 all-reduce + RMSNorm collective (K17) share one rounding.
+    # The pin keys on K17's admission (model/TP/dtype), not on
+    # VLLM_SM70_FLINT_AR_RMSNORM: with K17 off (the default) Flint still
+    # runs the C kernel, so on/off differ only in the collective, never in
+    # the RMSNorm rounding, and greedy A/B outputs stay comparable.
     # "native" stays as the fallback for args vllm_c does not support (a
     # weight dtype other than the input's, variance_size).
     SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
@@ -273,7 +277,7 @@ class Sm70CudaPlatform(CudaPlatform):
         pinned = list(cls.SM70_FUSED_ADD_RMS_NORM_PRIORITY)
         _log_pin_once(
             "vllm_sm70: fused_add_rms_norm IR priority pinned to %s "
-            "(K17 admits this model; was %s)",
+            "(K17 admits this model, with the fusion on or off; was %s)",
             pinned,
             list(priority.fused_add_rms_norm),
         )

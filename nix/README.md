@@ -76,7 +76,9 @@ Metrics are `GET /metrics` on the admin API, `127.0.0.1:${httpPort}` (8080).
 
 Agreed by the patch owners (Mara/Kai). Only `=0` does anything: it turns that
 sm_70 feature off. Environment variables can't turn features on, and any other
-`VLLM_SM70_*` variable from the old fork is ignored on this stack. Defaults and
+`VLLM_SM70_*` variable from the old fork is ignored on this stack. Exception:
+`VLLM_SM70_FLINT_AR_RMSNORM` is opt-in (default off, `=1` enables) as a
+signed-off fork deviation; see `sm70/csrc/custom_ar/PROVENANCE.md`. Defaults and
 tuning go through `--additional-config '{"sm70":{...}}'`, and only to change a
 default. Set a switch per model with `models.<name>.env`.
 
@@ -88,7 +90,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_FLINT_FUSED_ROUTER` | yes (Flint) |
 | `VLLM_SM70_FLINT_SAMPLER` | yes (Flint) |
 | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | yes (Flint) |
-| `VLLM_SM70_FLINT_AR_RMSNORM` | yes (Flint) |
+| `VLLM_SM70_FLINT_AR_RMSNORM` | yes (Flint); opt-in here, default off (`=1` enables; fork: on) |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |
 | `VLLM_SM70_QUANT` | new |

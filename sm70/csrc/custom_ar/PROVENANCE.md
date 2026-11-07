@@ -2,8 +2,36 @@
 
 Source: charlie-horse/vLLM at **cf9492a01**. Feature commits `45896b591`
 (fused collective + pattern), `9f175fc6e` (R5 fix: staged inputs, no graph
-buffers), `2eb8f3b0a` (default on). Fork measurement: decode step
+buffers), `2eb8f3b0a` (default on; **not** followed here, see "Signed-off
+fork deviation"). Fork measurement: decode step
 6.00 -> 5.59 ms (166.4 -> 179.3 tok/s at 4K).
+
+## Signed-off fork deviation: Flint default OFF
+
+**CHANGED [CONTROL] (Astro-approved, like #77 for TurboMind tuning):**
+`VLLM_SM70_FLINT_AR_RMSNORM` is opt-in here: unset or `0` leaves the fusion
+off (upstream custom all-reduce + separate `fused_add_rms_norm`), only `1`
+registers the pattern. Fork: on by default (`2eb8f3b0a`). The kernel, the
+pattern and the admission are unchanged; only the default moved.
+
+Reason: the AR microbench on c7fd4ee (98-call graph, µs/call, B = decode rows)
+showed the fused collective slower than unfused:
+
+| B | fused (`tp2_cross_device_reduce_fused_add_rms_norm`) | unfused (custom_ar + rms_norm) | custom_ar alone | NCCL |
+|---|---|---|---|---|
+| 1 | 11.25 | 9.20 | 6.27 | 20.85 |
+| 2 | 12.57 | 9.48 | 6.50 | 21.20 |
+| 4 | 15.31 | 10.06 | 7.06 | 23.18 |
+
+E2E: <pending Bea's K17 A/B>
+
+The `fused_add_rms_norm` -> `["vllm_c", "native"]` IR pin (below) still
+applies when K17 is off: it keys on K17's admission, not on the switch, so
+fusion on and off use the same FP16-residual rounding and an A/B compares
+only the collective. With the switch off, `register()` logs once at INFO
+"K17 fused AR+RMSNorm off by default (set VLLM_SM70_FLINT_AR_RMSNORM=1 to
+enable)". Path back to the fork default: an e2e A/B that shows the fused
+path faster.
 
 Design change from the carry map: **no upstream edit (U5 is dropped).** The
 kernel is in `_sm70_C` and is built against upstream's own
@@ -22,7 +50,7 @@ kernel is in `_sm70_C` and is built against upstream's own
 | `TORCH_LIBRARY_FRAGMENT(_sm70_C)` def | `csrc/torch_bindings.cpp:1689-1695` (`_C_custom_ar`) | adapted: `Tensor!` -> `Tensor(a!)`/`Tensor(b!)` |
 | `vllm_sm70/ar_rms_fusion.py: Tp2AllReduceFusedAddRMSNormPattern` | `vllm/compilation/passes/fusion/allreduce_rms_fusion.py:757-848` | adapted: `torch.ops.vllm.all_reduce` called directly; replacement is `torch.ops.vllm_sm70.*` |
 | `_match`, `_scaled_match`, `unfused_boundaries` | same file :725-754, :851-866 | verbatim logic |
-| `rejection` | same file `tp2_add_rms_rejection` :869-890 | adapted: no communication policy (kill switch moved to `register()`), adds `disable_custom_all_reduce` |
+| `rejection` | same file `tp2_add_rms_rejection` :869-890 | adapted: no communication policy (the switch, opt-in here, moved to `register()`), adds `disable_custom_all_reduce` |
 | `apply`, `register` | same file `AllReduceFusionPass.__init__`/`__call__` TP2 branches | adapted: one entry of `Sm70CompositePass` |
 | `operands_admitted`, `communicator_admitted`, `can_fuse` | `collective_provider.py:117-142` `fused_add_rms_norm_tp2`, `custom_all_reduce.py:675-684` `can_tp2_...` | adapted: upstream's `should_custom_ar` gate in front; multi-node repeated-buffer guard |
 | `tp2_all_reduce_fused_add_rms_norm` (op impl) + fake | `parallel_state.py:186-214`, `GroupCoordinator._tp2_..._out_place` :837-858, `CudaCommunicator.tp2_...` :475-506, `CustomAllreduce.tp2_...` :638-672 | adapted: one function on upstream's `device_communicator.ca_comm` |
@@ -79,5 +107,6 @@ Inductor (UP platforms/cuda.py:712-734), which keeps the residual sum in FP32
 (FP16 residual). `Sm70CudaPlatform.get_default_ir_op_priority` pins
 `fused_add_rms_norm` to `["vllm_c", "native"]` through upstream's platform
 hook (UP platforms/interface.py:1452, merged at config/kernel.py:461-478), so
-the unfused graph (switch off, prefill rows) and the fused collective round
-the same way. A user-set priority still comes first.
+the unfused graph (switch off, the default; prefill rows) and the fused
+collective round the same way. The pin follows K17's admission, not
+`VLLM_SM70_FLINT_AR_RMSNORM`. A user-set priority still comes first.

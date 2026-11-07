@@ -340,8 +340,11 @@ def clean_registry(fusion, monkeypatch):
     fusion[0]._log_once.cache_clear()
 
 
-@pytest.mark.parametrize("raw, enabled", [(None, True), ("1", True), ("0", False)])
-def test_kill_switch(monkeypatch, raw, enabled):
+# K17 default-off (signed-off fork deviation): opt-in, only "1" enables.
+@pytest.mark.parametrize(
+    "raw, enabled", [(None, False), ("", False), ("1", True), ("0", False)]
+)
+def test_opt_in_switch(monkeypatch, raw, enabled):
     from vllm_sm70 import envs
 
     if raw is None:
@@ -355,7 +358,7 @@ def test_kill_switch(monkeypatch, raw, enabled):
 
 def test_no_kernel_no_pattern_logged_once(fusion, clean_registry, monkeypatch, caplog):
     mod, _ = fusion
-    monkeypatch.delenv("VLLM_SM70_FLINT_AR_RMSNORM", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", "1")
     monkeypatch.setattr(mod, "kernel_available", lambda: False)
     with caplog.at_level(logging.INFO, logger="vllm.sm70"):
         assert mod.register() is False
@@ -365,7 +368,7 @@ def test_no_kernel_no_pattern_logged_once(fusion, clean_registry, monkeypatch, c
     assert len(hits) == 1
 
 
-def test_kill_switch_off_no_pattern(fusion, clean_registry, monkeypatch, caplog):
+def test_switch_zero_no_pattern(fusion, clean_registry, monkeypatch, caplog):
     mod, _ = fusion
     monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", "0")
     monkeypatch.setattr(mod, "kernel_available", lambda: True)
@@ -376,9 +379,29 @@ def test_kill_switch_off_no_pattern(fusion, clean_registry, monkeypatch, caplog)
     assert sum("=0" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_registers_with_kernel_and_changes_uuid(fusion, clean_registry, monkeypatch):
+def test_default_off_no_pattern_logged_once(
+    fusion, clean_registry, monkeypatch, caplog
+):
     mod, _ = fusion
     monkeypatch.delenv("VLLM_SM70_FLINT_AR_RMSNORM", raising=False)
+    monkeypatch.setattr(mod, "kernel_available", lambda: True)
+    with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+        assert mod.register() is False
+        assert mod.register() is False
+    assert clean_registry.patterns() == []
+    hits = [
+        r
+        for r in caplog.records
+        if "K17 fused AR+RMSNorm off by default "
+        "(set VLLM_SM70_FLINT_AR_RMSNORM=1 to enable)" in r.getMessage()
+    ]
+    assert len(hits) == 1 and hits[0].levelno == logging.INFO
+    assert hits[0].name.startswith("vllm.sm70")
+
+
+def test_registers_with_kernel_and_changes_uuid(fusion, clean_registry, monkeypatch):
+    mod, _ = fusion
+    monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", "1")
     monkeypatch.setattr(mod, "kernel_available", lambda: True)
     before = clean_registry.Sm70CompositePass().uuid()
     assert mod.register() is True

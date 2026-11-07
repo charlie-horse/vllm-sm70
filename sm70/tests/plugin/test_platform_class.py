@@ -163,6 +163,31 @@ def test_fused_add_rms_norm_priority_is_vllm_c(
         assert theirs.fused_add_rms_norm == ["native"]
 
 
+@pytest.mark.parametrize("raw", [None, "0", "1"])
+def test_fused_add_rms_norm_pin_ignores_the_k17_switch(platform_cls, monkeypatch, raw):
+    """K17 default-off: the vllm_c pin follows K17's admission (Flint), not
+    VLLM_SM70_FLINT_AR_RMSNORM, so fusion on and off round the same way."""
+    from vllm.config.compilation import CompilationMode
+
+    from vllm_sm70 import ar_rms_fusion
+
+    if raw is None:
+        monkeypatch.delenv("VLLM_SM70_FLINT_AR_RMSNORM", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", raw)
+    monkeypatch.setattr(ar_rms_fusion, "rejection", lambda config, tp: None)
+    cc = SimpleNamespace(backend="inductor", mode=CompilationMode.VLLM_COMPILE)
+    cfg = SimpleNamespace(
+        compilation_config=cc,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    assert platform_cls.get_default_ir_op_priority(cfg).fused_add_rms_norm == [
+        "vllm_c",
+        "native",
+    ]
+
+
 def test_fused_add_rms_norm_priority_merges_into_kernel_config(
     platform_cls, monkeypatch
 ):

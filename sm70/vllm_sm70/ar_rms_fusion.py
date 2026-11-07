@@ -35,8 +35,11 @@ contiguous and 16-byte aligned operands, scale 1 or a positive power of two.
 Anything else at runtime (prefill rows, a disabled or absent custom
 all-reduce) runs the unfused ops, with the same result.
 
-Kill switch: VLLM_SM70_FLINT_AR_RMSNORM=0 (read in register(), so the
-composite pass's uuid changes with it).
+Switch: VLLM_SM70_FLINT_AR_RMSNORM, OPT-IN (only "1" enables; unset or "0"
+is off). Signed-off fork deviation: the fork defaults it on (2eb8f3b0a), but
+the fused collective measured slower than unfused here (sm70/csrc/custom_ar/
+PROVENANCE.md). Read in register(), so the composite pass's uuid changes
+with it.
 """
 
 from __future__ import annotations
@@ -60,6 +63,8 @@ OP_NAMESPACE = "vllm_sm70"
 OP_NAME = "tp2_all_reduce_fused_add_rms_norm"
 KERNEL_NAMESPACE = "_sm70_C"
 KERNEL_NAME = "tp2_all_reduce_fused_add_rms_norm"
+# Opt-in (default off, signed-off fork deviation); the name is kept from the
+# kill-switch days because tests and docs refer to it.
 KILL_SWITCH = "VLLM_SM70_FLINT_AR_RMSNORM"
 
 # Shapes of the kernel (sm70/csrc/custom_ar): one 256-thread row per pack row.
@@ -550,18 +555,27 @@ def apply(graph: fx.Graph) -> int:
 def register() -> bool:
     """Called by vllm_sm70.passes.register(). Returns True if registered.
 
-    The pattern is registered only when the kill switch is on and _sm70_C has
+    The pattern is registered only when the opt-in is "1" and _sm70_C has
     the kernel, so the composite pass's uuid (its pattern list) reflects both.
     """
+    import os
+
     from vllm_sm70 import envs
     from vllm_sm70.passes import register_pattern
 
     if not getattr(envs, KILL_SWITCH):
-        _log_once(
-            logging.INFO,
-            f"vllm_sm70: {KILL_SWITCH}=0; TP2 all-reduce + fused_add_rms_norm "
-            "fusion not registered.",
-        )
+        if os.environ.get(KILL_SWITCH) == "0":
+            msg = (
+                f"vllm_sm70: K17 fused AR+RMSNorm off ({KILL_SWITCH}=0); "
+                "TP2 all-reduce + fused_add_rms_norm fusion not registered."
+            )
+        else:
+            msg = (
+                "vllm_sm70: K17 fused AR+RMSNorm off by default (set "
+                f"{KILL_SWITCH}=1 to enable); TP2 all-reduce + "
+                "fused_add_rms_norm fusion not registered."
+            )
+        _log_once(logging.INFO, msg)
         return False
     if not kernel_available():
         _log_once(

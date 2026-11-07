@@ -6,9 +6,11 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  Two reviewed exceptions select a kernel, both off by default until
-  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
+  Three reviewed exceptions select a kernel, all off by default:
+  VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2),
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32) and
+  VLLM_SM70_FLINT_AR_RMSNORM (K17; signed-off fork deviation, slower than
+  unfused on the AR microbench). See their comments.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -285,12 +287,17 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
         "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
     },
-    # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
-    # first runs on a graph (fork name kept).
+    # Kai (K17). Read by vllm_sm70.ar_rms_fusion.register() when the
+    # passes area registers (fork name kept).
     "passes": {
-        # "0": the TP2 all-reduce + fused_add_rms_norm pattern is not applied;
-        # graphs keep upstream's all_reduce and fused_add_rms_norm.
-        "VLLM_SM70_FLINT_AR_RMSNORM": kill_switch("VLLM_SM70_FLINT_AR_RMSNORM"),
+        # OPT-IN since the K17 default-off deviation (fork default: on, its
+        # 2eb8f3b0a): only "1" registers the TP2 all-reduce +
+        # fused_add_rms_norm pattern (Flint only, see ar_rms_fusion). Unset
+        # or "0": graphs keep upstream's custom all-reduce and a separate
+        # fused_add_rms_norm. Why off: on the AR microbench the fused
+        # collective was slower than unfused (sm70/csrc/custom_ar/
+        # PROVENANCE.md, "Signed-off fork deviation").
+        "VLLM_SM70_FLINT_AR_RMSNORM": opt_in("VLLM_SM70_FLINT_AR_RMSNORM"),
     },
     # Kai (TurboMind pre-capture warmup, vllm_sm70/warmup). Read once per
     # worker by Sm70CudaPlatform.kernel_warmup, before CUDA graph capture.
