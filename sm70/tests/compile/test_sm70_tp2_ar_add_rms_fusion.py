@@ -386,6 +386,55 @@ def test_registers_with_kernel_and_changes_uuid(fusion, clean_registry, monkeypa
     assert clean_registry.Sm70CompositePass().uuid() != before
 
 
+def test_registered_logs_positive_line_once(fusion, clean_registry, monkeypatch, caplog):
+    # Log gates assert this line; the =0 and no-kernel paths log their own.
+    mod, _ = fusion
+    monkeypatch.delenv("VLLM_SM70_FLINT_AR_RMSNORM", raising=False)
+    monkeypatch.setattr(mod, "kernel_available", lambda: True)
+    with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+        assert mod.register() is True
+        clean_registry._PATTERNS.clear()
+        assert mod.register() is True
+    hits = [r for r in caplog.records if "fusion registered" in r.getMessage()]
+    assert len(hits) == 1
+    assert hits[0].levelno == logging.INFO
+    assert "VLLM_SM70_FLINT_AR_RMSNORM=0" in hits[0].getMessage()
+
+
+def test_apply_logs_first_fused_graph_once(fusion, monkeypatch, caplog):
+    mod, _ = fusion
+    import vllm.config
+    import vllm.distributed
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(mod, "rejection", lambda config, tp: None)
+    monkeypatch.setattr(mod, "_epsilon", lambda config: 1e-6)
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16)),
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        vllm.distributed, "get_tp_group", lambda: SimpleNamespace(unique_name="tp:0")
+    )
+    monkeypatch.setattr(
+        mod, "_pattern_pass", lambda *a: SimpleNamespace(apply=lambda graph: 3)
+    )
+    monkeypatch.setattr(mod, "unfused_boundaries", lambda graph: 0)
+    mod._log_once.cache_clear()
+    try:
+        with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+            assert mod.apply(object()) == 3
+            assert mod.apply(object()) == 3
+    finally:
+        mod._log_once.cache_clear()
+    hits = [r for r in caplog.records if "fused 3 pairs" in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelno == logging.INFO
+
+
 def test_passes_area_without_kernel_registers_nothing(clean_registry, monkeypatch):
     # The real build state of the CPU suite: _sm70_C absent or without U5.
     from vllm_sm70 import ar_rms_fusion

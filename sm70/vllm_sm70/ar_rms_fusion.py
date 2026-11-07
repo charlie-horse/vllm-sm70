@@ -538,6 +538,13 @@ def apply(graph: fx.Graph) -> int:
         _totals["fused"],
         missed,
     )
+    if matched:
+        # Compile-time only: absent when Inductor's compile cache is warm.
+        _log_once(
+            logging.INFO,
+            "vllm_sm70: TP2 all-reduce + fused_add_rms_norm fused "
+            f"{matched} pairs in the first compiled graph.",
+        )
     if missed:
         _log_once(
             logging.WARNING,
@@ -573,4 +580,10 @@ def register() -> bool:
         return False
     register_op()
     register_pattern(PATTERN_NAME, PATTERN_VERSION, apply)
+    _log_once(
+        logging.INFO,
+        "vllm_sm70: TP2 all-reduce + fused_add_rms_norm fusion registered "
+        f"({KILL_SWITCH}=0 disables it); it applies when the model is admitted "
+        "and a graph is compiled.",
+    )
     return True
