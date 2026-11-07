@@ -305,6 +305,37 @@ def _getter_only(name):
     assert getattr(envs, name) is False
 
 
+def _flint_qk_rope_kv_off():
+    """M5 path: with the switch at "0", FlintSm70Attention's fused-route
+    admission (K15, vllm_sm70/flint/qk_norm_rope_kv.py) refuses an
+    otherwise eligible layer, so the layer runs the unfused q/k norm + RoPE
+    and upstream's Attention.forward."""
+    import torch
+
+    from vllm_sm70.flint.qk_norm_rope_kv import fused_route_rejection
+
+    def reason(enabled):
+        return fused_route_rejection(
+            enabled=enabled,
+            is_sm70=True,
+            dtype=torch.float16,
+            head_dim=128,
+            q_eps=1e-6,
+            k_eps=1e-6,
+            rotary_emb=None,  # a Flint full-attention (no-RoPE) layer
+            kv_cache_dtype="auto",
+            attn_type="decoder",
+            calculate_kv_scales=False,
+            kv_sharing=False,
+            backend_writes_kv_in_forward=False,
+        )
+
+    enabled = sm70_config(_vc({})).flint_qk_rope_kv
+    assert enabled is False
+    assert "VLLM_SM70_FLINT_QK_ROPE_KV=0" in reason(enabled)
+    assert reason(True) is None  # the same layer fuses when the switch is unset
+
+
 def _path_off(name):
     if name in KILL_SWITCHES:
         _field_off(name)
@@ -312,6 +343,8 @@ def _path_off(name):
             _nvfp4_gemv_not_selected()
         if name == "VLLM_SM70_FLINT_MOE_QPN_DECODE":
             _flint_moe_decode_off()
+        if name == "VLLM_SM70_FLINT_QK_ROPE_KV":
+            _flint_qk_rope_kv_off()
         if name == "VLLM_SM70_FP8_MOE_DECODE":
             _fp8_moe_decode_off()
         if name == "VLLM_SM70_FP8_MOE_COMPACT_DECODE":
