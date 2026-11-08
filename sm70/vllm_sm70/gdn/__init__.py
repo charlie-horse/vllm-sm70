@@ -29,3 +29,7 @@ def register() -> None:
         logger.debug("vllm_sm70.gdn: _sm70_C has no GDN ops (built without K08)")
         return
     kernels.register_chunk_gated_delta_rule()
+    if kernels.has_op("gdn_decode_mixed_qkv_global_state"):
+        from vllm_sm70.gdn import layer
+
+        layer.register_qwen_gdn_layer()
