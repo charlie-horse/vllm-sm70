@@ -200,11 +200,26 @@ def test_gemm_rejects_m_above_cap(qpn8_gpu):
 
 def test_opcheck(qpn8_gpu):
     weight, scales, _ = _weight(512, 1024)
+    # prepare takes the e4m3 weight itself (its TORCH_CHECK rejects a uint8
+    # view), and opcheck's test_schema compares inputs with torch.allclose,
+    # which has no Float8_e4m3fn kernel ("mul_cuda" not implemented). So run
+    # test_faketensor only, and check test_schema's two points by hand: no
+    # input is mutated (bitwise, on uint8/int32 views) and no output aliases
+    # an input (the schema declares fresh outputs).
+    weight_before = weight.view(torch.uint8).clone()
+    scales_before = scales.clone()
     torch.library.opcheck(
         torch.ops._sm70_C.fp8_qpn8_prepare_sm70.default,
         (weight, scales),
-        test_utils=("test_schema", "test_faketensor"),
+        test_utils=("test_faketensor",),
     )
+    outs = torch.ops._sm70_C.fp8_qpn8_prepare_sm70(weight, scales)
+    assert torch.equal(weight.view(torch.uint8), weight_before)
+    assert torch.equal(scales.view(torch.int32), scales_before.view(torch.int32))
+    inputs = {t.untyped_storage().data_ptr() for t in (weight, scales)}
+    assert len(outs) == 2  # codes, group_scales
+    for out in outs:
+        assert out.untyped_storage().data_ptr() not in inputs
     p = qpn8_gpu.qpn8_prepare(weight, scales)
     x = torch.randn(4, 1024, device="cuda", dtype=torch.float16)
     out = torch.empty(4, 512, device="cuda", dtype=torch.float16)
