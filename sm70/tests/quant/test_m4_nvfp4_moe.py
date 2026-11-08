@@ -263,6 +263,7 @@ class TorchMoeOps:
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_COMPACT", raising=False)
     from vllm_sm70.quant import nvfp4_moe
 
     nvfp4_moe.clear_decode_workspaces()
@@ -928,6 +929,195 @@ def test_register_checks_m4_hook():
 
 
 # --------------------------------------------------------------------------
+# Compact slot groups (FORK nvfp4_sm70_moe.py:718-721, 1619-1636)
+# --------------------------------------------------------------------------
+# Small top-6 contract, so slot counts match Flint's (6M; 18..60 at M 3..10).
+SMALL6 = (64, 64, 32, 6)
+FLINT_TOP_K = 6
+
+
+@pytest.mark.parametrize("m", range(1, 15))
+def test_compact_selection_by_slots_flint_top6(m):
+    """Flint top-6: compact iff 6M <= 80, i.e. M 1..13; the old per-expert
+    loop band (18..60 slots, M 3..10) is entirely compact."""
+    slots = m * FLINT_TOP_K
+    assert moe_rt.use_compact_grouped(m, FLINT_TOP_K) is (slots <= 80)
+    if 3 <= m <= 10:
+        assert 18 <= slots <= 60 and moe_rt.use_compact_grouped(m, FLINT_TOP_K)
+
+
+def test_compact_bound_edges():
+    assert moe_rt.COMPACT_MAX_SLOTS == 80  # FORK nvfp4_sm70_moe.py:88
+    assert not moe_rt.use_compact_grouped(0, 6)
+    assert moe_rt.use_compact_grouped(10, 8)  # 80 slots: last compact
+    assert not moe_rt.use_compact_grouped(11, 8)  # 88
+    assert moe_rt.use_compact_grouped(13, 6)  # 78
+    assert not moe_rt.use_compact_grouped(14, 6)  # 84
+
+
+def _record_stages(monkeypatch, tm):
+    """Wrap the mock dense stage to keep (rows, offsets, ids, group count)."""
+    seen = []
+    real = tm.nvfp4_moe_dense_stage_sm70_out
+
+    def spy(out, inp, offsets, ids, pw, ps, ne, k, n, g):
+        seen.append((inp.shape[0], offsets.clone(), ids.clone(), ne, offsets, ids))
+        real(out, inp, offsets, ids, pw, ps, ne, k, n, g)
+
+    monkeypatch.setattr(tm, "nvfp4_moe_dense_stage_sm70_out", spy)
+    return seen
+
+
+def _build6(m4, monkeypatch, seed=0):
+    monkeypatch.setattr(m4, "SUPPORTED_CONTRACTS", frozenset({SMALL6}))
+    return _build(m4, seed=seed, cfg=_moe_config(*SMALL6))
+
+
+@pytest.mark.parametrize("m", list(range(1, 12)) + [13, 14, 20])
+def test_compact_route_args_and_numbers(mods, monkeypatch, m):
+    """M 1..11 (incl. the 18..60-slot band), 13, 14, 20 on a top-6 contract:
+    both stages get one group per routed slot (offsets 0..slots, ids = the
+    sorted expert of each permuted row, count = slots) iff 6M <= 80, else
+    per-expert offsets over all experts. Output matches the reference."""
+    m4, tm = mods()
+    method, layer, w = _build6(m4, monkeypatch)
+    h, gi, e, k = SMALL6
+    seen = _record_stages(monkeypatch, tm)
+    x = (torch.randn(m, h, generator=torch.Generator().manual_seed(m)) * 0.5).half()
+    weights, ids = _routing(m, e, k, seed=m)
+    TorchMoeOps.allocations = 0
+    out = method.apply(layer, x, weights, ids, None, None)
+    assert TorchMoeOps.allocations == 0
+    assert len(seen) == 2  # W13, W2
+    slots = m * k
+    ws = layer.sm70_moe_workspace
+    for rows, offsets, sids, ne, off_t, ids_t in seen:
+        assert rows == slots
+        if slots <= 80:
+            assert ne == slots
+            assert torch.equal(offsets, torch.arange(slots + 1, dtype=torch.int32))
+            assert torch.equal(sids, torch.sort(ids.reshape(-1)).values.int())
+            # views into the persistent workspace: graph-safe, no allocation
+            assert off_t.data_ptr() == ws.compact_offsets.data_ptr()
+            assert ids_t.data_ptr() == ws.sorted_experts.data_ptr()
+            assert off_t.dtype == ids_t.dtype == torch.int32
+            assert ids_t.is_contiguous() and off_t.is_contiguous()
+        else:
+            assert ne == e
+            assert torch.equal(sids, torch.arange(e, dtype=torch.int32))
+            assert off_t.data_ptr() == ws.expert_offsets.data_ptr()
+    ref = _moe_reference(x, w, ids, weights, gi)
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
+@pytest.mark.parametrize("m", [3, 4, 8, 10])
+def test_compact_kill_switch_restores_per_expert_offsets(mods, monkeypatch, m):
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "0")
+    m4, tm = mods()
+    method, layer, w = _build6(m4, monkeypatch)
+    assert not method.compact_enabled and not m4.compact_policy_enabled()
+    h, gi, e, k = SMALL6
+    seen = _record_stages(monkeypatch, tm)
+    x = (torch.randn(m, h, generator=torch.Generator().manual_seed(m)) * 0.5).half()
+    weights, ids = _routing(m, e, k, seed=m)
+    out = method.apply(layer, x, weights, ids, None, None)
+    assert [s[3] for s in seen] == [e, e]
+    ref = _moe_reference(x, w, ids, weights, gi)
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
+@pytest.mark.parametrize("value", [None, "1", "", "off"])
+def test_only_zero_kills_compact(mods, monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", value)
+    m4, _ = mods()
+    method, _layer, _w = _build6(m4, monkeypatch)
+    assert method.compact_enabled
+
+
+def test_compact_config_off_is_not_reenabled_by_env(mods, monkeypatch):
+    from vllm_sm70 import config as sm70_cfg
+
+    m4, _ = mods()
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "1")
+    vc = SimpleNamespace(additional_config={"sm70": {"flint_moe_compact": False}})
+    sm70_cfg.clear_cache()
+    assert not m4.compact_policy_enabled(vc)
+
+
+def test_compact_duplicate_experts_stay_separate_groups(mods, monkeypatch):
+    """Two tokens with the same top-k: every expert id appears twice in the
+    sorted ids; each slot remains its own one-row group (FORK :606-609)."""
+    m4, tm = mods()
+    method, layer, w = _build6(m4, monkeypatch)
+    h, gi, e, k = SMALL6
+    seen = _record_stages(monkeypatch, tm)
+    x = torch.randn(4, h, generator=torch.Generator().manual_seed(7)).half()
+    weights, ids = _routing(1, e, k, seed=3)
+    weights, ids = weights.repeat(4, 1), ids.repeat(4, 1)
+    out = method.apply(layer, x, weights, ids, None, None)
+    (_, offsets, sids, ne, *_), _w2 = seen
+    assert ne == 24 and len(set(sids.tolist())) == 6
+    assert torch.equal(offsets.diff(), torch.ones(24, dtype=torch.int32))
+    ref = _moe_reference(x, w, ids, weights, gi)
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 4])
+def test_k12_keeps_m_le_2_and_compact_takes_m_ge_3(mods, monkeypatch, m):
+    """With K12 admitted, M<=2 goes to the decode (no dense stage); M>=3 takes
+    the compact dense stage (the regression band)."""
+    fm = make_fake_flint_moe()
+    m4, tm = mods(flint=fm)
+    method, layer, w = _build(m4)  # K12 fake admits any contract
+    h, gi, e, k = SMALL
+    seen = _record_stages(monkeypatch, tm)
+    x = torch.randn(m, h, generator=torch.Generator().manual_seed(m)).half()
+    weights, ids = _routing(m, e, k, seed=m)
+    out = method.apply(layer, x, weights, ids, None, None)
+    if m <= 2:
+        assert seen == [] and len(_decode_calls(fm, "decode")) == 1
+    else:
+        assert [s[3] for s in seen] == [m * k, m * k]
+        assert _decode_calls(fm, "decode") == []
+    ref = _moe_reference(x, w, ids, weights, gi)
+    torch.testing.assert_close(
+        out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+    )
+
+
+def test_compact_offsets_view_bounds(mods):
+    m4, _ = mods()
+    _, layer, _ = _build(m4)
+    ws = layer.sm70_moe_workspace
+    assert ws.compact_offsets.dtype == torch.int32
+    assert torch.equal(ws.compact_offsets, torch.arange(81, dtype=torch.int32))
+    assert ws.views(1)["compact_offsets"].numel() == SMALL[3] + 1
+    assert ws.views(10)["compact_offsets"].numel() == 81  # 80 slots
+    assert ws.views(64)["compact_offsets"].numel() == 81  # capped
+
+
+def test_compact_state_is_logged(mods, monkeypatch):
+    m4, _ = mods()
+    seen = []
+    monkeypatch.setattr(
+        m4.logger, "info_once", lambda msg, *a, **k: seen.append(msg % a)
+    )
+    _build(m4)
+    assert any("compact slot groups enabled" in s for s in seen), seen
+    seen.clear()
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "0")
+    _build(m4)
+    assert any("compact slot groups DISABLED" in s for s in seen), seen
+
+
+# --------------------------------------------------------------------------
 # GPU (Bea, c4130)
 # --------------------------------------------------------------------------
 def _gpu_layer(m4):
@@ -1004,7 +1194,7 @@ def test_gpu_flint_tp2_decode_matches_dense(monkeypatch, m, ids_dtype):
 
 @pytest.mark.gpu
 @needs_cuda
-@pytest.mark.parametrize("m", [1, 2, 8])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 10, 16])  # 3..10: compact groups
 def test_gpu_cuda_graph_matches_eager(m):
     import vllm_sm70.quant.nvfp4_moe as m4
 
@@ -1025,6 +1215,31 @@ def test_gpu_cuda_graph_matches_eager(m):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@needs_cuda
+@pytest.mark.parametrize("m", [3, 4, 8, 10, 13])
+def test_gpu_flint_tp2_compact_matches_per_expert(m):
+    """Compact slot groups (one launch per stage) vs per-expert offsets on
+    the same Flint TP2 layer, and both vs the reference."""
+    import vllm_sm70.quant.nvfp4_moe as m4
+
+    torch.cuda.set_device(0)
+    method, layer, w = _gpu_layer(m4)
+    assert method.compact_enabled
+    g = torch.Generator().manual_seed(200 + m)
+    x = (torch.randn(m, 2048, generator=g) * 0.5).half().cuda()
+    weights, ids = _routing(m, 256, 6, seed=m)
+    dw, di = weights.cuda(), ids.cuda()
+    compact = method.apply(layer, x, dw, di, None, None).clone()
+    method.compact_enabled = False
+    per_expert = method.apply(layer, x, dw, di, None, None)
+    method.compact_enabled = True
+    ref = _moe_reference(x.cpu(), w, ids, weights, 256)
+    tol = 2e-2 * ref.abs().max().item()
+    torch.testing.assert_close(compact.float().cpu(), ref, rtol=2e-2, atol=tol)
+    torch.testing.assert_close(compact.float(), per_expert.float(), rtol=2e-2, atol=tol)
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])

@@ -73,6 +73,17 @@ class Sm70Config(BaseModel):
     sm70_moe.py:472). No override applies.
     Kill: VLLM_SM70_FLINT_MOE_QPN_DECODE=0."""
 
+    flint_moe_compact: bool = True
+    """Flint NVFP4 routed experts when the dense-stage route serves a call
+    with M*top_k <= 80 routed slots (M 3..13 at top-6, plus M<=2 when K12
+    does not take it): each slot is its own one-row group, so each stage is
+    one compact grouped TurboMind launch. Without it, M*top_k in 18..64 runs
+    TurboMind's per-expert loop (256 launches per stage). Evidence: fork
+    _use_compact_grouped / _prepare_compact_slot_groups, always on and not
+    switched (nvfp4_sm70_moe.py:88, 570-618, 718-721, 1619-1636). No
+    override applies. Kill: VLLM_SM70_FLINT_MOE_COMPACT=0 (a new name: the
+    fork has no switch for this route)."""
+
     fp8_moe_decode: bool = True
     """Qwen FP8 MoE single-token decode route: the legacy compact
     active-expert decode (fork SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=1),
@@ -173,6 +184,7 @@ GRAPH_FIELDS: tuple[str, ...] = (
     "fp8_block_qpn8_turbomind_copy",
     "dflash2_verifier",
     "flint_moe_qpn_decode",
+    "flint_moe_compact",
     "fp8_moe_decode",
     "fp8_moe_compact_decode",
     "nvfp4_gemv",
@@ -188,6 +200,7 @@ Keep nvfp4_gemv in until it is tested."""
 KILL_SWITCHES: dict[str, tuple[str, Any]] = {
     "VLLM_SM70_MODELOPT_NVFP4_GEMV": ("nvfp4_gemv", False),
     "VLLM_SM70_FLINT_MOE_QPN_DECODE": ("flint_moe_qpn_decode", False),
+    "VLLM_SM70_FLINT_MOE_COMPACT": ("flint_moe_compact", False),
     "VLLM_SM70_FP8_MOE_DECODE": ("fp8_moe_decode", False),
     "VLLM_SM70_FP8_MOE_COMPACT_DECODE": ("fp8_moe_compact_decode", False),
     "VLLM_SM70_FLINT_QK_ROPE_KV": ("flint_qk_rope_kv", False),

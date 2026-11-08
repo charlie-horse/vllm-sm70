@@ -37,6 +37,7 @@ EFFECTIVE_DEFAULTS = {
     "quant_backend": "auto",
     "nvfp4_gemv": True,
     "flint_moe_qpn_decode": True,
+    "flint_moe_compact": True,
     "fp8_moe_decode": True,
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,
@@ -140,6 +141,7 @@ def test_registered_names_are_exactly_ours():
     }
     assert set(envs._SECTIONS["models"]) == {
         "VLLM_SM70_FLINT_MOE_QPN_DECODE",
+        "VLLM_SM70_FLINT_MOE_COMPACT",
         "VLLM_SM70_FLINT_QK_ROPE_KV",
         "VLLM_SM70_DFLASH2_VERIFIER",
         "VLLM_SM70_DFLASH2_EMULATION",
@@ -300,6 +302,17 @@ def _flint_moe_decode_off():
     assert not nvfp4_moe.decode_policy_enabled(_vc({"flint_moe_qpn_decode": True}))
 
 
+def _flint_moe_compact_off():
+    """M4: compact slot groups are off (per-expert offsets for every M); the
+    route-level check is in sm70/tests/quant/test_m4_nvfp4_moe.py."""
+    pytest.importorskip("vllm.envs")
+    from vllm_sm70.quant import nvfp4_moe
+
+    assert not nvfp4_moe.compact_policy_enabled(_vc({}))
+    assert not nvfp4_moe.compact_policy_enabled(_vc({"flint_moe_compact": True}))
+    assert nvfp4_moe.decode_policy_enabled(_vc({}))  # K12 is untouched
+
+
 def _getter_only(name):
     # TODO: replace with a path test in the patch named in PENDING.
     assert getattr(envs, name) is False
@@ -343,6 +356,8 @@ def _path_off(name):
             _nvfp4_gemv_not_selected()
         if name == "VLLM_SM70_FLINT_MOE_QPN_DECODE":
             _flint_moe_decode_off()
+        if name == "VLLM_SM70_FLINT_MOE_COMPACT":
+            _flint_moe_compact_off()
         if name == "VLLM_SM70_FLINT_QK_ROPE_KV":
             _flint_qk_rope_kv_off()
         if name == "VLLM_SM70_FP8_MOE_DECODE":
@@ -389,6 +404,7 @@ def test_env_cannot_enable(monkeypatch, value):
     off = {
         "nvfp4_gemv": False,
         "flint_moe_qpn_decode": False,
+        "flint_moe_compact": False,
         "fp8_moe_decode": False,
         "fp8_moe_compact_decode": False,
         "flint_qk_rope_kv": False,
@@ -449,6 +465,7 @@ def test_hash_changes_for_every_graph_field():
         "fp8_block_qpn8_turbomind_copy": True,
         "dflash2_verifier": "off",
         "flint_moe_qpn_decode": False,
+        "flint_moe_compact": False,
         "fp8_moe_decode": False,
         "fp8_moe_compact_decode": False,
         "nvfp4_gemv": False,
@@ -470,6 +487,7 @@ def test_compute_hash_requires_an_argument():
 _ENABLED = {
     "nvfp4_gemv": True,
     "flint_moe_qpn_decode": True,
+    "flint_moe_compact": True,
     "fp8_moe_decode": True,
     "fp8_moe_compact_decode": True,
     "flint_qk_rope_kv": True,

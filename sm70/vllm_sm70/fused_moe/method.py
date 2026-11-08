@@ -57,6 +57,19 @@ logger = init_logger("vllm.sm70.fused_moe")
 # back to upstream (which has no cc 7.0 MoE kernel either).
 SUPPORTED_TP_SIZES = (1, 2)
 DEFAULT_MAX_TOKENS = 8192  # FORK nix/module.nix serves --max-num-batched-tokens 8192
+# Largest routed-slot count (M * top_k) served as compact slot groups: the
+# TurboMind compact grouped bound (tm_moe_sm70.cu kNvfp4MaxCompactGroups).
+# ported from FORK nvfp4_sm70_moe.py:88 (_COMPACT_GROUPED_MAX_SLOTS)
+COMPACT_MAX_SLOTS = 80
+
+
+def use_compact_grouped(num_tokens: int, top_k: int) -> bool:
+    """Bound compact dispatch by its routed-row workload, not batch size.
+
+    ported from FORK nvfp4_sm70_moe.py:718-721 (_use_compact_grouped)
+    """
+    total_slots = num_tokens * top_k
+    return 0 < total_slots <= COMPACT_MAX_SLOTS
 
 
 # --------------------------------------------------------------------------
@@ -164,6 +177,10 @@ class Sm70MoEWorkspace:
             OPS.sort_workspace_size(slots, key.experts), dtype=torch.int8, device=dev
         )
         self.dense_expert_ids = torch.arange(key.experts, **i32)
+        # Compact slot groups: group g is routed slot g (one row each), so the
+        # offsets are 0..slots. FORK nvfp4_sm70_moe.py:570-618 writes them per
+        # call with a Triton kernel; they are constant, so they are built once.
+        self.compact_offsets = torch.arange(COMPACT_MAX_SLOTS + 1, **i32)
 
     @classmethod
     def get(cls, key: WorkspaceKey) -> Sm70MoEWorkspace:
@@ -203,6 +220,9 @@ class Sm70MoEWorkspace:
             "topk_ids_for_sort": self.topk_ids_for_sort[:slots].view(nk),
             "sort_workspace": self.sort_workspace,
             "dense_expert_ids": self.dense_expert_ids,
+            "compact_offsets": self.compact_offsets[
+                : min(slots, COMPACT_MAX_SLOTS) + 1
+            ],
         }
 
 
