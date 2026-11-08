@@ -20,6 +20,7 @@ patterns = [
   '''(?i)tp4''',                  # TP4 paths dropped
   '''(?i)1cat|onecat''',          # 1Cat env/policy indirection
   '''(?i)native_policy''',
+  '''^_SHAPES$''',                # M9a: fork sm70_dflash2_fp8.py TP4 shape->split table, replaced by split_for(k)
 ]
 
 # Port names that are expected to be new (no fork counterpart).
@@ -120,3 +121,18 @@ name = "policy: drop call-site native_policy argument"
 lang = "all"
 pattern = ''',\s*(native_policy\s*=\s*)?native_policy\b'''
 repl = ""
+
+# --- M9a (PR #92): fork quantization/sm70_dflash2_fp8.py -> vllm_sm70/ops/dflash2_fp8.py ---
+
+[[rule]]
+name = "M9a: _fp8_rows -> fp8_rows (public: the U1 dispatcher and tests use it)"
+lang = "py"
+pattern = '''\b_fp8_rows\b'''
+repl = "fp8_rows"
+
+[[rule]]
+name = "M9a: def _dispatch(x, weight, codes, ...) -> def _dispatch_impl (custom-op impl)"
+lang = "py"
+# Anchored on the signature: other fork files also define _dispatch.
+pattern = '''\bdef _dispatch(\(\s*x: torch\.Tensor,\s*weight: torch\.Tensor,\s*codes: torch\.Tensor)'''
+repl = "def _dispatch_impl\\1"
