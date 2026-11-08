@@ -43,6 +43,7 @@
       packages.${system} = {
         default = p.vllm;
         inherit (p) vllm tree venv;
+        gpu-tests = import ./nix/gpu-tests.nix { inherit pkgs lib; vllm = p.vllm; };
         sm70-ext = p.sm70ext;
         lmcache = p.lmcacheBuild;
         source = src;
