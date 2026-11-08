@@ -93,7 +93,7 @@ The "M8 verifier GEMVs" at the fork (cf9492a) are three routes. All three serve 
 
 **The exit test moves to Qwen3.8-27B.** No M9 route runs on Qwen3.6-35B-A3B at the fork, so the old reference (111 tok/s at 4K on the 3.6-35B) can't measure M9. At the fork's TP2 default even Qwen3.8 runs neither draft route, because both are flagged only at TP4 (`qwen3_dflash2.py:280`). So TP2 fork parity doesn't need M9: M9 is speed beyond the fork. **Decided (Astro, 2026-11-08):** the pass bar is DFlash2 4K decode ≥ the K18-only A/B arm and ≥ the 1Cat 1.5.1 documented Qwen3.8 number (Qwen speed is measured against the 1Cat docs, with no baseline runs; Mara has the citation). The acceptance rate must be unchanged within noise, and `VLLM_SM70_DFLASH2_VERIFIER=0` must restore K18 exactly.
 
-**Phase 3 exit:** Qwen3.6/3.8 4K decode on c4130, as a 3-run median, is at or above the documented 1Cat 1.5.1 numbers, with Flash-V100, GDN FlashQLA and DFlash2 on: Qwen3.6 row 1 >= 66 tok/s and row 2 (with DFlash2) >= 111 tok/s; Qwen3.8 row 4 >= 80 tok/s (floor). Row 3 is record-only. No fork or 1Cat baseline runs (Charlie, 2026-11-08).
+**Phase 3 exit:** Qwen3.6/3.8 4K decode on c4130, as a 3-run median, is at or above the documented 1Cat 1.5.1 numbers, with Flash-V100, GDN FlashQLA and DFlash2 on: Qwen3.6 row 1 >= 66 tok/s and row 2 (with DFlash2) >= 111 tok/s; Qwen3.8 row 4 >= 80 tok/s (floor). Row 3 is record-only. Qwen3.8 cold 100K-token TTFT <= 66 s (the documented 1Cat number, per Mara's run list, section F). No fork or 1Cat baseline runs (Charlie, 2026-11-08).
 
 ## Phase 4: Flint fast paths
 
