@@ -13,6 +13,8 @@ def register() -> None:
     global _registered
     if _registered:
         return
+    # Flint's glm47_sm70 reasoning parser (light import, no GPU needed).
+    from vllm_sm70 import reasoning  # noqa: F401
     from vllm_sm70.models import flint_sm70, qwen
 
     flint_sm70.register()
