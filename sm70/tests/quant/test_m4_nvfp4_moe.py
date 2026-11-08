@@ -1220,22 +1220,37 @@ def test_gpu_cuda_graph_matches_eager(m):
 @pytest.mark.gpu
 @needs_cuda
 @pytest.mark.parametrize("m", [3, 4, 8, 10, 13])
-def test_gpu_flint_tp2_compact_matches_per_expert(m):
+def test_gpu_flint_tp2_compact_matches_per_expert(monkeypatch, m):
     """Compact slot groups (one launch per stage) vs per-expert offsets on
-    the same Flint TP2 layer, and both vs the reference."""
+    the same Flint TP2 layer, and both vs the reference. A spy on the real
+    dense-stage op checks which route each call took (group count m*6 for
+    compact, 256 for per-expert), so equal outputs can't hide a route that
+    never ran."""
     import vllm_sm70.quant.nvfp4_moe as m4
+    from vllm_sm70.ops import tm
 
     torch.cuda.set_device(0)
     method, layer, w = _gpu_layer(m4)
     assert method.compact_enabled
+    counts = []
+    real = tm.nvfp4_moe_dense_stage_sm70_out
+
+    def spy(out, inp, offsets, ids, pw, ps, ne, k, n, g):
+        counts.append(ne)
+        return real(out, inp, offsets, ids, pw, ps, ne, k, n, g)
+
+    monkeypatch.setattr(tm, "nvfp4_moe_dense_stage_sm70_out", spy)
     g = torch.Generator().manual_seed(200 + m)
     x = (torch.randn(m, 2048, generator=g) * 0.5).half().cuda()
     weights, ids = _routing(m, 256, 6, seed=m)
     dw, di = weights.cuda(), ids.cuda()
     compact = method.apply(layer, x, dw, di, None, None).clone()
+    assert counts == [m * 6, m * 6]  # W13, W2 as compact slot groups
+    counts.clear()
     method.compact_enabled = False
     per_expert = method.apply(layer, x, dw, di, None, None)
     method.compact_enabled = True
+    assert counts == [256, 256]  # per-expert offsets
     ref = _moe_reference(x.cpu(), w, ids, weights, 256)
     tol = 2e-2 * ref.abs().max().item()
     torch.testing.assert_close(compact.float().cpu(), ref, rtol=2e-2, atol=tol)

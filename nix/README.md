@@ -89,7 +89,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_FLINT_SAMPLER` | yes (Flint) |
 | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | yes (Flint) |
 | `VLLM_SM70_FLINT_AR_RMSNORM` | yes (Flint) |
-| `VLLM_SM70_FLINT_MOE_COMPACT` | new (the fork route has no switch; name pending) |
+| `VLLM_SM70_FLINT_MOE_COMPACT` | new, not in fork (the fork route has no switch); approved as the eighth Flint switch |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |
 | `VLLM_SM70_QUANT` | new |
