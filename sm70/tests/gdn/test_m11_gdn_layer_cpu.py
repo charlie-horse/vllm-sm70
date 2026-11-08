@@ -313,3 +313,12 @@ def test_warmup_failure_is_logged_not_raised(monkeypatch, m11, gdn_stub, caplog)
     with caplog.at_level("WARNING", logger="vllm.sm70"):
         obj._warmup_prefill_kernels(torch.zeros(4, QKV, dtype=torch.float16), 0)
     assert "FlashQLA GDN decode warmup failed" in caplog.text
+
+
+def test_warmup_refusal_is_warned(monkeypatch, m11, gdn_stub, caplog):
+    _, cls = m11
+    obj, _, _ = _warmup_setup(monkeypatch, gdn_stub, cls)
+    monkeypatch.setattr(gdn_stub, "flashqla_decode", lambda *a, **k: False)
+    with caplog.at_level("WARNING", logger="vllm.sm70"):
+        obj._warmup_prefill_kernels(torch.zeros(4, QKV, dtype=torch.float16), 0)
+    assert caplog.text.count("FlashQLA GDN decode warmup refused") == 2  # t=1, 2

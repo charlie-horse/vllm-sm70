@@ -97,6 +97,14 @@ def register_qwen_gdn_layer():
             )
 
         def _warmup_prefill_kernels(self, qkv_or_qkvz, v_dim):
+            # Deviation from fork cf9492a (approved by Astro, 2026-11-08): the
+            # fork warmed the FlashQLA decode only with
+            # VLLM_SM70_FLASHQLA_DECODE_WARMUP=1 (default off, fork
+            # vllm/config/gdn.py:27), because its kernel was a pybind JIT.
+            # K08 is AOT, so here the decode warmup runs whenever the decode
+            # route is on: 4 tiny launches per layer, which load the module
+            # before graph capture and surface a broken kernel at startup.
+            # VLLM_SM70_GDN_DECODE_FLASHQLA=0 skips it (only "0" acts).
             first = not self._prefill_kernels_warmed_up
             super()._warmup_prefill_kernels(qkv_or_qkvz, v_dim)
             if first and _decode_on():
@@ -115,7 +123,7 @@ def register_qwen_gdn_layer():
             try:
                 for t in (1, 2):
                     for width in sorted({qkv, max(qkv, stride)}):
-                        kernels.flashqla_decode(
+                        ran = kernels.flashqla_decode(
                             torch.zeros(t, width, device=dev, dtype=dt)[:, :qkv],
                             torch.zeros(t, hv, device=dev, dtype=dt),
                             torch.zeros(t, hv, device=dev, dtype=dt),
@@ -126,6 +134,15 @@ def register_qwen_gdn_layer():
                             torch.empty(t, hv, self.head_v_dim, device=dev, dtype=dt),
                             scale=self.head_k_dim**-0.5,
                         )
+                        if not ran:
+                            logger.warning(
+                                "vllm_sm70: FlashQLA GDN decode warmup refused "
+                                "(tokens=%d, row stride=%d) for layer %s; decode "
+                                "falls back to upstream Triton for this shape",
+                                t,
+                                width,
+                                self.prefix,
+                            )
             except Exception:
                 logger.warning(
                     "vllm_sm70: FlashQLA GDN decode warmup failed for layer %s",
