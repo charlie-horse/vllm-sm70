@@ -224,11 +224,16 @@ class TorchMoeOps:
     @staticmethod
     def _sort(ids, n_expert, offsets64, scatter, sorted_experts, sorted_rows):
         flat = ids.reshape(-1).long()
+        # UP preprocessTopkIdKernel: invalid routes (-1 for padding tokens,
+        # or >= n_expert) become the sentinel n_expert, so they sort last and
+        # fall outside every expert's offsets (moe_permute_unpermute_op.cu
+        # :108-117, permute_unpermute_kernels/*.cu:141-165).
+        flat = torch.where((flat < 0) | (flat >= n_expert), n_expert, flat)
         order = torch.sort(flat, stable=True).indices
         sorted_rows.view(-1).copy_(order)
         sorted_experts.view(-1).copy_(flat[order])
         scatter.view(-1)[order] = torch.arange(flat.numel(), dtype=torch.int32)
-        counts = torch.bincount(flat, minlength=n_expert)
+        counts = torch.bincount(flat, minlength=n_expert + 1)[:n_expert]
         offsets64.copy_(torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)]))
         return order
 
@@ -999,7 +1004,7 @@ def test_compact_route_args_and_numbers(mods, monkeypatch, m):
             assert torch.equal(sids, torch.sort(ids.reshape(-1)).values.int())
             # views into the persistent workspace: graph-safe, no allocation
             assert off_t.data_ptr() == ws.compact_offsets.data_ptr()
-            assert ids_t.data_ptr() == ws.sorted_experts.data_ptr()
+            assert ids_t.data_ptr() == ws.compact_expert_ids.data_ptr()
             assert off_t.dtype == ids_t.dtype == torch.int32
             assert ids_t.is_contiguous() and off_t.is_contiguous()
         else:
@@ -1047,6 +1052,37 @@ def test_compact_config_off_is_not_reenabled_by_env(mods, monkeypatch):
     vc = SimpleNamespace(additional_config={"sm70": {"flint_moe_compact": False}})
     sm70_cfg.clear_cache()
     assert not m4.compact_policy_enabled(vc)
+
+
+@pytest.mark.parametrize("compact", [True, False], ids=["compact", "per_expert"])
+@pytest.mark.parametrize("m,pad", [(3, 1), (4, 2), (8, 3), (8, 8), (13, 13)])
+def test_padding_routes_stay_in_bounds(mods, monkeypatch, m, pad, compact):
+    """Padding tokens route to -1 (UP VLLM_MOE_SKIP_PADDING=1; in CUDA-graph
+    capture dummy runs every token is padding). The permute sorts them to
+    the sentinel id E. Compact groups must still pass only ids in [0, E):
+    the #97 capture crash on c4130 was the pointer table read at E. Real
+    tokens must match the reference on both routes."""
+    if not compact:
+        monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "0")
+    m4, tm = mods()
+    method, layer, w = _build6(m4, monkeypatch)
+    h, gi, e, k = SMALL6
+    seen = _record_stages(monkeypatch, tm)
+    x = (torch.randn(m, h, generator=torch.Generator().manual_seed(m)) * 0.5).half()
+    weights, ids = _routing(m, e, k, seed=m)
+    ids[m - pad :] = -1
+    weights[m - pad :] = 0
+    out = method.apply(layer, x, weights, ids, None, None)
+    assert len(seen) == 2
+    for _rows, _offsets, sids, ne, *_ in seen:
+        assert ne == (m * k if compact else e)
+        assert 0 <= int(sids.min()) and int(sids.max()) < e
+    real = m - pad
+    if real:
+        ref = _moe_reference(x[:real], w, ids[:real], weights[:real], gi)
+        torch.testing.assert_close(
+            out[:real].float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+        )
 
 
 def test_compact_duplicate_experts_stay_separate_groups(mods, monkeypatch):
@@ -1255,6 +1291,46 @@ def test_gpu_flint_tp2_compact_matches_per_expert(monkeypatch, m):
     tol = 2e-2 * ref.abs().max().item()
     torch.testing.assert_close(compact.float().cpu(), ref, rtol=2e-2, atol=tol)
     torch.testing.assert_close(compact.float(), per_expert.float(), rtol=2e-2, atol=tol)
+
+
+@pytest.mark.gpu
+@needs_cuda
+@pytest.mark.parametrize("m", [4, 8, 13])
+def test_gpu_compact_capture_with_all_padding_routes(m):
+    """The #97 crash: CUDA-graph capture where every token is padding (ids
+    -1, weights 0, as in vLLM's capture dummy runs), then replay with real
+    routing. Must not fault, and the replay must match eager per-expert."""
+    import vllm_sm70.quant.nvfp4_moe as m4
+
+    torch.cuda.set_device(0)
+    method, layer, w = _gpu_layer(m4)
+    assert method.compact_enabled
+    g = torch.Generator().manual_seed(300 + m)
+    x = (torch.randn(m, 2048, generator=g) * 0.5).half().cuda()
+    weights, ids = _routing(m, 256, 6, seed=m)
+    weights, ids = weights.cuda(), ids.cuda()
+    sw = torch.zeros_like(weights)  # static graph inputs, padding first
+    si = torch.full_like(ids, -1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        method.apply(layer, x, sw, si, None, None)  # eager, all padding
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = method.apply(layer, x, sw, si, None, None)
+    torch.cuda.synchronize()  # an out-of-bounds read would surface here
+    sw.copy_(weights)
+    si.copy_(ids)
+    graph.replay()
+    torch.cuda.synchronize()
+    method.compact_enabled = False
+    per_expert = method.apply(layer, x, weights, ids, None, None)
+    method.compact_enabled = True
+    ref = _moe_reference(x.cpu(), w, ids.cpu(), weights.cpu(), 256)
+    tol = 2e-2 * ref.abs().max().item()
+    torch.testing.assert_close(captured.float().cpu(), ref, rtol=2e-2, atol=tol)
+    torch.testing.assert_close(captured.float(), per_expert.float(), rtol=2e-2, atol=tol)
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])

@@ -524,16 +524,28 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         groups (FORK :606-609). Otherwise: per-expert offsets over all experts.
         FORK _prepare_compact_slot_groups copies the sorted ids into an
         active_expert_ids buffer with a Triton kernel and rewrites the
-        constant offsets each call; here the sorted ids (int32, contiguous)
-        are passed directly and the offsets are a persistent arange.
+        constant offsets each call. Here one torch.clamp writes the sorted
+        ids, clamped to [0, experts), into the persistent compact_expert_ids
+        buffer (the clamp handles padding routes, see below), and the offsets
+        are a persistent arange.
         """
         if self.compact_enabled and moe_rt.use_compact_grouped(num_tokens, top_k):
             slots = num_tokens * top_k
-            return (
-                buffers["compact_offsets"][: slots + 1],
-                buffers["sorted_experts"].reshape(slots),
-                slots,
-            )
+            # Padding routes: UP routers set padding tokens' ids to -1
+            # (VLLM_MOE_SKIP_PADDING=1, router/fused_topk_router.py), and
+            # every token is padding in CUDA-graph capture dummy runs
+            # (gpu_model_runner.py:5753). moe_permute maps them to the
+            # sentinel id `experts` (moe_permute_unpermute_op.cu:108-117).
+            # Per-expert offsets skip those rows, but a compact group would
+            # index the pointer table at `experts`, one past the end: the
+            # illegal memory access at capture on c4130 (#97 A/B). Clamp the
+            # group ids into a persistent buffer so those rows run on a real
+            # expert. Their output is discarded: padding tokens have weight 0
+            # and nothing reads their rows. The fork predates padding skip.
+            ids = buffers["compact_expert_ids"][:slots]
+            sorted_ids = buffers["sorted_experts"].reshape(slots)
+            torch.clamp(sorted_ids, 0, experts - 1, out=ids)
+            return buffers["compact_offsets"][: slots + 1], ids, slots
         return buffers["expert_offsets"], buffers["dense_expert_ids"], experts
 
 

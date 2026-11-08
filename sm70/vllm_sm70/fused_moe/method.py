@@ -181,6 +181,9 @@ class Sm70MoEWorkspace:
         # offsets are 0..slots. FORK nvfp4_sm70_moe.py:570-618 writes them per
         # call with a Triton kernel; they are constant, so they are built once.
         self.compact_offsets = torch.arange(COMPACT_MAX_SLOTS + 1, **i32)
+        # Per-slot expert ids for the compact groups: the sorted ids clamped
+        # to [0, experts) (see ModelOptNvFp4Sm70MoEMethod._stage_groups).
+        self.compact_expert_ids = torch.zeros(COMPACT_MAX_SLOTS, **i32)
 
     @classmethod
     def get(cls, key: WorkspaceKey) -> Sm70MoEWorkspace:
@@ -222,6 +225,9 @@ class Sm70MoEWorkspace:
             "dense_expert_ids": self.dense_expert_ids,
             "compact_offsets": self.compact_offsets[
                 : min(slots, COMPACT_MAX_SLOTS) + 1
+            ],
+            "compact_expert_ids": self.compact_expert_ids[
+                : min(slots, COMPACT_MAX_SLOTS)
             ],
         }
 
