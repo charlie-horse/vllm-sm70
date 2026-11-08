@@ -6,7 +6,7 @@
 nix build .#gpu-tests -o ~/vsm70/result-gpu-tests && ~/vsm70/result-gpu-tests/bin/pytest -q -m gpu sm70/tests/<dir-or-file>
 ```
 
-`.#gpu-tests` is the `.#vllm` python plus pytest (same Python, from the pinned nixpkgs); `bin/python` is the same wrapper without pytest's flags. Without the GPUs, `bin/pytest --collect-only -m gpu sm70/tests` still collects.
+`.#gpu-tests` is the `.#vllm` python plus pytest (same Python; only pytest, pluggy and iniconfig are added, from the pinned nixpkgs); `bin/python` is the same wrapper without pytest's flags. Without the GPUs, `bin/pytest --collect-only -m gpu sm70/tests` still collects.
 
 ## LMCache build check (CPU only, any time)
 
