@@ -36,7 +36,7 @@ Roadmap order. Each node appears once.
 | M6 | #32, #41 | 25 CPU tests (PR #32) | **partial**: `tests.quant.test_m6_qwen_fp8` 20 of 20 unit pass in the sweep. The TP2 e2e (Qwen3.6-35B-A3B and 3.8-27B, within 32 GB/GPU) is not run | `bea/nov7/logs/gpu_sweep.junit.xml` | TP2 e2e and memory fit |
 | K05 | #37 | CPU import shows 5 fv100 ops (PR #37) | **passed**: the exit's two tests were ported under new names and pass in the sweep: `test_fv100_prefill_sinks_gpu.py` 39/39 (port of `test_sm70_flash_v100_sinks_prefill`) and `test_fv100_d256_prefill_gpu.py` 24/24 (port of `test_sm70_flash_v100_splitkv_n`) | `bea/nov7/logs/gpu_sweep.junit.xml` | none for the exit |
 | K06 | #39, #51, #83, #84 | 1099 CPU passed at e50db90 (PR #84) | **not run**: the exit (Flint TP2 4K greedy-identical over 256 tokens on 5 prompts; decode tok/s >= fork) has no evidence | `bea/nov7/logs/k14.out` (throughput only) | greedy-identity run; tok/s vs fork |
-| K07 | #51 | CPU (PR #51) | **partial**: `tests.attention.test_fv100_spec_gpu` 36 of 36 pass, including smallq 12/12. DFlash2 acceptance (within 2% of the fork) not run | `bea/nov7/logs/gpu_sweep.junit.xml` | acceptance comparison |
+| K07 | #51 | CPU (PR #51) | **partial**: `tests.attention.test_fv100_spec_gpu` 36 of 36 pass, including smallq 12/12. DFlash2 acceptance A/B not run. Pass (Charlie, 2026-11-08) is `accept_len` with Flash-V100 spec verify on within 2% (relative) of `VLLM_SM70_FLASH_V100_SPEC=0`, same prompts, rows 2 and 4 | `bea/nov7/logs/gpu_sweep.junit.xml` | run the A/B (Mara's block D) |
 | K08 | #33 | `sm70/tests/gdn` CPU | **partial**: `tests.gdn.test_k08_gdn_gpu` 19 pass (the rel-L2 cases pass), 2 skip (they need `SM70_TEST_TRITON_CHUNK=1`) | `bea/nov7/logs/gpu_sweep.junit.xml` | run the 2 skipped cases with `SM70_TEST_TRITON_CHUNK=1` |
 | M11 | none | n/a | **not run**: no PR | none | write the layer subclass; GPU check vs upstream |
 | K09 | #50, #65 | CPU (PR #50) | **failed (probably test-side, not confirmed)**: `tests.qpn8.test_k09_qpn8_gpu` 390 pass, 1 fail (`test_opcheck`: `mul_cuda` not implemented for `Float8_e4m3fn`); isolated run `rc=1, 1 failed`. The max-abs-rel < 1e-2 check is not confirmed | `bea/nov7/logs/gpu_sweep.log`, `bea/nov7/logs/k09iso.log`, `bea/nov7/iso.out` | fix the FP8 dtype in opcheck (test side is the likely cause); re-run the exit |
@@ -71,9 +71,9 @@ Roadmap order. Each node appears once.
 - M6: unit 20/20; TP2 e2e and quality suite not run. **partial**.
 - Verdict: no criterion met in full.
 
-**Phase 3 exit** (Qwen3.6/3.8 decode and prefill at or above the fork's `bench_vllm.py` numbers, with Flash-V100, GDN FlashQLA and DFlash2 on)
+**Phase 3 exit** (Qwen3.6/3.8 4K decode at or above the documented 1Cat 1.5.1 numbers, as a 3-run median, with Flash-V100, GDN FlashQLA and DFlash2 on; Charlie, 2026-11-08: no fork or 1Cat baseline runs)
+- Bar: Qwen3.6 row 1 (no DFlash2) >= 66 tok/s; row 2 (with DFlash2) >= 111 tok/s; Qwen3.8 row 4 >= 80 tok/s (floor). Row 3 (Qwen3.8 without DFlash2) has no documented number and is record-only. Qwen3.8 cold 100K TTFT <= 66 s is also part of the bar.
 - Qwen decode and prefill numbers: **none**. The Nov 7 throughput numbers are Flint, not Qwen, so they do not count toward this exit.
-- DFlash2 spec decode vs fork (111 tok/s at 4K on the 3.6-35B): **not run**.
 - Verdict: **no evidence** for the criterion.
 
 **Phase 4 exit** (Flint TP2 4K decode at least 170 tok/s with every fast path on; every kill switch at 0 greedy-identical)
