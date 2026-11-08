@@ -187,7 +187,11 @@ def test_dynamic_prefill_trace_retains_m8_decode_dispatch(dflash2_gpu):
         dynamic=True,
     )
     tile, warps = getattr(layer, mod.GEOMETRY_ATTR)
-    for rows in [12, 8, 7, 32, 8, 128, 1]:
+    # No rows=1 here: Dynamo's backed dynamic shapes specialize sizes 0 and 1,
+    # so M=1 fails the M>=2 guard of the dynamic graph and compiles a second
+    # graph by design (that was the "assert 2 == 1"). M=2 keeps a small-M
+    # point; M=1 through the kernel is covered by test_m_below_8_is_padded_m8.
+    for rows in [12, 8, 7, 32, 8, 128, 2]:
         x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16) * 0.1
         actual = compiled(x)
         if rows <= 8:
