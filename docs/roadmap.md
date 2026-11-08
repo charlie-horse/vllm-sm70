@@ -65,7 +65,7 @@ The first runnable cut is **K01 + U1 + K02 + K03**. Attention is upstream TRITON
 |---|---|---|---|---|---|---|
 | K05 | 1 | Flash-V100 kernels, lean (~8.7K) | Kai | K01 | – | GPU: `test_sm70_flash_v100_sinks_prefill` and `test_sm70_flash_v100_splitkv_n` pass |
 | K06 | 2 | Flash-V100 attention backend (CUSTOM slot) | Kai | K05 | `VLLM_SM70_FLASH_V100=0` → TRITON_ATTN | GPU: Flint TP2 4K gives a greedy-identical 256-token continuation to TRITON_ATTN on 5 prompts; decode tok/s ≥ the fork's grouped two-launch number; LBNHC stride test passes |
-| K07 | 3 | Flash-V100 spec-decode verify for Qwen DFlash2 | Kai | K06 | `VLLM_SM70_FLASH_V100_SPEC=0` | GPU: smallq exactness test; Qwen DFlash2 acceptance within 2% of the fork |
+| K07 | 3 | Flash-V100 spec-decode verify for Qwen DFlash2 | Kai | K06 | `VLLM_SM70_FLASH_V100_SPEC=0` | GPU: smallq exactness test; Qwen DFlash2 `accept_len` with Flash-V100 spec verify on within 2% (relative) of `VLLM_SM70_FLASH_V100_SPEC=0`, same prompts, rows 2 and 4 of `sm70/scripts/qwen_phase2/qwen_matrix.sh` (A/B in our build, not against the fork) |
 | K08 | 1 | GDN FlashQLA native prefill + decode | Kai | K01 | `VLLM_SM70_GDN_DECODE_FLASHQLA=0`, `VLLM_SM70_GDN_FLASHQLA_PREFILL=0` | GPU: prefill/decode state vs upstream Triton, rel-L2 < 1e-3 |
 | M11 | 2 | Qwen GDN layer subclass (`vllm_sm70/gdn/layer.py`, ~60 lines). Overrides `_forward_core_decode_non_spec` (upstream `qwen_gdn_linear_attn.py:1981`) and `_warmup_prefill_kernels` (:1308-1415) to call K08 | Mara | K08 | K08's switches | GPU: GDN layer output vs the upstream path within tolerance |
 | K10 | 2 | opt: GDN TileLang prefill (needs a Nix tilelang) | Kai | K08 | `VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0` (default 0) | GPU: TileLang vs native state rel-L2 < 4e-4 |
@@ -93,7 +93,7 @@ The "M8 verifier GEMVs" at the fork (cf9492a) are three routes. All three serve 
 
 **The exit test moves to Qwen3.8-27B.** No M9 route runs on Qwen3.6-35B-A3B at the fork, so the old reference (111 tok/s at 4K on the 3.6-35B) can't measure M9. At the fork's TP2 default even Qwen3.8 runs neither draft route, because both are flagged only at TP4 (`qwen3_dflash2.py:280`). So TP2 fork parity doesn't need M9: M9 is speed beyond the fork. **Decided (Astro, 2026-11-08):** the pass bar is DFlash2 4K decode ≥ the K18-only A/B arm and ≥ the 1Cat 1.5.1 documented Qwen3.8 number (Qwen speed is measured against the 1Cat docs, with no baseline runs; Mara has the citation). The acceptance rate must be unchanged within noise, and `VLLM_SM70_DFLASH2_VERIFIER=0` must restore K18 exactly.
 
-**Phase 3 exit:** Qwen3.6/3.8 decode and prefill on c4130 are at or above the fork's numbers in `bench_vllm.py`, with Flash-V100, GDN FlashQLA and DFlash2 on.
+**Phase 3 exit:** Qwen3.6/3.8 4K decode on c4130, as a 3-run median, is at or above the documented 1Cat 1.5.1 numbers, with Flash-V100, GDN FlashQLA and DFlash2 on: Qwen3.6 row 1 >= 66 tok/s and row 2 (with DFlash2) >= 111 tok/s; Qwen3.8 row 4 >= 80 tok/s (floor). Row 3 is record-only. No fork or 1Cat baseline runs (Charlie, 2026-11-08).
 
 ## Phase 4: Flint fast paths
 
