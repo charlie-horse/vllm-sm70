@@ -187,7 +187,8 @@ def test_dynamic_prefill_trace_retains_m8_decode_dispatch(dflash2_gpu):
         dynamic=True,
     )
     tile, warps = getattr(layer, mod.GEOMETRY_ATTR)
-    for rows in [12, 8, 7, 32, 8, 128, 1]:
+
+    def check(rows):
         x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16) * 0.1
         actual = compiled(x)
         if rows <= 8:
@@ -198,7 +199,17 @@ def test_dynamic_prefill_trace_retains_m8_decode_dispatch(dflash2_gpu):
         else:
             expected = F.linear(x, layer.weight)
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+    # One dynamic graph serves every M >= 2: prefill sizes and the M<=8 decode.
+    for rows in [12, 8, 7, 32, 8, 128, 2]:
+        check(rows)
     assert len(compilations) == 1
+    # M=1 (the commonest decode size) through the compiled route. Dynamo's
+    # backed dynamic shapes specialize sizes 0 and 1, so M=1 fails the M>=2
+    # guard and compiles exactly one more graph, by design (the earlier
+    # "assert 2 == 1"). It must still dispatch to the M8 kernel bitwise.
+    check(1)
+    assert len(compilations) == 2
     x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.1
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
