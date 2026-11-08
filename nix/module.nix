@@ -90,7 +90,11 @@ let
         # patches); then restore it here.
         "--enable-prompt-tokens-details"
         "--tool-call-parser" "glm47"
-        "--reasoning-parser" "glm47"
+        # glm47_sm70 = the fork's glm47 parser, ported in vllm_sm70/reasoning.py.
+        # Upstream's glm47 leaks Flint's <think> into content when a request
+        # sends enable_thinking=false. "--reasoning-parser glm47" restores upstream.
+        "--reasoning-parser-plugin" "vllm_sm70.reasoning"
+        "--reasoning-parser" "glm47_sm70"
         "--exclude-tools-when-tool-choice-none"
         "--override-generation-config" ''{"temperature":1.0,"top_p":0.95,"top_k":20}''
       ];

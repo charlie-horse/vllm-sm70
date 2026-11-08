@@ -375,8 +375,11 @@ before trusting their numbers.
    Flash-V100 a diff points at the K14 fused decode), a degenerate or first-token
    divergence (the script flags these), or text that reads as gibberish.
 4. **Bench.** Start `vllm serve` on the window stack with prod flags (no
-   `--attention-backend`) and run `~/archive/scripts/bench_vllm.py` at 4K
-   and 32K. Fork today: 177 tok/s (4K), 163 tok/s (32K). Ours on
+   `--attention-backend`). The prod flags are Flint's `args` in
+   `nix/module.nix`, including `--tool-call-parser glm47
+   --reasoning-parser-plugin vllm_sm70.reasoning --reasoning-parser
+   glm47_sm70`. Without them, Flint's `<think>` lands in `content`. Then run
+   `~/archive/scripts/bench_vllm.py` at 4K and 32K. Fork today: 177 tok/s (4K), 163 tok/s (32K). Ours on
    TRITON_ATTN was 47 tok/s at 32K, TTFT 31.5 s. Report decode tok/s and
    TTFT next to the fork's.
 
