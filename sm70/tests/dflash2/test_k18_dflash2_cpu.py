@@ -136,9 +136,12 @@ def test_each_engine_decides_for_itself(monkeypatch):
     assert dflash2.select_unquantized_gemm("auto") is dispatcher
 
 
-def test_selection_logged_once_per_decision(monkeypatch):
+def test_selection_logged_once_per_switch(monkeypatch):
     """The "prepared" lines come from marking/packing; only this line shows
-    the U1 dispatcher was picked (Quinn, #108)."""
+    the U1 dispatcher was picked (Quinn, #108). Logged once per switch to the
+    dispatcher, not per config object: on c4130 the draft is built under its
+    own qualified VllmConfig, and per-key logging printed it twice per rank
+    (Bea's #108 smoke)."""
     pytest.importorskip("vllm")
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     lines = []
@@ -147,12 +150,21 @@ def test_selection_logged_once_per_decision(monkeypatch):
     )
     for _ in range(5):
         dflash2.select_unquantized_gemm("auto")
+    draft_cfg = qwen_vllm_config()  # a second, equally qualified config object
+    assert draft_cfg is not QWEN38
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: draft_cfg)
+    for _ in range(5):
+        dflash2.select_unquantized_gemm("auto")
     assert len(lines) == 1
     assert "K18 DFlash2 draft GEMM dispatcher selected" in lines[0]
     assert "linear_backend=auto" in lines[0]
     monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN36)
     dflash2.select_unquantized_gemm("auto")
     assert len(lines) == 1  # not selected: no line
+    # A later qualified engine switches back to the dispatcher: logged again.
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN38)
+    dflash2.select_unquantized_gemm("auto")
+    assert len(lines) == 2
 
 
 def test_killed_packs_nothing_even_when_forced(monkeypatch):

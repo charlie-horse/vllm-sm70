@@ -24,7 +24,7 @@ Switch: ``VLLM_SM70_DFLASH2_FP16=0`` turns it off everywhere (and with it
   M9a, which rides on this hook). It is independent of
   ``VLLM_SM70_DFLASH2_VERIFIER=0``, which turns off M9a only.
 Selection is decided once per engine: the first ``select_unquantized_gemm``
-  call made under a VllmConfig decides, logs once when it picks the
+  call made under a VllmConfig decides, logs once per switch to the
   dispatcher, and is cached per (engine config, linear_backend) (UP calls
   ``dispatch_unquantized_gemm()`` on every forward of lm_head and the MoE
   router gate); a call with no current config returns the most recent
@@ -237,6 +237,18 @@ def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] 
     if key not in _SELECTED:
         _SELECTED[key] = _select(linear_backend, vllm_config)
     choice = _SELECTED[key]
+    if choice is not None and _LATEST.get(linear_backend) is not choice:
+        # Once per switch to the dispatcher, not per config object: the
+        # draft is built under its own (equally qualified) VllmConfig, which
+        # re-decides, so per-key logging printed the line twice per rank
+        # (Bea's #108 smoke). The "prepared" lines come from marking and
+        # packing; this is the evidence that U1 picked the dispatcher.
+        logger.info(
+            "vllm_sm70: K18 DFlash2 draft GEMM dispatcher selected for "
+            "linear_backend=%s (default: Qwen3.8 DFlash2 verifier contract; "
+            "VLLM_SM70_DFLASH2_FP16=0 disables it).",
+            linear_backend,
+        )
     _LATEST[linear_backend] = choice
     return choice
 
@@ -259,14 +271,6 @@ def _select(linear_backend: str, vllm_config: Any) -> Callable[..., Any] | None:
             return None
     except Exception:  # pragma: no cover - vllm layout changed
         return None
-    # Once per (engine, backend) decision: the "prepared" lines come from
-    # marking/packing, so this is the only evidence the dispatcher was picked.
-    logger.info(
-        "vllm_sm70: K18 DFlash2 draft GEMM dispatcher selected for "
-        "linear_backend=%s (default: Qwen3.8 DFlash2 verifier contract; "
-        "VLLM_SM70_DFLASH2_FP16=0 disables it).",
-        linear_backend,
-    )
     return dflash2_unquantized_gemm
 
 
