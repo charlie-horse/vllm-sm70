@@ -45,17 +45,27 @@ def test_u1_gemm_hook_k18(platform_cls, monkeypatch):
     from vllm_sm70.ops import dflash2
 
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
-    for value, expected in ((None, None), ("0", None), ("1", True)):
+    # A current engine config; whether it is the Qwen3.8 contract is patched.
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: object())
+    cases = (
+        # (qualified, switch value, K18 selected)
+        (True, None, True),  # default on for the Qwen3.8 contract
+        (True, "1", True),
+        (True, "0", False),  # kill switch
+        (False, None, False),  # any other engine keeps upstream dispatch
+    )
+    for qualified, value, expected in cases:
+        monkeypatch.setattr(dflash2, "_qualified", lambda cfg, q=qualified: q)
         if value is None:
             monkeypatch.delenv("VLLM_SM70_DFLASH2_FP16", raising=False)
         else:
             monkeypatch.setenv("VLLM_SM70_DFLASH2_FP16", value)
         dflash2.reset_selection_cache()
         got = platform_cls.get_unquantized_gemm("auto")
-        if expected is None:
-            assert got is None, value  # opt-in: default is upstream
+        if expected:
+            assert got is dflash2.dflash2_unquantized_gemm, (qualified, value)
         else:
-            assert got is dflash2.dflash2_unquantized_gemm
+            assert got is None, (qualified, value)
     dflash2.reset_selection_cache()
 
 

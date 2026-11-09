@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+from _dflash2_helpers import qwen_vllm_config as _vllm_config  # noqa: E402
 from torch import nn  # noqa: E402
 from vllm_sm70.ops import dflash2, dflash2_fp8  # noqa: E402
 
@@ -251,31 +252,6 @@ def test_op_fake_under_fake_tensor_mode(cpu_qpn8):
 
 
 # --------------------------------------------------------- verifier gate
-def _vllm_config(*, arch="Qwen3_5ForConditionalGeneration", k=7, sm70=None):
-    text = SimpleNamespace(
-        hidden_size=5120, num_attention_heads=24, num_key_value_heads=4, head_dim=256
-    )
-    model = SimpleNamespace(
-        architectures=[arch], dtype=torch.float16, hf_text_config=text
-    )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
-    )
-    spec = SimpleNamespace(
-        method="dflash", num_speculative_tokens=k, draft_model_config=draft
-    )
-    parallel = SimpleNamespace(
-        pipeline_parallel_size=1, enable_dbo=False, ubatch_size=0
-    )
-    additional = {"sm70": sm70} if sm70 is not None else {}
-    return SimpleNamespace(
-        model_config=model,
-        speculative_config=spec,
-        parallel_config=parallel,
-        additional_config=additional,
-    )
-
-
 @pytest.fixture
 def _fresh_cfg(monkeypatch):
     from vllm_sm70 import config
@@ -325,7 +301,9 @@ def test_gate_tolerates_missing_configs(_fresh_cfg):
 # ----------------------------------------------------------- marking (vllm)
 def test_mark_draft_linears_sets_fp8_flag(monkeypatch):
     linear = pytest.importorskip("vllm.model_executor.layers.linear")
-    monkeypatch.setenv(K18, "1")
+    monkeypatch.delenv(K18, raising=False)  # K18 is on by default for Qwen3.8
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    cfg = _vllm_config()
 
     def proj():
         m = nn.Module()
@@ -337,12 +315,18 @@ def test_mark_draft_linears_sets_fp8_flag(monkeypatch):
     layer.self_attn.qkv_proj = proj()
     layer.mlp = nn.Module()
     layer.mlp.down_proj = proj()
-    marked = dflash2.mark_draft_linears(layer, fp8=True)
+    marked = dflash2.mark_draft_linears(layer, vllm_config=cfg, fp8=True)
     assert len(marked) == 2
     for m in marked:
         assert getattr(m, dflash2.MARK_ATTR) and getattr(m, dflash2_fp8.FP8_MARK_ATTR)
     other = nn.Module()
     other.mlp = nn.Module()
     other.mlp.down_proj = proj()
-    (m,) = dflash2.mark_draft_linears(other)
+    (m,) = dflash2.mark_draft_linears(other, vllm_config=cfg)
     assert not getattr(m, dflash2_fp8.FP8_MARK_ATTR, False)
+    # K18's kill switch also stops M9a's flag (the route rides on K18's hook).
+    monkeypatch.setenv(K18, "0")
+    third = nn.Module()
+    third.mlp = nn.Module()
+    third.mlp.down_proj = proj()
+    assert dflash2.mark_draft_linears(third, vllm_config=cfg, fp8=True) == []
