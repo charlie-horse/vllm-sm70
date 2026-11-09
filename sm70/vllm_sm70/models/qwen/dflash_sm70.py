@@ -625,6 +625,30 @@ def _build_classes() -> dict[str, type]:
         # UP factory: DFlashQwen3ForCausalLM.model_cls (qwen3_dflash.py:737, :748)
         model_cls = DFlash2SM70Qwen3Model
 
+        # UP signature: qwen3_dflash2.py:397
+        def __init__(self, *, vllm_config, prefix: str = "") -> None:
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+            from vllm_sm70.ops import dflash2_rerank
+
+            # A2: decided once per draft model (M1 contract + switches).
+            self.use_sm70_qpn8_rerank = dflash2_rerank.rerank_wanted(vllm_config)
+
+        def compute_candidates(self, hidden_states):
+            # UP qwen3_dflash2.py:408-413. A2: QPN8 support search + exact
+            # FP32 rerank for one drafting request; upstream otherwise.
+            if self.use_sm70_qpn8_rerank:
+                from vllm_sm70.ops import dflash2_rerank
+
+                out = dflash2_rerank.maybe_candidates(
+                    self.lm_head,
+                    self.candidate_logits_processor,
+                    hidden_states,
+                    self.model.candidate_selector.top_k,
+                )
+                if out is not None:
+                    return out
+            return super().compute_candidates(hidden_states)
+
         def load_weights(self, weights):
             # UP qwen3_dflash.py:851. K18: pack the flagged projections once
             # the weights are final, before profiling and graph capture, so
