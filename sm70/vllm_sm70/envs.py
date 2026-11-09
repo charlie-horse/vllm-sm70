@@ -228,6 +228,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # K07: "0" -> verify rows take the causal paged prefill (K06) instead
         # of the smallq -> XQA expansion; graphs then cover 1-token decode.
         "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
+        # A1: "0" -> the K07 verify expansion runs as torch ops (~20
+        # launches per full-attention cache group) instead of one Triton
+        # launch (attention/flash_v100/spec/smallq.py). Read when each
+        # Flash-V100 metadata builder is built. CPU tensors always use torch.
+        "VLLM_SM70_FLASH_V100_SMALLQ_METADATA": kill_switch(
+            "VLLM_SM70_FLASH_V100_SMALLQ_METADATA"
+        ),
     },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {
