@@ -212,7 +212,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # candidate top-k uses upstream's dense FP16 LM head. Default on for
         # the same contract as M9a (VLLM_SM70_DFLASH2_VERIFIER=0 also turns
         # it off), one drafting request (M <= 8). Keeps an E4M3 copy of the
-        # LM head per rank (~0.64 GiB at TP2), made on the first eager draft
+        # LM head per rank (0.59 GiB at TP2), made on the first eager draft
         # step (the profile run). Read when the draft model is built.
         "VLLM_SM70_DFLASH2_QPN8_RERANK": kill_switch("VLLM_SM70_DFLASH2_QPN8_RERANK"),
     },

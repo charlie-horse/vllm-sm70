@@ -71,6 +71,9 @@ def _head(n: int, k: int, *, seed: int = 0, start: int = 0) -> nn.Module:
     )
     head.bias = None
     head.tp_size = 1
+    # The TP2 shard of a 2n vocabulary: no padding on any rank.
+    head.org_vocab_size = head.org_vocab_size_padded = 2 * n
+    head.num_added_embeddings = 0
     head.shard_indices = SimpleNamespace(
         num_org_vocab_padding=0, num_added_elements=0, org_vocab_start_index=start
     )
@@ -142,6 +145,22 @@ def test_admission_reasons(cpu_qpn8, monkeypatch):
     assert "SM70" in dflash2_rerank.admission(_head(128, 256), lp, 16)
     monkeypatch.setattr(dflash2_rerank, "ops_available", lambda: False)
     assert "QPN8" in dflash2_rerank.admission(_head(128, 256), lp, 16)
+
+
+def test_admission_is_rank_symmetric(cpu_qpn8):
+    # Vocab padding sits on the last TP rank only. Every rank must decline
+    # together, or the ranks enter the closing all-gather with different
+    # dtypes (fp32 here, fp16 upstream).
+    lp = _processor()
+    first_rank = _head(128, 256)  # no local padding...
+    first_rank.org_vocab_size = 2 * 128 - 8  # ...but the global vocab is padded
+    assert "padded" in dflash2_rerank.admission(first_rank, lp, 16)
+    added = _head(128, 256)
+    added.num_added_embeddings = 16
+    assert "extended" in dflash2_rerank.admission(added, lp, 16)
+    no_attrs = _head(128, 256)
+    del no_attrs.org_vocab_size
+    assert dflash2_rerank.admission(no_attrs, lp, 16) is not None
 
 
 def test_switch_registered_and_only_zero_kills(monkeypatch):

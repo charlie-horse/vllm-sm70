@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A2 GPU tests: DFlash2 QPN8 support search + exact FP32 rerank on SM70.
 
-The real Qwen3.8 TP2 head shard (124160 x 5120, two 62080-row chunks) with
+A random FP16 head of the Qwen3.8 TP2 shard shape (124160 x 5120, two
+62080-row chunks; not the checkpoint's weights: the row 4 A/B against
+VLLM_SM70_DFLASH2_QPN8_RERANK=0 checks real weights) with
 K09's channel-FP8 GEMM and the Triton exact dots. Checks: the Triton dots
 against an FP32 reference; the route's top-16 equals the FP32 dense top-16
 and its values match it; against upstream's FP16 dense head the ids agree
@@ -49,6 +51,8 @@ def head(rerank):
     module.weight = torch.nn.Parameter(weight, requires_grad=False)
     module.bias = None
     module.tp_size = 1
+    module.org_vocab_size = module.org_vocab_size_padded = N
+    module.num_added_embeddings = 0
     module.shard_indices = SimpleNamespace(
         num_org_vocab_padding=0, num_added_elements=0, org_vocab_start_index=0
     )

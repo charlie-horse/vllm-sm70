@@ -17,7 +17,7 @@ What: the DFlash2 draft picks its selector_top_k (16) candidates per drafted
 Why: Bea's E2 trace of Qwen3.8 row 4 at TP2 has the draft head as one FP16
   GEMM of 124160 x 5120 at M=7: 2.02 ms of a 44.8 ms verify step, plus
   0.24 ms of full-vocabulary top-k. K18 does not cover this shape.
-Cost: one E4M3 copy of the head per rank (~0.64 GB at TP2), made on the
+Cost: one E4M3 copy of the head per rank (0.59 GiB = 0.64 GB at TP2), made on the
   first eager call (the profile run, so it counts against KV cache), not at
   load: the draft shares the target's head only after load
   (UP spec_decode/dflash/utils.py:62-73).
@@ -123,9 +123,20 @@ def admission(lm_head, logits_processor, top_k: int) -> str | None:
     rows, hidden = weight.shape
     if rows < CANDIDATES or rows % 32 or hidden % 128 or (hidden // 16) % SPLIT_K:
         return f"shape {tuple(weight.shape)} (needs N>=64, N%32=0, K%128=0)"
+    # Every check here must decide the same on every TP rank: the route ends
+    # in an all-gather that all ranks must enter with the same dtype. Vocab
+    # padding sits on the last rank only, so test the global vocabulary.
     shard = getattr(lm_head, "shard_indices", None)
-    if shard is None or shard.num_org_vocab_padding or shard.num_added_elements:
-        return "padded or extended vocabulary shard"
+    org = getattr(lm_head, "org_vocab_size", None)
+    if (
+        shard is None
+        or org is None
+        or getattr(lm_head, "org_vocab_size_padded", None) != org
+        or getattr(lm_head, "num_added_embeddings", 0)
+        or shard.num_org_vocab_padding
+        or shard.num_added_elements
+    ):
+        return "padded or extended vocabulary"
     if getattr(logits_processor, "logits_as_input", False):
         return "logits_as_input"
     head_dtype = getattr(logits_processor, "head_dtype", None)
