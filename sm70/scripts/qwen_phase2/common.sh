@@ -17,6 +17,10 @@ QP2_ATTN_BACKEND="${QP2_ATTN_BACKEND:-TRITON_ATTN}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+# The Nix wrapper defaults VLLM_USE_V2_MODEL_RUNNER=0 for Flint (roadmap D2).
+# DFlash drafts need the V2 runner ("Model Runner V1 does not support: DFlash
+# candidate-head drafts"), so the Qwen scripts run every row on V2.
+export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
 
 qp2_log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
