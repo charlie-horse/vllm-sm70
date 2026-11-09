@@ -55,8 +55,9 @@ This repo already defines the LMCache unit: `systemd.services.vllm-lmcache` in `
    ```sh
    systemctl cat vllm-lmcache.service
    ```
-2. **Host flake change:** import this flake's NixOS module (the `nixosModules` output that provides `services.vllm-sm70` and `services.lmcache-sm70`; name the exact output in the host flake here: TODO, Charlie). **Delete** the fork's own `vllm-lmcache` definition. Do not keep both: two definitions conflict.
-3. Torch and env: on the build `aczb9zwk`, `bin/lmcache` already runs on the same env (`vzniv8cf…-vllm-sm70-env`) and torch 2.14.0 that the LMCache server used in testing. Confirm with `nix path-info -r` on the built closure (see section 4, check 0), rather than assuming.
+2. **Host flake change:** import `inputs.<vllm-input>.nixosModules.default`. That module is the same as `services.vllm-sm70` and already imports `lmcache`, so do **not** also import `.lmcache`. **Delete** the fork's own `vllm-lmcache` definition. Do not keep both: two definitions conflict. Only the input name and the `#c4130` attribute remain for Charlie to fill in.
+3. Torch and env: on the build `aczb9zwk`, `bin/lmcache` already runs on the same env (`vzniv8cf…-vllm-sm70-env`) and torch 2.14.0 that the LMCache server used in testing. Confirm with the closure check in step 3.3a, rather than assuming.
+   - 3.3a Closure check, on c4130 after the realise in section 2: `nix-store -qR <outPath> | grep -E 'vzniv8cf|005jhwin'` must show both the env and torch 2.14.0.
 4. **[SUDO: Charlie]** Switch:
    ```sh
    sudo nixos-rebuild switch --flake <host-flake>#c4130
@@ -80,10 +81,10 @@ Run in order; stop at the first failure and go to section 5.
 1. `systemctl is-active vllm-lmcache.service vllm.service` returns `active` for both (after the wait in section 3.4).
 2. The vLLM service serves: one completion request against the served model (Qwen or Flint, whichever prod uses) returns a non-empty answer.
 3. **LMCache reuse, with prefix caching on** (prod args set `--enable-prefix-caching`, `nix/module.nix:195`). A second identical send is served by the GPU prefix cache, so a plain resend cannot show LMCache reuse. Use these two checks instead:
-   - (a) Send a long prompt P (at least two 256-token chunks). Then read the LMCache status and confirm `total_object_count` and `memory_used_bytes` went up. The status endpoint is TODO: name it from the `lmcache-server.log` of the test run.
+   - (a) Send a long prompt P (at least two 256-token chunks). Then read the LMCache status and confirm `total_object_count` and `memory_used_bytes` went up. The endpoint is `GET 127.0.0.1:<httpPort>/status` (loopback only, no auth). `httpPort` is `services.lmcache-sm70.httpPort`, default 8080 (`nix/lmcache.nix:127-131`), unless the host overrides it: `curl -s 127.0.0.1:8080/status`.
    - (b) **[SUDO: Charlie]** Restart `vllm.service` only. LMCache keeps its L1 store, and the GPU prefix cache is cleared. Resend P. `prompt_tokens_by_source[external_kv_transfer]` should be close to the prompt length minus the last partial 256-token chunk, and the answer should match the first send.
 4. etcd health OK (C3's exit test).
-5. **Greedy identity:** the 5 prompts from the gate run give the same output as the recorded base arm. The recorded outputs are `greedy.json` from the 1c matrix base arm (exact path TODO: Quinn to name it; it was not checked in this doc).
+5. **Greedy identity, against a fresh base recorded on `latest`.** The existing `S1c-base1/greedy.json` (under `~/vllm-sm70-work/bea/nov8/logs/`) is **not** a reference for this build: it came from `bfbbf360` with tuning off, the V1 runner and no LMCache connector. Use it only as the source of the 5 prompts. During Bea's GPU gate run on the `latest` commit, with the prod unit's args and env, record a fresh base `greedy.json` and compare the cutover run against it. Path of the new file: TODO, filled in when it exists.
 
 ## 5. Rollback to the fork
 
@@ -106,7 +107,8 @@ Use this if any step in section 4 fails, or if prod misbehaves within the first 
 
 ## Open items for Charlie
 
-- Name the `nixosModules` output the host imports (section 3.2) and the host flake's vllm and LMCache input names, and the `#c4130` attribute.
+- Name the host flake's vllm input name and the `#c4130` attribute (section 2 and 3.2).
 - Confirm the GC retention policy (how many generations to keep).
 - Confirm the downtime window for the switch.
-- Name the LMCache status endpoint (section 4.3a) and the recorded greedy-output file (section 4.5).
+- Record the fresh base `greedy.json` on `latest` during the gate run and fill its path in section 4.5.
+- Run §4.3b (restart `vllm.service`, then resend) once in Bea's gate window before C3 relies on it. It is untested: every reuse proven so far happened within one vLLM instance.
