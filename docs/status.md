@@ -1,6 +1,6 @@
 # Status: roadmap nodes vs evidence
 
-Snapshot as of 2026-11-08, from merged PRs (#1-#88), PR comments, and Nov 5-7 GPU logs on c4130 (read-only). `~/vllm-sm70-work/...` paths are on c4130.
+Snapshot as of 2026-11-08, from merged PRs (#1-#99, with #92 and #97 merged after the Nov 7 sweep), PR comments, Nov 5-7 GPU logs on c4130 (read-only), and Quinn's Flint step 1 verification (`quinn-step1-verify.md`). `~/vllm-sm70-work/...` paths are on c4130.
 
 **Status terms**
 - **passed**: a PR, log or junit file shows the exit test (or the named part of it) passing.
@@ -30,7 +30,7 @@ Roadmap order. Each node appears once.
 | M7 | #22, #45 | `test_m7_dflash_sm70.py` CPU | **partial**: `tests.models.test_m7_dflash_sm70` 3 pass (`test_triton_matches_reference_gpu`, two bitwise), 1 skip (`test_e2e_real_draft_gpu`, the exit's fp16 draft forward). PR #34's "Triton 3/3" is not the same run | `bea/nov7/logs/gpu_sweep.junit.xml` | the skipped e2e draft forward; acceptance-rate e2e (needs M6 e2e) |
 | K03 | #26, #28 | `sm70/tests/ops` CPU (PR #26) | **partial**: `tests.ops` 102 passed in the sweep. The exit's named cases (TM vs `torch.matmul` at M in {1,2,8,64,512}; MoE vs reference loop) are not identified in the junit | `bea/nov7/logs/gpu_sweep.junit.xml` | confirm the named cases; MoE reference loop unverified |
 | M3 | #24, #30, #42 | 25 CPU tests (PR #24) | **passed**: `tests.quant.test_m3_nvfp4_linear` 99 of 99 pass in the sweep. Test contents confirmed from the test code. | `bea/nov7/logs/gpu_sweep.junit.xml` | GEMV path depends on K11 (now passed) |
-| M4 | #31, #34, #52, #72, #79 | 22 CPU tests (PR #31) | **passed**: `tests.quant.test_m4_nvfp4_moe` 12 of 12 pass in the sweep. Test contents confirmed from the test code. | `bea/nov7/logs/gpu_sweep.junit.xml` | none for the exit as stated |
+| M4 | #31, #34, #52, #72, #79, #97 | 22 CPU tests (PR #31) | **passed**: `tests.quant.test_m4_nvfp4_moe` 12 of 12 pass in the sweep. Test contents confirmed from the test code. #97 (compact slot groups, M*top_k <= 80; merged after the sweep) has no GPU log in this doc | `bea/nov7/logs/gpu_sweep.junit.xml` | GPU log for #97 (reported cliff fix, see K14) |
 | K04 | none | n/a | **not run** (optional) | none | AWQ not built |
 | M5 | #36, #41, #52 | 333 CPU passed (PR #36) | **partial**: the Nov 7 gate run passes t1, t2, t3, t4c, t4d, t4e, t5, t6, t7; t4b is skipped by design under Flash-V100 (T4e replaces it). The roadmap exit is the quality suite (math 10/10, code 5/5, needle@32K 3/3, gibberish at c20, glm47, LMCache), which has no log. The Nov 6 `window.out` shows t4a, t4b, t5 FAIL, but it predates the Nov 7 gate rulings and is superseded | `bea/nov7/logs/m5full.out`, `bea/m5-cal-nov7/window-full-n7/`, `bea/nov7/logs/mutation.out` (mutation check); superseded: `bea/m5-cal-nov7/window.out` | run and log the quality suite |
 | M6 | #32, #41 | 25 CPU tests (PR #32) | **partial**: `tests.quant.test_m6_qwen_fp8` 20 of 20 unit pass in the sweep. The TP2 e2e (Qwen3.6-35B-A3B and 3.8-27B, within 32 GB/GPU) is not run | `bea/nov7/logs/gpu_sweep.junit.xml` | TP2 e2e and memory fit |
@@ -44,7 +44,7 @@ Roadmap order. Each node appears once.
 | K11 | #53 | CPU (PR #53) | **passed**: `tests.ops.test_k11_nvfp4_tm_gemv_gpu` 28 of 28 pass in the sweep. The exit is "fork tests listed in the carry map"; that mapping is not done | `bea/nov7/logs/gpu_sweep.junit.xml` | map the carry-map tests |
 | K12 | #55 | CPU 565 passed (PR #55) | **passed**: `tests.flint_moe` 15 passed, 0 failed (Nov 7 01:12). Exit is "fork tests in the carry map", not mapped one-to-one | `bea/nov7/logs/flint_moe.junit.xml` | map the carry-map tests |
 | K13 | #57, #86 | 1296 CPU passed at 8480748 (PR #86) | **partial**: `tests.router.test_k13_router_gpu` 12 of 12 pass in the sweep. "Greedy-identical with the switch off" not seen | `bea/nov7/logs/gpu_sweep.junit.xml` | greedy-identity with `VLLM_SM70_FLINT_FUSED_ROUTER=0` |
-| K14 | #56, #79 | 535 CPU passed (PR #56) | **partial**: one-launch sink decode is live. Mean of two reps, default arm: 175.5 tok/s at n=1, 262.3 at n=2, 37.5 at n=4, 56.0 at n=8. Switch-off arm (`VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0`): 121.0, 196.3, 36.6, 55.0. The n=4 drop is in both arms, so it is not K14. The regression test `test_decode_sinks_descending_capture_regression` is reported 2/2 in the sweep (per-file parse by Quinn) | `bea/nov7/logs/k14.out`, `bea/nov7/logs/gpu_sweep.junit.xml` | root-cause the n=4 drop (both arms); n=20 coherence sweep |
+| K14 | #56, #79, #97 | 535 CPU passed (PR #56) | **partial**: one-launch sink decode is live. Mean of two reps, default arm: 175.5 tok/s at n=1, 262.3 at n=2, 37.5 at n=4, 56.0 at n=8. Switch-off arm (`VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0`): 121.0, 196.3, 36.6, 55.0. The n=4 drop was in both arms, so it was not K14. The regression test `test_decode_sinks_descending_capture_regression` is reported 2/2 in the sweep (per-file parse by Quinn). #97 is reported to fix the n=4 cliff (59.1 tok/s/stream at n=4, per Astro; no log checked here) | `bea/nov7/logs/k14.out`, `bea/nov7/logs/gpu_sweep.junit.xml` | log for the #97 n=4 result; n=20 coherence sweep |
 | K15 | #54 | 533 CPU passed (PR #54) | **passed**: `tests.flint.test_k15_qk_norm_rope_kv_gpu` 50 of 50 pass in the sweep. Exit is "vs unfused ops" | `bea/nov7/logs/gpu_sweep.junit.xml` | none for the exit |
 | K16 | #59, #66 | 1307 CPU passed at 0291f61 (PR #66) | **passed** for the K16 suite: 66 of 66 (`k16_full.junit.xml`). M10 sampler: G1 and G3 pass; G2 xfail; G4 XPASS (`test_m10_flint_sampler.junit.xml`). "Greedy-identical with switch off" not shown | `bea/nov7/logs/k16_full.junit.xml`, `bea/nov7/logs/test_m10_flint_sampler.junit.xml` | greedy identity with `VLLM_SM70_FLINT_SAMPLER=0`; decide whether the G4 XPASS needs its marker updated |
 | K17 | #63, #73, #88 | 576 CPU passed (PR #63) | **partial**: `tests.distributed.test_sm70_tp2_ar_fused_add_rms_norm` 2 of 2 pass (bitwise test). Pass-firing on `bfbbf360` (#88) and switch-off greedy identity are missing. Throughput A/B only: median of 3 runs, `k17-default/e2e.out` 175.7 tok/s vs `k17-off/e2e.out` 174.7 tok/s at ctx 4096 greedy (JSON write failed; numbers from the printed line) | `bea/nov7/logs/gpu_sweep.junit.xml`, `bea/nov7/logs/k17-default/`, `bea/nov7/logs/k17-off/` | pass-firing log on `bfbbf360`; switch-off greedy identity |
@@ -52,8 +52,8 @@ Roadmap order. Each node appears once.
 | U3 | #43 | 505 CPU passed (PR #43) | n/a (CPU exit test) | PR #43 | none |
 | U4 | #44 | 509 CPU passed (PR #44) | n/a (CPU exit test) | PR #44 | none |
 | U5 | #60 | header-hash test (PR #73) | **not run**: R5 FULL-capture check with expandable segments has no evidence | none | run the R5 check |
-| M8 | #65 | CPU (PR #65) | **not run**: the decode A/B that decides the default is not in any log. The qpn8 GPU suite (390 of 391 pass) ran | `bea/nov7/logs/gpu_sweep.junit.xml` (qpn8 tests) | run `m8_qpn8_ab.sh` |
-| M9 | none | n/a | **not run**: "not in a PR until its hook point is named" | none | name the hook point; PR; GPU test |
+| M8 | #65, #102 (open warning PR) | CPU (PR #65) | **closed by decision (Astro, 2026-11-08): wired, no-op at prod defaults; M32 opt-in not recommended.** A/B on main 6355538 (Bea, opt-in on): QPN8/M6 = 0.994 / 0.985 / 0.733 / 0.669 at c=1..4; greedy 5/5. Shipped default (max_m = 8) admits no layer, so prod equals M6. Fork-parity copy run skipped by decision. The qpn8 GPU suite (390 of 391 pass) ran in Nov 7 | `side-session-notes/local_f53bb309…/mara-m8-ab-verdict.md` (verdict table); `bea/nov7/logs/gpu_sweep.junit.xml` (qpn8 tests); raw A/B log path not recorded in this doc | M32 warning lands in #102 (open); no further M8 work |
+| M9 | #91, #92 | #91 names the hook points (U1 via K18, PluggableLayer OOT), 0 upstream lines; #92 (M9a) merged at 2fe63e6, channel-FP8 M8 projections via U1/K18 | **not run**: no GPU test for M9a in the sweep or any log | `bea/nov7/logs/gpu_sweep.junit.xml` (no M9a tests) | GPU test for M9a and M9b; M9b's gate is independent of M8 (Mara) |
 | M10 | #66, #86 | 1296 CPU passed (PR #86) | **partial**: router and sampler GPU tests pass in the isolated runs (see K13, K16). The e2e "greedy-identical with each switch off" is not seen | `bea/nov7/logs/` (above) | e2e identity runs |
 | M10a | #86 | CPU (PR #86) | **partial**: router part of M10 | as above | as above |
 | C1 | none | n/a | **not run** | none | side-by-side bench and quality run vs fork |
@@ -77,15 +77,24 @@ Roadmap order. Each node appears once.
 - Verdict: **no evidence** for the criterion.
 
 **Phase 4 exit** (Flint TP2 4K decode at least 170 tok/s with every fast path on; every kill switch at 0 greedy-identical)
-- Throughput: 175.5 tok/s mean at n=1 with K14 on (`k14.out`) is above 170, but K13, K16, K17 and M10 were not all confirmed on in that run. **unverified**.
-- Greedy-identical with each switch at 0: **no evidence** for any switch.
-- Verdict: no criterion met with evidence.
+- Kill-switch criterion, as decided by Charlie (2026-11-08): teacher-forced within the fork envelope for the 5 kernel-changing switches, not bitwise greedy identity. The roadmap text still says "greedy-identical"; `docs/roadmap.md` is not changed by this doc.
+- Throughput: Quinn's step 1b recompute of the single-stream e2e runs, 4K default 173.3 tok/s and 4K greedy 176.9 tok/s (both above 170). The fast-path state of those runs is per Quinn's build check (`l56dj370` / `hmrk01b1`). **partial**: K13, K16, K17 and M10 are not all confirmed on in that run.
+- Fork 32K comparison (no roadmap gate): fork 162.8 default / 162.7 greedy (Bea, Nov 5); ours 156.3 default (−4.0%) and 148.1 greedy (−9.0%). Greedy is slower than default on our build, unexplained; a 5-run rerun is open.
+- Greedy-identical with each switch at 0: **no evidence** for any switch. Quinn's step 1c matrix (below) shows each switch took effect and gives per-switch greedy counts, but those counts are not the criterion Charlie chose.
+- Verdict: no criterion met in full.
+
+**Flint step 1 (Quinn's verification, `quinn-step1-verify.md`, 2026-11-08)**
+- 1a Flash-V100 vs TRITON_ATTN: **confirmed**. Backends correct; 18 of 37 greedy outputs identical; runs repeat.
+- 1b single-stream decode: **confirmed** (numbers above). Label nit: the e2e JSON carries the hard-coded fork label `bea-baseline-e66530b`.
+- 1c kill-switch matrix: **arms and numbers confirmed**; decision is Astro's. Greedy identity per switch: GEMV 1/5, QPN 1/5, QK_ROPE 1/5, ROUTER 1/5, SAMPLER 5/5 (vacuous: greedy never reaches the sampler), ATTN 2/5, AR_RMSNORM 5/5. Model-level teacher-forced evidence is missing for MODELOPT_NVFP4_GEMV, FLINT_MOE_QPN_DECODE and FLINT_ATTN_FUSED_DECODE. `ATTN_FUSED_DECODE` logs nothing, so its route is not confirmed by a log line.
+- 1d M5 quality on `a3dc3b2`: 5 of 6 **confirmed** (math 10/10, code 5/5, needle@32K 3/3, concurrency 20 clean, parse checks 4/4). **LMCache prefix reuse not shown**: the second-send speedup came from vLLM's GPU prefix cache, not LMCache retrieve. Needs a prefix-cache reset between sends and external-source token counts.
+- Still pending: 1c for the three uncovered switches (teacher-forced), 1d LMCache reuse. Bea's cutover finding stands (prod `vllm-lmcache.service` cannot register the new build's KV).
 
 **Phase 5 exit**: not started (C1-C4 not run).
 
 ## Nodes with no GPU exit-test evidence
 
-- **Not run:** K01, N2, M2, K04, K06, K10, M8, M9, M11, U5, C1, C3, C4
+- **Not run:** K01, N2, M2, K04, K06, K10, M9, M11, U5, C1, C3, C4 (M8 closed by decision, see table)
 - **Failed:** K09 (opcheck FP8 dtype; probably test-side), K18 (trace test; probably test-side)
 - **Unverified or partial:** U2, M5 (quality suite missing), M6 (TP2 e2e), M7, K03, K07 (acceptance), K08, K13 (greedy identity), K14 (n=4 drop; n=20 sweep), K16 (greedy identity), K17 (pass-firing, switch-off identity), M10, M10a, C2
 
