@@ -57,6 +57,38 @@ logger = logging.getLogger("vllm.sm70")
 
 FULL_WINDOW = (-1, -1)
 
+VERIFY_SWITCH = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+_verify_logged = False
+
+
+def verify_kernel_enabled() -> bool:
+    """B2 kill switch: only "0" acts (K07's XQA expansion runs instead)."""
+    return os.environ.get(VERIFY_SWITCH) != "0"
+
+
+def use_verify_kernel(
+    query: torch.Tensor, key_cache: torch.Tensor, metadata: FlashAttnV100Metadata
+) -> bool:
+    """B2 takes a K07 verify batch whose requests all have 8 tokens."""
+    return (
+        bool(getattr(metadata, "spec_verify", False))
+        and getattr(metadata, "verify_query_len", 0) == fv100.VERIFY_QUERY_LEN
+        and verify_kernel_enabled()
+        and fv100.verify_supported(query, key_cache)
+    )
+
+
+def _log_verify_once() -> None:
+    global _verify_logged
+    if not _verify_logged:
+        _verify_logged = True
+        logger.info(
+            "vllm_sm70: Flash-V100 DFlash2 verify kernel active (8 tokens per "
+            "request, KV read once; %s=0 keeps the K07 XQA expansion).",
+            VERIFY_SWITCH,
+        )
+
+
 SMALL_BATCH_SWITCH = "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
 SMALL_BATCH_ROWS = 16  # two DFlash2 verify requests (8 rows each)
 SMALL_BATCH_PARTITION = 256
@@ -144,6 +176,21 @@ def run_decode(
         hints = dict(max_seq_len_hint=envelope, workspace_seq_capacity_hint=envelope)
     else:
         hints = dict(max_seq_len_hint=max(metadata.max_seq_len, 1))
+    if use_xqa(q, key_cache, window, sinks) and use_verify_kernel(
+        q, key_cache, metadata
+    ):
+        _log_verify_once()
+        fv100.flash_attn_decode_verify(
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=scale,
+            out=out,
+            **hints,
+        )
+        return
     if use_xqa(q, key_cache, window, sinks):
         partition = small_batch_partition(num) if captured else None
         if partition is not None:

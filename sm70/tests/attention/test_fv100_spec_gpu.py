@@ -398,6 +398,132 @@ def test_small_batch_graph_at_long_envelopes(
         assert diff < MAX_ABS, (step, lens[:batch], diff)
 
 
+# ------------------------- B2: verify kernel (KV read once per request)
+
+VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+# Lengths around the 128-key partition and 32-key tile edges, and long ones.
+B2_LENS = [8, 31, 127, 128, 129, 161, 300, 4096, 4097, 40000]
+
+
+def _verify_forward(ours_b, ours, layer, q, kv, cm, out):
+    md = ours_b.build(0, cm)
+    assert md.verify_query_len == L
+    ours.forward(layer, q, None, None, kv, md, out)
+
+
+@pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
+@pytest.mark.parametrize("block_size", [16, 832])
+@pytest.mark.parametrize("batch", [1, 3])
+@torch.inference_mode()
+def test_verify_kernel_matches_triton_and_k07(
+    fv100_gpu, monkeypatch, heads, block_size, batch
+):
+    """Eager: the verify kernel against TRITON_ATTN and against K07's XQA
+    expansion (switch off), over lengths at partition and tile edges."""
+    device, fv100 = fv100_gpu
+    d, capacity = 256, 65536
+    ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, capacity)
+    ours, tri = _impls(heads, d)
+    width = -(-capacity // block_size)
+    pool = -(-max(B2_LENS) // block_size) + 8
+    kv = _kv(pool, block_size, heads[1], d, device, seed=31)
+    layer = _layer(device)
+    for i in range(0, len(B2_LENS), batch):
+        lens = (B2_LENS[i : i + batch] + B2_LENS[:batch])[:batch]
+        table = _table(batch, width, pool, device, seed=32 + i)
+        q = _q(L * batch, heads, d, device, seed=33 + i)
+        cm = _cm([L] * batch, lens, table, device)
+        monkeypatch.delenv(VERIFY, raising=False)
+        fv100.clear_workspaces()
+        out = torch.empty_like(q)
+        _verify_forward(ours_b, ours, layer, q, kv, cm, out)
+        assert any(
+            k[4] == fv100.VERIFY_PARTITION_SIZE for k in fv100._decode_workspace_cache
+        )
+        ref = torch.empty_like(q)
+        tri.forward(layer, q, None, None, kv, tri_b.build(0, cm), ref)
+        monkeypatch.setenv(VERIFY, "0")
+        k07 = torch.empty_like(q)
+        ours.forward(layer, q, None, None, kv, ours_b.build(0, cm), k07)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), lens
+        diff = (out.float() - ref.float()).abs().max().item()
+        assert diff < MAX_ABS, (lens, diff)
+        diff_k07 = (out.float() - k07.float()).abs().max().item()
+        assert diff_k07 < MAX_ABS, (lens, diff_k07)
+
+
+@pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
+@pytest.mark.parametrize("capacity", [32768, 150000], ids=["env32k", "env150k"])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@torch.inference_mode()
+def test_verify_kernel_graph_replays_after_rebuild(
+    fv100_gpu, monkeypatch, heads, capacity, batch
+):
+    """A captured verify batch (grid sized for the envelope) replays fresh
+    lengths, tables and queries, including contexts above 32K."""
+    device, fv100 = fv100_gpu
+    monkeypatch.delenv(VERIFY, raising=False)
+    d, block_size = 256, 16
+    fv100.clear_workspaces()
+    ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, capacity)
+    ours, tri = _impls(heads, d)
+    width = -(-capacity // block_size)
+    pool = 512
+    table = _table(batch, width, pool, device, seed=41)
+    kv = _kv(pool, block_size, heads[1], d, device, seed=42)
+    layer = _layer(device)
+    q = _q(L * batch, heads, d, device, seed=43)
+    out = torch.empty_like(q)
+    lens0 = [4096] * batch
+    ours_b.build(0, _cm([L] * batch, lens0, table, device))
+    md = ours_b.build_for_cudagraph_capture(_cm([L] * batch, lens0, table, device))
+    assert md.verify_query_len == L
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        ours.forward(layer, q, None, None, kv, md, out)
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ours.forward(layer, q, None, None, kv, md, out)
+    steps = [[129, 4096, 8, 1000], [min(capacity, 40000), 300, 31000, 128]]
+    for step, lens in enumerate(steps):
+        lens = lens[:batch]
+        q.copy_(_q(L * batch, heads, d, device, seed=50 + step))
+        table.random_(0, pool)
+        cm = _cm([L] * batch, lens, table, device)
+        ours_b.build(0, cm)
+        graph.replay()
+        ref = torch.empty_like(q)
+        tri.forward(layer, q, None, None, kv, tri_b.build(0, cm), ref)
+        torch.cuda.synchronize()
+        diff = (out.float() - ref.float()).abs().max().item()
+        assert diff < MAX_ABS, (step, lens, diff)
+
+
+@torch.inference_mode()
+def test_verify_kernel_padding_requests_write_zeros(fv100_gpu):
+    """Rows whose request has seq_len 0 (CUDA-graph padding) come out zero."""
+    device, fv100 = fv100_gpu
+    heads, d, block_size = (12, 2), 256, 16
+    pool, width = 64, 8
+    kv = _kv(pool, block_size, heads[1], d, device, seed=61)
+    k, v = fv100.split_lbnhc_kv_cache(kv, d)
+    q = _q(2 * L, heads, d, device, seed=62)
+    table = _table(2 * L, width, pool, device, seed=63)
+    table[L:] = table[L : L + 1]  # each request's rows share one table row
+    table[:L] = table[:1]
+    lens = torch.tensor(
+        [100 - L + 1 + j for j in range(L)] + [0] * L, dtype=torch.int32, device=device
+    )
+    out = torch.full_like(q, 7.0)
+    fv100.flash_attn_decode_verify(q, k, v, table, lens, out=out, max_seq_len_hint=128)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out[:L]).all()
+    assert torch.count_nonzero(out[L:]) == 0
+
+
 # -------------------------------------- mixed batch: verify rows vs prefill
 
 

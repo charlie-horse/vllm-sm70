@@ -14,6 +14,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import torch  # noqa: E402
 from _fv100_ref import decode_reference, prefill_reference  # noqa: E402
 
 
@@ -24,7 +25,26 @@ class CpuOps:
     def __call__(self, name: str):
         if "prefill" in name:
             return self._prefill(name)
+        if name == "fv100_decode_verify":
+            return self._verify(name)
         return self._decode(name)
+
+    def _verify(self, name):
+        # B2: same expanded-row contract as the XQA decode (row b's query at
+        # position seq_lens[b] - 1), 8 rows per request, 128-key partitions.
+        def op(out, q, k, v, table, lens, tmp, mx, es, scale, query_len, launch):
+            assert query_len == 8 and q.shape[0] % 8 == 0
+            assert launch * 128 >= int(lens.max()), (launch, int(lens.max()))
+            assert tmp.shape[2] >= launch and mx.shape[2] >= launch
+            for r in range(0, q.shape[0], 8):  # one table row per request
+                assert torch.equal(table[r : r + 8], table[r : r + 1].expand(8, -1))
+            self.calls.append(
+                (name, {"rows": q.shape[0], "launch": launch, "query_len": query_len})
+            )
+            ref = decode_reference(q, k, v, table, lens, scale=scale)
+            out.copy_(ref.to(out.dtype))
+
+        return op
 
     def _decode(self, name):
         def op(

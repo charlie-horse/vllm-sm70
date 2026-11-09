@@ -397,6 +397,7 @@ def _run_case(
 @pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
 def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_VERIFY_KERNEL", "0")  # B2 off
     names = _run_case(
         monkeypatch,
         cpu_ops,
@@ -409,6 +410,95 @@ def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     )
     assert names == ["fv100_decode_paged_xqa"]
     assert cpu_ops.calls[0][1]["rows"] == 3 * L
+
+
+# ------------------------------------------------- B2: verify kernel route
+
+VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+
+
+@pytest.fixture
+def verify_op(monkeypatch, cpu_ops):
+    # The verify op as if _sm70_C had it (the CPU stand-in runs it).
+    from vllm_sm70.ops import fv100
+
+    real = fv100.has_op
+    monkeypatch.setattr(
+        fv100, "has_op", lambda name: name == fv100.VERIFY_OP or real(name)
+    )
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    monkeypatch.delenv(VERIFY, raising=False)
+    return cpu_ops
+
+
+@requires_vllm
+@pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
+def test_uniform_verify_takes_the_verify_kernel(monkeypatch, verify_op, heads):
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=heads,
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=[L, L, L],
+        seq_lens=[300, 9, 1000],
+    )
+    assert names == ["fv100_decode_verify"]
+    call = verify_op.calls[0][1]
+    assert call["rows"] == 3 * L and call["launch"] == -(-1000 // 128)
+
+
+@requires_vllm
+@pytest.mark.parametrize(
+    "heads,query_lens,env",
+    [
+        ((12, 2), [L, 5, L], None),  # not every request has 8 tokens
+        ((8, 2), [L, L], None),  # GQA 4: XQA only
+        ((12, 2), [L, L], "0"),  # kill switch
+    ],
+    ids=["ragged", "gqa4", "switch-off"],
+)
+def test_other_verify_batches_keep_xqa(monkeypatch, verify_op, heads, query_lens, env):
+    if env is not None:
+        monkeypatch.setenv(VERIFY, env)
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=heads,
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=query_lens,
+        seq_lens=[400 + 10 * i for i in range(len(query_lens))],
+    )
+    assert names == ["fv100_decode_paged_xqa"]
+
+
+@requires_vllm
+def test_builder_marks_uniform_verify_batches(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    b = _builder(monkeypatch)
+    assert b.build(0, _cm([L, L], [300, 40])).verify_query_len == L
+    assert b.build(0, _cm([L, 3], [300, 40])).verify_query_len == 0
+    assert b.build(0, _cm([L, L, 20], [300, 40, 500])).verify_query_len == L
+    assert b.build(0, _cm([1, 1], [300, 40])).verify_query_len == 0
+    cap = b.build_for_cudagraph_capture(_cm([L] * 4, [L] * 4))
+    assert cap.verify_query_len == L
+
+
+def test_verify_switch_registered_and_reads_only_zero(monkeypatch):
+    from vllm_sm70 import envs
+    from vllm_sm70.attention.flash_v100 import dispatch
+
+    assert VERIFY in envs._SECTIONS["attention"]
+    assert dispatch.VERIFY_SWITCH == VERIFY
+    for value, on in ((None, True), ("1", True), ("0", False)):
+        if value is None:
+            monkeypatch.delenv(VERIFY, raising=False)
+        else:
+            monkeypatch.setenv(VERIFY, value)
+        assert dispatch.verify_kernel_enabled() is on
 
 
 @requires_vllm

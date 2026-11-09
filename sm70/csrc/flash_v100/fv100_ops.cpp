@@ -23,6 +23,11 @@
 // between launches; the kernel's last CTA re-zeroes its counter). Shapes the
 // fused kernel does not take ignore the counters and decode in two launches.
 //
+// B2 adds `fv100_decode_verify` (verify_decode.cu, new code): DFlash2 verify
+// rows (8 query tokens per request, K07-expanded seq_lens and block table)
+// in one CTA per (request, kv head, 128-key partition), so each verify step
+// reads the KV once, plus its reducer. D256, GQA 6/8, fp16 KV only.
+//
 // KV cache views: k_cache and v_cache are [num_blocks, block_size, H_kv, D]
 // views with arbitrary strides in the first three dims and a contiguous last
 // dim. Upstream v0.33.0 (LBNHC) interleaves K and V per head, so a view has
@@ -188,6 +193,14 @@ void prefill_paged_sinks(at::Tensor out, const at::Tensor& q,
       std::nullopt, 0, sinks);
 }
 
+// B2: defined in verify_decode.cu.
+void decode_verify(at::Tensor out, const at::Tensor& q,
+                   const at::Tensor& k_cache, const at::Tensor& v_cache,
+                   const at::Tensor& block_table, const at::Tensor& seq_lens,
+                   at::Tensor tmp_out, at::Tensor max_logits,
+                   at::Tensor exp_sums, double softmax_scale,
+                   int64_t query_len, int64_t launch_num_partitions);
+
 }  // namespace vllm_sm70::fv100
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
@@ -238,6 +251,19 @@ TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
   m.impl("fv100_decode_paged_xqa", &vllm_sm70::fv100::decode_paged_xqa);
   m.impl("fv100_prefill_paged", &vllm_sm70::fv100::prefill_paged);
   m.impl("fv100_prefill_paged_sinks", &vllm_sm70::fv100::prefill_paged_sinks);
+}
+
+// B2: DFlash2 verify attention, KV read once per verify step.
+TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
+  m.def(
+      "fv100_decode_verify(Tensor(a!) out, Tensor q, Tensor k_cache, Tensor "
+      "v_cache, Tensor block_table, Tensor seq_lens, Tensor(b!) tmp_out, "
+      "Tensor(c!) max_logits, Tensor(d!) exp_sums, float softmax_scale, int "
+      "query_len, int launch_num_partitions) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
+  m.impl("fv100_decode_verify", &vllm_sm70::fv100::decode_verify);
 }
 
 #ifdef VLLM_SM70_FV100_FUSED_DECODE
