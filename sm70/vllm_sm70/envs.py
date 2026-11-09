@@ -6,9 +6,11 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  Two reviewed exceptions select a kernel, both off by default until
-  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
+  One reviewed exception selects a kernel and stays off by default:
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32, not recommended).
+- VLLM_SM70_DFLASH2_FP16 (K18 + M9a) is auto (`_auto_opt_in`): the code
+  decides (on for the Qwen3.8 DFlash2 verifier contract, M9), "0" turns it
+  off, and "1" forces it on for A/B runs. See its comment.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -67,16 +69,19 @@ def opt_in(name: str) -> Callable[[], bool]:
 
 
 def _auto_opt_in(name: str) -> Callable[[], bool | None]:
-    """Tri-state getter: True for "1", None when unset (the caller decides
-    from the model, "auto"), False for any other value (so "0" turns it off).
+    """Tri-state getter: "0" -> False (kill switch rule: only "0" turns a
+    feature off), "1" -> True (forced on, for A/B runs), anything else,
+    unset included -> None ("auto": the code decides from the model).
     Used by VLLM_SM70_DFLASH2_FP16 (K18) since M9 made it auto-on for the
     Qwen3.8 DFlash2 verifier contract."""
 
     def getter() -> bool | None:
         value = os.environ.get(name)
-        if value is None:
-            return None
-        return value == "1"
+        if value == "0":
+            return False
+        if value == "1":
+            return True
+        return None
 
     getter.__name__ = f"auto_opt_in_{name}"
     return getter
@@ -213,12 +218,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # than M6 TurboMind at M=24/32 (c=3/4); it logs a warning when used.
         "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
         # K18 (vllm_sm70/ops/dflash2.py): the DFlash2 draft FP16 M<=8 GEMM
-        # (+ M9a's channel-FP8 route, which rides on it). "1" forces it on,
-        # "0" (or any other value) off. UNSET = AUTO (M9, 2026-11-09): on iff
+        # (+ M9a's channel-FP8 route, which rides on it). "0" off, "1" forced
+        # on; unset or any other value = AUTO (M9, 2026-11-09): on iff
         # the DFlash2 verifier resolves on (Qwen3.8-27B + DFlash2 k=7; not
         # with VLLM_SM70_DFLASH2_VERIFIER=0), else off. Evidence: E3 A/B,
         # row 4 TP2, 43.1 -> 41.1 ms/step, acceptance unchanged. Costs a
-        # second draft weight copy (~1.6 GB/GPU for the 27B draft at TP2).
+        # second draft weight copy (~0.85 GiB/GPU for the 27B draft at TP2).
         # Off: get_unquantized_gemm returns None, nothing is marked or
         # packed. Read once (selection cached) when layers are built/loaded.
         "VLLM_SM70_DFLASH2_FP16": _auto_opt_in("VLLM_SM70_DFLASH2_FP16"),

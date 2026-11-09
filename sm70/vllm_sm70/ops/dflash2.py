@@ -13,7 +13,7 @@ How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
   :func:`prepare_dflash2_fp16_m8` packed, and calls ``F.linear`` (UP
   ``default_unquantized_gemm``) for everything else. M7's DFlash2 draft
   subclass marks the layers at construction and packs them in load_weights.
-Switch: ``VLLM_SM70_DFLASH2_FP16``: "1" on, any other value off, unset = auto
+Switch: ``VLLM_SM70_DFLASH2_FP16``: "0" off, "1" forced on, anything else = auto
   (:func:`k18_wanted`: on iff the DFlash2 verifier resolves on, i.e. the
   Qwen3.8 + DFlash2 k=7 contract; M9 decision 2026-11-09). Off:
   ``get_unquantized_gemm`` returns None (upstream dispatch, untouched),
@@ -138,23 +138,38 @@ def gemm_available() -> bool:
     return all(has_op(name) for name in GEMM_OPS)
 
 
+# The auto decision from vLLM's current config, resolved once per process
+# (UP calls the U1 hook on every lm_head / router-gate forward, where no config
+# may be current). reset_selection_cache() clears it.
+_auto_decision: bool | None = None
+
+
 def k18_wanted(vllm_config: Any = None) -> bool:
-    """The K18 switch. "1" -> True, set to anything else -> False, unset ->
-    auto: True iff the DFlash2 verifier resolves on for ``vllm_config``
-    (default: vLLM's current config; none set -> False). Auto reuses M9a's
-    gate (dflash2_fp8.draft_fp8_wanted), so K18 and M9a turn on together and
-    VLLM_SM70_DFLASH2_VERIFIER=0 turns both off."""
+    """The K18 switch. "0" -> False, "1" -> True, otherwise auto: True iff
+    the DFlash2 verifier resolves on for ``vllm_config`` (default: vLLM's
+    current config, decided once and cached; none current -> False, not
+    cached). Auto reuses M9a's gate (dflash2_fp8.draft_fp8_wanted), so K18 and
+    M9a turn on together and VLLM_SM70_DFLASH2_VERIFIER=0 turns both off."""
+    global _auto_decision
     value = envs.VLLM_SM70_DFLASH2_FP16
     if value is not None:
         return value
-    if vllm_config is None:
-        try:
-            from vllm.config import get_current_vllm_config_or_none
-        except ImportError:  # pragma: no cover - vllm layout changed
-            return False
-        vllm_config = get_current_vllm_config_or_none()
-        if vllm_config is None:
-            return False
+    if vllm_config is not None:
+        return _auto_from(vllm_config)
+    if _auto_decision is not None:
+        return _auto_decision
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+    except ImportError:  # pragma: no cover - vllm layout changed
+        return False
+    current = get_current_vllm_config_or_none()
+    if current is None:
+        return False
+    _auto_decision = _auto_from(current)
+    return _auto_decision
+
+
+def _auto_from(vllm_config: Any) -> bool:
     try:
         return bool(dflash2_fp8.draft_fp8_wanted(vllm_config))
     except Exception:
@@ -207,11 +222,16 @@ def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] 
     on every forward of lm_head (UP vocab_parallel_embedding.py:83) and the
     MoE router gate (UP moe_runner.py:910), so the answer is cached per
     linear_backend for the process. reset_selection_cache() clears it.
+    None unless K18 is wanted (:func:`k18_wanted`: VLLM_SM70_DFLASH2_FP16=1,
+    or auto with the Qwen3.8 DFlash2 verifier contract) and the ops are built,
+    and for an explicit FlashInfer BF16 backend. Logs once when it selects.
     """
     return _select_cached(linear_backend, k18_wanted())
 
 
 def reset_selection_cache() -> None:
+    global _auto_decision
+    _auto_decision = None
     _select_cached.cache_clear()
 
 
@@ -231,6 +251,12 @@ def _select_cached(linear_backend: str, wanted: bool) -> Callable[..., Any] | No
             return None
     except Exception:  # pragma: no cover - vllm layout changed
         return None
+    logger.info(
+        "vllm_sm70: K18 DFlash2 draft GEMM dispatcher selected (%s)",
+        "VLLM_SM70_DFLASH2_FP16=1"
+        if envs.VLLM_SM70_DFLASH2_FP16
+        else "auto: DFlash2 verifier contract",
+    )
     return dflash2_unquantized_gemm
 
 

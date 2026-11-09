@@ -62,9 +62,11 @@ def test_switch_registered_auto_opt_in(monkeypatch):
     assert KILL in envs._SECTIONS["ops"]
     monkeypatch.delenv(KILL)
     assert envs.VLLM_SM70_DFLASH2_FP16 is None  # unset = auto (M9)
-    for value in ("0", "", "true", "on", " 1"):
+    for value in ("", "true", "on", " 1", "off", " 0"):
         monkeypatch.setenv(KILL, value)
-        assert envs.VLLM_SM70_DFLASH2_FP16 is False, value
+        assert envs.VLLM_SM70_DFLASH2_FP16 is None, value  # auto: only "0" kills
+    monkeypatch.setenv(KILL, "0")
+    assert envs.VLLM_SM70_DFLASH2_FP16 is False
     monkeypatch.setenv(KILL, "1")
     assert envs.VLLM_SM70_DFLASH2_FP16 is True
 
@@ -603,9 +605,28 @@ def test_auto_select_and_mark_follow_current_config(_auto, monkeypatch):
         _fake_decoder_layer(_linear_method()), vllm_config=_qwen38_cfg()
     )
     assert marked
+    # Decided once per process: forward-time calls with no current config
+    # keep the answer (UP calls the hook on every lm_head forward).
+    monkeypatch.setattr(vc, "get_current_vllm_config_or_none", lambda: None)
+    assert dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
+    assert dflash2.k18_wanted()
+    # reset_selection_cache() re-decides from the (new) current config.
     monkeypatch.setattr(
         vc,
         "get_current_vllm_config_or_none",
         lambda: _qwen38_cfg(arch="Qwen3_5MoeForConditionalGeneration"),
     )
-    assert dflash2.select_unquantized_gemm("auto") is None  # not stuck in cache
+    dflash2.reset_selection_cache()
+    assert dflash2.select_unquantized_gemm("auto") is None
+
+
+def test_select_logs_once(_auto, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv(KILL, "1")
+    dflash2.reset_selection_cache()
+    with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+        for _ in range(3):
+            dflash2.select_unquantized_gemm("auto")
+    hits = [r for r in caplog.records if "dispatcher selected" in r.getMessage()]
+    assert len(hits) == 1 and "VLLM_SM70_DFLASH2_FP16=1" in hits[0].getMessage()
