@@ -269,6 +269,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "models": {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
         "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
+        # "0": Sm70Config.flint_moe_compact=False (Flint NVFP4 MoE dense stage
+        # with M*top_k <= 80 slots goes back to per-expert offsets). New name:
+        # the fork's compact slot route has no switch.
+        "VLLM_SM70_FLINT_MOE_COMPACT": kill_switch("VLLM_SM70_FLINT_MOE_COMPACT"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".

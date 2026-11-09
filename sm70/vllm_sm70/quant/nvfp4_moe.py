@@ -17,7 +17,8 @@ Why: on cc 7.0, UP's NVFP4 MoE backend selection has no kernel (Marlin and
   quantization/nvfp4_sm70_moe.py:794-1731 (ModelOptNvFp4SM70MoEMethod), pruned
   to Flint's TP2 dense-stage route. Dropped from the fork: Qwen3.8 QPN /
   fused-SwiGLU / raw-scale / grouped lanes (:158-520), the GLM-5.3 lanes
-  (:311-335, 685-717, 994-1037), the single-token compact slots (:528-620),
+  (:311-335, 685-717, 994-1037), the M=1 direct single-token slots
+  (:527-568, :1550-1558; M=1 takes K12 or the compact slot groups below),
   the persistent single-launch decode (:293-310), and diagnostics
   (:1688-1716).
   M<=2 decode: at load, layers that ``vllm_sm70.ops.flint_moe.admit_layer``
@@ -25,10 +26,18 @@ Why: on cc 7.0, UP's NVFP4 MoE backend selection has no kernel (Marlin and
   and the device's shared split-K workspace; ``apply`` sends calls that
   ``flint_moe.can_decode`` accepts (M in {1, 2}) to the K12 two-kernel
   decode. Everything else stays on the dense-stage route.
+  Compact slot groups (FORK :570-618, :718-721, :1619-1636): when the dense
+  stage serves M*top_k <= 80 routed slots, both stages run with one row per
+  slot (``_stage_groups``), one grouped TurboMind launch each. Above 80
+  slots they use per-expert offsets, and TurboMind's grouped prefill takes
+  rows > 64. Without compact groups, 18..64 slots (Flint M 3..10) fall
+  into TurboMind's per-expert loop: 256 launches per stage.
 Kill-switch: ``Sm70Config.flint_moe_qpn_decode`` /
   ``VLLM_SM70_FLINT_MOE_QPN_DECODE=0`` turns off the M<=2 decode fast path
-  (K12 ops). The dense stage then serves every M. ``VLLM_SM70_QUANT=0`` (M2)
-  disables the whole route.
+  (K12 ops). The dense stage then serves every M.
+  ``Sm70Config.flint_moe_compact`` / ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns
+  off the compact slot groups (per-expert offsets for every M).
+  ``VLLM_SM70_QUANT=0`` (M2) disables the whole route.
 
 Ops: Kai's, only through ``vllm_sm70.ops.tm`` (K03): nvfp4_sm70_prepare,
 awq_moe_build_strided_ptrs, nvfp4_moe_dense_stage_sm70_out (W13 always runs on
@@ -160,6 +169,15 @@ def decode_policy_enabled(vllm_config: Any = None) -> bool:
     return bool(sm70_config(vllm_config).flint_moe_qpn_decode)
 
 
+def compact_policy_enabled(vllm_config: Any = None) -> bool:
+    """Sm70Config.flint_moe_compact after VLLM_SM70_FLINT_MOE_COMPACT=0."""
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+    return bool(sm70_config(vllm_config).flint_moe_compact)
+
+
 def _flint_moe():
     """Kai's K12 wrappers (vllm_sm70.ops.flint_moe), or None if not importable."""
     try:
@@ -208,6 +226,13 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         self.use_global_sf = False  # read by UP create_weights (modelopt.py:1009)
         validate_contract(moe_config)
         self.decode_enabled = decode_policy_enabled()
+        self.compact_enabled = compact_policy_enabled()
+        logger.info_once(
+            "SM70 NVFP4 MoE: compact slot groups %s for dense-stage calls with "
+            "M*top_k <= %d (VLLM_SM70_FLINT_MOE_COMPACT=0 disables them).",
+            "enabled" if self.compact_enabled else "DISABLED",
+            moe_rt.COMPACT_MAX_SLOTS,
+        )
 
     # create_weights: inherited from UP ModelOptNvFp4FusedMoE (modelopt.py:912).
 
@@ -451,14 +476,17 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         tm = _tm()
         output = torch.zeros((num_tokens, hidden), dtype=x.dtype, device=x.device)
         moe_rt.route_materialized(buffers, x, topk_ids, experts, top_k)
+        stage_offsets, stage_expert_ids, stage_experts = self._stage_groups(
+            buffers, num_tokens, top_k, experts
+        )
         tm.nvfp4_moe_dense_stage_sm70_out(
             buffers["gate_up"],
             buffers["permuted_input"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_expert_ids,
             layer.w13_strided_ptrs_w,
             layer.w13_strided_ptrs_s,
-            experts,
+            stage_experts,
             hidden,
             2 * inter,
             NVFP4_GROUP_SIZE,
@@ -467,16 +495,58 @@ class ModelOptNvFp4Sm70MoEMethod(Sm70MoEMethodBase, ModelOptNvFp4FusedMoE):
         tm.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
             buffers["intermediate"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_expert_ids,
             layer.w2_strided_ptrs_w,
             layer.w2_strided_ptrs_s,
-            experts,
+            stage_experts,
             inter,
             hidden,
             NVFP4_GROUP_SIZE,
         )
+        # Unpermute always uses the per-expert offsets (FORK :1683-1685).
         return moe_rt.unpermute(buffers, topk_weights, output)
+
+    def _stage_groups(
+        self,
+        buffers: dict[str, torch.Tensor],
+        num_tokens: int,
+        top_k: int,
+        experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """(offsets, expert ids, group count) for both dense stages.
+
+        ported from FORK nvfp4_sm70_moe.py:1619-1640. With M*top_k <= 80 each
+        routed slot is its own one-row group (offsets 0..slots, ids = the
+        sorted expert id of each permuted row), which TurboMind's compact
+        grouped dispatch serves in one launch per stage (tm_moe_sm70.cu:
+        input rows == group count <= 80). Duplicate expert ids stay separate
+        groups (FORK :606-609). Otherwise: per-expert offsets over all experts.
+        FORK _prepare_compact_slot_groups copies the sorted ids into an
+        active_expert_ids buffer with a Triton kernel and rewrites the
+        constant offsets each call. Here one torch.clamp writes the sorted
+        ids, clamped to [0, experts), into the persistent compact_expert_ids
+        buffer (the clamp handles padding routes, see below), and the offsets
+        are a persistent arange.
+        """
+        if self.compact_enabled and moe_rt.use_compact_grouped(num_tokens, top_k):
+            slots = num_tokens * top_k
+            # Padding routes: UP routers set padding tokens' ids to -1
+            # (VLLM_MOE_SKIP_PADDING=1, router/fused_topk_router.py), and
+            # every token is padding in CUDA-graph capture dummy runs
+            # (gpu_model_runner.py:5753). moe_permute maps them to the
+            # sentinel id `experts` (moe_permute_unpermute_op.cu:108-117).
+            # Per-expert offsets skip those rows, but a compact group would
+            # index the pointer table at `experts`, one past the end: the
+            # illegal memory access at capture on c4130 (#97 A/B). Clamp the
+            # group ids into a persistent buffer so those rows run on a real
+            # expert. Their output is discarded: padding tokens have weight 0
+            # and nothing reads their rows. The fork predates padding skip.
+            ids = buffers["compact_expert_ids"][:slots]
+            sorted_ids = buffers["sorted_experts"].reshape(slots)
+            torch.clamp(sorted_ids, 0, experts - 1, out=ids)
+            return buffers["compact_offsets"][: slots + 1], ids, slots
+        return buffers["expert_offsets"], buffers["dense_expert_ids"], experts
 
 
 def build_moe_method(quant_config: Any, moe_config: FusedMoEConfig):
