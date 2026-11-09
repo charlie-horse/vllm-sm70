@@ -13,7 +13,7 @@ Host names below are as used elsewhere in the repo. Keep IPs, tailnet names and 
 - [ ] Bea's GPU gate passed on the same commit, in a downtime window (00:00–06:00 ET, per `docs/release.md`).
 - [ ] `main` CI is green on that commit.
 - [ ] Astro says OK.
-- [ ] `latest` is fast-forwarded to that commit (`docs/release.md`, "Moving `latest`"). The current `latest` is the bootstrap `3869cd6`, which has not passed the gates and must not be deployed.
+- [ ] `latest` is fast-forwarded to `cef0f9e`, the build C1 validated (`docs/release.md`, "Moving `latest`"). Do not point it at newer `main`. The current `latest` is the bootstrap `3869cd6`, which has not passed the gates and must not be deployed.
 - [ ] The rollback target (the fork's current flake input and `vllm-lmcache` unit) is recorded, see section 5.
 
 ## 1. GC c4130 (before the switch)
@@ -45,7 +45,10 @@ The host flake (charlie-horse/flake, `hosts/c4130/vllm`) consumes this repo. Cha
    nix flake update <vllm-input-name>
    ```
 2. Build the closure on the build host first (r440), then realise it on c4130 with `nix-store --realise <outPath>` (same method as `docs/phase1-gpu-runbook.md` section 1). Do not switch yet.
-3. Confirm the outPath matches the commit on `latest`.
+3. Confirm the outPath matches `cef0f9e`.
+4. **Host config for Flint** (set in the host flake, on the `vllm` module's Flint model entry):
+   - `maxNumSeqs = 20`. The module default is 2 (`nix/module.nix:73`), but C1 and prod ran 20. Without this override the host serves at 2.
+   - Reasoning parser `glm47_sm70` (`--reasoning-parser glm47_sm70`, `--reasoning-parser-plugin vllm_sm70.reasoning`, `nix/module.nix:96-97`). Confirm the host does not override it to `glm47`.
 
 ## 3. Replace the fork's vllm-lmcache with this flake's module
 
