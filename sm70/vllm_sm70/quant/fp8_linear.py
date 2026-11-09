@@ -226,10 +226,17 @@ _QPN8_DENSE_SCRATCH = _Qpn8DenseScratch()
 _LOGGED: set[str] = set()
 
 
-def _log_once(msg: str) -> None:
+def _log_once(msg: str, level: int = logging.INFO) -> None:
     if msg not in _LOGGED:
         _LOGGED.add(msg)
-        m8_logger.info(msg)
+        m8_logger.log(level, msg)
+
+
+M32_SLOW_WARNING = (
+    "VLLM_SM70_FP8_QPN8_M32=1 is not recommended: block QPN8 at M=17..32 "
+    "measured 27-33% slower than M6 TurboMind (Qwen3.8-27B TP2 DFlash2, "
+    "c=3/4, M8 A/B 2026-11-08); unset it to stay on M6 at these rows."
+)
 
 
 _COPY_BYTES: dict[str, int] = {}
@@ -441,6 +448,8 @@ class Fp8Sm70LinearMethod(Fp8LinearMethod):
                 else "dequantizes into a shared FP16 scratch."
             )
         )
+        if max_m > QPN8_DEFAULT_MAX_M:
+            _log_once(M32_SLOW_WARNING, logging.WARNING)
         _count_copy_bytes(device, copy_bytes)
         return True
 
