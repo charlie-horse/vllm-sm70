@@ -113,6 +113,47 @@ def test_expansion_rejects_more_rows_than_the_buffer():
         )
 
 
+def test_cpu_expansion_never_uses_the_kernel():
+    # A1's Triton expansion is CUDA-only; CPU tensors (and vLLM-free
+    # imports) keep the torch path.
+    from vllm_sm70.attention.flash_v100.spec.verify import VerifyExpansion
+
+    exp = VerifyExpansion(64, torch.device("cpu"), max_reqs=8)
+    assert not exp.uses_kernel
+
+
+@pytest.mark.parametrize(
+    "max_rows,max_reqs,row_block",
+    [(64, 8, 16), (64, None, 128), (8, 1, 2), (2048, 256, 512), (1, None, 2)],
+)
+def test_kernel_row_block_is_fixed_per_builder(max_rows, max_reqs, row_block):
+    # One compile per builder: the kernel's request block depends only on
+    # the builder's capacity, never on the step's batch.
+    from vllm_sm70.attention.flash_v100.spec.verify import VerifyExpansion
+
+    exp = VerifyExpansion(max_rows, torch.device("cpu"), max_reqs=max_reqs)
+    assert exp.row_block == row_block
+    assert exp.row_block > (max_reqs or max_rows)
+
+
+@requires_vllm
+def test_smallq_kill_switch_registered_and_reads_only_zero(monkeypatch):
+    from vllm_sm70 import envs
+    from vllm_sm70.attention.flash_v100.spec import smallq
+
+    assert smallq.KILL_SWITCH == "VLLM_SM70_FLASH_V100_SMALLQ_METADATA"
+    assert smallq.KILL_SWITCH in envs._SECTIONS["attention"]
+    monkeypatch.delenv(smallq.KILL_SWITCH, raising=False)
+    assert smallq.smallq_metadata_enabled()
+    monkeypatch.setenv(smallq.KILL_SWITCH, "1")
+    assert smallq.smallq_metadata_enabled()
+    monkeypatch.setenv(smallq.KILL_SWITCH, "0")
+    assert not smallq.smallq_metadata_enabled()
+    assert not smallq.can_expand(torch.device("cuda"))
+    monkeypatch.delenv(smallq.KILL_SWITCH)
+    assert not smallq.can_expand(torch.device("cpu"))
+
+
 def test_kill_switch_registered_and_reads_only_zero(monkeypatch):
     from vllm_sm70 import envs
     from vllm_sm70.attention.flash_v100 import spec
@@ -194,6 +235,12 @@ def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None):
         slot_mapping=torch.zeros(n, dtype=torch.int64),
         causal=causal,
     )
+
+
+@requires_vllm
+def test_builder_sizes_the_kernel_by_max_num_seqs(monkeypatch):
+    b = _builder(monkeypatch)  # max_num_seqs 8 -> rows 0..8 fit a block of 16
+    assert b.verify.max_rows == 8 * L and b.verify.row_block == 16
 
 
 @requires_vllm
