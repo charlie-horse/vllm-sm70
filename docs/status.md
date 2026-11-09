@@ -36,7 +36,7 @@ Roadmap order. Each node appears once.
 | M6 | #32, #41 | 25 CPU tests (PR #32) | **partial**: `tests.quant.test_m6_qwen_fp8` 20 of 20 unit pass in the sweep. The TP2 e2e (Qwen3.6-35B-A3B and 3.8-27B, within 32 GB/GPU) is not run | `bea/nov7/logs/gpu_sweep.junit.xml` | TP2 e2e and memory fit |
 | K05 | #37 | CPU import shows 5 fv100 ops (PR #37) | **passed**: the exit's two tests were ported under new names and pass in the sweep: `test_fv100_prefill_sinks_gpu.py` 39/39 (port of `test_sm70_flash_v100_sinks_prefill`) and `test_fv100_d256_prefill_gpu.py` 24/24 (port of `test_sm70_flash_v100_splitkv_n`) | `bea/nov7/logs/gpu_sweep.junit.xml` | none for the exit |
 | K06 | #39, #51, #83, #84 | 1099 CPU passed at e50db90 (PR #84) | **not run**: the exit (Flint TP2 4K greedy-identical over 256 tokens on 5 prompts; decode tok/s >= fork) has no evidence | `bea/nov7/logs/k14.out` (throughput only) | greedy-identity run; tok/s vs fork |
-| K07 | #51 | CPU (PR #51) | **partial**: `tests.attention.test_fv100_spec_gpu` 36 of 36 pass, including smallq 12/12. DFlash2 acceptance A/B not run. Pass (Charlie, 2026-11-08) is `accept_len` with Flash-V100 spec verify on within 2% (relative) of `VLLM_SM70_FLASH_V100_SPEC=0`, same prompts, rows 2 and 4 of `sm70/scripts/qwen_phase2/qwen_matrix.sh` | `bea/nov7/logs/gpu_sweep.junit.xml` | run the A/B with `qwen_matrix.sh 2` and `qwen_matrix.sh 4` |
+| K07 | #51 | CPU (PR #51) | **passed**: Bea's D2 A/B on main 6355538 (CUSTOM backend, same prompts, k=7). `accept_len` with Flash-V100 spec verify on vs `VLLM_SM70_FLASH_V100_SPEC=0`: row 2 3.56 vs 3.61 (−1.4%), row 4 3.94 vs 3.93 (+0.3%), both within the 2% bar; all four runs pass quality. Exit (Charlie, 2026-11-08) per `sm70/scripts/qwen_phase2/qwen_matrix.sh` rows 2 and 4. `tests.attention.test_fv100_spec_gpu` 36 of 36 pass, smallq 12/12 | `side-session-notes/local_f53bb309…/bea-qwen-blocks.md` §D2 (A/B numbers); `bea/nov7/logs/gpu_sweep.junit.xml` (fv100 spec tests) | none for the exit |
 | K08 | #33 | `sm70/tests/gdn` CPU | **partial**: `tests.gdn.test_k08_gdn_gpu` 19 pass (the rel-L2 cases pass), 2 skip (they need `SM70_TEST_TRITON_CHUNK=1`) | `bea/nov7/logs/gpu_sweep.junit.xml` | run the 2 skipped cases with `SM70_TEST_TRITON_CHUNK=1` |
 | M11 | #96 (merged, `a700639`) | n/a | **not run**: layer subclass is in #96; no GPU exit test yet | none | GPU check vs upstream |
 | K09 | #50, #65, #95 | CPU (PR #50) | **partial**: Nov 7 sweep had 1 fail, `test_opcheck` (`mul_cuda` not implemented for `Float8_e4m3fn`; test-side). #95 (merged) fixes it; rerun `-k opcheck`: 1 passed (`nov8/logs/kai3/p95.log`). The max-abs-rel < 1e-2 check is not confirmed | `bea/nov7/logs/gpu_sweep.log`, `bea/nov7/logs/k09iso.log`, `bea/nov8/logs/kai3/p95.log` | confirm the max-abs-rel < 1e-2 check; re-run the full exit |
@@ -96,9 +96,9 @@ Roadmap order. Each node appears once.
 
 - **Not run:** K01, N2, M2, K04, K06, K10, M11, U5, C1, C3, C4 (M8 closed by decision, see table)
 - **Failed in Nov 7 sweep, fixed by merged test PRs and rerun passing:** K09 (#95), K18 (#94); the exit parts that remain are in their rows
-- **Unverified or partial:** U2, M5 (LMCache reuse), M6 (TP2 e2e), M7 (e2e metrics fix, #101), M9 (M9a test, M9b), K03, K07 (acceptance), K08, K09 (max-abs-rel), K13 (greedy identity), K14 (n=20 sweep), K16 (greedy identity), K17 (pass-firing, switch-off identity), K18 (fp16 GEMM, acceptance), M10, M10a, C2
+- **Unverified or partial:** U2, M5 (LMCache reuse), M6 (TP2 e2e), M7 (e2e metrics fix, #101), M9 (M9a test, M9b), K03, K08, K09 (max-abs-rel), K13 (greedy identity), K14 (n=20 sweep), K16 (greedy identity), K17 (pass-firing, switch-off identity), K18 (fp16 GEMM, acceptance), M10, M10a, C2
 
-**Passed (GPU exit):** N0 (Phase 1), K05, K11 (suite), K12 (suite), K15, K16 (suite), M3, M4.
+**Passed (GPU exit):** N0 (Phase 1), K05, K07, K11 (suite), K12 (suite), K15, K16 (suite), M3, M4.
 
 ## Not verified in this doc
 - CPU counts beyond those stated in PR bodies; current main CI.
