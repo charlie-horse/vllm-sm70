@@ -10,21 +10,30 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-from _dflash2_helpers import dflash2_schemas  # noqa: E402
+from _dflash2_helpers import dflash2_schemas, qwen_vllm_config  # noqa: E402
 from torch import nn  # noqa: E402
+from vllm_sm70 import config as sm70_cfg  # noqa: E402
 from vllm_sm70 import envs  # noqa: E402
 from vllm_sm70.ops import dflash2  # noqa: E402
 
 KILL = "VLLM_SM70_DFLASH2_FP16"
+QWEN38 = qwen_vllm_config()
+QWEN36 = qwen_vllm_config(arch="Qwen3_5MoeForConditionalGeneration")
 
 
 @pytest.fixture(autouse=True)
-def _switch_on(monkeypatch):
-    """Most tests run opted in (=1); default-off tests delenv explicitly."""
-    monkeypatch.setenv(KILL, "1")
+def _qwen38_engine(monkeypatch):
+    """Default switch (unset = on), and the current engine is the qualified
+    Qwen3.8 DFlash2 contract. Tests that need another engine patch
+    dflash2._current_vllm_config themselves."""
+    monkeypatch.delenv(KILL, raising=False)
+    monkeypatch.delenv("VLLM_SM70_DFLASH2_VERIFIER", raising=False)
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN38)
+    sm70_cfg.clear_cache()
     dflash2.reset_selection_cache()
     yield
     dflash2.reset_selection_cache()
+    sm70_cfg.clear_cache()
 
 
 # ------------------------------------------------------------------ schemas
@@ -57,24 +66,64 @@ def test_sources_cmake_lists_both_files():
 
 
 # ---------------------------------------------------------------- env / kill
-def test_switch_registered_opt_in(monkeypatch):
+def test_switch_registered_kill_switch(monkeypatch):
+    """K18 is a kill switch since E3: unset or anything but "0" is on."""
     assert KILL in envs.environment_variables()
     assert KILL in envs._SECTIONS["ops"]
-    monkeypatch.delenv(KILL)
-    assert envs.VLLM_SM70_DFLASH2_FP16 is False  # default OFF
-    for value in ("0", "", "true", "on", " 1"):
+    assert envs.VLLM_SM70_DFLASH2_FP16 is True  # default ON (unset)
+    for value in ("", "1", "true", "on", " 0", "00", "false"):
         monkeypatch.setenv(KILL, value)
-        assert envs.VLLM_SM70_DFLASH2_FP16 is False, value
-    monkeypatch.setenv(KILL, "1")
-    assert envs.VLLM_SM70_DFLASH2_FP16 is True
+        assert envs.VLLM_SM70_DFLASH2_FP16 is True, value
+    monkeypatch.setenv(KILL, "0")
+    assert envs.VLLM_SM70_DFLASH2_FP16 is False
 
 
-def test_default_off_selects_and_marks_nothing(monkeypatch):
-    monkeypatch.delenv(KILL)
+def test_k18_wanted_only_for_the_qwen38_contract(monkeypatch):
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    assert dflash2.k18_wanted(QWEN38)
+    assert not dflash2.k18_wanted(QWEN36)  # MoE arch: not qualified
+    assert not dflash2.k18_wanted(qwen_vllm_config(k=5))
+    assert not dflash2.k18_wanted(None)
+    # Independent of the verifier switch: VERIFIER=0 is "K18 alone" (E3 B).
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_VERIFIER", "0")
+    sm70_cfg.clear_cache()
+    assert dflash2.k18_wanted(QWEN38)
+    monkeypatch.setenv(KILL, "0")
+    assert not dflash2.k18_wanted(QWEN38)
+    monkeypatch.delenv(KILL)
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: False)
+    assert not dflash2.k18_wanted(QWEN38)  # ops not built
+
+
+def test_unqualified_engine_selects_and_marks_nothing(monkeypatch):
+    """Qwen3.6 (and any engine outside the contract) keeps upstream dispatch
+    exactly, with K18's switch at its default."""
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN36)
+    assert dflash2.enabled()
     assert dflash2.select_unquantized_gemm("auto") is None
+    layer = _fake_decoder_layer(_linear_method())
+    assert dflash2.mark_draft_linears(layer, vllm_config=QWEN36) == []
+
+
+def test_selection_waits_for_an_engine_config(monkeypatch):
+    """A call with no current VllmConfig returns None and caches nothing; the
+    first call under a config decides."""
+    pytest.importorskip("vllm")
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: None)
+    assert dflash2.select_unquantized_gemm("auto") is None
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN38)
+    assert dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
+    # Decided: later calls without a config (per-forward lm_head) keep it.
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: None)
+    assert dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
+
+
+def test_killed_packs_nothing_even_when_forced(monkeypatch):
+    monkeypatch.setenv(KILL, "0")
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     assert not dflash2.enabled()
-    assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
     layer = nn.Linear(2048, 512, bias=False).half()
     monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
     assert not dflash2.mark_and_prepare(layer)  # even a forced mark packs nothing
@@ -355,20 +404,28 @@ def _fake_decoder_layer(quant_method):
     return layer
 
 
-def test_mark_draft_linears_flags_six_projections():
+def test_mark_draft_linears_flags_six_projections(monkeypatch):
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     layer = _fake_decoder_layer(_linear_method())
-    marked = dflash2.mark_draft_linears(layer)
+    marked = dflash2.mark_draft_linears(layer, vllm_config=QWEN38)  # default on
     assert len(marked) == 6
     assert all(getattr(m, dflash2.MARK_ATTR) for m in marked)
 
 
-def test_mark_skips_quantized_and_kill_switch(monkeypatch):
+def test_mark_skips_quantized_unqualified_and_kill_switch(monkeypatch):
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     _linear_method()
-    assert dflash2.mark_draft_linears(_fake_decoder_layer(object())) == []
+    layer = _fake_decoder_layer(object())
+    assert dflash2.mark_draft_linears(layer, vllm_config=QWEN38) == []
+    layer = _fake_decoder_layer(_linear_method())
+    assert dflash2.mark_draft_linears(layer, vllm_config=QWEN36) == []
     monkeypatch.setenv(KILL, "0")
-    assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
+    layer = _fake_decoder_layer(_linear_method())
+    assert dflash2.mark_draft_linears(layer, vllm_config=QWEN38) == []
     monkeypatch.delenv(KILL)
-    assert dflash2.mark_draft_linears(_fake_decoder_layer(_linear_method())) == []
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: False)
+    layer = _fake_decoder_layer(_linear_method())
+    assert dflash2.mark_draft_linears(layer, vllm_config=QWEN38) == []
 
 
 # ------------------------------------------------- reload / no autograd
@@ -466,13 +523,16 @@ def _m7_classes(monkeypatch):
 WEIGHTS = {"on": False}
 
 
-def _build_m7_layer(m7, weights=False):
+def _build_m7_layer(m7, weights=False, vllm_config=QWEN38):
+    """M7's draft decoder layer under ``vllm_config`` (default: the qualified
+    Qwen3.8 contract, so K18 marks at its default). The fake weights use the
+    Qwen3.6 TP2 shard shapes only to keep CPU tensors small; K18 admits by
+    shard shape, independently of which contract enabled it."""
     from types import SimpleNamespace
 
     WEIGHTS["on"] = weights
 
     cls = m7.DFlash2SM70Qwen3DecoderLayer
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16))
     config = SimpleNamespace(hidden_size=64, rms_norm_eps=1e-6)
     return cls(vllm_config, config=config, layer_idx=0)
 
@@ -487,6 +547,7 @@ def _marked(layer):
 
 def test_m7_layer_marks_exactly_six_projections(monkeypatch):
     m7 = _m7_classes(monkeypatch)
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     layer = _build_m7_layer(m7)
     assert layer.use_sm70_bf16_emulation
     assert _marked(layer) == {
@@ -499,23 +560,26 @@ def test_m7_layer_marks_exactly_six_projections(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("value", [None, "0"])
-def test_m7_default_marks_and_packs_nothing(monkeypatch, value):
+@pytest.mark.parametrize(
+    "engine,value",
+    [("qwen3.6", None), ("qwen3.8", "0")],
+    ids=["unqualified_default", "qwen38_killed"],
+)
+def test_m7_unqualified_or_killed_marks_and_packs_nothing(monkeypatch, engine, value):
     m7 = _m7_classes(monkeypatch)
-    if value is None:
-        monkeypatch.delenv(KILL)
-    else:
+    if value is not None:
         monkeypatch.setenv(KILL, value)
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
-    layer = _build_m7_layer(m7, weights=True)
+    cfg = QWEN36 if engine == "qwen3.6" else QWEN38
+    layer = _build_m7_layer(m7, weights=True, vllm_config=cfg)
     assert _marked(layer) == set()
     assert dflash2.prepare_marked(layer) == 0
     assert not any(hasattr(m, dflash2.PACKED_ATTR) for m in layer.modules())
 
 
-def test_m7_opt_in_marks_and_packs_six(monkeypatch):
-    m7 = _m7_classes(monkeypatch)  # autouse fixture: KILL=1
+def test_m7_qwen38_default_marks_and_packs_six(monkeypatch):
+    m7 = _m7_classes(monkeypatch)  # autouse fixture: switch unset (on)
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     monkeypatch.setattr(dflash2, "_is_sm70", lambda device: True)
     layer = _build_m7_layer(m7, weights=True)

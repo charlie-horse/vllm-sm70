@@ -17,9 +17,10 @@ How it hooks in: patch U1, through K18. ``ops.dflash2.dflash2_unquantized_gemm``
   (``FP8_MARK_ATTR``) only when the DFlash2 verifier resolves on
   (``Sm70Config.dflash2_verifier``) and k == 7. No upstream line.
 Switch: ``VLLM_SM70_DFLASH2_VERIFIER=0`` (M1) -> nothing is flagged, and K18's
-  FP16 M8 path (or F.linear) runs. The route also needs K18's opt-in
-  ``VLLM_SM70_DFLASH2_FP16=1``, because only then does U1 select the K18
-  dispatcher; like K18 it was never run at TP2 in the fork.
+  FP16 M8 path (or F.linear) runs. The route also needs K18's U1 dispatcher,
+  which is on by default for the same Qwen3.8 contract; so
+  ``VLLM_SM70_DFLASH2_FP16=0`` turns this route off too. E3 (2026-11-09,
+  TP2) measured it -0.9 ms/step over K18 alone; the fork never ran it at TP2.
 
 Ported from fork cf9492a
 vllm/model_executor/layers/quantization/sm70_dflash2_fp8.py (133 lines)

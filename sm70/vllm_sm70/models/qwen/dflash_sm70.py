@@ -572,7 +572,9 @@ def _build_classes() -> dict[str, type]:
                 from vllm_sm70.ops import dflash2, dflash2_fp8
 
                 dflash2.mark_draft_linears(
-                    self, fp8=dflash2_fp8.draft_fp8_wanted(vllm_config)
+                    self,
+                    vllm_config=vllm_config,
+                    fp8=dflash2_fp8.draft_fp8_wanted(vllm_config),
                 )
 
     class DFlash2SM70Qwen3Model(DFlash2Qwen3Model):

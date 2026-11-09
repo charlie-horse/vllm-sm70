@@ -13,13 +13,21 @@ How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
   :func:`prepare_dflash2_fp16_m8` packed, and calls ``F.linear`` (UP
   ``default_unquantized_gemm``) for everything else. M7's DFlash2 draft
   subclass marks the layers at construction and packs them in load_weights.
-Switch: OPT-IN. Only ``VLLM_SM70_DFLASH2_FP16=1`` enables it (envs.py says
-  why). Unset or any other value: ``get_unquantized_gemm`` returns None
-  (upstream dispatch, untouched), nothing is marked or packed, F.linear runs.
-Selection is decided once: ``select_unquantized_gemm`` is cached per
-  linear_backend (UP calls ``dispatch_unquantized_gemm()`` on every forward of
-  lm_head and the MoE router gate), and each layer's route (N, K, tile, warps)
-  is fixed when it is packed (``ROUTE_ATTR``); a call only checks ``x``.
+Default: on for the qualified Qwen3.8 DFlash2 contract only
+  (:func:`k18_wanted`: M1's ``dflash2_verifier_qualified``, the fork's
+  verifier contract), approved by Astro on E3 (2026-11-09: -1.1 ms/step
+  alone, -2.0 ms/step with M9a, acceptance unchanged). Every other engine
+  (Qwen3.6, Flint, no DFlash2) keeps upstream dispatch exactly:
+  ``get_unquantized_gemm`` returns None and nothing is marked.
+Switch: ``VLLM_SM70_DFLASH2_FP16=0`` turns it off everywhere (and with it
+  M9a, which rides on this hook). It is independent of
+  ``VLLM_SM70_DFLASH2_VERIFIER=0``, which turns off M9a only.
+Selection is decided once per engine: the first ``select_unquantized_gemm``
+  call made under a VllmConfig decides and caches per linear_backend (UP
+  calls ``dispatch_unquantized_gemm()`` on every forward of lm_head and the
+  MoE router gate); a call with no current config returns None uncached. Each
+  layer's route (N, K, tile, warps) is fixed when it is packed
+  (``ROUTE_ATTR``); a call only checks ``x``.
 
 Ported from fork cf9492a vllm/model_executor/layers/quantization/
 sm70_dflash2_fp16.py and vllm/model_executor/layers/sm70_compact_topk.py;
@@ -28,7 +36,6 @@ see sm70/csrc/dflash2/PROVENANCE.md for the line map and what changed.
 
 from __future__ import annotations
 
-import functools
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -137,7 +144,10 @@ def gemm_available() -> bool:
 
 
 def enabled() -> bool:
-    """Opted in (VLLM_SM70_DFLASH2_FP16=1) and the GEMM ops built."""
+    """Not killed (VLLM_SM70_DFLASH2_FP16 != "0") and the GEMM ops built.
+
+    Engine-independent; :func:`k18_wanted` adds the Qwen3.8 contract.
+    """
     return bool(envs.VLLM_SM70_DFLASH2_FP16) and gemm_available()
 
 
@@ -171,26 +181,64 @@ def dflash2_unquantized_gemm(
     return F.linear(x, weight, bias)
 
 
+def _qualified(vllm_config: Any) -> bool:
+    """The fork's Qwen3.8 DFlash2 verifier contract (M1), getattr only."""
+    from vllm_sm70.config import dflash2_verifier_qualified
+
+    return dflash2_verifier_qualified(
+        getattr(vllm_config, "model_config", None),
+        getattr(vllm_config, "speculative_config", None),
+        getattr(vllm_config, "parallel_config", None),
+    )
+
+
+def k18_wanted(vllm_config: Any) -> bool:
+    """K18 for this engine: not killed, ops built, and the Qwen3.8 contract.
+
+    Independent of ``VLLM_SM70_DFLASH2_VERIFIER`` (that switch turns off M9a
+    only, so its "=0" arm is K18 alone, E3 arm B).
+    """
+    return vllm_config is not None and enabled() and _qualified(vllm_config)
+
+
+def _current_vllm_config() -> Any:
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+    except ImportError:  # pragma: no cover - CPU venv without vllm
+        return None
+    return get_current_vllm_config_or_none()
+
+
+_SELECTED: dict[str, Callable[..., Any] | None] = {}
+
+
 def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] | None:
     """What Sm70CudaPlatform.get_unquantized_gemm returns (None -> upstream).
 
-    Called when each UnquantizedLinearMethod is built (UP linear.py:176) and
+    Called when each UnquantizedLinearMethod is built (UP linear.py:176),
+    inside model construction where the engine's VllmConfig is current, and
     on every forward of lm_head (UP vocab_parallel_embedding.py:83) and the
-    MoE router gate (UP moe_runner.py:910), so the answer is cached per
-    linear_backend for the process. reset_selection_cache() clears it.
+    MoE router gate (UP moe_runner.py:910). The first call under a config
+    decides for the process and is cached per linear_backend; a call with no
+    current config returns None and caches nothing. reset_selection_cache()
+    clears it.
     """
-    return _select_cached(linear_backend)
+    if linear_backend in _SELECTED:
+        return _SELECTED[linear_backend]
+    vllm_config = _current_vllm_config()
+    if vllm_config is None:
+        return None
+    choice = _select(linear_backend, vllm_config)
+    _SELECTED[linear_backend] = choice
+    return choice
 
 
 def reset_selection_cache() -> None:
-    _select_cached.cache_clear()
+    _SELECTED.clear()
 
 
-@functools.cache
-def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
-    if not envs.VLLM_SM70_DFLASH2_FP16:
-        return None
-    if not gemm_available():
+def _select(linear_backend: str, vllm_config: Any) -> Callable[..., Any] | None:
+    if not k18_wanted(vllm_config):
         return None
     # An explicit FlashInfer BF16 backend keeps upstream's choice (UP
     # layers/utils.py:695); "auto" there is default_unquantized_gemm, which
@@ -206,16 +254,17 @@ def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
 
 
 def mark_draft_linears(
-    decoder_layer: torch.nn.Module, *, fp8: bool = False
+    decoder_layer: torch.nn.Module, *, vllm_config: Any, fp8: bool = False
 ) -> list[torch.nn.Module]:
     """Flag one DFlash2 draft decoder layer's unquantized projections.
 
     ported from FORK qwen3_dflash2.py:280-298, without its TP==4 condition
-    (admission is by shard shape, GEOMETRY). ``fp8`` also flags them for
+    (admission is by shard shape, GEOMETRY). Nothing is flagged unless
+    :func:`k18_wanted` holds for ``vllm_config``. ``fp8`` also flags them for
     M9a's channel-FP8 route (the caller decides: verifier on and k == 7,
     FORK :295-297). Returns the flagged modules.
     """
-    if not envs.VLLM_SM70_DFLASH2_FP16:
+    if not k18_wanted(vllm_config):
         return []
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 

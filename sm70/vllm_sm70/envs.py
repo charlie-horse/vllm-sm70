@@ -6,9 +6,10 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  Two reviewed exceptions select a kernel, both off by default until
-  measured: VLLM_SM70_DFLASH2_FP16 (K18; the fork never ran it at TP2) and
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See their comments.
+  One reviewed exception selects a kernel, off by default:
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See its comment.
+  (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
+  now a kill switch.)
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -55,8 +56,7 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_DFLASH2_FP16 (K18) and VLLM_SM70_FP8_QPN8_M32 (K09),
-    opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09), opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -196,14 +196,17 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # NOT RECOMMENDED: the M8 A/B (2026-11-08) measured it 27-33% slower
         # than M6 TurboMind at M=24/32 (c=3/4); it logs a warning when used.
         "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
-        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
-        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
-        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
-        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
-        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
-        # Off: get_unquantized_gemm returns None, nothing is marked or
-        # packed. Read once (selection cached) when layers are built/loaded.
-        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
+        # K18 (vllm_sm70/ops/dflash2.py): "0" -> no DFlash2 draft FP16 M<=8
+        # GEMM, and so no M9a channel-FP8 route either (it rides on K18's
+        # U1 hook). Default on, but only for the qualified Qwen3.8 DFlash2
+        # contract (dflash2.k18_wanted); every other engine keeps upstream
+        # dispatch. Was opt-in until E3 (2026-11-09, Qwen3.8 row 4 at TP2:
+        # -1.1 ms/step alone, -2.0 with M9a, acceptance unchanged; approved
+        # by Astro). Packing keeps a second weight copy (~1.7 GB/GPU for the
+        # 27B draft at TP2; FP8 with M9a). Off: get_unquantized_gemm
+        # returns None, nothing is marked or packed. Read once (selection
+        # cached) when layers are built/loaded.
+        "VLLM_SM70_DFLASH2_FP16": kill_switch("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.

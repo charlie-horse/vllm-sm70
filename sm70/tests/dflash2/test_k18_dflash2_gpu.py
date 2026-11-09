@@ -23,11 +23,14 @@ pytestmark = pytest.mark.gpu
 
 
 @pytest.fixture(autouse=True)
-def _opt_in(monkeypatch):
-    """K18 is opt-in (VLLM_SM70_DFLASH2_FP16=1); these tests exercise it."""
+def _qwen38_engine(monkeypatch):
+    """K18 at its default (on) for a current engine that is the Qwen3.8
+    DFlash2 contract (dflash2.k18_wanted)."""
     from vllm_sm70.ops import dflash2
 
-    monkeypatch.setenv("VLLM_SM70_DFLASH2_FP16", "1")
+    monkeypatch.delenv("VLLM_SM70_DFLASH2_FP16", raising=False)
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: object())
+    monkeypatch.setattr(dflash2, "_qualified", lambda cfg: True)
     dflash2.reset_selection_cache()
     yield
     dflash2.reset_selection_cache()
@@ -163,7 +166,7 @@ def test_u1_gemm_callable(dflash2_gpu, monkeypatch):
         assert torch.equal(
             gemm(plain, x, plain.weight, None), F.linear(x, plain.weight)
         )
-    monkeypatch.delenv(mod.KILL_SWITCH)  # default: off
+    monkeypatch.setenv(mod.KILL_SWITCH, "0")  # killed: upstream dispatch
     mod.reset_selection_cache()
     assert mod.select_unquantized_gemm("auto") is None
     fresh = torch.nn.Linear(5120, 3072, bias=False, device="cuda", dtype=torch.float16)
