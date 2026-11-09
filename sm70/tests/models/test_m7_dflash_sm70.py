@@ -467,6 +467,8 @@ def test_e2e_real_draft_gpu():
         dtype="half",
         max_model_len=8192,
         gpu_memory_utilization=0.88,
+        # LLM() defaults disable_log_stats=True; get_metrics() below needs stats.
+        disable_log_stats=False,
         speculative_config=json.loads(
             json.dumps(
                 {
