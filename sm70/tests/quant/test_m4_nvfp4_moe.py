@@ -1333,6 +1333,76 @@ def test_gpu_compact_capture_with_all_padding_routes(m):
     torch.testing.assert_close(captured.float(), per_expert.float(), rtol=2e-2, atol=tol)
 
 
+@pytest.mark.gpu
+@needs_cuda
+@pytest.mark.parametrize("pad_x", ["randn", "nan"])
+@pytest.mark.parametrize("m,pad", [(4, 1), (8, 3)])
+def test_gpu_compact_graph_mixed_real_and_padding(monkeypatch, m, pad, pad_x):
+    """The serving case (Quinn, #100): real and padding tokens in one batch
+    (UP VLLM_MOE_SKIP_PADDING=1; e.g. 3 requests padded to the 4-token
+    graph). The last `pad` tokens route to -1 with weight 0. Captured under a
+    CUDA graph with compact slot groups, then replayed: real rows match the
+    reference and the eager per-expert route, and padding rows are exactly 0
+    on both routes.
+
+    UP's finalize skips every slot at or past offset[E]
+    (moe_permute_unpermute_kernel.inl:132, num_valid = offset[E]), so a
+    padding row keeps its zero fill. With finite padding activations
+    0 * weight would also give 0, so the "nan" case fills the padding rows of
+    x with NaN: compact still computes those slots (clamped to expert E-1),
+    and an exact 0 then shows that finalize never reads them and that they
+    don't leak into real rows."""
+    import vllm_sm70.quant.nvfp4_moe as m4
+    from vllm_sm70.ops import tm
+
+    torch.cuda.set_device(0)
+    method, layer, w = _gpu_layer(m4)
+    assert method.compact_enabled
+    counts = []
+    real_op = tm.nvfp4_moe_dense_stage_sm70_out
+
+    def spy(out, inp, offsets, ids, pw, ps, ne, k, n, g):
+        counts.append(ne)
+        return real_op(out, inp, offsets, ids, pw, ps, ne, k, n, g)
+
+    monkeypatch.setattr(tm, "nvfp4_moe_dense_stage_sm70_out", spy)
+    real = m - pad
+    g = torch.Generator().manual_seed(400 + m)
+    x = (torch.randn(m, 2048, generator=g) * 0.5).half()
+    if pad_x == "nan":
+        x[real:] = float("nan")
+    x = x.cuda()
+    weights, ids = _routing(m, 256, 6, seed=m)
+    ids[real:] = -1
+    weights[real:] = 0
+    dw, di = weights.cuda(), ids.cuda()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        method.apply(layer, x, dw, di, None, None)  # warm up off-graph
+    torch.cuda.current_stream().wait_stream(stream)
+    counts.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = method.apply(layer, x, dw, di, None, None)
+    assert counts == [m * 6, m * 6]  # compact slot groups were captured
+    graph.replay()
+    torch.cuda.synchronize()
+    counts.clear()
+    method.compact_enabled = False
+    per_expert = method.apply(layer, x, dw, di, None, None)
+    method.compact_enabled = True
+    assert counts == [256, 256]  # per-expert offsets
+    ref = _moe_reference(x[:real].cpu(), w, ids[:real], weights[:real], 256)
+    tol = 2e-2 * ref.abs().max().item()
+    got = captured[:real].float()
+    torch.testing.assert_close(got.cpu(), ref, rtol=2e-2, atol=tol)
+    torch.testing.assert_close(got, per_expert[:real].float(), rtol=2e-2, atol=tol)
+    zeros = torch.zeros(pad, 2048, dtype=captured.dtype, device=captured.device)
+    torch.testing.assert_close(captured[real:], zeros, rtol=0, atol=0)
+    torch.testing.assert_close(per_expert[real:], zeros, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_get_quant_method_tp_gate(mods, device, monkeypatch, tp):
     """SM70 MoE is validated at TP1/TP2 only; TP4+ refuses, never falls back."""

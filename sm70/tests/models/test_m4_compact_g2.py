@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """G2c: the M4 compact slot route (#97) on vs off, teacher-forced, at TP2.
 
-Written by Bea for the #97 A/B (a3dc3b2, build l56dj370; notes
-bea-ab97-a3dc3b2.md). It is the correctness gate for the
-VLLM_SM70_FLINT_MOE_COMPACT route; this file commits it so the gate can be
-reproduced (Quinn).
+Written by Bea for the #97 A/B (a3dc3b2, build l56dj370). It is the
+correctness gate for the VLLM_SM70_FLINT_MOE_COMPACT route; this file
+commits it so the gate can be reproduced (Quinn).
 
 Same harness and limits as M10a's G2 (test_m10_flint_router.py) and M5's
 T4a: teacher-forced decode logprobs (sm70/scripts/m5_teacher_forced.py) of
