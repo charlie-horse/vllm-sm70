@@ -233,7 +233,7 @@ def _log_once(msg: str, level: int = logging.INFO) -> None:
 
 
 M32_SLOW_WARNING = (
-    "VLLM_SM70_FP8_QPN8_M32=1 is not recommended: block QPN8 at M=17..32 "
+    "VLLM_SM70_FP8_QPN8_M32=1 is not recommended: block QPN8 at M=24/32 "
     "measured 27-33% slower than M6 TurboMind (Qwen3.8-27B TP2 DFlash2, "
     "c=3/4, M8 A/B 2026-11-08); unset it to stay on M6 at these rows."
 )

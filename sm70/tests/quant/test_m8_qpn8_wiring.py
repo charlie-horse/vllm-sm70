@@ -699,7 +699,8 @@ def test_m32_optin_warns(mods, engine, monkeypatch, caplog, m32):
     lin._LOGGED.discard(lin.M32_SLOW_WARNING)
     engine(_vllm_config({}))
     with caplog.at_level(logging.INFO, logger="vllm.sm70"):
-        _layer(lin, 256, [256])
+        _, layer, _, _ = _layer(lin, 256, [256])
+    assert layer.sm70_fp8_qpn8 is True  # admitted in both arms
     warned = [
         r for r in caplog.records
         if r.levelno == logging.WARNING and r.getMessage() == lin.M32_SLOW_WARNING
