@@ -51,6 +51,8 @@ from vllm_sm70 import _ext  # noqa: E402
 
 _ext.load()
 
+from vllm_sm70.ops import dflash2_fp8  # noqa: E402  (M9a, rides on this hook)
+
 logger = logging.getLogger("vllm.sm70")
 
 GEMM_OPS = ("sm70_dflash2_fp16_m8_out", "sm70_dflash2_fp16_dispatch_out")
@@ -157,7 +159,11 @@ def dflash2_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """U1 GEMM: the M<=8 kernel for packed DFlash2 draft layers, else F.linear."""
+    """U1 GEMM for DFlash2 draft layers: M9a's channel-FP8 route (M 8..32),
+    else the M<=8 FP16 kernel, else F.linear (FORK linear.py:396-410 order)."""
+    out = dflash2_fp8.apply_dflash2_fp8_m8(layer, x, bias)
+    if out is not None:
+        return out
     out = apply_dflash2_fp16_m8(layer, x, bias)
     if out is not None:
         return out
@@ -199,11 +205,15 @@ def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
     return dflash2_unquantized_gemm
 
 
-def mark_draft_linears(decoder_layer: torch.nn.Module) -> list[torch.nn.Module]:
+def mark_draft_linears(
+    decoder_layer: torch.nn.Module, *, fp8: bool = False
+) -> list[torch.nn.Module]:
     """Flag one DFlash2 draft decoder layer's unquantized projections.
 
     ported from FORK qwen3_dflash2.py:280-298, without its TP==4 condition
-    (admission is by shard shape, GEOMETRY). Returns the flagged modules.
+    (admission is by shard shape, GEOMETRY). ``fp8`` also flags them for
+    M9a's channel-FP8 route (the caller decides: verifier on and k == 7,
+    FORK :295-297). Returns the flagged modules.
     """
     if not envs.VLLM_SM70_DFLASH2_FP16:
         return []
@@ -229,6 +239,8 @@ def mark_draft_linears(decoder_layer: torch.nn.Module) -> list[torch.nn.Module]:
             getattr(projection, "quant_method", None), UnquantizedLinearMethod
         ):
             setattr(projection, MARK_ATTR, True)
+            if fp8:
+                setattr(projection, dflash2_fp8.FP8_MARK_ATTR, True)
             marked.append(projection)
     return marked
 
@@ -327,11 +339,17 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
 def prepare_marked(modules: Iterable[torch.nn.Module] | torch.nn.Module) -> int:
     """Pack every marked layer under ``modules``; returns how many were packed.
 
-    Safe to call again after a weight reload: existing buffers are refilled.
+    A layer M9a admits gets the channel-FP8 copy instead of the FP16 M8
+    packing (FORK linear.py:351-352). Safe to call again after a weight
+    reload: existing buffers are refilled.
     """
     if isinstance(modules, torch.nn.Module):
         modules = modules.modules()
-    return sum(1 for m in modules if prepare_dflash2_fp16_m8(m))
+    return sum(
+        1
+        for m in modules
+        if dflash2_fp8.prepare_dflash2_fp8_m8(m) or prepare_dflash2_fp16_m8(m)
+    )
 
 
 def apply_dflash2_fp16_m8(

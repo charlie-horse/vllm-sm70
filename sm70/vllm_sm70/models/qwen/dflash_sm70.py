@@ -567,9 +567,13 @@ def _build_classes() -> dict[str, type]:
                 apply_layer_emulation(self, config, dtype)
                 # K18: flag the draft projections for the M<=8 FP16 GEMM
                 # (packed in load_weights below). FORK qwen3_dflash2.py:280-298.
-                from vllm_sm70.ops import dflash2
+                # M9a: with the DFlash2 verifier on (k=7), also flag them for
+                # the channel-FP8 M8..32 route. FORK qwen3_dflash2.py:295-297.
+                from vllm_sm70.ops import dflash2, dflash2_fp8
 
-                dflash2.mark_draft_linears(self)
+                dflash2.mark_draft_linears(
+                    self, fp8=dflash2_fp8.draft_fp8_wanted(vllm_config)
+                )
 
     class DFlash2SM70Qwen3Model(DFlash2Qwen3Model):
         decoder_layer_cls = DFlash2SM70Qwen3DecoderLayer
