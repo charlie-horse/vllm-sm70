@@ -223,6 +223,82 @@ def test_capture_launches_the_max_model_len_envelope(rec):
     assert eager[12] * eager[11] < 4096
 
 
+# ------------------------------------------- B1: small captured batches
+
+SMALL = "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
+
+
+def _run_qwen38(rec, rows, *, capture, max_model_len=32768, heads=(12, 2)):
+    # One Qwen3.8 TP2 full-attention layer: 12 q / 2 kv heads, D256 (XQA).
+    from vllm_sm70.attention.flash_v100 import dispatch
+
+    q = torch.zeros((rows, heads[0], 256), dtype=torch.float16)
+    k = torch.zeros((8, 16, heads[1], 256), dtype=torch.float16)
+    md = _metadata(rows, [4096] * rows, 4096)
+    md.max_model_len = max_model_len
+    md.cudagraph_capture = capture
+    dispatch.run_decode(
+        q, k, k, torch.empty_like(q), md, scale=0.1, window=(-1, -1), sinks=None
+    )
+    name, args = rec.calls[-1]
+    assert name == "fv100_decode_paged_xqa"
+    return args[11], args[12]  # partition size, launched partitions
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+@pytest.mark.parametrize("max_model_len", [32768, 150000])
+def test_small_captured_batch_uses_256_partitions(
+    rec, monkeypatch, rows, max_model_len
+):
+    monkeypatch.delenv(SMALL, raising=False)
+    partition, launched = _run_qwen38(
+        rec, rows, capture=True, max_model_len=max_model_len
+    )
+    assert partition == 256
+    assert launched * partition >= max_model_len  # still the full envelope
+
+
+@pytest.mark.parametrize("rows", [17, 64])
+def test_larger_captured_batch_keeps_the_envelope_default(rec, monkeypatch, rows):
+    monkeypatch.delenv(SMALL, raising=False)
+    assert _run_qwen38(rec, rows, capture=True)[0] == 1024
+
+
+def test_small_batch_kill_switch(rec, monkeypatch):
+    from vllm_sm70 import envs
+
+    assert SMALL in envs._SECTIONS["attention"]
+    monkeypatch.setenv(SMALL, "1")
+    assert _run_qwen38(rec, 8, capture=True)[0] == 256
+    monkeypatch.setenv(SMALL, "0")
+    assert _run_qwen38(rec, 8, capture=True)[0] == 1024
+
+
+def test_eager_decode_is_unchanged(rec, monkeypatch):
+    # Eager plans from the live max_seq_len (4096 -> 256) with or without B1.
+    for value in ("0", "1"):
+        monkeypatch.setenv(SMALL, value)
+        partition, launched = _run_qwen38(rec, 8, capture=False)
+        assert (partition, launched) == (256, 16)
+
+
+def test_short_envelope_was_already_256(rec, monkeypatch):
+    monkeypatch.setenv(SMALL, "0")
+    assert _run_qwen38(rec, 8, capture=True, max_model_len=4096)[0] == 256
+
+
+def test_small_batch_workspace_is_its_own_cache_entry(rec, fv100, monkeypatch):
+    # The 256-partition workspace is sized for <= 16 rows; the 1024 one for
+    # the large batches keeps its own entry.
+    monkeypatch.delenv(SMALL, raising=False)
+    _run_qwen38(rec, 64, capture=True)
+    _run_qwen38(rec, 16, capture=True)
+    by_partition = {key[4]: ws for key, ws in fv100._decode_workspace_cache.items()}
+    assert set(by_partition) == {256, 1024}
+    assert by_partition[256].tmp_out.size(0) == 16
+    assert by_partition[1024].tmp_out.size(0) == 64
+
+
 # --------------------------------------------------------------------- GPU
 
 
