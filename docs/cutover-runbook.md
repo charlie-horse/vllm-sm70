@@ -1,6 +1,8 @@
 # Cutover runbook (C3): draft
 
-**Status: draft. Not for use yet.** C3 is blocked on C1 (side-by-side bench and quality run vs the fork, not run) and on the four gates in `docs/release.md` for the commit that `latest` will point at. Nothing in this file has been run on c4130.
+**Upstream-status:** not-upstreamable
+
+**Status: draft. Not for use yet.** C1 ran on `cef0f9e` (build `aczb9zwk`) on 2026-11-09. Its verdict is HOLD for the `glm47_sm70` parser rerun (Quinn's review 5833794085). The GPU gate has not run on `cef0f9e`. C3 is blocked until the four gates in `docs/release.md` pass on the commit that `latest` will point at. Nothing in this file has been run on c4130.
 
 Steps marked **[SUDO: Charlie]** need root on c4130 and are for Charlie to run. This doc does not carry or ask for credentials.
 
@@ -8,12 +10,12 @@ Host names below are as used elsewhere in the repo. Keep IPs, tailnet names and 
 
 ## 0. Preconditions (all must hold before step 1)
 
-- [ ] C1 passed on the target commit (`docs/roadmap.md`, Phase 5). Not run yet.
+- [ ] C1 passed on the target commit (`docs/roadmap.md`, Phase 5). C1 ran on `cef0f9e` on 2026-11-09; the verdict is HOLD for the `glm47_sm70` parser rerun (review 5833794085). A later note in the session says C1 passed; confirm the verdict before this item is ticked.
 - [ ] C2 passed on c4130: LMCache check (`scripts/check-lmcache-cpu.sh`, plus the GPU smoke and `kvtier_test.py`, both still open in `docs/status.md`).
 - [ ] Bea's GPU gate passed on the same commit, in a downtime window (00:00–06:00 ET, per `docs/release.md`).
 - [ ] `main` CI is green on that commit.
 - [ ] Astro says OK.
-- [ ] `latest` is fast-forwarded to `cef0f9e`, the build C1 validated (`docs/release.md`, "Moving `latest`"). Do not point it at newer `main`. The current `latest` is the bootstrap `3869cd6`, which has not passed the gates and must not be deployed.
+- [ ] `latest` is fast-forwarded to the commit that has passed all four gates (`docs/release.md`, "Moving `latest`"). Today the only candidate is `cef0f9e`, which C1 ran on, but no gate has passed on it yet. A newer commit is fine once all four gates pass on that commit. The current `latest` is the bootstrap `3869cd6`, which has not passed the gates and must not be deployed.
 - [ ] The rollback target (the fork's current flake input and `vllm-lmcache` unit) is recorded, see section 5.
 
 ## 1. GC c4130 (before the switch)
@@ -45,10 +47,11 @@ The host flake (charlie-horse/flake, `hosts/c4130/vllm`) consumes this repo. Cha
    nix flake update <vllm-input-name>
    ```
 2. Build the closure on the build host first (r440), then realise it on c4130 with `nix-store --realise <outPath>` (same method as `docs/phase1-gpu-runbook.md` section 1). Do not switch yet.
-3. Confirm the outPath matches `cef0f9e`.
-4. **Host config for Flint** (set in the host flake, on the `vllm` module's Flint model entry):
-   - `maxNumSeqs = 20`. The module default is 2 (`nix/module.nix:73`), but C1 and prod ran 20. Without this override the host serves at 2.
-   - Reasoning parser `glm47_sm70` (`--reasoning-parser glm47_sm70`, `--reasoning-parser-plugin vllm_sm70.reasoning`, `nix/module.nix:96-97`). Confirm the host does not override it to `glm47`.
+3. Confirm the outPath is `/nix/store/aczb9zwk50svcc2pvrw54qh9vyar70ym-vllm-sm70-0.33.0`, the store path C1 ran on. If the host builds a different outPath, it is overriding one of this flake's inputs (for example with `inputs.nixpkgs.follows`). C1 does not cover that build, so stop. A mismatch also means the host lock pulled the wrong commit.
+4. **Host config for Flint**, set in the host flake:
+   - `services.vllm-sm70.models.flint.maxNumSeqs = 20;`. The module applies `mkDefault` to each field (`nix/module.nix:279-283`), so this overrides only this field. The default is 2 (`nix/module.nix:73`); C1 and prod ran 20.
+   - **Do not set `models.flint.args`.** `args` is a single field, so a host list replaces the module's whole list, parser flags included. If the host must set it, the list must include both `--reasoning-parser-plugin vllm_sm70.reasoning` and `--reasoning-parser glm47_sm70` (`nix/module.nix:96-97`).
+   - After the switch, check the startup log's `non-default args` for `'reasoning_parser': 'glm47_sm70'`. C1's log is how this gap was found.
 
 ## 3. Replace the fork's vllm-lmcache with this flake's module
 
