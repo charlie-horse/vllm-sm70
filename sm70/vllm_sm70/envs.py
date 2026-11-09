@@ -201,11 +201,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # U1 hook). Default on, but only for the qualified Qwen3.8 DFlash2
         # contract (dflash2.k18_wanted); every other engine keeps upstream
         # dispatch. Was opt-in until E3 (2026-11-09, Qwen3.8 row 4 at TP2:
-        # -1.1 ms/step alone, -2.0 with M9a, acceptance unchanged; approved
-        # by Astro). Packing keeps a second weight copy (~1.7 GB/GPU for the
-        # 27B draft at TP2; FP8 with M9a). Off: get_unquantized_gemm
-        # returns None, nothing is marked or packed. Read once (selection
-        # cached) when layers are built/loaded.
+        # -1.1 ms/step alone, -2.0 with M9a; probe accepted/step unchanged
+        # alone, -1.6% with M9a; approved by Astro). Packing keeps a second
+        # weight copy of the 27B draft at TP2: ~0.85 GiB/GPU by default
+        # (M9a, FP8), ~1.63 GiB/GPU with VERIFIER=0 (FP16; E3 KV). Off:
+        # get_unquantized_gemm returns None, nothing is marked or packed.
+        # Read once per engine (selection cached) when layers are built.
         "VLLM_SM70_DFLASH2_FP16": kill_switch("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {

@@ -120,6 +120,41 @@ def test_selection_waits_for_an_engine_config(monkeypatch):
     assert dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
 
 
+def test_each_engine_decides_for_itself(monkeypatch):
+    """Cached per engine config, not per process: a second engine in the same
+    process (in-process TP1 tests) re-decides; config-less calls follow the
+    most recent engine."""
+    pytest.importorskip("vllm")
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    dispatcher = dflash2.dflash2_unquantized_gemm
+    assert dflash2.select_unquantized_gemm("auto") is dispatcher  # Qwen3.8
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN36)
+    assert dflash2.select_unquantized_gemm("auto") is None
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: None)
+    assert dflash2.select_unquantized_gemm("auto") is None  # latest: Qwen3.6
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN38)
+    assert dflash2.select_unquantized_gemm("auto") is dispatcher
+
+
+def test_selection_logged_once_per_decision(monkeypatch):
+    """The "prepared" lines come from marking/packing; only this line shows
+    the U1 dispatcher was picked (Quinn, #108)."""
+    pytest.importorskip("vllm")
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    lines = []
+    monkeypatch.setattr(
+        dflash2.logger, "info", lambda msg, *a, **k: lines.append(msg % a)
+    )
+    for _ in range(5):
+        dflash2.select_unquantized_gemm("auto")
+    assert len(lines) == 1
+    assert "K18 DFlash2 draft GEMM dispatcher selected" in lines[0]
+    assert "linear_backend=auto" in lines[0]
+    monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN36)
+    dflash2.select_unquantized_gemm("auto")
+    assert len(lines) == 1  # not selected: no line
+
+
 def test_killed_packs_nothing_even_when_forced(monkeypatch):
     monkeypatch.setenv(KILL, "0")
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)

@@ -16,18 +16,21 @@ How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
 Default: on for the qualified Qwen3.8 DFlash2 contract only
   (:func:`k18_wanted`: M1's ``dflash2_verifier_qualified``, the fork's
   verifier contract), approved by Astro on E3 (2026-11-09: -1.1 ms/step
-  alone, -2.0 ms/step with M9a, acceptance unchanged). Every other engine
-  (Qwen3.6, Flint, no DFlash2) keeps upstream dispatch exactly:
-  ``get_unquantized_gemm`` returns None and nothing is marked.
+  alone, -2.0 ms/step with M9a; probe acceptance unchanged alone, -1.6% with
+  M9a). Every other engine (Qwen3.6, Flint, no DFlash2) keeps upstream
+  dispatch exactly: ``get_unquantized_gemm`` returns None and nothing is
+  marked.
 Switch: ``VLLM_SM70_DFLASH2_FP16=0`` turns it off everywhere (and with it
   M9a, which rides on this hook). It is independent of
   ``VLLM_SM70_DFLASH2_VERIFIER=0``, which turns off M9a only.
 Selection is decided once per engine: the first ``select_unquantized_gemm``
-  call made under a VllmConfig decides and caches per linear_backend (UP
-  calls ``dispatch_unquantized_gemm()`` on every forward of lm_head and the
-  MoE router gate); a call with no current config returns None uncached. Each
-  layer's route (N, K, tile, warps) is fixed when it is packed
-  (``ROUTE_ATTR``); a call only checks ``x``.
+  call made under a VllmConfig decides, logs once when it picks the
+  dispatcher, and is cached per (engine config, linear_backend) (UP calls
+  ``dispatch_unquantized_gemm()`` on every forward of lm_head and the MoE
+  router gate); a call with no current config returns the most recent
+  engine's decision, or None before any. Each layer's route (N, K, tile,
+  warps) is fixed when it is packed (``ROUTE_ATTR``); a call only checks
+  ``x``.
 
 Ported from fork cf9492a vllm/model_executor/layers/quantization/
 sm70_dflash2_fp16.py and vllm/model_executor/layers/sm70_compact_topk.py;
@@ -209,7 +212,10 @@ def _current_vllm_config() -> Any:
     return get_current_vllm_config_or_none()
 
 
-_SELECTED: dict[str, Callable[..., Any] | None] = {}
+# (linear_backend, id(VllmConfig)) -> decision; and per backend, the decision
+# of the most recent engine, for the calls made with no current config.
+_SELECTED: dict[tuple[str, int], Callable[..., Any] | None] = {}
+_LATEST: dict[str, Callable[..., Any] | None] = {}
 
 
 def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] | None:
@@ -218,23 +224,26 @@ def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] 
     Called when each UnquantizedLinearMethod is built (UP linear.py:176),
     inside model construction where the engine's VllmConfig is current, and
     on every forward of lm_head (UP vocab_parallel_embedding.py:83) and the
-    MoE router gate (UP moe_runner.py:910). The first call under a config
-    decides for the process and is cached per linear_backend; a call with no
-    current config returns None and caches nothing. reset_selection_cache()
-    clears it.
+    MoE router gate (UP moe_runner.py:910). Decided once per (engine config,
+    linear_backend) and cached, so a second engine in the same process (TP1
+    tests) decides for itself. A call with no current config returns the most
+    recent engine's decision for that backend, or None before any engine;
+    it caches nothing. reset_selection_cache() clears both.
     """
-    if linear_backend in _SELECTED:
-        return _SELECTED[linear_backend]
     vllm_config = _current_vllm_config()
     if vllm_config is None:
-        return None
-    choice = _select(linear_backend, vllm_config)
-    _SELECTED[linear_backend] = choice
+        return _LATEST.get(linear_backend)
+    key = (linear_backend, id(vllm_config))
+    if key not in _SELECTED:
+        _SELECTED[key] = _select(linear_backend, vllm_config)
+    choice = _SELECTED[key]
+    _LATEST[linear_backend] = choice
     return choice
 
 
 def reset_selection_cache() -> None:
     _SELECTED.clear()
+    _LATEST.clear()
 
 
 def _select(linear_backend: str, vllm_config: Any) -> Callable[..., Any] | None:
@@ -250,6 +259,14 @@ def _select(linear_backend: str, vllm_config: Any) -> Callable[..., Any] | None:
             return None
     except Exception:  # pragma: no cover - vllm layout changed
         return None
+    # Once per (engine, backend) decision: the "prepared" lines come from
+    # marking/packing, so this is the only evidence the dispatcher was picked.
+    logger.info(
+        "vllm_sm70: K18 DFlash2 draft GEMM dispatcher selected for "
+        "linear_backend=%s (default: Qwen3.8 DFlash2 verifier contract; "
+        "VLLM_SM70_DFLASH2_FP16=0 disables it).",
+        linear_backend,
+    )
     return dflash2_unquantized_gemm
 
 
