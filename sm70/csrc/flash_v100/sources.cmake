@@ -6,7 +6,8 @@
 # when CUDA and sm_70 were found (the CPU-only binding has no CUDA sources).
 #
 # Mirrors the fork's flash-attention-v100/setup.py CUDAExtension
-# "flash_attn_v100_cuda" (cf9492a), reduced to the two lean kernel files; the
+# "flash_attn_v100_cuda" (cf9492a), reduced to the two lean kernel files (plus
+# B2's verify_decode.cu, new code); the
 # pybind module (fused_mha_api.cpp) is replaced by fv100_ops.cpp, which
 # registers TORCH_LIBRARY_FRAGMENT(_sm70_C) ops. No CUTLASS, no cuBLAS.
 #
@@ -31,7 +32,8 @@ set(_VLLM_SM70_FV100_ROOT "${CMAKE_CURRENT_LIST_DIR}")
 
 set(VLLM_SM70_FV100_CUDA_SRCS
   "${_VLLM_SM70_FV100_ROOT}/flash_decode_paged.cu"
-  "${_VLLM_SM70_FV100_ROOT}/fused_mha_forward_paged.cu")
+  "${_VLLM_SM70_FV100_ROOT}/fused_mha_forward_paged.cu"
+  "${_VLLM_SM70_FV100_ROOT}/verify_decode.cu")
 set(VLLM_SM70_FV100_CXX_SRCS
   "${_VLLM_SM70_FV100_ROOT}/fv100_ops.cpp")
 

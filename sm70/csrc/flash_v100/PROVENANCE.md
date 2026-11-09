@@ -100,8 +100,9 @@ Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.c
 | `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash-attention-v100/kernel/flash_decode_paged.cu` | adapted | 3254 | 7382 | 38f49201f | `eddf0f86e370664b0487423261b8c48136f7b21f539c4295a7b09721241e6af7` | `ede98fc9d28bea2812b4a871fa3ca3e0b12cd2ae783b4a76e95c8aeac0144cbe` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash-attention-v100/kernel/fused_mha_forward_paged.cu` | adapted | 3065 | 4228 | 5f9c273a8 | `8393eff871d5120e7c9f64e97f97235084163913e4798a5d8fb6dc549c3949dd` | `12d5b8a5118a47b040fb1963040e5db8c1805b0145fda67733c867460e06b630` |
 | `sm70/csrc/flash_v100/fv100_config.h` | `flash-attention-v100/include/flash_v100_policy.h` | new | 56 | 466 | c8efae47b | `76ee201719ee9646c4b3e057a6be3912842de8220a1ae2ace349cf44669f0788` | `1fabfd62dfe0284695af025fc1cd0478451a7d123703f6035befd57fa98231a0` |
-| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 260 | 166 | 38f49201f | `f0c6d27680fafdb2c9bd5e0a6c219c16392f88856bf466370d67bf668c3e0da9` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
-| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 62 | 143 | 8235544d4 | `26f9db2ef1993faf84b149986470d1d94ae8b31cc0530772661953dc143b5ed5` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
+| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 286 | 166 | 38f49201f | `c3b69f7777f2f61720188480aef5f6bc92b25b60716233fc796237c23a6abda2` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
+| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 64 | 143 | 8235544d4 | `ae5dcd7e2a34b911a54a5dd0ab819f6cdd3591bb00bb51ab4e52950a1c10c00c` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
+| `sm70/csrc/flash_v100/verify_decode.cu` | - | new | 542 | - | - | `26f1e61913fe07122bf7840ad2f5125006627e7d0add1a902b67398723e53a5f` | - |
 
 ## Adaptations (commit 3)
 

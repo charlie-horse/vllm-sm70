@@ -87,6 +87,9 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     fv_seq_lens: torch.Tensor | None = None
     # K07: decode rows are the token-wise expansion of verify rows.
     spec_verify: bool = False
+    # B2: every decode request has exactly verify_query_len tokens (so decode
+    # row = request * verify_query_len + token); 0 when not uniform.
+    verify_query_len: int = 0
 
 
 def group_prefill_rows(
@@ -221,8 +224,13 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             )
         fv_seq_lens = self._seq_lens_buf[:num_reqs]
         fv_seq_lens.copy_(cm.seq_lens[:num_reqs], non_blocking=True)
+        verify_query_len = 0
         if expand:
             decode_rows = num_decode_tokens
+            if num_decodes and num_decode_tokens == num_decodes * self.spec_query_len:
+                qsl = cm.query_start_loc_cpu[: num_decodes + 1]
+                if bool(((qsl[1:] - qsl[:-1]) == self.spec_query_len).all()):
+                    verify_query_len = self.spec_query_len
             decode_seq_lens, decode_block_table = self.verify.expand(
                 cm.query_start_loc,
                 fv_seq_lens,
@@ -256,6 +264,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             decode_block_table=decode_block_table,
             fv_seq_lens=fv_seq_lens,
             spec_verify=expand,
+            verify_query_len=verify_query_len,
         )
 
     def build_for_cudagraph_capture(
