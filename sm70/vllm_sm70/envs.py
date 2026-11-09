@@ -212,6 +212,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
         "VLLM_SM70_FLASH_V100": kill_switch("VLLM_SM70_FLASH_V100"),
+        # B1: "0" -> a captured XQA decode of <= 16 rows keeps the
+        # envelope's partition size (1024 when max_model_len >= 32768)
+        # instead of 256 (attention/flash_v100/dispatch.py). Read at capture.
+        "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION": kill_switch(
+            "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
+        ),
         # K14 (C4): "0" -> Flint sink layers decode with the grouped
         # partition kernel plus reducer (two launches) instead of the
         # one-launch fused kernel. Read on every decode call
@@ -228,12 +234,6 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # K07: "0" -> verify rows take the causal paged prefill (K06) instead
         # of the smallq -> XQA expansion; graphs then cover 1-token decode.
         "VLLM_SM70_FLASH_V100_SPEC": kill_switch("VLLM_SM70_FLASH_V100_SPEC"),
-        # B1: "0" -> a captured XQA decode of <= 16 rows keeps the
-        # envelope's partition size (1024 when max_model_len >= 32768)
-        # instead of 256 (attention/flash_v100/dispatch.py). Read at capture.
-        "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION": kill_switch(
-            "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
-        ),
     },
     # Kai (K08 FlashQLA GDN, U2 FLA launch schedule). Kill switches only.
     "gdn": {

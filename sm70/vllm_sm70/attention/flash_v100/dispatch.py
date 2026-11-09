@@ -20,12 +20,21 @@ B1 (small captured batches): the envelope alone would pick 1024-token
 partitions whenever max_model_len >= 32768 (ops/fv100.py
 _select_default_decode_partition_size), where eager decode at the same
 context uses 256. A captured XQA decode of at most SMALL_BATCH_ROWS rows
-then runs a few long partitions on a mostly idle GPU: Bea's microbench (one
-Qwen3.8 TP2 layer, 2 kv heads, page 832, envelope 32768) measured 1 row at
-4K context 260 us with 1024 vs 70 us with 256, and the 8 rows of one DFlash2
-verify step 258 vs 239 us at 4K, 211 vs 54 us at 1K, 1005 vs 778 us at 16K.
-So those captures pass partition 256. Envelope 150000 costs the same (empty
-partitions exit at once). The 256-partition workspace is its own cache entry
+then runs a few long partitions on a mostly idle GPU. Bea's microbench
+(one Qwen3.8 TP2 layer, 2 kv heads, page 832, envelope 32768; us per
+layer-step, partition 1024 -> 256):
+
+  context   1 row          8 verify rows (one DFlash2 request)
+  1K        208 -> 52      211 -> 54
+  4K        261 -> 70      258 -> 239
+  16K       265 -> 151     1005 -> 778
+  32K       280 -> 291     1761 -> 1549
+
+At 32K context a single row is 4% slower with 256 (280 vs 291; 280 vs
+292 at envelope 150000); everywhere else 256 is as fast or faster, so
+these captures pass partition 256. Envelope 150000 costs the same as
+32768 (empty partitions exit at once); 64K and 128K contexts are not
+measured yet. The 256-partition workspace is its own cache entry
 sized for <= SMALL_BATCH_ROWS rows: 12.5 MB at a 32K envelope, 100 MB above
 131072 (12 q heads). Kill switch VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0
 (read at capture; only "0" acts) keeps the envelope's default.
