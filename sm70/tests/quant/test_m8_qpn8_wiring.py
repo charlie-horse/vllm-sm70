@@ -30,6 +30,7 @@ Why: a wrong route or scale layout is silent garbage, not a crash.
 Kill-switch: VLLM_SM70_FP8_BLOCK_QPN8=0.
 """
 
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -688,3 +689,20 @@ def test_gpu_qpn8_m1_cuda_graph(gpu_ops, engine):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m32", ["0", "1"], ids=["max8", "m32-optin"])
+def test_m32_optin_warns(mods, engine, monkeypatch, caplog, m32):
+    """M8 closure (2026-11-08): the M32 opt-in logs a not-recommended warning."""
+    lin, _, _ = mods()
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_M32", m32)
+    lin._LOGGED.discard(lin.M32_SLOW_WARNING)
+    engine(_vllm_config({}))
+    with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+        _, layer, _, _ = _layer(lin, 256, [256])
+    assert layer.sm70_fp8_qpn8 is True  # admitted in both arms
+    warned = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage() == lin.M32_SLOW_WARNING
+    ]
+    assert len(warned) == (1 if m32 == "1" else 0)

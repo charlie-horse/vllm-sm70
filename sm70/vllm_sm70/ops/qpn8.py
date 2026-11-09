@@ -30,7 +30,8 @@ and keeps the TurboMind copy per `fp8_block_qpn8_turbomind_copy`
 M cap: `qpn8_max_m(block_scaled=True)` is the M up to which the QPN8 GEMV
 runs. It is 8 for block-scaled weights (the block-FP8 checkpoints) unless
 VLLM_SM70_FP8_QPN8_M32=1 opts in to the K09 block-scaled M=9..32 routing
-(not yet validated on V100), and QPN8_MAX_M = 32 (the compiled kernel bound)
+(not recommended: 27-33% slower than TurboMind at M=24/32 in the M8 A/B,
+2026-11-08), and QPN8_MAX_M = 32 (the compiled kernel bound)
 for channel-scaled weights (the fork's own M9..32 kernels, on by default).
 Dispatch and needs_turbomind_fallback() use it; use it for any M gate too.
 

@@ -190,10 +190,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     }
     | {
         # K09: "1" lets block-scaled QPN8 serve M=9..32 (two-row-tile kernel,
-        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off until a
-        # V100 accuracy check and an M16/M32 bench against TurboMind pass; off,
+        # 16-row chunks; vllm_sm70/ops/qpn8.py qpn8_max_m). Default off; off,
         # block-scaled M>8 takes TurboMind (if held) or dequantize + mm. Unlike
         # the other opt_in switches this one selects a kernel.
+        # NOT RECOMMENDED: the M8 A/B (2026-11-08) measured it 27-33% slower
+        # than M6 TurboMind at M=24/32 (c=3/4); it logs a warning when used.
         "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
         # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
         # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
