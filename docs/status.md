@@ -27,7 +27,7 @@ Roadmap order. Each node appears once.
 | U2 | #33 | `sm70/tests/gdn` CPU | **unverified**: "upstream GDN tests pass on sm70" not identified. `tests.gdn` (repo's own GDN tests) 19 pass, 2 skip in the sweep | `bea/nov7/logs/gpu_sweep.junit.xml` | name the upstream GDN test; run it |
 | K02 | #12, #78 | `check_turbomind_provenance.py --fork` OK at 7958a70 (PR #78) | n/a (build + provenance node) | PR #78 comment | none |
 | M2 | #9 | mocked cc tests (PR #9) | **not run**: real Flint and Qwen config admission not tested on GPU | none | run real checkpoint configs through the capability check |
-| M7 | #22, #45 | `test_m7_dflash_sm70.py` CPU | **partial**: `tests.models.test_m7_dflash_sm70` 3 pass (`test_triton_matches_reference_gpu`, two bitwise), 1 skip (`test_e2e_real_draft_gpu`, the exit's fp16 draft forward). PR #34's "Triton 3/3" is not the same run. Nov 8 e2e ran the draft on V2 for 392 s, then failed at `get_metrics()` ("Stat logging disabled"), a test-side failure | `bea/nov7/logs/gpu_sweep.junit.xml`; `bea/qwen-phase2/20261108T2035/m7/e2e.junit.xml` | fix the metrics call (#101, open); the skipped e2e draft forward; acceptance-rate e2e |
+| M7 | #22, #45, #101 | `test_m7_dflash_sm70.py` CPU | **passed**: e2e at #101 (merged `d83288f`) is the exit's real-draft run. Bea run `20261108T2257-m7-101` (per Mara's ledger note; log path not re-checked here). The Nov 8 run before the fix (`20261108T2035`) failed at `get_metrics()` ("Stat logging disabled"), a test-side failure. Earlier GPU sweep: `tests.models.test_m7_dflash_sm70` 3 pass, 1 skip (`test_e2e_real_draft_gpu`) | `bea/qwen-phase2/20261108T2257-m7-101/` (per Mara); `bea/qwen-phase2/20261108T2035/m7/e2e.junit.xml` (pre-fix failure); `bea/nov7/logs/gpu_sweep.junit.xml` | none for the exit |
 | K03 | #26, #28 | `sm70/tests/ops` CPU (PR #26) | **partial**: `tests.ops` 102 passed in the sweep. The exit's named cases (TM vs `torch.matmul` at M in {1,2,8,64,512}; MoE vs reference loop) are not identified in the junit | `bea/nov7/logs/gpu_sweep.junit.xml` | confirm the named cases; MoE reference loop unverified |
 | M3 | #24, #30, #42 | 25 CPU tests (PR #24) | **passed**: `tests.quant.test_m3_nvfp4_linear` 99 of 99 pass in the sweep. Test contents confirmed from the test code. | `bea/nov7/logs/gpu_sweep.junit.xml` | GEMV path depends on K11 (now passed) |
 | M4 | #31, #34, #52, #72, #79, #97 | 22 CPU tests (PR #31) | **passed**: `tests.quant.test_m4_nvfp4_moe` 12 of 12 pass in the sweep. Test contents confirmed from the test code. #97 (compact slot groups, M*top_k <= 80; merged after the sweep) passes its GPU tests at a3dc3b2 (24/24 incl. all-padding routes; G2c teacher-forced gate), per Quinn's review | `bea/nov7/logs/gpu_sweep.junit.xml`; `nov8/logs/ab97b/test_m4.junit.xml` (24/24 at a3dc3b2, incl. all-padding routes); `ab97b/g2c.log` (teacher-forced gate pass); `nov8/logs/kai3/p100-m4.log` (28/28, #100 open) | none for the exit as stated. `dbd41ba` has the same M4 code and tests as a3dc3b2 (empty diff). Paths under `~/vllm-sm70-work/bea/`; from Quinn's PR #103 review, not re-read here |
@@ -38,7 +38,7 @@ Roadmap order. Each node appears once.
 | K06 | #39, #51, #83, #84 | 1099 CPU passed at e50db90 (PR #84) | **not run**: the exit (Flint TP2 4K greedy-identical over 256 tokens on 5 prompts; decode tok/s >= fork) has no evidence | `bea/nov7/logs/k14.out` (throughput only) | greedy-identity run; tok/s vs fork |
 | K07 | #51 | CPU (PR #51) | **passed**: Bea's D2 A/B on main 6355538 (CUSTOM backend, same prompts, k=7). `accept_len` with Flash-V100 spec verify on vs `VLLM_SM70_FLASH_V100_SPEC=0`: row 2 accept_len −1.43%, row 4 +0.30% (recomputed from results.json; the note gives 3.56 vs 3.61 and 3.94 vs 3.93), both within the 2% bar; all four runs pass quality. INFO: row 2 decode-phase accept_len is −2.16%; K07 logs no route line, because the off arm is set by the script env. Exit (Charlie, 2026-11-08) per `sm70/scripts/qwen_phase2/qwen_matrix.sh` rows 2 and 4. `tests.attention.test_fv100_spec_gpu` 36 of 36 pass, smallq 12/12 | `bea/qwen-phase2/20261108T2035/d2-{on,off}/row{2,4}/results.json` (build k3jsgqgg = main 6355538); `side-session-notes/local_f53bb309…/bea-qwen-blocks.md` §D2; `bea/nov7/logs/gpu_sweep.junit.xml` (fv100 spec tests) | none for the exit |
 | K08 | #33 | `sm70/tests/gdn` CPU | **partial**: `tests.gdn.test_k08_gdn_gpu` 19 pass (the rel-L2 cases pass), 2 skip (they need `SM70_TEST_TRITON_CHUNK=1`) | `bea/nov7/logs/gpu_sweep.junit.xml` | run the 2 skipped cases with `SM70_TEST_TRITON_CHUNK=1` |
-| M11 | #96 (merged, `a700639`) | n/a | **not run**: layer subclass is in #96; no GPU exit test yet | none | GPU check vs upstream |
+| M11 | #96 (merged, `a700639`) | n/a | **passed**: C2 layer test 5/5; C3 e2e at util 0.92, quality pass both arms; K08 decode4k ties switch-off (89.5/89.6 tok/s row 1, 22.9/22.9 row 3), so no batch-1 decode speedup (per Mara's ledger note; log paths not re-checked here) | none recorded in this doc (Mara's ledger note) | none for the exit as stated; batch-1 speedup not claimed |
 | K09 | #50, #65, #95 | CPU (PR #50) | **partial**: Nov 7 sweep had 1 fail, `test_opcheck` (`mul_cuda` not implemented for `Float8_e4m3fn`; test-side). #95 (merged) fixes it; rerun `-k opcheck`: 1 passed (`nov8/logs/kai3/p95.log`). The max-abs-rel < 1e-2 check is not confirmed | `bea/nov7/logs/gpu_sweep.log`, `bea/nov7/logs/k09iso.log`, `bea/nov8/logs/kai3/p95.log` | confirm the max-abs-rel < 1e-2 check; re-run the full exit |
 | K10 | none | n/a | **not run** (opt) | none | needs a Nix TileLang |
 | K11 | #53 | CPU (PR #53) | **passed**: `tests.ops.test_k11_nvfp4_tm_gemv_gpu` 28 of 28 pass in the sweep. The exit is "fork tests listed in the carry map"; that mapping is not done | `bea/nov7/logs/gpu_sweep.junit.xml` | map the carry-map tests |
@@ -73,7 +73,7 @@ Roadmap order. Each node appears once.
 
 **Phase 3 exit** (Qwen3.6/3.8 4K decode at or above the documented 1Cat 1.5.1 numbers, as a 3-run median, with Flash-V100, GDN FlashQLA and DFlash2 on; Charlie, 2026-11-08: no fork or 1Cat baseline runs)
 - Bar: Qwen3.6 row 1 (no DFlash2) >= 66 tok/s; row 2 (with DFlash2) >= 111 tok/s; Qwen3.8 row 4 >= 80 tok/s (floor). Row 3 (Qwen3.8 without DFlash2) has no documented number and is record-only. Qwen3.8 cold 100K TTFT <= 66 s is also part of the bar.
-- Qwen decode and prefill numbers: **none**. The Nov 7 throughput numbers are Flint, not Qwen, so they do not count toward this exit.
+- Qwen decode and prefill numbers: **none**. Block F (the speed run) is on hold behind the 1Cat parity slot (Mara, `mara-1cat-parity.md`). The Nov 7 throughput numbers are Flint, not Qwen, so they do not count toward this exit.
 - Verdict: **no evidence** for the criterion.
 
 **Phase 4 exit** (Flint TP2 4K decode at least 170 tok/s with every fast path on; kill switches per Charlie's 2026-11-08 criterion, see below)
@@ -94,11 +94,11 @@ Roadmap order. Each node appears once.
 
 ## Nodes with no GPU exit-test evidence
 
-- **Not run:** K01, N2, M2, K04, K06, K10, M11, U5, C1, C3, C4 (M8 closed by decision, see table)
+- **Not run:** K01, N2, M2, K04, K06, K10, U5, C1, C3, C4 (M8 closed by decision, see table)
 - **Failed in Nov 7 sweep, fixed by merged test PRs and rerun passing:** K09 (#95), K18 (#94); the exit parts that remain are in their rows
-- **Unverified or partial:** U2, M5 (LMCache reuse), M6 (TP2 e2e), M7 (e2e metrics fix, #101), M9 (M9a test, M9b), K03, K08, K09 (max-abs-rel), K13 (greedy identity), K14 (n=20 sweep), K16 (greedy identity), K17 (pass-firing, switch-off identity), K18 (fp16 GEMM, acceptance), M10, M10a, C2
+- **Unverified or partial:** U2, M5 (LMCache reuse), M6 (TP2 e2e), M9 (M9a test, M9b), K03, K08, K09 (max-abs-rel), K13 (greedy identity), K14 (n=20 sweep), K16 (greedy identity), K17 (pass-firing, switch-off identity), K18 (fp16 GEMM, acceptance), M10, M10a, C2
 
-**Passed (GPU exit):** N0 (Phase 1), K05, K07, K11 (suite), K12 (suite), K15, K16 (suite), M3, M4.
+**Passed (GPU exit):** N0 (Phase 1), K05, K07, K11 (suite), K12 (suite), K15, K16 (suite), M3, M4, M7, M11.
 
 ## Not verified in this doc
 - CPU counts beyond those stated in PR bodies; current main CI.
