@@ -15,10 +15,37 @@ lean subset:
 CUDA graphs: a captured decode replays for any sequence length, so under
 capture the launch grid covers max_model_len (the "workspace envelope");
 eager decode launches only what the batch's max_seq_len needs.
+
+B1 (small captured batches): the envelope alone would pick 1024-token
+partitions whenever max_model_len >= 32768 (ops/fv100.py
+_select_default_decode_partition_size), where eager decode at the same
+context uses 256. A captured XQA decode of at most SMALL_BATCH_ROWS rows
+then runs a few long partitions on a mostly idle GPU. Bea's microbench
+(one Qwen3.8 TP2 layer, 2 kv heads, page 832, envelope 32768; us per
+layer-step, partition 1024 -> 256):
+
+  context   1 row          8 verify rows (one DFlash2 request)
+  1K        208 -> 52      211 -> 54
+  4K        261 -> 70      258 -> 239
+  16K       265 -> 151     1005 -> 778
+  32K       280 -> 291     1761 -> 1549
+  64K       555 -> 533     3278 -> 3079     (envelope 150000)
+  128K      1104 -> 1009   6533 -> 6094     (envelope 150000)
+
+At 32K context a single row is 4% slower with 256 (280 vs 291; 280 vs
+292 at envelope 150000); everywhere else 256 is as fast or faster, so
+these captures pass partition 256. Envelope 150000 costs the same as
+32768 (empty partitions exit at once). The 256-partition workspace is its
+own cache entry sized for <= SMALL_BATCH_ROWS rows: 12.5 MB at a 32K
+envelope, 100 MB above 131072 (12 q heads). Kill switch
+VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0
+(read at capture; only "0" acts) keeps the envelope's default.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,7 +55,36 @@ from vllm_sm70.ops import fv100
 if TYPE_CHECKING:
     from vllm_sm70.attention.flash_v100.metadata import FlashAttnV100Metadata
 
+logger = logging.getLogger("vllm.sm70")
+
 FULL_WINDOW = (-1, -1)
+
+SMALL_BATCH_SWITCH = "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
+SMALL_BATCH_ROWS = 16  # two DFlash2 verify requests (8 rows each)
+SMALL_BATCH_PARTITION = 256
+_small_batch_logged = False
+
+
+def small_batch_partition(rows: int) -> int | None:
+    """Partition size for a captured XQA decode of `rows` rows, or None."""
+    if os.environ.get(SMALL_BATCH_SWITCH) == "0":
+        return None
+    if not 1 <= rows <= SMALL_BATCH_ROWS:
+        return None
+    return SMALL_BATCH_PARTITION
+
+
+def _log_small_batch_once() -> None:
+    global _small_batch_logged
+    if not _small_batch_logged:
+        _small_batch_logged = True
+        logger.info(
+            "vllm_sm70: Flash-V100 captured XQA decode of <= %d rows uses "
+            "%d-token partitions (%s=0 keeps the envelope's default).",
+            SMALL_BATCH_ROWS,
+            SMALL_BATCH_PARTITION,
+            SMALL_BATCH_SWITCH,
+        )
 
 
 def split_kv_cache(
@@ -84,12 +140,17 @@ def run_decode(
     out = output[:num]
     seq_lens = metadata.decode_seq_lens
     block_table = metadata.decode_block_table
-    if metadata.cudagraph_capture or _capturing():
+    captured = metadata.cudagraph_capture or _capturing()
+    if captured:
         envelope = max(metadata.max_model_len, metadata.max_seq_len, 1)
         hints = dict(max_seq_len_hint=envelope, workspace_seq_capacity_hint=envelope)
     else:
         hints = dict(max_seq_len_hint=max(metadata.max_seq_len, 1))
     if use_xqa(q, key_cache, window, sinks):
+        partition = small_batch_partition(num) if captured else None
+        if partition is not None:
+            hints["partition_size_hint"] = partition
+            _log_small_batch_once()
         fv100.flash_attn_decode_paged_xqa(
             q,
             key_cache,

@@ -336,6 +336,68 @@ def test_verify_graph_replays_after_rebuild(fv100_gpu, monkeypatch, heads):
         assert diff < MAX_ABS, (step, diff)
 
 
+# B1 envelopes: (max_model_len, capture lengths, replay steps). The 150000
+# envelope replays contexts above 32K (40000, 100000).
+B1_CASES = {
+    "env32k": (32768, 4096, ([1000, 4096], [5000, 300])),
+    "env150k": (150000, 40000, ([40000, 100000], [100000, 2000])),
+}
+
+
+@pytest.mark.parametrize("case", sorted(B1_CASES))
+@pytest.mark.parametrize("query_len", [L, 1], ids=["verify", "decode"])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("small", ["1", "0"], ids=["b1", "b1-off"])
+@torch.inference_mode()
+def test_small_batch_graph_at_long_envelopes(
+    fv100_gpu, monkeypatch, case, query_len, batch, small
+):
+    """B1: a captured XQA decode of <= 16 rows (verify rows of one or two
+    requests, or single-token rows) at a 32K or 150K envelope (256-token
+    partitions; 1024 with the switch off) replays to TRITON_ATTN's output,
+    including contexts above 32K."""
+    device, fv100 = fv100_gpu
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION", small)
+    capacity, cap_len, steps = B1_CASES[case]
+    heads, d, block_size = (12, 2), 256, 16
+    fv100.clear_workspaces()
+    ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, capacity)
+    ours, tri = _impls(heads, d)
+    width = -(-capacity // block_size)
+    pool = 512
+    table = _table(batch, width, pool, device, seed=14)
+    kv = _kv(pool, block_size, heads[1], d, device, seed=15)
+    layer = _layer(device)
+    tokens = query_len * batch
+    q = _q(tokens, heads, d, device, seed=16)
+    out = torch.empty_like(q)
+    qlens = [query_len] * batch
+    lens0 = [cap_len] * batch
+    ours_b.build(0, _cm(qlens, lens0, table, device))
+    md = ours_b.build_for_cudagraph_capture(_cm(qlens, lens0, table, device))
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        ours.forward(layer, q, None, None, kv, md, out)
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ours.forward(layer, q, None, None, kv, md, out)
+    partitions = {key[4] for key in fv100._decode_workspace_cache}
+    assert (256 in partitions) == (small == "1"), partitions
+    for step, lens in enumerate(steps):
+        q.copy_(_q(tokens, heads, d, device, seed=20 + step))
+        table.random_(0, pool)
+        cm = _cm(qlens, lens[:batch], table, device)
+        ours_b.build(0, cm)
+        graph.replay()
+        ref = torch.empty_like(q)
+        tri.forward(layer, q, None, None, kv, tri_b.build(0, cm), ref)
+        torch.cuda.synchronize()
+        diff = (out.float() - ref.float()).abs().max().item()
+        assert diff < MAX_ABS, (step, lens[:batch], diff)
+
+
 # -------------------------------------- mixed batch: verify rows vs prefill
 
 
