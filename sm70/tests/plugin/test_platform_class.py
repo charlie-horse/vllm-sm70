@@ -53,7 +53,7 @@ def test_u1_gemm_hook_k18(platform_cls, monkeypatch):
         dflash2.reset_selection_cache()
         got = platform_cls.get_unquantized_gemm("auto")
         if expected is None:
-            assert got is None, value  # opt-in: default is upstream
+            assert got is None, value  # unset (auto, no config in scope) or "0"
         else:
             assert got is dflash2.dflash2_unquantized_gemm
     dflash2.reset_selection_cache()

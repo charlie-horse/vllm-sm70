@@ -13,9 +13,11 @@ How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
   :func:`prepare_dflash2_fp16_m8` packed, and calls ``F.linear`` (UP
   ``default_unquantized_gemm``) for everything else. M7's DFlash2 draft
   subclass marks the layers at construction and packs them in load_weights.
-Switch: OPT-IN. Only ``VLLM_SM70_DFLASH2_FP16=1`` enables it (envs.py says
-  why). Unset or any other value: ``get_unquantized_gemm`` returns None
-  (upstream dispatch, untouched), nothing is marked or packed, F.linear runs.
+Switch: ``VLLM_SM70_DFLASH2_FP16``: "1" on, any other value off, unset = auto
+  (:func:`k18_wanted`: on iff the DFlash2 verifier resolves on, i.e. the
+  Qwen3.8 + DFlash2 k=7 contract; M9 decision 2026-11-09). Off:
+  ``get_unquantized_gemm`` returns None (upstream dispatch, untouched),
+  nothing is marked or packed, F.linear runs.
 Selection is decided once: ``select_unquantized_gemm`` is cached per
   linear_backend (UP calls ``dispatch_unquantized_gemm()`` on every forward of
   lm_head and the MoE router gate), and each layer's route (N, K, tile, warps)
@@ -136,9 +138,36 @@ def gemm_available() -> bool:
     return all(has_op(name) for name in GEMM_OPS)
 
 
-def enabled() -> bool:
-    """Opted in (VLLM_SM70_DFLASH2_FP16=1) and the GEMM ops built."""
-    return bool(envs.VLLM_SM70_DFLASH2_FP16) and gemm_available()
+def k18_wanted(vllm_config: Any = None) -> bool:
+    """The K18 switch. "1" -> True, set to anything else -> False, unset ->
+    auto: True iff the DFlash2 verifier resolves on for ``vllm_config``
+    (default: vLLM's current config; none set -> False). Auto reuses M9a's
+    gate (dflash2_fp8.draft_fp8_wanted), so K18 and M9a turn on together and
+    VLLM_SM70_DFLASH2_VERIFIER=0 turns both off."""
+    value = envs.VLLM_SM70_DFLASH2_FP16
+    if value is not None:
+        return value
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+        except ImportError:  # pragma: no cover - vllm layout changed
+            return False
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return False
+    try:
+        return bool(dflash2_fp8.draft_fp8_wanted(vllm_config))
+    except Exception:
+        logger.warning(
+            "vllm_sm70: K18 auto check failed; DFlash2 draft FP16 GEMM off",
+            exc_info=True,
+        )
+        return False
+
+
+def enabled(vllm_config: Any = None) -> bool:
+    """K18 wanted (:func:`k18_wanted`) and the GEMM ops built."""
+    return k18_wanted(vllm_config) and gemm_available()
 
 
 def _is_sm70(device: torch.device) -> bool:
@@ -179,7 +208,7 @@ def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] 
     MoE router gate (UP moe_runner.py:910), so the answer is cached per
     linear_backend for the process. reset_selection_cache() clears it.
     """
-    return _select_cached(linear_backend)
+    return _select_cached(linear_backend, k18_wanted())
 
 
 def reset_selection_cache() -> None:
@@ -187,8 +216,8 @@ def reset_selection_cache() -> None:
 
 
 @functools.cache
-def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
-    if not envs.VLLM_SM70_DFLASH2_FP16:
+def _select_cached(linear_backend: str, wanted: bool) -> Callable[..., Any] | None:
+    if not wanted:
         return None
     if not gemm_available():
         return None
@@ -206,7 +235,7 @@ def _select_cached(linear_backend: str) -> Callable[..., Any] | None:
 
 
 def mark_draft_linears(
-    decoder_layer: torch.nn.Module, *, fp8: bool = False
+    decoder_layer: torch.nn.Module, *, fp8: bool = False, vllm_config: Any = None
 ) -> list[torch.nn.Module]:
     """Flag one DFlash2 draft decoder layer's unquantized projections.
 
@@ -215,7 +244,7 @@ def mark_draft_linears(
     M9a's channel-FP8 route (the caller decides: verifier on and k == 7,
     FORK :295-297). Returns the flagged modules.
     """
-    if not envs.VLLM_SM70_DFLASH2_FP16:
+    if not k18_wanted(vllm_config):
         return []
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 

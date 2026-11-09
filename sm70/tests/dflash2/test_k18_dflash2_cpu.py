@@ -57,11 +57,11 @@ def test_sources_cmake_lists_both_files():
 
 
 # ---------------------------------------------------------------- env / kill
-def test_switch_registered_opt_in(monkeypatch):
+def test_switch_registered_auto_opt_in(monkeypatch):
     assert KILL in envs.environment_variables()
     assert KILL in envs._SECTIONS["ops"]
     monkeypatch.delenv(KILL)
-    assert envs.VLLM_SM70_DFLASH2_FP16 is False  # default OFF
+    assert envs.VLLM_SM70_DFLASH2_FP16 is None  # unset = auto (M9)
     for value in ("0", "", "true", "on", " 1"):
         monkeypatch.setenv(KILL, value)
         assert envs.VLLM_SM70_DFLASH2_FP16 is False, value
@@ -70,6 +70,7 @@ def test_switch_registered_opt_in(monkeypatch):
 
 
 def test_default_off_selects_and_marks_nothing(monkeypatch):
+    """Unset, with no vLLM config in scope (and so no verifier contract): off."""
     monkeypatch.delenv(KILL)
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     assert dflash2.select_unquantized_gemm("auto") is None
@@ -545,3 +546,66 @@ def test_m7_load_weights_calls_prepare_marked(monkeypatch):
     model = object.__new__(cls)
     assert cls.load_weights(model, iter(())) == {"w"}
     assert order == ["load", ("prepare", model)]
+
+
+# ------------------------------------------------------- M9: auto default
+def _qwen38_cfg(**kw):
+    from test_m9a_dflash2_fp8_cpu import _vllm_config
+
+    return _vllm_config(**kw)
+
+
+@pytest.fixture
+def _auto(monkeypatch):
+    from vllm_sm70 import config
+
+    monkeypatch.delenv(KILL)
+    monkeypatch.delenv("VLLM_SM70_DFLASH2_VERIFIER", raising=False)
+    monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
+    config.clear_cache()
+    yield
+    config.clear_cache()
+
+
+def test_auto_on_for_qwen38_verifier_contract(_auto):
+    assert dflash2.k18_wanted(_qwen38_cfg())
+    assert dflash2.enabled(_qwen38_cfg())
+
+
+def test_auto_off_outside_contract(_auto):
+    moe = "Qwen3_5MoeForConditionalGeneration"
+    assert not dflash2.k18_wanted(_qwen38_cfg(arch=moe))
+    assert not dflash2.k18_wanted(_qwen38_cfg(k=5))
+    assert not dflash2.k18_wanted(_qwen38_cfg(sm70={"dflash2_verifier": "off"}))
+    assert not dflash2.k18_wanted(None)  # no current vLLM config
+
+
+def test_auto_off_with_verifier_kill(_auto, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_VERIFIER", "0")
+    assert not dflash2.k18_wanted(_qwen38_cfg())
+
+
+def test_explicit_switch_overrides_auto(_auto, monkeypatch):
+    monkeypatch.setenv(KILL, "0")
+    assert not dflash2.k18_wanted(_qwen38_cfg())
+    monkeypatch.setenv(KILL, "1")
+    assert dflash2.k18_wanted(_qwen38_cfg(arch="Qwen3_5MoeForConditionalGeneration"))
+
+
+def test_auto_select_and_mark_follow_current_config(_auto, monkeypatch):
+    pytest.importorskip("vllm")
+    import vllm.config as vc
+
+    monkeypatch.setattr(vc, "get_current_vllm_config_or_none", lambda: _qwen38_cfg())
+    dflash2.reset_selection_cache()
+    assert dflash2.select_unquantized_gemm("auto") is dflash2.dflash2_unquantized_gemm
+    marked = dflash2.mark_draft_linears(
+        _fake_decoder_layer(_linear_method()), vllm_config=_qwen38_cfg()
+    )
+    assert marked
+    monkeypatch.setattr(
+        vc,
+        "get_current_vllm_config_or_none",
+        lambda: _qwen38_cfg(arch="Qwen3_5MoeForConditionalGeneration"),
+    )
+    assert dflash2.select_unquantized_gemm("auto") is None  # not stuck in cache

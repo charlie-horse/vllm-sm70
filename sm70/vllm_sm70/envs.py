@@ -55,14 +55,30 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_DFLASH2_FP16 (K18) and VLLM_SM70_FP8_QPN8_M32 (K09),
-    opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09), opt-in by review decision.
+    (VLLM_SM70_DFLASH2_FP16 / K18 uses _auto_opt_in instead.)
     """
 
     def getter() -> bool:
         return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
+    return getter
+
+
+def _auto_opt_in(name: str) -> Callable[[], bool | None]:
+    """Tri-state getter: True for "1", None when unset (the caller decides
+    from the model, "auto"), False for any other value (so "0" turns it off).
+    Used by VLLM_SM70_DFLASH2_FP16 (K18) since M9 made it auto-on for the
+    Qwen3.8 DFlash2 verifier contract."""
+
+    def getter() -> bool | None:
+        value = os.environ.get(name)
+        if value is None:
+            return None
+        return value == "1"
+
+    getter.__name__ = f"auto_opt_in_{name}"
     return getter
 
 
@@ -196,14 +212,16 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # NOT RECOMMENDED: the M8 A/B (2026-11-08) measured it 27-33% slower
         # than M6 TurboMind at M=24/32 (c=3/4); it logs a warning when used.
         "VLLM_SM70_FP8_QPN8_M32": opt_in("VLLM_SM70_FP8_QPN8_M32"),
-        # K18 (vllm_sm70/ops/dflash2.py). OPT-IN: only "1" enables the
-        # DFlash2 draft FP16 M<=8 GEMM. Why off by default: the fork only
-        # ran it at TP4 (it marked no layer at TP2, so TP2 used F.linear),
-        # 9 of its 10 TP2 tile/warps choices are unmeasured, and packing
-        # keeps a second weight copy (~1.7 GB/GPU for the 27B draft at TP2).
+        # K18 (vllm_sm70/ops/dflash2.py): the DFlash2 draft FP16 M<=8 GEMM
+        # (+ M9a's channel-FP8 route, which rides on it). "1" forces it on,
+        # "0" (or any other value) off. UNSET = AUTO (M9, 2026-11-09): on iff
+        # the DFlash2 verifier resolves on (Qwen3.8-27B + DFlash2 k=7; not
+        # with VLLM_SM70_DFLASH2_VERIFIER=0), else off. Evidence: E3 A/B,
+        # row 4 TP2, 43.1 -> 41.1 ms/step, acceptance unchanged. Costs a
+        # second draft weight copy (~1.6 GB/GPU for the 27B draft at TP2).
         # Off: get_unquantized_gemm returns None, nothing is marked or
         # packed. Read once (selection cached) when layers are built/loaded.
-        "VLLM_SM70_DFLASH2_FP16": opt_in("VLLM_SM70_DFLASH2_FP16"),
+        "VLLM_SM70_DFLASH2_FP16": _auto_opt_in("VLLM_SM70_DFLASH2_FP16"),
     },
     "attention": {
         # K06: "0" -> upstream selection (TRITON_ATTN) instead of Flash-V100.
