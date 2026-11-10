@@ -10,7 +10,7 @@ Host names below are as used elsewhere in the repo. Keep IPs, tailnet names and 
 
 - [ ] C1 passed on the target commit (`docs/roadmap.md`, Phase 5). C1 passed on `cef0f9e` (build `aczb9zwk`) on 2026-11-09, after the `glm47_sm70` parser rerun.
 - [ ] C2 passed on c4130: LMCache check (`scripts/check-lmcache-cpu.sh`, plus the GPU smoke and `kvtier_test.py`, both still open in `docs/status.md`).
-- [ ] Bea's GPU gate passed on the same commit, in a downtime window (00:00–06:00 ET, per `docs/release.md`).
+- [ ] Bea's GPU gate passed on the same commit, in a downtime window (22:00–06:00 ET, via flake#5, per `docs/release.md`).
 - [ ] `main` CI is green on that commit.
 - [ ] Astro says OK.
 - [ ] `latest` is fast-forwarded to the commit that has passed all four gates (`docs/release.md`, "Moving `latest`"). Today the only candidate is `cef0f9e`. C1 has passed on it; the GPU gate, CI and Astro's OK are still open. A newer commit is fine once all four gates pass on that commit. The current `latest` is the bootstrap `3869cd6`, which has not passed the gates and must not be deployed.

@@ -115,6 +115,7 @@ Snapshot 2026-11-10. Source: Astro's and Quinn's notes; not re-checked here.
   4. The host config sets `models.flint.maxNumSeqs = 20` and `models.flint.args` (incl. `--hf-overrides`), per `docs/cutover-runbook.md` step 2.4 (PR #115).
   5. The untested §4.3b check (restart `vllm.service`, then resend) runs in the window.
   6. C2 still partial (GPU smoke and `kvtier_test.py` open).
+  7. **New, from Quinn's review:** c4130 switched to system-43 at 10:22 ET (`6qnj8v4g…`), which adds apiserver OIDC (`kube-apiserver.service`, `authentication-config.yaml`). flake#4's built toplevel (`fiiqm433…`, flake main d8088a1) lacks it, and switching to it would take OIDC off the apiserver. flake#4 must be merged with current flake main, and its c4130 toplevel diff redone against the running system, before Felix flips it.
 - **After C3:** C4 (archive the fork) per `docs/fork-retirement.md`; Charlie's call.
 
 ## Not verified in this doc

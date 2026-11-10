@@ -11,9 +11,14 @@
 ## Steps after C3
 
 1. **README pointer.** On `charlie-horse/vLLM`, put a short notice at the top of `README.md`: the fork is kept as a reference only; production builds from `charlie-horse/vllm-sm70` (link to its `latest` branch and `docs/release.md`); no further changes land here. Commit to the default branch. Charlie merges or pushes.
-2. **Pin the last fork commit.** Record the fork's final commit SHA in `docs/release.md` History, so the reference point is recoverable.
+2. **Pin the last fork commit.** Record the fork's final commit SHA in this doc (section "What stays"), not in `docs/release.md` History, which only logs `latest` moves. Fill it in after C3.
 3. **Stop automation that points at the fork.** Check the host flake, CI and any scripts for references to the fork's flake input or the fork's `vllm-lmcache` unit. Remove them. (The host flake change itself is in `docs/cutover-runbook.md` section 2.)
-4. **Keep, as reference:** the fork's source tree and history (read-only use), the TurboMind provenance check inputs (`check_turbomind_provenance.py --fork`, PR #78), and the fork's operator docs that `docs/roadmap.md` cites for switch names.
+4. **Keep, as reference:** the fork's source tree and history (read-only use), and the fork's operator docs that `docs/roadmap.md` cites for switch names. Tools that read a fork checkout at cf9492a, all of which must keep working against a read-only fork:
+   - `sm70/tools/check_turbomind_provenance.py --fork` (PR #78);
+   - `sm70/tools/check_flash_v100_provenance.py`;
+   - `sm70/tools/check_qpn8_provenance.py`;
+   - `scripts/verify-port.py --fork`, which every port review uses.
+   Before archiving, run each once against the fork tree and record the result here.
 5. **Archive, after Charlie's yes:** set the repository to archived on GitHub (Settings → Archive). Archived repos stay readable and forkable; no pushes, issues or PRs. This is hard to undo cleanly (unarchiving is possible but needs Charlie).
 
 ## What stays
