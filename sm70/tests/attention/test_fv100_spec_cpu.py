@@ -466,6 +466,38 @@ def test_other_verify_batches_keep_xqa(monkeypatch, verify_op, heads, query_lens
 
 
 @requires_vllm
+def test_eager_verify_keeps_one_workspace_at_growing_lengths(monkeypatch, verify_op):
+    # Eager B2 launches for the live length but sizes its workspace for the
+    # max_model_len envelope (4096 here -> 32 partitions): one cache entry,
+    # never one per length (Quinn's #114 review).
+    from vllm_sm70.ops import fv100
+
+    launches = []
+    for seq_len in (300, 1000, 2500, 4000):
+        verify_op.calls.clear()
+        names = _run_case(
+            monkeypatch,
+            verify_op,
+            heads=(12, 2),
+            head_size=256,
+            window=None,
+            sinks=None,
+            query_lens=[L, L],
+            seq_lens=[seq_len, 200],
+        )
+        assert names == ["fv100_decode_verify"]
+        launches.append(verify_op.calls[0][1]["launch"])
+        keys = [
+            key
+            for key in fv100._decode_workspace_cache
+            if key[4] == fv100.VERIFY_PARTITION_SIZE
+        ]
+        assert len(keys) == 1, keys
+        assert keys[0][6] == 4096 // fv100.VERIFY_PARTITION_SIZE
+    assert launches == [-(-s // 128) for s in (300, 1000, 2500, 4000)]
+
+
+@requires_vllm
 def test_verify_batches_over_the_workspace_cap_keep_xqa(monkeypatch, verify_op):
     from vllm_sm70.ops import fv100
 

@@ -991,27 +991,32 @@ def flash_attn_decode_verify(
     q / out [rows, H_q, 256] with rows = requests * 8, token-major (row =
     request * 8 + token); seq_lens [rows] and block_table [rows, blocks] are
     K07's expansion (visible length per token; the 8 rows of a request share
-    one table row). The grid covers max_seq_len_hint keys, or the
-    workspace_seq_capacity_hint envelope under CUDA-graph capture.
+    one table row). The grid covers max_seq_len_hint keys (the live length
+    eagerly, the max_model_len envelope under CUDA-graph capture). The
+    workspace is sized for workspace_seq_capacity_hint, which callers set to
+    the envelope on every call: one cache entry per engine, whatever the
+    live length (a per-length size would allocate a new workspace for each
+    eager length and never free the old ones).
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     if out is None:
         out = torch.empty_like(q)
     seq_hint = int(max_seq_len_hint or block_table.shape[1] * k_cache.shape[1])
-    capacity = int(workspace_seq_capacity_hint or seq_hint)
+    capacity = max(int(workspace_seq_capacity_hint or seq_hint), seq_hint)
     part = VERIFY_PARTITION_SIZE
-    launch = max(1, -(-max(seq_hint, capacity) // part))
-    if launch > VERIFY_MAX_PARTITIONS:
+    launch = max(1, -(-seq_hint // part))
+    workspace_parts = max(1, -(-capacity // part))
+    if workspace_parts > VERIFY_MAX_PARTITIONS:
         raise ValueError(
-            f"{launch} verify partitions exceed {VERIFY_MAX_PARTITIONS} "
-            f"(max_seq_len {max(seq_hint, capacity)})"
+            f"{workspace_parts} verify partitions exceed {VERIFY_MAX_PARTITIONS} "
+            f"(max_seq_len {capacity})"
         )
     plan = _DecodePlan(
         partition_size=part,
-        actual_num_partitions=max(1, -(-seq_hint // part)),
+        actual_num_partitions=launch,
         launch_num_partitions=launch,
-        workspace_num_partitions=launch,
+        workspace_num_partitions=workspace_parts,
     )
     # Exact partition capacity (the budget above assumes it) and no
     # active_num_partitions refresh (the verify kernel does not read it).

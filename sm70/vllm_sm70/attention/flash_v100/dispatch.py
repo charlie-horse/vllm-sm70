@@ -190,6 +190,8 @@ def run_decode(
         q, key_cache, metadata
     ):
         _log_verify_once()
+        # The workspace always covers the envelope (one cache entry per
+        # engine); only the launch grid follows the live length eagerly.
         fv100.flash_attn_decode_verify(
             q,
             key_cache,
@@ -198,7 +200,10 @@ def run_decode(
             seq_lens,
             softmax_scale=scale,
             out=out,
-            **hints,
+            max_seq_len_hint=hints["max_seq_len_hint"],
+            workspace_seq_capacity_hint=max(
+                metadata.max_model_len, metadata.max_seq_len, 1
+            ),
         )
         return
     if use_xqa(q, key_cache, window, sinks):
