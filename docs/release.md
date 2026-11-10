@@ -8,7 +8,13 @@ Hosts consume this flake as `github:charlie-horse/vllm-sm70/latest`, never `main
 
 1. `main` CI is green on it (patch series, both Python unit jobs, Nix eval).
 2. C1 passes on it: the side-by-side bench and quality run against the fork on c4130 (see `docs/roadmap.md`, Phase 5).
-3. Bea's GPU gate passed on it, in a downtime window (00:00–06:00 ET).
+3. Bea's GPU gate passed on it, in a downtime window (22:00–06:00 ET, via flake#5). "Bea's GPU gate" is the following list, run on that exact commit at prod args:
+   - `pytest -m gpu` passes.
+   - M5 T1–T7 pass (the T-gates are defined in `docs/m5-calibration-nov7.md`).
+   - The 6-switch envelope: each of the 6 kernel-changing switches (`MODELOPT_NVFP4_GEMV`, `FLINT_MOE_QPN_DECODE`, `FLINT_QK_ROPE_KV`, `FLINT_FUSED_ROUTER`, `FLINT_ATTN_FUSED_DECODE`, `FLINT_MOE_COMPACT`) stays within the fork envelope when set to 0, teacher-forced.
+   - 4K decode ≥ 170 tok/s, and 32K decode measured at prod args, recorded against C1's fork numbers at prod args (`C1-fork/e2e.out`): 4K 177.8 tok/s, 32K 163.0 default and 165.6 greedy. No gate at 32K yet.
+   - Precondition: no leftover servers on the test ports. Check `ss -ltnp` for the vLLM and LMCache ports before the gate. After start, confirm the fresh `lmcache-server.log` shows the server bound (C1R's LMCache once failed to bind and used a stale server).
+   - The LMCache reuse check (`docs/cutover-runbook.md` section 4.3) and the check5 and quality probes.
 4. Astro says OK.
 
 A gate run on another commit doesn't count, even if only docs changed in between. Never force-push `latest` or move it backwards. To roll back, revert on `main`, run the gates again, and fast-forward.
