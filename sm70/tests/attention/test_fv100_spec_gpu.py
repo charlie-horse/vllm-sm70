@@ -181,6 +181,93 @@ def test_smallq_decode_matches_causal_prefill(fv100_gpu, query_len, heads, decod
     torch.testing.assert_close(smallq, prefill, atol=1.5e-2, rtol=1e-2)
 
 
+# ------------------------------- A1: one-launch expansion == torch expansion
+
+
+@pytest.mark.parametrize("width", [3, 129, 300])
+@pytest.mark.parametrize("row_stride_pad", [0, 37], ids=["dense", "strided"])
+@torch.inference_mode()
+def test_smallq_kernel_matches_torch_expansion(
+    fv100_gpu, monkeypatch, width, row_stride_pad
+):
+    """Bit-identical to the torch path: mixed lengths, empty rows, padding.
+
+    When strided, the block table is a column slice of a wider buffer (row
+    stride > width). Padding tokens get seq_len 0; their table
+    rows are not part of the contract (neither path's decode reads them).
+    """
+    from vllm_sm70.attention.flash_v100.spec.verify import (
+        VerifyExpansion,
+        expand_reference,
+    )
+
+    device, _ = fv100_gpu
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SMALLQ_METADATA", raising=False)
+    max_reqs = 16
+    cap = max_reqs * L + 8  # room for padding tokens after a full batch
+    kern = VerifyExpansion(cap, device, max_reqs=max_reqs)
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_SMALLQ_METADATA", "0")
+    ref = VerifyExpansion(cap, device, max_reqs=max_reqs)
+    assert kern.uses_kernel and not ref.uses_kernel
+    gen = torch.Generator().manual_seed(width + row_stride_pad)
+    cases = [
+        [L] * 16,
+        [L],
+        [L, 0, L, 3, 1, L],  # an empty row (equal boundaries) and short rows
+        [1] * 7,
+        [5, L, L, 2],
+    ]
+    for query_lens in cases:
+        rows = len(query_lens)
+        qsl = torch.zeros(rows + 1, dtype=torch.int32)
+        qsl[1:] = torch.tensor(query_lens).cumsum(0)
+        mapped = int(qsl[-1])
+        seq = [int(torch.randint(q, 5000, (1,), generator=gen)) + 1 for q in query_lens]
+        wide = torch.randint(
+            0, 10**6, (rows, width + row_stride_pad), generator=gen, dtype=torch.int32
+        ).to(device)
+        table = wide[:, :width]
+        for pad in (0, 5):
+            args = (
+                qsl.to(device),
+                torch.tensor(seq, dtype=torch.int32, device=device),
+                table,
+                rows,
+                mapped,
+                mapped + pad,
+            )
+            ks, kt = kern.expand(*args)
+            rs, rt = ref.expand(*args)
+            torch.cuda.synchronize()
+            assert torch.equal(ks, rs), (query_lens, pad)
+            assert torch.equal(kt[:mapped], rt[:mapped]), (query_lens, pad)
+            want_rows, want_lens = expand_reference(query_lens, seq)
+            assert ks[:mapped].tolist() == want_lens
+            assert ks[mapped:].tolist() == [0] * pad
+            assert torch.equal(kt[:mapped], table[torch.tensor(want_rows)])
+
+
+@torch.inference_mode()
+def test_smallq_kernel_rewrites_the_same_buffers(fv100_gpu, monkeypatch):
+    # Graph safety: each step's kernel launch writes the builder's
+    # persistent buffers in place, like the torch path.
+    from vllm_sm70.attention.flash_v100.spec.verify import VerifyExpansion
+
+    device, _ = fv100_gpu
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SMALLQ_METADATA", raising=False)
+    exp = VerifyExpansion(4 * L, device, max_reqs=4)
+    assert exp.uses_kernel
+    qsl = torch.arange(0, 5 * L, L, dtype=torch.int32, device=device)
+    table = torch.arange(4 * 8, dtype=torch.int32, device=device).view(4, 8)
+    ptrs = set()
+    for step in range(3):
+        lens = torch.tensor([100 + step, 9, 40, 2000], dtype=torch.int32, device=device)
+        s, t = exp.expand(qsl, lens, table, 4, 4 * L, 4 * L)
+        ptrs.add((s.data_ptr(), t.data_ptr()))
+        assert s[L - 1].item() == 100 + step
+    assert len(ptrs) == 1
+
+
 # ----------------------------------------- verify vs TRITON_ATTN (+ graph)
 
 

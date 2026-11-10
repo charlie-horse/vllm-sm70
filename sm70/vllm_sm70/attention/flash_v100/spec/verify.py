@@ -20,6 +20,10 @@ rewritten in place with device ops (no host sync); forward reads fixed-size
 prefixes of them. The decode route itself (XQA / scalar) was already
 capture-safe (K06), so uniform verify batches can be captured
 (UNIFORM_BATCH) without the K06 downgrade.
+
+A1: on CUDA the expansion is one Triton launch (spec/smallq.py) instead of
+~20 torch launches; VLLM_SM70_FLASH_V100_SMALLQ_METADATA=0 (read when the
+builder is built) keeps the torch path, which CPU tensors always take.
 """
 
 from __future__ import annotations
@@ -27,15 +31,29 @@ from __future__ import annotations
 import torch
 
 
+def _next_pow2(n: int) -> int:
+    return 1 << max(int(n) - 1, 0).bit_length()
+
+
 class VerifyExpansion:
     """Persistent buffers for token-wise verify rows of one metadata builder."""
 
-    def __init__(self, max_rows: int, device: torch.device) -> None:
+    def __init__(
+        self, max_rows: int, device: torch.device, max_reqs: int | None = None
+    ) -> None:
         self.max_rows = max(int(max_rows), 1)
         self.device = device
         self.seq_lens = torch.zeros(self.max_rows, dtype=torch.int32, device=device)
         self.block_table: torch.Tensor | None = None  # [max_rows, width], lazily
         self._arange = torch.arange(self.max_rows, dtype=torch.int64, device=device)
+        # One kernel shape per builder (compiled before capture): rows are
+        # requests, at most max_reqs (else max_rows, one token each).
+        self.row_block = _next_pow2(int(max_reqs or self.max_rows) + 1)
+        self.uses_kernel = False
+        if torch.device(device).type == "cuda":
+            from vllm_sm70.attention.flash_v100.spec import smallq
+
+            self.uses_kernel = smallq.can_expand(torch.device(device))
 
     def _ensure_block_table(self, width: int) -> torch.Tensor:
         if self.block_table is None or self.block_table.shape[1] < width:
@@ -74,6 +92,31 @@ class VerifyExpansion:
         table = self._ensure_block_table(width)
         out_seq = self.seq_lens[:num_tokens]
         out_table = table[:num_tokens, :width]
+        if (
+            num_rows
+            and num_mapped_tokens
+            and self.uses_kernel
+            and num_rows < self.row_block
+            and query_start_loc.dtype == seq_lens.dtype == block_table.dtype
+            and block_table.dtype == torch.int32
+            and block_table.stride(1) == 1
+        ):
+            from vllm_sm70.attention.flash_v100.spec.smallq import (
+                expand_verify_rows,
+            )
+
+            expand_verify_rows(
+                out_seq,
+                out_table,
+                query_start_loc,
+                seq_lens,
+                block_table,
+                num_rows=num_rows,
+                num_mapped_tokens=num_mapped_tokens,
+                num_tokens=num_tokens,
+                row_block=self.row_block,
+            )
+            return out_seq, out_table
         out_seq.zero_()
         if num_rows and num_mapped_tokens:
             qsl = query_start_loc[: num_rows + 1].to(torch.int64)

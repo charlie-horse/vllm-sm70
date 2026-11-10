@@ -29,14 +29,16 @@ layer-step, partition 1024 -> 256):
   4K        261 -> 70      258 -> 239
   16K       265 -> 151     1005 -> 778
   32K       280 -> 291     1761 -> 1549
+  64K       555 -> 533     3278 -> 3079     (envelope 150000)
+  128K      1104 -> 1009   6533 -> 6094     (envelope 150000)
 
 At 32K context a single row is 4% slower with 256 (280 vs 291; 280 vs
 292 at envelope 150000); everywhere else 256 is as fast or faster, so
 these captures pass partition 256. Envelope 150000 costs the same as
-32768 (empty partitions exit at once); 64K and 128K contexts are not
-measured yet. The 256-partition workspace is its own cache entry
-sized for <= SMALL_BATCH_ROWS rows: 12.5 MB at a 32K envelope, 100 MB above
-131072 (12 q heads). Kill switch VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0
+32768 (empty partitions exit at once). The 256-partition workspace is its
+own cache entry sized for <= SMALL_BATCH_ROWS rows: 12.5 MB at a 32K
+envelope, 100 MB above 131072 (12 q heads). Kill switch
+VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0
 (read at capture; only "0" acts) keeps the envelope's default.
 """
 

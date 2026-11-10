@@ -41,6 +41,7 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -58,6 +59,8 @@ from vllm_sm70.attention.flash_v100.spec.verify import VerifyExpansion
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+
+logger = init_logger("vllm.sm70.attention")
 
 
 @dataclass(frozen=True)
@@ -183,10 +186,18 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             device=device,
         )
         self.verify = (
-            VerifyExpansion(max_num_seqs * self.spec_query_len, device)
+            VerifyExpansion(
+                max_num_seqs * self.spec_query_len, device, max_reqs=max_num_seqs
+            )
             if self.spec_verify
             else None
         )
+        if self.verify is not None and self.verify.uses_kernel:
+            logger.info_once(
+                "vllm_sm70: Flash-V100 verify metadata expands in one launch "
+                "per cache group (VLLM_SM70_FLASH_V100_SMALLQ_METADATA=0 "
+                "restores the torch expansion)."
+            )
 
     @classmethod
     def get_cudagraph_support(
