@@ -67,8 +67,12 @@ constexpr int kVecPerRow = kD / 8;  // uint4 per 256-half row
 // Finite "minus infinity": --use_fast_math is on for these sources, so
 // masked scores never rely on IEEE infinities.
 constexpr float kNegInf = -1.0e30f;
-// Reducer smem holds one float per partition (48 KB default limit).
-constexpr int kMaxPartitions = 12288;
+// Reducer smem: one float per partition (dynamic) plus kWarps + 1 floats of
+// static scratch, inside the 48 KB a launch gets without opting in.
+constexpr int kMaxPartitions = 12000;
+static_assert(kMaxPartitions * sizeof(float) + (kWarps + 1) * sizeof(float) <=
+                  48 * 1024,
+              "reducer shared memory over the default limit");
 
 template <int G>
 struct VerifyShape {

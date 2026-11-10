@@ -90,8 +90,9 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     fv_seq_lens: torch.Tensor | None = None
     # K07: decode rows are the token-wise expansion of verify rows.
     spec_verify: bool = False
-    # B2: every decode request has exactly verify_query_len tokens (so decode
-    # row = request * verify_query_len + token); 0 when not uniform.
+    # B2: every decode request has exactly verify_query_len tokens, or is
+    # zero-token padding at the tail (so decode row = request *
+    # verify_query_len + token); 0 when not uniform.
     verify_query_len: int = 0
 
 
@@ -239,8 +240,17 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         if expand:
             decode_rows = num_decode_tokens
             if num_decodes and num_decode_tokens == num_decodes * self.spec_query_len:
+                # Real requests with spec_query_len tokens each, then only
+                # zero-token CUDA-graph padding requests (the V2 runner pads
+                # at the tail; their rows have seq_len 0).
                 qsl = cm.query_start_loc_cpu[: num_decodes + 1]
-                if bool(((qsl[1:] - qsl[:-1]) == self.spec_query_len).all()):
+                qlens = qsl[1:] - qsl[:-1]
+                real = int((qlens == self.spec_query_len).sum())
+                if (
+                    real
+                    and bool((qlens[:real] == self.spec_query_len).all())
+                    and bool((qlens[real:] == 0).all())
+                ):
                     verify_query_len = self.spec_query_len
             decode_seq_lens, decode_block_table = self.verify.expand(
                 cm.query_start_loc,

@@ -215,13 +215,13 @@ def _builder(monkeypatch, heads=(12, 2), head_size=256, spec_tokens=SPEC_TOKENS)
     )
 
 
-def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None):
+def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None, num_tokens=None):
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     width = width or -(-max(seq_lens) // block_size)
     qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
     qsl[1:] = torch.tensor(query_lens).cumsum(0)
-    n = int(qsl[-1])
+    n = num_tokens or int(qsl[-1])
     table = torch.arange(len(query_lens) * width, dtype=torch.int32).view(-1, width)
     return CommonAttentionMetadata(
         query_start_loc=qsl.clone(),
@@ -462,6 +462,32 @@ def test_uniform_verify_takes_the_verify_kernel(monkeypatch, verify_op, heads):
 def test_other_verify_batches_keep_xqa(monkeypatch, verify_op, heads, query_lens, env):
     if env is not None:
         monkeypatch.setenv(VERIFY, env)
+    _expect_xqa(monkeypatch, verify_op, heads, query_lens)
+
+
+@requires_vllm
+def test_verify_batches_over_the_workspace_cap_keep_xqa(monkeypatch, verify_op):
+    from vllm_sm70.ops import fv100
+
+    # 2 requests fit, 3 do not (max_model_len 4096 -> 32 partitions).
+    per_row = 12 * 32 * 520
+    monkeypatch.setattr(fv100, "VERIFY_WORKSPACE_BUDGET", 2 * L * per_row)
+    _expect_xqa(monkeypatch, verify_op, (12, 2), [L, L, L])
+    verify_op.calls.clear()
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=(12, 2),
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=[L, L],
+        seq_lens=[400, 410],
+    )
+    assert names == ["fv100_decode_verify"]
+
+
+def _expect_xqa(monkeypatch, verify_op, heads, query_lens):
     names = _run_case(
         monkeypatch,
         verify_op,
@@ -485,6 +511,26 @@ def test_builder_marks_uniform_verify_batches(monkeypatch):
     assert b.build(0, _cm([1, 1], [300, 40])).verify_query_len == 0
     cap = b.build_for_cudagraph_capture(_cm([L] * 4, [L] * 4))
     assert cap.verify_query_len == L
+    # FULL-graph replay pads with zero-token requests at the tail only.
+    padded = b.build(0, _cm([L, 0], [300, 0], num_tokens=2 * L))
+    assert padded.decode_rows == 2 * L and padded.verify_query_len == L
+    assert padded.decode_seq_lens[L:].tolist() == [0] * L
+    middle = b.build(0, _cm([L, 0, L], [300, 0, 40], num_tokens=3 * L))
+    assert middle.verify_query_len == 0
+
+
+def test_verify_rows_cap_follows_the_workspace_budget():
+    from vllm_sm70.ops import fv100
+
+    # Qwen3.8 TP2: 12 q heads, D256. 520 B per (row, head, 128-key partition).
+    assert fv100.verify_max_rows(12, 256, 32768) == 168  # 21 requests
+    assert fv100.verify_max_rows(12, 256, 150000) == 32  # 4 requests
+    assert fv100.verify_max_rows(8, 256, 262144) == 24  # Qwen3.6 TP2, 1Cat len
+    for heads, length in ((12, 32768), (12, 150000), (8, 262144)):
+        rows = fv100.verify_max_rows(heads, 256, length)
+        parts = -(-length // 128)
+        assert rows % 8 == 0
+        assert rows * heads * parts * 520 <= fv100.VERIFY_WORKSPACE_BUDGET
 
 
 def test_verify_switch_registered_and_reads_only_zero(monkeypatch):

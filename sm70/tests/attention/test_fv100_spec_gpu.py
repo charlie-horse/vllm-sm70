@@ -101,12 +101,12 @@ def _layer(device):
     return SimpleNamespace(_k_scale=one, _v_scale=one, _q_scale=one)
 
 
-def _cm(query_lens, seq_lens, table, device, causal=True):
+def _cm(query_lens, seq_lens, table, device, causal=True, num_tokens=None):
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
     qsl[1:] = torch.tensor(query_lens).cumsum(0)
-    n = int(qsl[-1])
+    n = num_tokens or int(qsl[-1])
     return CommonAttentionMetadata(
         query_start_loc=qsl.to(device),
         query_start_loc_cpu=qsl,
@@ -500,6 +500,66 @@ def test_verify_kernel_graph_replays_after_rebuild(
         torch.cuda.synchronize()
         diff = (out.float() - ref.float()).abs().max().item()
         assert diff < MAX_ABS, (step, lens, diff)
+
+
+@pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
+@pytest.mark.parametrize("batch", [2, 4])
+@torch.inference_mode()
+def test_verify_kernel_graph_with_padding_requests(
+    fv100_gpu, monkeypatch, heads, batch
+):
+    """Capture `batch` verify requests, then replay with batch - 1 live
+    ones and a zero-token padding request at the tail (the V2 runner's FULL
+    graph padding: seq_len 0). Live rows match TRITON_ATTN on the live
+    requests; the padding rows come out zero, through builder and graph."""
+    device, fv100 = fv100_gpu
+    monkeypatch.delenv(VERIFY, raising=False)
+    d, block_size, capacity = 256, 16, 32768
+    fv100.clear_workspaces()
+    ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, capacity)
+    ours, tri = _impls(heads, d)
+    width = -(-capacity // block_size)
+    pool = 512
+    table = _table(batch, width, pool, device, seed=71)
+    kv = _kv(pool, block_size, heads[1], d, device, seed=72)
+    layer = _layer(device)
+    q = _q(L * batch, heads, d, device, seed=73)
+    out = torch.empty_like(q)
+    full = [4096] * batch
+    ours_b.build(0, _cm([L] * batch, full, table, device))
+    md = ours_b.build_for_cudagraph_capture(_cm([L] * batch, full, table, device))
+    assert md.verify_query_len == L
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        ours.forward(layer, q, None, None, kv, md, out)
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ours.forward(layer, q, None, None, kv, md, out)
+    live = batch - 1
+    lens = [300 + 1000 * i for i in range(live)]
+    q.copy_(_q(L * batch, heads, d, device, seed=74))
+    table.random_(0, pool)
+    padded = _cm([L] * live + [0], lens + [0], table, device, num_tokens=L * batch)
+    md_live = ours_b.build(0, padded)
+    assert md_live.decode_rows == L * batch and md_live.verify_query_len == L
+    out.fill_(7.0)
+    graph.replay()
+    ref = torch.empty_like(q[: L * live])
+    tri.forward(
+        layer,
+        q[: L * live],
+        None,
+        None,
+        kv,
+        tri_b.build(0, _cm([L] * live, lens, table[:live], device)),
+        ref,
+    )
+    torch.cuda.synchronize()
+    diff = (out[: L * live].float() - ref.float()).abs().max().item()
+    assert diff < MAX_ABS, diff
+    assert torch.count_nonzero(out[L * live :]) == 0
 
 
 @torch.inference_mode()

@@ -71,12 +71,20 @@ def verify_kernel_enabled() -> bool:
 def use_verify_kernel(
     query: torch.Tensor, key_cache: torch.Tensor, metadata: FlashAttnV100Metadata
 ) -> bool:
-    """B2 takes a K07 verify batch whose requests all have 8 tokens."""
-    return (
+    """B2 takes a K07 verify batch whose requests all have 8 tokens, up to
+    the rows whose workspace fits fv100.VERIFY_WORKSPACE_BUDGET at this
+    max_model_len. The switch is read here on every call, so a CUDA graph
+    keeps the route it was captured with."""
+    if not (
         bool(getattr(metadata, "spec_verify", False))
         and getattr(metadata, "verify_query_len", 0) == fv100.VERIFY_QUERY_LEN
         and verify_kernel_enabled()
         and fv100.verify_supported(query, key_cache)
+    ):
+        return False
+    envelope = max(int(metadata.max_model_len), int(metadata.max_seq_len), 1)
+    return query.shape[0] <= fv100.verify_max_rows(
+        query.shape[1], query.shape[2], envelope
     )
 
 

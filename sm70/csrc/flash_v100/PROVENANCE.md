@@ -102,7 +102,7 @@ Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.c
 | `sm70/csrc/flash_v100/fv100_config.h` | `flash-attention-v100/include/flash_v100_policy.h` | new | 56 | 466 | c8efae47b | `76ee201719ee9646c4b3e057a6be3912842de8220a1ae2ace349cf44669f0788` | `1fabfd62dfe0284695af025fc1cd0478451a7d123703f6035befd57fa98231a0` |
 | `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 286 | 166 | 38f49201f | `c3b69f7777f2f61720188480aef5f6bc92b25b60716233fc796237c23a6abda2` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
 | `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 64 | 143 | 8235544d4 | `ae5dcd7e2a34b911a54a5dd0ab819f6cdd3591bb00bb51ab4e52950a1c10c00c` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
-| `sm70/csrc/flash_v100/verify_decode.cu` | - | new | 542 | - | - | `26f1e61913fe07122bf7840ad2f5125006627e7d0add1a902b67398723e53a5f` | - |
+| `sm70/csrc/flash_v100/verify_decode.cu` | - | new | 546 | - | - | `02be03d5e4d7c720720c0c8a2e6a5628bac36328d3780e5d6131bc732c5ef290` | - |
 
 ## Adaptations (commit 3)
 
