@@ -45,8 +45,21 @@ Marked `TODO(sm70-attn)` / `TODO(sm70-moe)` in `module.nix`; upstream v0.33.0
 rejects them at startup until the patch series adds them:
 
 - `--kernel-config.sm70_skinny_moe false` (Flint).
-- `--attention-backend FLASH_ATTN_V100` (qwen3.8-27b) and the DFlash draft's
-  `attention_backend = "FLASH_ATTN_V100"`. Without them vLLM picks TRITON_ATTN.
+
+Attention needs no flag: the sm70 platform picks Flash-V100 (K06,
+`AttentionBackendEnum.CUSTOM`) for fp16 head-128/256 layers, target
+and DFlash draft alike, unless `VLLM_SM70_FLASH_V100=0`.
+
+## Qwen serve flags
+
+The `qwen3.6-35b-a3b` and `qwen3.8-27b` entries use the flags measured on
+c4130 (Phase 3 Block F): async scheduling, the V2 model runner
+(`VLLM_USE_V2_MODEL_RUNNER=1`, which DFlash drafts need), Flash-V100
+attention, and LMCache. The fork/1Cat serve flags are an opt-in for A/B
+runs (they measured 12-27% slower per step): set
+`models."qwen3.8-27b".asyncScheduling = false` (plus `maxNumSeqs = 4`)
+in the host, and the same for `qwen3.6-35b-a3b`. The comment above `builtinModels` in
+`module.nix` has both entries.
 
 ## LMCache patches
 
