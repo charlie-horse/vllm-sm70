@@ -101,6 +101,22 @@ Roadmap order. Each node appears once.
 
 **Passed (GPU exit):** N0 (Phase 1), K05, K07, K11 (suite), K12 (suite), K15, K16 (suite), M3, M4, M7, M11.
 
+## Cutover ledger (C1, C3)
+
+Snapshot 2026-11-10. Source: Astro's and Quinn's notes; not re-checked here.
+
+- **C1: PASS** on `cef0f9e` (build `aczb9zwk`), 2026-11-09, after the `glm47_sm70` parser rerun (review 5833861019).
+- **`latest`:** still `3869cd6` (bootstrap). Held until Bea's GPU gate passes on `cef0f9e`.
+- **GPU window:** 22:00–06:00 via flake#5, tonight. Bea runs Bea's GPU gate first thing (`docs/release.md`, gate 3).
+- **Cutover blockers (C3):**
+  1. Bea's GPU gate on `cef0f9e` (not run yet).
+  2. Quinn confirms the gate result; then Astro's OK; then fast-forward `latest` and send the SHA to Felix and Quinn.
+  3. Felix flips flake#4 to `/latest`.
+  4. The host config sets `models.flint.maxNumSeqs = 20` and `models.flint.args` (incl. `--hf-overrides`), per `docs/cutover-runbook.md` step 2.4 (PR #115).
+  5. The untested §4.3b check (restart `vllm.service`, then resend) runs in the window.
+  6. C2 still partial (GPU smoke and `kvtier_test.py` open).
+- **After C3:** C4 (archive the fork) per `docs/fork-retirement.md`; Charlie's call.
+
 ## Not verified in this doc
 - CPU counts beyond those stated in PR bodies; current main CI.
 - The Nov 6 `window.out` is treated as superseded by the Nov 7 `m5full` run, per the Nov 7 gate rulings.

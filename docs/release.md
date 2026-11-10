@@ -8,7 +8,12 @@ Hosts consume this flake as `github:charlie-horse/vllm-sm70/latest`, never `main
 
 1. `main` CI is green on it (patch series, both Python unit jobs, Nix eval).
 2. C1 passes on it: the side-by-side bench and quality run against the fork on c4130 (see `docs/roadmap.md`, Phase 5).
-3. Bea's GPU gate passed on it, in a downtime window (00:00–06:00 ET).
+3. Bea's GPU gate passed on it, in a downtime window (22:00–06:00 ET, via flake#5). "Bea's GPU gate" is the following list, run on that exact commit at prod args:
+   - `pytest -m gpu` passes.
+   - M5 T1–T7 pass (the Flint numerical gates in `docs/roadmap.md`, M5).
+   - The 6-switch envelope: each of the 6 kernel-changing switches (`MODELOPT_NVFP4_GEMV`, `FLINT_MOE_QPN_DECODE`, `FLINT_QK_ROPE_KV`, `FLINT_FUSED_ROUTER`, `FLINT_ATTN_FUSED_DECODE`, `FLINT_MOE_COMPACT`) stays within the fork envelope when set to 0, teacher-forced.
+   - 4K decode ≥ 170 tok/s, and 32K decode measured at prod args (recorded, with the fork's 162.8 tok/s for comparison; no gate at 32K yet).
+   - The LMCache reuse check (`docs/cutover-runbook.md` section 4.3) and the check5 and quality probes.
 4. Astro says OK.
 
 A gate run on another commit doesn't count, even if only docs changed in between. Never force-push `latest` or move it backwards. To roll back, revert on `main`, run the gates again, and fast-forward.
