@@ -49,16 +49,19 @@ The host flake (charlie-horse/flake, `hosts/c4130/vllm`) consumes this repo. Cha
 4. **Host config for Flint**, set in the host flake:
    - `services.vllm-sm70.models.flint.maxNumSeqs = 20;`. The module applies `mkDefault` to each field (`nix/module.nix:279-283`), so this overrides only this field. The default is 2 (`nix/module.nix:73`); C1 and prod ran 20.
    - **The host must set `models.flint.args`.** At `cef0f9e` the module's Flint entry has no `--hf-overrides`. Without it vLLM loads upstream's `FlintForCausalLM`, which asserts bf16 and FlashInfer (`sm70/vllm_sm70/models/flint_sm70/__init__.py:10-17`), so the service does not start on V100. `args` is a single field, so the host list replaces the module's whole list. Set it to the module's `cef0f9e` Flint list plus `--hf-overrides`, in this order:
+     ```nix
+     services.vllm-sm70.models.flint.args = [
+       "--kv-cache-dtype" "auto"
+       "--enable-prompt-tokens-details"
+       "--tool-call-parser" "glm47"
+       "--reasoning-parser-plugin" "vllm_sm70.reasoning"
+       "--reasoning-parser" "glm47_sm70"
+       "--exclude-tools-when-tool-choice-none"
+       "--override-generation-config" ''{"temperature":1.0,"top_p":0.95,"top_k":20}''
+       "--hf-overrides" ''{"architectures":["FlintSm70ForCausalLM"]}''
+     ];
      ```
-     --kv-cache-dtype auto
-     --enable-prompt-tokens-details
-     --tool-call-parser glm47
-     --reasoning-parser-plugin vllm_sm70.reasoning
-     --reasoning-parser glm47_sm70
-     --exclude-tools-when-tool-choice-none
-     --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20}'
-     --hf-overrides '{"architectures":["FlintSm70ForCausalLM"]}'
-     ```
+     Write it in Nix as shown. Do not shell-quote the JSON args: the single quotes would reach vLLM literally and break both JSON args at startup.
      This is the argument list C1 served (`C1R-ours/cmdline.txt`), apart from host and port. Keep both parser flags. Using upstream's `glm47` parser without the plugin leaks Flint's `<think>` text into the answer when thinking is off.
    - Moving `--hf-overrides` into the module is a new commit and needs the four gates again. That is Astro's call; until then the host list is the source of truth.
    - After the switch, check the startup log's `non-default args` for `'reasoning_parser': 'glm47_sm70'` and `'hf_overrides'`. C1's log is how the parser gap was found.
