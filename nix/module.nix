@@ -41,11 +41,11 @@ let
 
   # DFlash2 speculative decoding with a local draft checkpoint (upstream
   # `method = "dflash"`; draft KV follows the target's FP16 KV).
-  # TODO(sm70-attn): the fork ran the draft on its FLASH_ATTN_V100 backend.
-  # Upstream v0.33.0 has no such backend (an unknown name is a startup error),
-  # so `attention_backend` is left unset and vLLM picks TRITON_ATTN, the only
-  # sm_70 backend upstream. Put `attention_backend = "FLASH_ATTN_V100"` back
-  # once the patch series registers it (Mara/Kai's attention patches).
+  # No `attention_backend`: with none chosen, the sm70 platform picks
+  # Flash-V100 (K06, registered as AttentionBackendEnum.CUSTOM) for the
+  # target's and the draft's fp16 head-256 layers, the backend the fork ran
+  # as FLASH_ATTN_V100. Leaving it unchosen keeps VLLM_SM70_FLASH_V100=0
+  # (fall back to TRITON_ATTN) working; an explicit CUSTOM would bypass it.
   dflashConfig =
     draftDir:
     builtins.toJSON {
@@ -57,7 +57,33 @@ let
       enforce_eager = false;
     };
 
+  # Environment of the Qwen DFlash2 entries: Flint's (see there). The V2
+  # model runner is the separate `v2ModelRunner` field, so a host that
+  # replaces `env` (e.g. to set a kill switch) keeps it.
+  qwenEnv = {
+    CUDA_DEVICE_ORDER = "PCI_BUS_ID";
+    VLLM_SKIP_P2P_CHECK = "0";
+  };
+
   # Built-in models (see the `models` option for the fields).
+  #
+  # The Qwen entries carry the serve flags measured on c4130 (Phase 3 Block F,
+  # 2026-11-09): async scheduling on, V2 runner, Flash-V100 attention. The
+  # fork/1Cat serve flags measured 12-27% slower per step on this stack
+  # (--no-async-scheduling: rank skew), so they are an opt-in for A/B runs
+  # only. A host sets them per field (each built-in field is a mkDefault):
+  #
+  #   services.vllm-sm70.models."qwen3.8-27b" = {
+  #     asyncScheduling = false; # 1Cat: --no-async-scheduling
+  #     maxNumSeqs = 4;
+  #   };
+  #   services.vllm-sm70.models."qwen3.6-35b-a3b" = {
+  #     asyncScheduling = false;
+  #     maxNumSeqs = 4;
+  #   };
+  #
+  # The other 1Cat values (memory utilization, max-model-len, block sizes)
+  # are unchanged from the fork's entries below.
   builtinModels = {
     # Flint NVFP4, per the fork's scripts/serve_flint_nvfp4_v100_pcie.sh.
     # Weights: the fixed-output checkpoint converted from the GGUF
@@ -119,6 +145,15 @@ let
         ];
         # vLLM's attention block size for this model (aligned to the GDN page).
         lmcacheChunkSize = 1056;
+        asyncScheduling = true;
+        # Not measured above batch 1 yet (Bea's gate serve checks it starts:
+        # Mamba cache blocks must be >= max-num-seqs).
+        maxNumSeqs = 20;
+        # DFlash candidate-head drafts need the V2 model runner ("Model Runner
+        # V1 does not support: DFlash candidate-head drafts"); the wrapper
+        # defaults it to 0 for Flint (D2).
+        v2ModelRunner = true;
+        env = qwenEnv;
         args = [
           "--tool-call-parser" "qwen3_coder"
           "--reasoning-parser" "qwen3"
@@ -145,18 +180,26 @@ let
             dir = draftDir;
           }
         ];
+        # >= 102K for the cold 100K-token TTFT exit (Phase 3).
         maxModelLen = 150000;
         gpuMemoryUtilization = 0.91;
         # Must be a multiple of vLLM's block size, which --mamba-block-size sets.
         lmcacheChunkSize = 8192;
+        asyncScheduling = true;
+        # The DFlash2 verifier fast paths (K18, M9a, the QPN8 rerank) are M8
+        # paths: one drafting request. More requests fall back to the batched
+        # kernels (more total throughput, less tok/s per request).
+        maxNumSeqs = 8;
+        # DFlash candidate-head drafts need the V2 model runner ("Model Runner
+        # V1 does not support: DFlash candidate-head drafts"); the wrapper
+        # defaults it to 0 for Flint (D2).
+        v2ModelRunner = true;
+        env = qwenEnv;
         args = [
           "--tool-call-parser" "qwen3_coder"
           "--reasoning-parser" "qwen3"
           "--language-model-only"
-          # TODO(sm70-attn): the fork used `--attention-backend FLASH_ATTN_V100`.
-          # Unset for now, so upstream picks TRITON_ATTN on sm_70; restore it
-          # once the patch series registers the backend (Mara/Kai). Whether
-          # TRITON_ATTN accepts --block-size 2048 is a Phase 1 runtime check.
+          # Kept for LMCache: the 8192 chunk must be a multiple of the block size.
           "--block-size" "2048"
           "--mamba-block-size" "8192"
           "--mamba-cache-mode" "align"
@@ -250,8 +293,11 @@ in
     # { repo, revision, dir }; the first is the served checkpoint) or a Nix
     # store `path`; optional maxModelLen / gpuMemoryUtilization / maxNumSeqs
     # overrides; `lmcache` (default true) and its `lmcacheChunkSize`; `package`
-    # (the wrapped vllm to run, default this flake's `vllm`); extra service `env`;
-    # `asyncScheduling` (default false); and model-specific `vllm serve` `args`.
+    # (the wrapped vllm to run, default this flake's `vllm`); extra service `env`
+    # (a host value replaces the built-in one as a whole); `v2ModelRunner`
+    # (default false: sets VLLM_USE_V2_MODEL_RUNNER=1, kept when `env` is
+    # replaced; an explicit `env` value still wins); `asyncScheduling`
+    # (default false); and model-specific `vllm serve` `args`.
     models = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf lib.types.raw);
       description = ''
@@ -346,7 +392,11 @@ in
         "vllm-model-fetch.service"
         "nvidia-persistenced.service"
       ] ++ lib.optional lmcache "vllm-lmcache.service";
-      environment = env // { HF_HUB_OFFLINE = "1"; } // (model.env or { });
+      environment =
+        env
+        // { HF_HUB_OFFLINE = "1"; }
+        // lib.optionalAttrs (model.v2ModelRunner or false) { VLLM_USE_V2_MODEL_RUNNER = "1"; }
+        // (model.env or { });
       serviceConfig = {
         User = "vllm";
         Group = "vllm";
