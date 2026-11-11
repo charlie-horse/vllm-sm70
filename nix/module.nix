@@ -57,12 +57,10 @@ let
       enforce_eager = false;
     };
 
-  # Environment of the Qwen DFlash2 entries. DFlash candidate-head drafts need
-  # the V2 model runner ("Model Runner V1 does not support: DFlash
-  # candidate-head drafts"); the wrapper defaults it to 0 for Flint (D2).
-  # The rest is Flint's env (see there).
+  # Environment of the Qwen DFlash2 entries: Flint's (see there). The V2
+  # model runner is the separate `v2ModelRunner` field, so a host that
+  # replaces `env` (e.g. to set a kill switch) keeps it.
   qwenEnv = {
-    VLLM_USE_V2_MODEL_RUNNER = "1";
     CUDA_DEVICE_ORDER = "PCI_BUS_ID";
     VLLM_SKIP_P2P_CHECK = "0";
   };
@@ -151,6 +149,10 @@ let
         # Not measured above batch 1 yet (Bea's gate serve checks it starts:
         # Mamba cache blocks must be >= max-num-seqs).
         maxNumSeqs = 20;
+        # DFlash candidate-head drafts need the V2 model runner ("Model Runner
+        # V1 does not support: DFlash candidate-head drafts"); the wrapper
+        # defaults it to 0 for Flint (D2).
+        v2ModelRunner = true;
         env = qwenEnv;
         args = [
           "--tool-call-parser" "qwen3_coder"
@@ -188,6 +190,10 @@ let
         # paths: one drafting request. More requests fall back to the batched
         # kernels (more total throughput, less tok/s per request).
         maxNumSeqs = 8;
+        # DFlash candidate-head drafts need the V2 model runner ("Model Runner
+        # V1 does not support: DFlash candidate-head drafts"); the wrapper
+        # defaults it to 0 for Flint (D2).
+        v2ModelRunner = true;
         env = qwenEnv;
         args = [
           "--tool-call-parser" "qwen3_coder"
@@ -287,8 +293,11 @@ in
     # { repo, revision, dir }; the first is the served checkpoint) or a Nix
     # store `path`; optional maxModelLen / gpuMemoryUtilization / maxNumSeqs
     # overrides; `lmcache` (default true) and its `lmcacheChunkSize`; `package`
-    # (the wrapped vllm to run, default this flake's `vllm`); extra service `env`;
-    # `asyncScheduling` (default false); and model-specific `vllm serve` `args`.
+    # (the wrapped vllm to run, default this flake's `vllm`); extra service `env`
+    # (a host value replaces the built-in one as a whole); `v2ModelRunner`
+    # (default false: sets VLLM_USE_V2_MODEL_RUNNER=1, kept when `env` is
+    # replaced; an explicit `env` value still wins); `asyncScheduling`
+    # (default false); and model-specific `vllm serve` `args`.
     models = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf lib.types.raw);
       description = ''
@@ -383,7 +392,11 @@ in
         "vllm-model-fetch.service"
         "nvidia-persistenced.service"
       ] ++ lib.optional lmcache "vllm-lmcache.service";
-      environment = env // { HF_HUB_OFFLINE = "1"; } // (model.env or { });
+      environment =
+        env
+        // { HF_HUB_OFFLINE = "1"; }
+        // lib.optionalAttrs (model.v2ModelRunner or false) { VLLM_USE_V2_MODEL_RUNNER = "1"; }
+        // (model.env or { });
       serviceConfig = {
         User = "vllm";
         Group = "vllm";
