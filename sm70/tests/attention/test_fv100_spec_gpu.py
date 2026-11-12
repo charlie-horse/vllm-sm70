@@ -270,6 +270,10 @@ def test_smallq_kernel_rewrites_the_same_buffers(fv100_gpu, monkeypatch):
 
 # ----------------------------------------- verify vs TRITON_ATTN (+ graph)
 
+# B2's switch. The K07 tests below set it to "0": B2 takes 8-token verify by
+# default and has its own tests (B2 section), and K07 stays the fallback.
+VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+
 
 @pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
 @pytest.mark.parametrize("batch", [1, 4])
@@ -277,6 +281,7 @@ def test_smallq_kernel_rewrites_the_same_buffers(fv100_gpu, monkeypatch):
 @torch.inference_mode()
 def test_verify_matches_triton(fv100_gpu, monkeypatch, heads, batch, block_size):
     device, _ = fv100_gpu
+    monkeypatch.setenv(VERIFY, "0")
     d, context = 256, 4096
     ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, 8192)
     ours, tri = _impls(heads, d)
@@ -302,6 +307,7 @@ def test_verify_matches_triton(fv100_gpu, monkeypatch, heads, batch, block_size)
 def test_verify_graph_replays_after_rebuild(fv100_gpu, monkeypatch, heads):
     """UNIFORM_BATCH: capture a verify batch, rebuild metadata, replay."""
     device, _ = fv100_gpu
+    monkeypatch.setenv(VERIFY, "0")
     d, block_size, batch, capacity = 256, 16, 4, 4096
     ours_b, tri_b = _builders(monkeypatch, heads, d, block_size, device, capacity)
     ours, tri = _impls(heads, d)
@@ -355,9 +361,12 @@ def test_small_batch_graph_at_long_envelopes(
     """B1: a captured XQA decode of <= 16 rows (verify rows of one or two
     requests, or single-token rows) at a 32K or 150K envelope (256-token
     partitions; 1024 with the switch off) replays to TRITON_ATTN's output,
-    including contexts above 32K."""
+    including contexts above 32K. B2 is off (VERIFY): the verify rows are
+    K07's XQA expansion; B2's envelope test is
+    test_verify_kernel_graph_replays_after_rebuild."""
     device, fv100 = fv100_gpu
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION", small)
+    monkeypatch.setenv(VERIFY, "0")
     capacity, cap_len, steps = B1_CASES[case]
     heads, d, block_size = (12, 2), 256, 16
     fv100.clear_workspaces()
@@ -400,7 +409,6 @@ def test_small_batch_graph_at_long_envelopes(
 
 # ------------------------- B2: verify kernel (KV read once per request)
 
-VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
 # Lengths around the 128-key partition and 32-key tile edges, and long ones.
 B2_LENS = [8, 31, 127, 128, 129, 161, 300, 4096, 4097, 40000]
 
@@ -487,6 +495,8 @@ def test_verify_kernel_graph_replays_after_rebuild(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         ours.forward(layer, q, None, None, kv, md, out)
+    partitions = {key[4] for key in fv100._decode_workspace_cache}
+    assert partitions == {fv100.VERIFY_PARTITION_SIZE}, partitions
     steps = [[129, 4096, 8, 1000], [min(capacity, 40000), 300, 31000, 128]]
     for step, lens in enumerate(steps):
         lens = lens[:batch]
