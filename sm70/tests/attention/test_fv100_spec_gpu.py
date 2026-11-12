@@ -270,8 +270,8 @@ def test_smallq_kernel_rewrites_the_same_buffers(fv100_gpu, monkeypatch):
 
 # ----------------------------------------- verify vs TRITON_ATTN (+ graph)
 
-# B2's switch. The K07 tests below set it to "0": B2 takes 8-token verify by
-# default and has its own tests (B2 section), and K07 stays the fallback.
+# B2's switch. B2 takes 8-token verify by default; the two K07 tests below
+# set it to "0" (K07 stays the fallback), B1's test runs both.
 VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
 
 
@@ -351,22 +351,26 @@ B1_CASES = {
 
 
 @pytest.mark.parametrize("case", sorted(B1_CASES))
-@pytest.mark.parametrize("query_len", [L, 1], ids=["verify", "decode"])
+@pytest.mark.parametrize(
+    "query_len,b2",
+    [(L, "1"), (L, "0"), (1, "1")],
+    ids=["verify-b2", "verify-k07", "decode"],
+)
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("small", ["1", "0"], ids=["b1", "b1-off"])
 @torch.inference_mode()
 def test_small_batch_graph_at_long_envelopes(
-    fv100_gpu, monkeypatch, case, query_len, batch, small
+    fv100_gpu, monkeypatch, case, query_len, b2, batch, small
 ):
     """B1: a captured XQA decode of <= 16 rows (verify rows of one or two
     requests, or single-token rows) at a 32K or 150K envelope (256-token
     partitions; 1024 with the switch off) replays to TRITON_ATTN's output,
-    including contexts above 32K. B2 is off (VERIFY): the verify rows are
-    K07's XQA expansion; B2's envelope test is
-    test_verify_kernel_graph_replays_after_rebuild."""
+    including contexts above 32K. Verify rows take the B2 kernel by default
+    (128-token partitions, whatever B1's switch says) and K07's XQA
+    expansion with VERIFY=0."""
     device, fv100 = fv100_gpu
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION", small)
-    monkeypatch.setenv(VERIFY, "0")
+    monkeypatch.setenv(VERIFY, b2)
     capacity, cap_len, steps = B1_CASES[case]
     heads, d, block_size = (12, 2), 256, 16
     fv100.clear_workspaces()
@@ -393,7 +397,10 @@ def test_small_batch_graph_at_long_envelopes(
     with torch.cuda.graph(graph):
         ours.forward(layer, q, None, None, kv, md, out)
     partitions = {key[4] for key in fv100._decode_workspace_cache}
-    assert (256 in partitions) == (small == "1"), partitions
+    if query_len == L and b2 == "1":
+        assert partitions == {fv100.VERIFY_PARTITION_SIZE}, partitions
+    else:
+        assert (256 in partitions) == (small == "1"), partitions
     for step, lens in enumerate(steps):
         q.copy_(_q(tokens, heads, d, device, seed=20 + step))
         table.random_(0, pool)

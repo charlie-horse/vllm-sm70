@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import torch  # noqa: E402
-from _fv100_ref import decode_reference, prefill_reference  # noqa: E402
+from _fv100_ref import FULL, decode_reference, prefill_reference  # noqa: E402
 
 
 class CpuOps:
@@ -41,7 +41,10 @@ class CpuOps:
             self.calls.append(
                 (name, {"rows": q.shape[0], "launch": launch, "query_len": query_len})
             )
-            ref = decode_reference(q, k, v, table, lens, scale=scale)
+            # Full attention: B2 takes no window and no sinks.
+            ref = decode_reference(
+                q, k, v, table, lens, scale=scale, window=FULL, sinks=None
+            )
             out.copy_(ref.to(out.dtype))
 
         return op
