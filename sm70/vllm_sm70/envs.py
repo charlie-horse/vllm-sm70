@@ -225,6 +225,15 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION": kill_switch(
             "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
         ),
+        # B2: "0" -> DFlash2 verify rows take K07's XQA expansion (each of
+        # the 8 tokens streams the KV) instead of the verify kernel that
+        # reads it once (csrc/flash_v100/verify_decode.cu; D256, GQA 6/8,
+        # 8 tokens per request; batches whose workspace would exceed 256 MB
+        # stay on K07). Read on every decode call, so a captured graph keeps
+        # the route it was captured with.
+        "VLLM_SM70_FLASH_V100_VERIFY_KERNEL": kill_switch(
+            "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+        ),
         # K14 (C4): "0" -> Flint sink layers decode with the grouped
         # partition kernel plus reducer (two launches) instead of the
         # one-launch fused kernel. Read on every decode call

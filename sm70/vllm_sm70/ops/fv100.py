@@ -456,11 +456,16 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
+    round_partitions: bool = True,
+    refresh_active: bool = True,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
+    # B2's verify workspace keeps its exact partition count (round_partitions
+    # False); the K05 decode rounds to a power of two (fork behaviour).
+    capacity_of = _round_decode_partition_capacity if round_partitions else int
     # Rows are shared across batch sizes (fork default share_workspace=on).
-    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
+    partition_capacity = capacity_of(plan.workspace_num_partitions)
     key = (
         device_index,
         stream_id,
@@ -485,7 +490,7 @@ def _get_decode_workspace_for_plan(
             ),
             num_heads=num_heads,
             head_dim=head_dim,
-            max_num_partitions=_round_decode_partition_capacity(
+            max_num_partitions=capacity_of(
                 max(
                     plan.workspace_num_partitions,
                     previous.max_num_partitions if previous else 0,
@@ -501,7 +506,8 @@ def _get_decode_workspace_for_plan(
     if _cuda_graph_capture_active():
         workspace.captured = True
     if active_num_partitions is None:
-        workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+        if refresh_active:
+            workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
         workspace.tmp_out[:batch_capacity],
@@ -933,6 +939,113 @@ def xqa_supported(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
     return q.shape[1] // k_cache.shape[2] in XQA_GQA_RATIOS
 
 
+# ---------------------------------------------------------------------------
+# B2: DFlash2 verify attention (verify_decode.cu, new code)
+# ---------------------------------------------------------------------------
+VERIFY_OP = "fv100_decode_verify"
+VERIFY_QUERY_LEN = 8  # tokens per request (DFlash2 k = 7 plus the anchor)
+VERIFY_PARTITION_SIZE = 128  # keys per CTA (verify_decode.cu kPart)
+VERIFY_GQA_RATIOS = (6, 8)
+VERIFY_MAX_PARTITIONS = 12000  # verify_decode.cu kMaxPartitions
+# Bytes of verify workspace allowed per (device, stream). The workspace is
+# rows x H_q x partitions x (256 fp16 partial + 2 fp32 stats) = 520 B per
+# (row, head, partition), partitions = ceil(max_model_len / 128), exact (not
+# rounded to a power of two). Qwen3.8 TP2 (12 q heads): 1.6 MB per row at a
+# 32768 envelope (cap 168 rows = 21 requests), 7.3 MB per row at 150000
+# (cap 32 rows = 4 requests). Larger verify batches keep K07's XQA path.
+VERIFY_WORKSPACE_BUDGET = 256 * 2**20
+
+
+def verify_max_rows(num_heads: int, head_dim: int, max_seq_len: int) -> int:
+    """Most verify rows (whole requests) whose workspace fits the budget."""
+    parts = max(1, -(-int(max_seq_len) // VERIFY_PARTITION_SIZE))
+    per_row = num_heads * parts * (head_dim * 2 + 2 * 4)
+    rows = VERIFY_WORKSPACE_BUDGET // max(per_row, 1)
+    return rows - rows % VERIFY_QUERY_LEN
+
+
+def verify_supported(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
+    """Shapes flash_attn_decode_verify accepts (besides the row layout)."""
+    if not has_op(VERIFY_OP) or not xqa_supported(q, k_cache):
+        return False
+    if q.dtype != torch.float16 or k_cache.dtype != torch.float16:
+        return False
+    if q.shape[0] % VERIFY_QUERY_LEN:
+        return False
+    return q.shape[1] // k_cache.shape[2] in VERIFY_GQA_RATIOS
+
+
+def flash_attn_decode_verify(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    max_seq_len_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+) -> torch.Tensor:
+    """DFlash2 verify rows, KV read once per request (B2).
+
+    q / out [rows, H_q, 256] with rows = requests * 8, token-major (row =
+    request * 8 + token); seq_lens [rows] and block_table [rows, blocks] are
+    K07's expansion (visible length per token; the 8 rows of a request share
+    one table row). The grid covers max_seq_len_hint keys (the live length
+    eagerly, the max_model_len envelope under CUDA-graph capture). The
+    workspace is sized for workspace_seq_capacity_hint, which callers set to
+    the envelope on every call: one cache entry per engine, whatever the
+    live length (a per-length size would allocate a new workspace for each
+    eager length and never free the old ones).
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if out is None:
+        out = torch.empty_like(q)
+    seq_hint = int(max_seq_len_hint or block_table.shape[1] * k_cache.shape[1])
+    capacity = max(int(workspace_seq_capacity_hint or seq_hint), seq_hint)
+    part = VERIFY_PARTITION_SIZE
+    launch = max(1, -(-seq_hint // part))
+    workspace_parts = max(1, -(-capacity // part))
+    if workspace_parts > VERIFY_MAX_PARTITIONS:
+        raise ValueError(
+            f"{workspace_parts} verify partitions exceed {VERIFY_MAX_PARTITIONS} "
+            f"(max_seq_len {capacity})"
+        )
+    plan = _DecodePlan(
+        partition_size=part,
+        actual_num_partitions=launch,
+        launch_num_partitions=launch,
+        workspace_num_partitions=workspace_parts,
+    )
+    # Exact partition capacity (the budget above assumes it) and no
+    # active_num_partitions refresh (the verify kernel does not read it).
+    tmp_out, max_logits, exp_sums, _ = _get_decode_workspace_for_plan(
+        q,
+        batch_capacity=q.shape[0],
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        plan=plan,
+        round_partitions=False,
+        refresh_active=False,
+    )
+    _op(VERIFY_OP)(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        float(softmax_scale),
+        VERIFY_QUERY_LEN,
+        launch,
+    )
+    return out
+
+
 # fork flash_attn_interface.py:1950-2100 (DFlash2 split route dropped)
 def flash_attn_prefill_paged(
     q: torch.Tensor,
@@ -1140,6 +1253,26 @@ if has_op("fv100_prefill_paged_sinks"):
         window_size_left: int,
         window_size_right: int,
         sinks: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if has_op(VERIFY_OP):
+
+    @register_fake("_sm70_C::fv100_decode_verify")
+    def _fv100_decode_verify_fake(
+        out: torch.Tensor,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tmp_out: torch.Tensor,
+        max_logits: torch.Tensor,
+        exp_sums: torch.Tensor,
+        softmax_scale: float,
+        query_len: int,
+        launch_num_partitions: int,
     ) -> None:
         return None
 

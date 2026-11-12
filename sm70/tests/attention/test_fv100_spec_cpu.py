@@ -215,13 +215,13 @@ def _builder(monkeypatch, heads=(12, 2), head_size=256, spec_tokens=SPEC_TOKENS)
     )
 
 
-def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None):
+def _cm(query_lens, seq_lens, causal=True, block_size=16, width=None, num_tokens=None):
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     width = width or -(-max(seq_lens) // block_size)
     qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
     qsl[1:] = torch.tensor(query_lens).cumsum(0)
-    n = int(qsl[-1])
+    n = num_tokens or int(qsl[-1])
     table = torch.arange(len(query_lens) * width, dtype=torch.int32).view(-1, width)
     return CommonAttentionMetadata(
         query_start_loc=qsl.clone(),
@@ -397,6 +397,7 @@ def _run_case(
 @pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
 def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_VERIFY_KERNEL", "0")  # B2 off
     names = _run_case(
         monkeypatch,
         cpu_ops,
@@ -409,6 +410,173 @@ def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     )
     assert names == ["fv100_decode_paged_xqa"]
     assert cpu_ops.calls[0][1]["rows"] == 3 * L
+
+
+# ------------------------------------------------- B2: verify kernel route
+
+VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
+
+
+@pytest.fixture
+def verify_op(monkeypatch, cpu_ops):
+    # The verify op as if _sm70_C had it (the CPU stand-in runs it).
+    from vllm_sm70.ops import fv100
+
+    real = fv100.has_op
+    monkeypatch.setattr(
+        fv100, "has_op", lambda name: name == fv100.VERIFY_OP or real(name)
+    )
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    monkeypatch.delenv(VERIFY, raising=False)
+    return cpu_ops
+
+
+@requires_vllm
+@pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
+def test_uniform_verify_takes_the_verify_kernel(monkeypatch, verify_op, heads):
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=heads,
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=[L, L, L],
+        seq_lens=[300, 9, 1000],
+    )
+    assert names == ["fv100_decode_verify"]
+    call = verify_op.calls[0][1]
+    assert call["rows"] == 3 * L and call["launch"] == -(-1000 // 128)
+
+
+@requires_vllm
+@pytest.mark.parametrize(
+    "heads,query_lens,env",
+    [
+        ((12, 2), [L, 5, L], None),  # not every request has 8 tokens
+        ((8, 2), [L, L], None),  # GQA 4: XQA only
+        ((12, 2), [L, L], "0"),  # kill switch
+    ],
+    ids=["ragged", "gqa4", "switch-off"],
+)
+def test_other_verify_batches_keep_xqa(monkeypatch, verify_op, heads, query_lens, env):
+    if env is not None:
+        monkeypatch.setenv(VERIFY, env)
+    _expect_xqa(monkeypatch, verify_op, heads, query_lens)
+
+
+@requires_vllm
+def test_eager_verify_keeps_one_workspace_at_growing_lengths(monkeypatch, verify_op):
+    # Eager B2 launches for the live length but sizes its workspace for the
+    # max_model_len envelope (4096 here -> 32 partitions): one cache entry,
+    # never one per length (Quinn's #114 review).
+    from vllm_sm70.ops import fv100
+
+    launches = []
+    for seq_len in (300, 1000, 2500, 4000):
+        verify_op.calls.clear()
+        names = _run_case(
+            monkeypatch,
+            verify_op,
+            heads=(12, 2),
+            head_size=256,
+            window=None,
+            sinks=None,
+            query_lens=[L, L],
+            seq_lens=[seq_len, 200],
+        )
+        assert names == ["fv100_decode_verify"]
+        launches.append(verify_op.calls[0][1]["launch"])
+        keys = [
+            key
+            for key in fv100._decode_workspace_cache
+            if key[4] == fv100.VERIFY_PARTITION_SIZE
+        ]
+        assert len(keys) == 1, keys
+        assert keys[0][6] == 4096 // fv100.VERIFY_PARTITION_SIZE
+    assert launches == [-(-s // 128) for s in (300, 1000, 2500, 4000)]
+
+
+@requires_vllm
+def test_verify_batches_over_the_workspace_cap_keep_xqa(monkeypatch, verify_op):
+    from vllm_sm70.ops import fv100
+
+    # 2 requests fit, 3 do not (max_model_len 4096 -> 32 partitions).
+    per_row = 12 * 32 * 520
+    monkeypatch.setattr(fv100, "VERIFY_WORKSPACE_BUDGET", 2 * L * per_row)
+    _expect_xqa(monkeypatch, verify_op, (12, 2), [L, L, L])
+    verify_op.calls.clear()
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=(12, 2),
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=[L, L],
+        seq_lens=[400, 410],
+    )
+    assert names == ["fv100_decode_verify"]
+
+
+def _expect_xqa(monkeypatch, verify_op, heads, query_lens):
+    names = _run_case(
+        monkeypatch,
+        verify_op,
+        heads=heads,
+        head_size=256,
+        window=None,
+        sinks=None,
+        query_lens=query_lens,
+        seq_lens=[400 + 10 * i for i in range(len(query_lens))],
+    )
+    assert names == ["fv100_decode_paged_xqa"]
+
+
+@requires_vllm
+def test_builder_marks_uniform_verify_batches(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
+    b = _builder(monkeypatch)
+    assert b.build(0, _cm([L, L], [300, 40])).verify_query_len == L
+    assert b.build(0, _cm([L, 3], [300, 40])).verify_query_len == 0
+    assert b.build(0, _cm([L, L, 20], [300, 40, 500])).verify_query_len == L
+    assert b.build(0, _cm([1, 1], [300, 40])).verify_query_len == 0
+    cap = b.build_for_cudagraph_capture(_cm([L] * 4, [L] * 4))
+    assert cap.verify_query_len == L
+    # FULL-graph replay pads with zero-token requests at the tail only.
+    padded = b.build(0, _cm([L, 0], [300, 0], num_tokens=2 * L))
+    assert padded.decode_rows == 2 * L and padded.verify_query_len == L
+    assert padded.decode_seq_lens[L:].tolist() == [0] * L
+    middle = b.build(0, _cm([L, 0, L], [300, 0, 40], num_tokens=3 * L))
+    assert middle.verify_query_len == 0
+
+
+def test_verify_rows_cap_follows_the_workspace_budget():
+    from vllm_sm70.ops import fv100
+
+    # Qwen3.8 TP2: 12 q heads, D256. 520 B per (row, head, 128-key partition).
+    assert fv100.verify_max_rows(12, 256, 32768) == 168  # 21 requests
+    assert fv100.verify_max_rows(12, 256, 150000) == 32  # 4 requests
+    assert fv100.verify_max_rows(8, 256, 262144) == 24  # Qwen3.6 TP2, 1Cat len
+    for heads, length in ((12, 32768), (12, 150000), (8, 262144)):
+        rows = fv100.verify_max_rows(heads, 256, length)
+        parts = -(-length // 128)
+        assert rows % 8 == 0
+        assert rows * heads * parts * 520 <= fv100.VERIFY_WORKSPACE_BUDGET
+
+
+def test_verify_switch_registered_and_reads_only_zero(monkeypatch):
+    from vllm_sm70 import envs
+    from vllm_sm70.attention.flash_v100 import dispatch
+
+    assert VERIFY in envs._SECTIONS["attention"]
+    assert dispatch.VERIFY_SWITCH == VERIFY
+    for value, on in ((None, True), ("1", True), ("0", False)):
+        if value is None:
+            monkeypatch.delenv(VERIFY, raising=False)
+        else:
+            monkeypatch.setenv(VERIFY, value)
+        assert dispatch.verify_kernel_enabled() is on
 
 
 @requires_vllm

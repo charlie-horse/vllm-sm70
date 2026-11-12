@@ -40,6 +40,7 @@ EXPECTED_OPS = {
     "fv100_prefill_paged",
     "fv100_prefill_paged_sinks",
     "fv100_decode_paged_sinks_fused",  # K14, under FUSED_GUARD
+    "fv100_decode_verify",  # B2 (verify_decode.cu)
 }
 FUSED_OP = "fv100_decode_paged_sinks_fused"
 FUSED_GUARD = "VLLM_SM70_FV100_FUSED_DECODE"
@@ -227,6 +228,7 @@ def test_sources_cmake_builds_the_lean_files_only():
         "flash_decode_paged.cu",
         "fused_mha_forward_paged.cu",
         "fv100_ops.cpp",
+        "verify_decode.cu",  # B2
     }
     top = (SM70 / "CMakeLists.txt").read_text()
     assert 'include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")' in top
@@ -340,6 +342,45 @@ def test_fakes_return_none_on_meta(fv100):
     assert (
         ops.fv100_prefill_paged_sinks(*prefill, _meta(16, dtype=torch.float32)) is None
     )
+    qv = _meta(8, 12, 256)
+    kv = _meta(10, 16, 2, 256)
+    verify = (
+        _meta(8, 12, 256),
+        qv,
+        kv,
+        kv,
+        _meta(8, 3, dtype=torch.int32),
+        _meta(8, dtype=torch.int32),
+        _meta(8, 12, 2, 256),
+        _meta(8, 12, 2, dtype=torch.float32),
+        _meta(8, 12, 2, dtype=torch.float32),
+        0.0625,
+        8,
+        2,
+    )
+    assert ops.fv100_decode_verify(*verify) is None
+
+
+def test_verify_schema_takes_query_len_and_no_partition_size():
+    schema = sm70_schemas(area=AREA)["fv100_decode_verify"]
+    assert schema == (
+        "fv100_decode_verify(Tensor(a!) out, Tensor q, Tensor k_cache, Tensor "
+        "v_cache, Tensor block_table, Tensor seq_lens, Tensor(b!) tmp_out, "
+        "Tensor(c!) max_logits, Tensor(d!) exp_sums, float softmax_scale, int "
+        "query_len, int launch_num_partitions) -> ()"
+    )
+
+
+def test_verify_constants_match_the_kernel(fv100):
+    text = (CSRC / "verify_decode.cu").read_text()
+    for name, value in (
+        ("kQLen", fv100.VERIFY_QUERY_LEN),
+        ("kPart", fv100.VERIFY_PARTITION_SIZE),
+        ("kMaxPartitions", fv100.VERIFY_MAX_PARTITIONS),
+    ):
+        assert re.search(rf"constexpr int {name} = {value};", text), name
+    assert "group == 6 || group == 8" in text
+    assert fv100.VERIFY_GQA_RATIOS == (6, 8)
 
 
 def test_no_fake_exemptions(fv100):
