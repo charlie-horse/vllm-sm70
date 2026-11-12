@@ -106,8 +106,8 @@ Roadmap order. Each node appears once.
 Snapshot 2026-11-10. Source: Astro's and Quinn's notes; not re-checked here.
 
 - **C1: PASS** on `cef0f9e` (build `aczb9zwk`), 2026-11-09, after the `glm47_sm70` parser rerun (review 5833861019).
-- **`latest`:** still `3869cd6` (bootstrap). Held until Bea's GPU gate passes on `cef0f9e`.
-- **GPU window:** 22:00–06:00 via flake#5, tonight. Bea runs Bea's GPU gate first thing (`docs/release.md`, gate 3).
+- **`latest`:** moved to `cef0f9e` on 2026-11-12 (fast-forward from `3869cd6`). Gate 3 passed with Charlie's waiver for the two `capture_bench` asserts; see `docs/release.md` History. Felix notified to flip flake#4 to `/latest`.
+- **GPU window:** 22:00–06:00 via flake#5. Bea's GPU gate on `cef0f9e` ran in that window (Quinn's verdict: pass).
 - **Cutover blockers (C3):**
   1. Bea's GPU gate on `cef0f9e` (not run yet).
   2. Quinn confirms the gate result; then Astro's OK; then fast-forward `latest` and send the SHA to Felix and Quinn.

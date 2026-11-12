@@ -34,5 +34,8 @@ Record each move in the table below, in the same PR or straight after it.
 | date (UTC) | commit | CI | C1 | GPU gate | OK |
 |---|---|---|---|---|---|
 | 2026-11-05 | `3869cd6` | green | – | – | Astro (bootstrap only) |
+| 2026-11-12 | `cef0f9e` | green (four jobs) | PASS (2026-11-09, after the `glm47_sm70` rerun; review 5833861019) | PASS with waiver (Quinn's verdict; see below) | Astro, Charlie's waiver |
+
+**Waiver, 2026-11-12:** Charlie granted a waiver for the two `capture_bench` asserts in `tests(K07)`. #118's fixed capture-bench run (2/2 on `aczb9zwk`, the build the gates ran on) replaces those asserts (Quinn's verdict, relayed by Astro). Quinn's #118 review notes the waiver still needs Astro's sign-off under this doc; Astro relayed it.
 
 The first entry is a **bootstrap**. It created the branch so the host flake has something to lock, and it has not passed C1 or the GPU gate. Don't deploy it: the cutover (C3) waits until `latest` has been fast-forwarded to a commit that passed all four gates.
