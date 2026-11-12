@@ -2,7 +2,12 @@
 """K07 GPU benchmark: captured-decode envelope cost (sm70/tools/bench_fv100_capture.py).
 
 Prints the table (run with -s to see it); asserts only that every number
-was measured and that the envelope workspace is the larger one.
+was measured and that each captured workspace covers its grid in tokens,
+the envelope one at least as many as the context one. Not in bytes: a
+>= 32K envelope plans 1024-token partitions and a shorter context 256
+(fv100._select_default_decode_partition_size), so the envelope workspace
+can be the smaller (flint-tp2 at 32768, ctx 16384: 32 x 1024 vs 64 x 256
+partitions, 0.13 vs 0.26 MiB at B=1).
 
     pytest -m "gpu and slow" -s sm70/tests/attention/test_fv100_capture_bench_gpu.py
 """
@@ -39,8 +44,9 @@ def test_capture_envelope_benchmark(fv100_gpu, batch):
         print(
             f"{r.shape} mml={r.max_model_len} ctx={r.context} B={r.batch} {r.route}: "
             f"eager {r.eager_us:.1f}us, graph-env {r.graph_env_us:.1f}us, "
-            f"graph-ctx {r.graph_ctx_us:.1f}us, ws-env {r.workspace_env_mib:.2f}MiB, "
-            f"ws-ctx {r.workspace_ctx_mib:.2f}MiB"
+            f"graph-ctx {r.graph_ctx_us:.1f}us, ws-env {r.workspace_env_mib:.2f}MiB "
+            f"p{r.partition_env}, ws-ctx {r.workspace_ctx_mib:.2f}MiB p{r.partition_ctx}"
         )
         assert min(r.eager_us, r.graph_env_us, r.graph_ctx_us) > 0
-        assert r.workspace_env_mib >= r.workspace_ctx_mib
+        assert r.tokens_ctx >= r.context, r
+        assert r.tokens_env >= max(r.max_model_len, r.tokens_ctx), r

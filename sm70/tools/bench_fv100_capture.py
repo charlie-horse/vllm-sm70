@@ -14,9 +14,12 @@ max_model_len and live context, the decode time per step for:
   graph-ctx   captured with a grid sized for the live context (what a
               context-bucketed capture would run)
 
-and the decode workspace (tmp_out + max_logits + exp_sums) for each sizing.
-One attention layer, one decode step; multiply by the layer count for a
-model step. Needs an SM70 GPU and _sm70_C with the K05 ops.
+and the decode workspace (tmp_out + max_logits + exp_sums) for each sizing,
+with its partition size and the tokens it covers. An envelope of 32768 or
+more plans 1024-token partitions (fv100._select_default_decode_partition_size)
+where a shorter capture plans 256, so the envelope workspace can be the
+smaller one. One attention layer, one decode step; multiply by the layer
+count for a model step. Needs an SM70 GPU and _sm70_C with the K05 ops.
 
   python sm70/tools/bench_fv100_capture.py [--batch 1] [--iters 200] [--json out.json]
 """
@@ -49,14 +52,24 @@ class Row:
     graph_ctx_us: float
     workspace_env_mib: float
     workspace_ctx_mib: float
+    partition_env: int
+    partition_ctx: int
+    tokens_env: int
+    tokens_ctx: int
 
 
-def _workspace_mib(fv100) -> float:
-    total = 0
-    for ws in fv100._decode_workspace_cache.values():
+def _workspace(fv100) -> tuple[float, int, int]:
+    """(MiB, partition size, tokens covered) of the cached decode workspaces.
+
+    Cache key index 4 is the partition size (fv100._get_decode_workspace_for_plan).
+    """
+    total, partition, tokens = 0, 0, 0
+    for key, ws in fv100._decode_workspace_cache.items():
         for t in (ws.tmp_out, ws.max_logits, ws.exp_sums):
             total += t.numel() * t.element_size()
-    return total / 2**20
+        partition = max(partition, key[4])
+        tokens = max(tokens, key[4] * ws.max_num_partitions)
+    return total / 2**20, partition, tokens
 
 
 def _time(fn, iters: int) -> float:
@@ -133,16 +146,31 @@ def run(
                     # vLLM does, so the workspace cache sees one stream.
                     with torch.cuda.graph(g, stream=side):
                         call(hint, hint)
-                    return g, _workspace_mib(fv100)
+                    return (g, *_workspace(fv100))
 
                 fv100.clear_workspaces()
                 eager = _time(lambda: call(ctx, None), iters)
-                g_env, ws_env = graph_of(mml)
+                g_env, ws_env, part_env, tok_env = graph_of(mml)
                 env = _time(g_env.replay, iters)
-                g_ctx, ws_ctx = graph_of(ctx)
+                g_ctx, ws_ctx, part_ctx, tok_ctx = graph_of(ctx)
                 tight = _time(g_ctx.replay, iters)
                 rows.append(
-                    Row(name, mml, ctx, batch, route, eager, env, tight, ws_env, ws_ctx)
+                    Row(
+                        name,
+                        mml,
+                        ctx,
+                        batch,
+                        route,
+                        eager,
+                        env,
+                        tight,
+                        ws_env,
+                        ws_ctx,
+                        part_env,
+                        part_ctx,
+                        tok_env,
+                        tok_ctx,
+                    )
                 )
                 del g_env, g_ctx
             fv100.clear_workspaces()
@@ -159,7 +187,8 @@ def main() -> int:
     rows = run(args.batch, args.iters)
     hdr = (
         f"{'shape':18} {'mml':>7} {'ctx':>6} {'B':>2} {'route':6} {'eager':>8} "
-        f"{'g-env':>8} {'g-ctx':>8} {'ws-env':>8} {'ws-ctx':>8}"
+        f"{'g-env':>8} {'g-ctx':>8} {'ws-env':>8} {'ws-ctx':>8} {'p-env':>5} "
+        f"{'p-ctx':>5}"
     )
     print(hdr + "\n" + "-" * len(hdr))
     for r in rows:
@@ -167,9 +196,12 @@ def main() -> int:
             f"{r.shape:18} {r.max_model_len:>7} {r.context:>6} {r.batch:>2} "
             f"{r.route:6} {r.eager_us:8.1f} {r.graph_env_us:8.1f} "
             f"{r.graph_ctx_us:8.1f} {r.workspace_env_mib:8.2f} "
-            f"{r.workspace_ctx_mib:8.2f}"
+            f"{r.workspace_ctx_mib:8.2f} {r.partition_env:>5} {r.partition_ctx:>5}"
         )
-    print("times: us per layer-step; workspace: MiB per (device, stream, shape)")
+    print(
+        "times: us per layer-step; workspace: MiB per (device, stream, shape); "
+        "p: partition size (tokens)"
+    )
     if args.json:
         with open(args.json, "w") as f:
             json.dump([asdict(r) for r in rows], f, indent=1)
