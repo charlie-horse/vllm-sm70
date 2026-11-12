@@ -143,11 +143,13 @@ let
             dir = draftDir;
           }
         ];
-        # Must be a multiple of vLLM's KV block LCM. The block is pinned below
-        # so the chunk doesn't depend on the attention backend: Flash-V100
-        # picks 1104 on its own, with groups of 1104 and 2208 (LCM 2208);
-        # TRITON_ATTN (VLLM_SM70_FLASH_V100=0) picks 1056, so 1104 also covers
-        # its GDN page. 1056 was TRITON_ATTN's block on the Nov 8 run.
+        # Must be a multiple of vLLM's "kv lcm block sizes". The block is
+        # pinned below so it doesn't depend on the attention backend (vLLM only
+        # ever raises a pinned block). With these flags and the DFlash draft,
+        # Flash-V100 picks 1104 on its own, with KV groups of 1104 and 2208
+        # (LCM 2208). The VLLM_SM70_FLASH_V100=0 start check establishes
+        # TRITON_ATTN's LCM; if a start logs an LCM N that doesn't divide this
+        # chunk, set the chunk to N.
         lmcacheChunkSize = 2208;
         asyncScheduling = true;
         # Not measured above batch 1 yet (Bea's gate serve checks it starts:
