@@ -143,8 +143,12 @@ let
             dir = draftDir;
           }
         ];
-        # vLLM's attention block size for this model (aligned to the GDN page).
-        lmcacheChunkSize = 1056;
+        # Must be a multiple of vLLM's KV block LCM. The block is pinned below
+        # so the chunk doesn't depend on the attention backend: Flash-V100
+        # picks 1104 on its own, with groups of 1104 and 2208 (LCM 2208);
+        # TRITON_ATTN (VLLM_SM70_FLASH_V100=0) picks 1056, so 1104 also covers
+        # its GDN page. 1056 was TRITON_ATTN's block on the Nov 8 run.
+        lmcacheChunkSize = 2208;
         asyncScheduling = true;
         # Not measured above batch 1 yet (Bea's gate serve checks it starts:
         # Mamba cache blocks must be >= max-num-seqs).
@@ -158,6 +162,9 @@ let
           "--tool-call-parser" "qwen3_coder"
           "--reasoning-parser" "qwen3"
           "--language-model-only"
+          # Kept for LMCache (see lmcacheChunkSize).
+          "--block-size" "1104"
+          "--mamba-block-size" "1104"
           "--mamba-cache-mode" "align"
           "--speculative-config" (dflashConfig draftDir)
         ];
