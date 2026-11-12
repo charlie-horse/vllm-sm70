@@ -34,5 +34,15 @@ Record each move in the table below, in the same PR or straight after it.
 | date (UTC) | commit | CI | C1 | GPU gate | OK |
 |---|---|---|---|---|---|
 | 2026-11-05 | `3869cd6` | green | – | – | Astro (bootstrap only) |
+| 2026-11-12 | `cef0f9e` | green (four jobs) | PASS (2026-11-09, after the `glm47_sm70` rerun; review 5833861019) | PASS with accepted deviations (see below; Quinn's verdict) | granted by Charlie; Astro's OK (gate 4), 2026-11-12 |
+
+**Gate 3 record, `cef0f9e` (build `aczb9zwk`), 2026-11-12.** Accepted deviations, all under Quinn's verdict:
+
+1. **`pytest -m gpu` ran per file, not as one process.** The single process hung at 662 of 1412 (a harness problem: "GPU memory not released after shutdown" in the model tests' `_shutdown`, the same as Nov 7's sweep). It also collected an untracked copy, `test_bea_switch_g2.py` (3 tests, not in `cef0f9e`). Coverage was completed one process per file, on the clean `cef0f9e` tree: all 1409 `cef0f9e` tests ran, and all passed except the 2 `capture_bench` cases (see 4). Logs: `nov8/logs/GATE/{pytest-gpu.partial.log,pyfiles,pyfiles2}`.
+2. **Early window.** Prod was stopped and the gate started at 21:35 ET, before the 22:00 window start, by an intentional early `gpu-window-start` (Astro and Charlie).
+3. **LMCache §4.3.** Tonight's run showed store only, because prefix caching was on. Retrieval is taken from the Nov 9 prefix-cache-off rerun on the same build `aczb9zwk`: `external_kv_transfer` 11008 tokens.
+4. **Waiver for one `capture_bench` assert.** `ws-env MiB >= ws-ctx MiB` fails in both cases (B=1, B=8) of `sm70/tests/attention/test_fv100_capture_bench_gpu.py` at flint-tp2, mml 32768, ctx 16384. The cause is a test bug: it compares bytes across different partition sizes (1024 vs 256). Replacement evidence: #118 at `9c96f0e` (now in main `32250ff`), 2/2 on `aczb9zwk` (`GATE/capb/capb.log`). Granted by Charlie; Astro's OK (gate 4), 2026-11-12.
+
+**Numbers gate 3 asks for, `cef0f9e` at prod args:** 4K decode 174.6 tok/s (≥ 170). 32K decode 157.1 tok/s default and 157.5 greedy (rerun 158.0 / 153.7 / 157.8), against C1's fork numbers at prod args: 163.0 default and 165.6 greedy.
 
 The first entry is a **bootstrap**. It created the branch so the host flake has something to lock, and it has not passed C1 or the GPU gate. Don't deploy it: the cutover (C3) waits until `latest` has been fast-forwarded to a commit that passed all four gates.
