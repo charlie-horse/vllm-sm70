@@ -103,15 +103,15 @@ Roadmap order. Each node appears once.
 
 ## Cutover ledger (C1, C3)
 
-Snapshot 2026-11-10. Source: Astro's and Quinn's notes; not re-checked here.
+Snapshot 2026-11-12. Source: Astro's and Quinn's notes; not re-checked here.
 
 - **C1: PASS** on `cef0f9e` (build `aczb9zwk`), 2026-11-09, after the `glm47_sm70` parser rerun (review 5833861019).
-- **`latest`:** moved to `cef0f9e` on 2026-11-12 (fast-forward from `3869cd6`). Gate 3 passed with Charlie's waiver for the two `capture_bench` asserts; see `docs/release.md` History. Felix notified to flip flake#4 to `/latest`.
+- **`latest`:** moved to `cef0f9e` on 2026-11-12 (fast-forward from `3869cd6`). Gate 3 passed with accepted deviations and Charlie's waiver for one `capture_bench` assert; see `docs/release.md` History. Felix has been pinged, but the flip to `/latest` waits on blocker 7 (the re-diff).
 - **GPU window:** 22:00–06:00 via flake#5. Bea's GPU gate on `cef0f9e` ran in that window (Quinn's verdict: pass).
 - **Cutover blockers (C3):**
-  1. Bea's GPU gate on `cef0f9e` (not run yet).
-  2. Quinn confirms the gate result; then Astro's OK; then fast-forward `latest` and send the SHA to Felix and Quinn.
-  3. Felix flips flake#4 to `/latest`.
+  1. Done (2026-11-12): Bea's GPU gate on `cef0f9e`, with the deviations in `docs/release.md`; Quinn's verdict; Astro's OK.
+  2. Done (2026-11-12): `latest` fast-forwarded to `cef0f9e` and the SHA sent to Felix and Quinn.
+  3. Open, waits on blocker 7: Felix flips flake#4 to `/latest`.
   4. The host config sets `models.flint.maxNumSeqs = 20` and `models.flint.args` (incl. `--hf-overrides`), per `docs/cutover-runbook.md` step 2.4 (PR #115).
   5. The untested §4.3b check (restart `vllm.service`, then resend) runs in the window.
   6. C2 still partial (GPU smoke and `kvtier_test.py` open).
