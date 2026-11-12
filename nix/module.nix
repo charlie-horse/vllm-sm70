@@ -76,14 +76,15 @@ let
   #   services.vllm-sm70.models."qwen3.8-27b" = {
   #     asyncScheduling = false; # 1Cat: --no-async-scheduling
   #     maxNumSeqs = 4;
+  #     gpuMemoryUtilization = 0.91; # 1Cat row 4; OOMs with LMCache on
   #   };
   #   services.vllm-sm70.models."qwen3.6-35b-a3b" = {
   #     asyncScheduling = false;
   #     maxNumSeqs = 4;
   #   };
   #
-  # The other 1Cat values (memory utilization, max-model-len, block sizes)
-  # are unchanged from the fork's entries below.
+  # The other 1Cat values (max-model-len, block sizes) are unchanged from the
+  # fork's entries below.
   builtinModels = {
     # Flint NVFP4, per the fork's scripts/serve_flint_nvfp4_v100_pcie.sh.
     # Weights: the fixed-output checkpoint converted from the GGUF
@@ -182,7 +183,9 @@ let
         ];
         # >= 102K for the cold 100K-token TTFT exit (Phase 3).
         maxModelLen = 150000;
-        gpuMemoryUtilization = 0.91;
+        # gpuMemoryUtilization: the module default 0.88. The fork's 0.91 OOMs
+        # at startup next to vllm-lmcache, which holds ~1.7 GiB on GPU0 at
+        # chunk 8192 (q3.8 run, 2026-11-12); 0.88 starts.
         # Must be a multiple of vLLM's block size, which --mamba-block-size sets.
         lmcacheChunkSize = 8192;
         asyncScheduling = true;
