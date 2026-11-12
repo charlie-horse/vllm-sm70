@@ -103,20 +103,21 @@ Roadmap order. Each node appears once.
 
 ## Cutover ledger (C1, C3)
 
-Snapshot 2026-11-12. Source: Astro's and Quinn's notes; not re-checked here.
+Snapshot 2026-11-12. Source: Astro's and Quinn's notes; Quinn reviewed the cutover; not re-checked here.
 
 - **C1: PASS** on `cef0f9e` (build `aczb9zwk`), 2026-11-09, after the `glm47_sm70` parser rerun (review 5833861019).
-- **`latest`:** moved to `cef0f9e` on 2026-11-12 (fast-forward from `3869cd6`). Gate 3 passed with accepted deviations and Charlie's waiver for one `capture_bench` assert; see `docs/release.md` History. Felix has been pinged, but the flip to `/latest` waits on blocker 7 (the re-diff).
-- **GPU window:** 22:00–06:00 via flake#5. Bea's GPU gate on `cef0f9e` ran in that window (Quinn's verdict: pass).
+- **`latest`:** moved to `cef0f9e` on 2026-11-12 (fast-forward from `3869cd6`). Gate 3 passed with accepted deviations (pass with accepted deviations) and Charlie's waiver for one `capture_bench` assert; see `docs/release.md` History.
+- **GPU window:** 22:00–06:00 via flake#5. Bea's GPU gate on `cef0f9e` ran in that window: pass with accepted deviations (Quinn's verdict).
+- **C3 cutover: DONE.** c4130 generation 47 (`fldaiwwa`, flake main `05a6990`, flake#4) has served the gated `aczb9zwk` stack since 05:42 on 2026-11-12. Prod smoke passed: check5 6/6, 4K 174.1 tok/s (Astro; Quinn verified).
 - **Cutover blockers (C3):**
   1. Done (2026-11-12): Bea's GPU gate on `cef0f9e`, with the deviations in `docs/release.md`; Quinn's verdict; Astro's OK.
   2. Done (2026-11-12): `latest` fast-forwarded to `cef0f9e` and the SHA sent to Felix and Quinn.
-  3. Open, waits on blocker 7: Felix flips flake#4 to `/latest`.
-  4. The host config sets `models.flint.maxNumSeqs = 20` and `models.flint.args` (incl. `--hf-overrides`), per `docs/cutover-runbook.md` step 2.4 (PR #115).
-  5. The untested §4.3b check (restart `vllm.service`, then resend) runs in the window.
-  6. C2 still partial (GPU smoke and `kvtier_test.py` open).
-  7. **New, from Quinn's review:** c4130 switched to system-43 at 10:22 ET (`6qnj8v4g…`), which adds apiserver OIDC (`kube-apiserver.service`, `authentication-config.yaml`). flake#4's built toplevel (`fiiqm433…`, flake main d8088a1) lacks it, and switching to it would take OIDC off the apiserver. flake#4 must be merged with current flake main, and its c4130 toplevel diff redone against the running system, before Felix flips it.
-- **After C3:** C4 (archive the fork) per `docs/fork-retirement.md`; Charlie's call.
+  3. Done (2026-11-12): Felix flipped flake#4 to `/latest`; generation 47 is live (see the cutover line above).
+  4. Done: the host config sets `models.flint.maxNumSeqs = 20` and `models.flint.args` (incl. `--hf-overrides`), per `docs/cutover-runbook.md` step 2.4 (PR #115).
+  5. Open: the untested §4.3b check (restart `vllm.service`, then resend). Not yet run.
+  6. Open: C2 still partial (GPU smoke and `kvtier_test.py` open).
+  7. Done: flake#4 merged with current flake main, and its c4130 toplevel re-diff passed at `c0d7c18` (Quinn). The apiserver OIDC config from system-43 is kept.
+- **Still open after cutover:** the Qwen gate; fork archival (C4, Charlie's call per `docs/fork-retirement.md`).
 
 ## Not verified in this doc
 - CPU counts beyond those stated in PR bodies; current main CI.
