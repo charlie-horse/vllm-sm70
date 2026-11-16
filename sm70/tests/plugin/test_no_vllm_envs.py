@@ -25,6 +25,7 @@ def test_names_and_sections():
         "sampler",
         "passes",
         "warmup",
+        "graph",
     ]
 
 

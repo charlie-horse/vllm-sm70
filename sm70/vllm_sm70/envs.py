@@ -360,6 +360,18 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # so it is not part of the LUT identity.
         "VLLM_SM70_GEMM_LUT_STRICT": opt_in("VLLM_SM70_GEMM_LUT_STRICT"),
     },
+    # Tess (T8/T9 fork graph policy, vllm_sm70/graph_policy.py). Read once per
+    # VllmConfig in Sm70CudaPlatform.apply_config_platform_defaults.
+    "graph": {
+        # "0": upstream's CUDA graph capture sizes instead of the fork's SM70
+        # tables ({1, 2, 4, 8, 16, 32} <= max_num_seqs plus max_num_seqs;
+        # speculative: verifier, auxiliary and mixed sizes).
+        "VLLM_SM70_GRAPH_CAPTURE_SIZES": kill_switch("VLLM_SM70_GRAPH_CAPTURE_SIZES"),
+        # "0": upstream's CUDA graph memory estimate stays in the KV budget
+        # (V1 runner). Otherwise VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 is
+        # set when unset, as on the fork.
+        "VLLM_SM70_GRAPH_MEMORY_POLICY": kill_switch("VLLM_SM70_GRAPH_MEMORY_POLICY"),
+    },
 }
 
 

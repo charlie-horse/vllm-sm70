@@ -136,6 +136,18 @@ class Sm70CudaPlatform(CudaPlatform):
         return path
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        # T8/T9: the fork's SM70 CUDA graph capture sizes and graph-memory
+        # profiling (vllm_sm70/graph_policy.py). Runs before upstream's
+        # _set_cudagraph_sizes (UP config/vllm.py:1825 vs :2013); explicit
+        # user sizes win. Off with VLLM_SM70_GRAPH_CAPTURE_SIZES=0 /
+        # VLLM_SM70_GRAPH_MEMORY_POLICY=0.
+        super().apply_config_platform_defaults(vllm_config)
+        from vllm_sm70 import graph_policy
+
+        graph_policy.apply(vllm_config)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         super().check_and_update_config(vllm_config)
         _ensure_areas_imported()
