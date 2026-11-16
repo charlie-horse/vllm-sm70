@@ -26,7 +26,7 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 | `vllm.nix` | build | `{ vllm, lmcacheUi }` (contract in the file) |
 | `lmcache-build.nix` | build | LMCache 0.5.6 from the sdist for sm_70, on the wrapper's PYTHONPATH (`packages.lmcache`) |
 | `patches/lmcache/` | integration | LMCache sdist patches (list in `default.nix`), applied by `lmcache-build.nix` |
-| `checkpoint.nix` | integration | `flintCheckpoint` FOD, recipe from input `vllm-legacy` |
+| `checkpoint.nix` | integration | `flintCheckpoint` (`requireFile`, fixed output; no build recipe) |
 | `checks.nix` | integration | flake checks |
 
 ## Flint checkpoint
@@ -34,10 +34,34 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 `flintCheckpoint` is fixed-output (`name = "flint-nvfp4-modelopt"`, recursive
 sha256 `sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=`), so its path is
 always `/nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`,
-the same as the old flake's. Upstream vLLM has no Flint converter, so the
-recipe (converter env, GGUF, HF config) comes from the old flake (input
-`vllm-legacy`, cf9492a) with its own locked nixpkgs/uv2nix; it only builds if
-the path is in no store or cache.
+the same as the old flake's. It is a `requireFile`: Nix substitutes it from a
+store or cache, and the build fails if it is in none. This flake has no
+recipe for it, because the converter (`vllm.models.flint.convert_gguf`)
+exists only in the fork (charlie-horse/vLLM), and this flake no longer
+depends on the fork.
+
+If the path is missing from every store:
+
+1. Copy it from a host that still has it (c4130, r440):
+   `nix copy --from ssh://<host> /nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`.
+2. Otherwise regenerate it with the fork at cf9492a
+   (`cf9492a01eeca0cac731c0fa62015e2c85aaf272`). If the fork repo has been
+   deleted, this needs an offline copy of that tree (an archived checkout or
+   tarball); nothing in this repo replaces the converter. The fork's
+   `nix/package.nix` provides `flintConverter` (Python env), `gguf` and
+   `hfConfig`. Convert (~15 min, ~25 GB RAM, ~23 GB output):
+
+   ```sh
+   export HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1
+   $flintConverter/bin/python -m vllm.models.flint.convert_gguf \
+     $gguf ./flint-nvfp4-modelopt --hf-config $hfConfig --device cpu
+   rm -f ./flint-nvfp4-modelopt/conversion_report.json  # run metadata, not reproducible
+   nix-store --add-fixed --recursive sha256 ./flint-nvfp4-modelopt
+   ```
+
+   The directory must be named `flint-nvfp4-modelopt`. `nix-store` must print
+   the path above; a different path means the output differs and the module
+   will not use it.
 
 ## Fork-only settings left out for now
 

@@ -15,11 +15,6 @@
     pyproject-build-systems.inputs.nixpkgs.follows = "nixpkgs";
     pyproject-build-systems.inputs.pyproject-nix.follows = "pyproject-nix";
     pyproject-build-systems.inputs.uv2nix.follows = "uv2nix";
-
-    # The former fork's flake, kept only for the Flint checkpoint recipe
-    # (converter, GGUF and config pins; ./nix/checkpoint.nix). Its own lock
-    # pins its nixpkgs/uv2nix; nothing from it reaches the serving closure.
-    vllm-legacy.url = "github:charlie-horse/vLLM/cf9492a01eeca0cac731c0fa62015e2c85aaf272";
   };
 
   outputs =
