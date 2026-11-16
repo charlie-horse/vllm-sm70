@@ -90,6 +90,61 @@ runs (they measured 12-27% slower per step): set
 in the host, and the same for `qwen3.6-35b-a3b`. The comment above `builtinModels` in
 `module.nix` has both entries.
 
+## TurboMind small-shape tuning and the GEMM LUT
+
+The fork timed TurboMind NVFP4/FP8 kernels for small shapes (M <= 64) at
+startup (`*_TUNE_SMALL_SHAPES=1`). Here that is off by default (#77): timing
+per instance made restarts, TP ranks, and eager vs graph decode pick different
+kernels. The way back to the fork's speed with fixed kernels is tuning on plus
+a LUT exported once, which the `services.vllm-sm70.turbomind` options set:
+
+| option | env | default |
+|---|---|---|
+| `tuneSmallShapes` | `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1` | `false` (C++ default 0 applies) |
+| `gemmLutPath` | `VLLM_SM70_GEMM_LUT_PATH` | `null` |
+| `gemmLutExportPath` | `VLLM_SM70_GEMM_LUT_EXPORT_PATH` | `null` |
+| `gemmLutStrict` | `VLLM_SM70_GEMM_LUT_STRICT=1` | `false` |
+
+A model's `env` still wins over these. The default stays off until the A/B
+below passes: no tuned+LUT run of T4c (two fresh instances bitwise equal) or
+of tok/s is recorded yet.
+
+**Export the LUT once on c4130** (as admin; outside the GPU window; the vllm
+user owns `/var/lib/vllm`). A runtime drop-in needs no rebuild and is gone
+after a reboot or `revert`:
+
+```sh
+sudo systemctl edit --runtime vllm
+#   [Service]
+#   Environment=VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=1 VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1
+#   Environment=VLLM_SM70_GEMM_LUT_EXPORT_PATH=/var/lib/vllm/tm-lut-flint-{arch}.bin
+sudo systemctl restart vllm
+# wait for "Application startup complete", then:
+sudo journalctl -u vllm -b | grep -E "TurboMind pre-capture warmup|LUT exported"
+ls -l /var/lib/vllm/tm-lut-flint-sm70.bin /var/lib/vllm/tm-lut-flint-sm70.bin.plan.json
+sudo systemctl revert vllm && sudo systemctl restart vllm
+```
+
+`{arch}` becomes `sm70`. Then (A/B and T4c, `docs/m5-calibration-nov7.md`
+"Tuning on with a LUT") start twice with tuning on, `VLLM_SM70_GEMM_LUT_PATH`
+set to the same template and `VLLM_SM70_GEMM_LUT_STRICT=1`: each start must
+log "tuned (measured) 0 calls on this rank" and "N/N calls covered", and the
+outputs must be bitwise equal. Measure decode tok/s at n = 1/4/8/20 against the
+default (tuning off). If both pass, the host sets:
+
+```nix
+services.vllm-sm70.turbomind = {
+  tuneSmallShapes = true;
+  gemmLutPath = "/var/lib/vllm/tm-lut-flint-{arch}.bin";
+};
+```
+
+Re-export after any change to the vLLM/`_sm70_C` build, the model, TP size,
+`maxNumSeqs` or the CUDA graph capture sizes (the warmup plans one call per
+capture size). A LUT from another build, GPU or knob setting is refused with a
+WARNING and the warmup tunes as without it (not reproducible until
+re-exported); `gemmLutStrict = true` makes that a startup failure instead.
+
 ## LMCache patches
 
 `patches/lmcache/default.nix` lists the patches for the LMCache 0.5.6 sdist;
@@ -139,6 +194,8 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_DFLASH2_EMULATION` | new |
 | `VLLM_SM70_DFLASH2_VERIFIER` | new |
 | `VLLM_SM70_SHARED_MOE_OVERLAP` | new |
+| `VLLM_SM70_GRAPH_CAPTURE_SIZES` | new switch for the fork's SM70 CUDA graph capture sizes (T8; the fork had no switch) |
+| `VLLM_SM70_GRAPH_MEMORY_POLICY` | new switch for the fork's `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` on V1 (T9) |
 
 To turn the whole plugin off, set `VLLM_PLUGINS` to a comma-separated list
 that leaves out `sm70`. vLLM then loads neither entry point
