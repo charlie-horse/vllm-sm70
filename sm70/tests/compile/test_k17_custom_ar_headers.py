@@ -58,10 +58,16 @@ def _csrc() -> Path | None:
 
 def test_pin_file_covers_the_included_headers():
     assert set(_pins()) == HEADERS
-    source = (AREA / "tp2_ar_fused_add_rms_norm.cu").read_text()
-    included = set(re.findall(r'#include "([^"]+)"', source))
+    sources = sorted(AREA.glob("*.cu")) + sorted(AREA.glob("*.cuh"))
+    local = {p.name for p in AREA.glob("*.cuh")}
+    included = set()
+    for path in sources:
+        included |= set(re.findall(r'#include "([^"]+)"', path.read_text()))
+    # Every .cu goes through the shared header with the ABI pins.
+    for path in AREA.glob("*.cu"):
+        assert '#include "custom_ar_common.cuh"' in path.read_text(), path.name
     # custom_collective_common.cuh comes in through custom_all_reduce.cuh.
-    assert included | {"custom_collective_common.cuh"} == HEADERS
+    assert (included - local) | {"custom_collective_common.cuh"} == HEADERS
 
 
 def test_pins_are_for_the_current_base():

@@ -545,6 +545,7 @@ def test_kill_switch_is_registered():
     assert set(envs._SECTIONS["sampler"]) == {
         "VLLM_SM70_FLINT_SAMPLER",
         "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
+        "VLLM_SM70_TOP1_CUSTOM_AR",
     }
 
 

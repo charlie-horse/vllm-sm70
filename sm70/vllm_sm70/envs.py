@@ -328,6 +328,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_GREEDY_TOKEN_FASTPATH": kill_switch(
             "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
         ),
+        # "0": the greedy top-1 fast path exchanges its (value, id) pairs with
+        # the NCCL all-gather (get_top_tokens) instead of the custom-AR kernel
+        # _sm70_C::custom_ar_top1_argmax. Read per greedy step by
+        # vllm_sm70/sample_greedy.py; env-only (no Sm70Config field). Fork
+        # name and default kept (FORK envs.py:8315, default on).
+        "VLLM_SM70_TOP1_CUSTOM_AR": kill_switch("VLLM_SM70_TOP1_CUSTOM_AR"),
     },
     # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
     # first runs on a graph (fork name kept).
