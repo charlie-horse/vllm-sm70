@@ -7,9 +7,9 @@
 # Existing copies (c4130, r440's cache) are reused and nothing re-converts.
 # `checks.<system>.flint-checkpoint-outpath` fails evaluation if it drifts.
 #
-# There is no build recipe here: upstream vLLM has no Flint converter
-# (vllm.models.flint.convert_gguf exists only in the fork), and evaluating the
-# fork's flake would make this flake depend on the fork repo. requireFile only
+# There is no build recipe here: upstream vLLM has no Flint converter; the
+# fork's converter is copied to sm70/tools/flint/ (from cf9492a) but is not
+# wired into a derivation (its env needs gguf, which .#vllm lacks). requireFile only
 # substitutes; if the path is in no store or cache, the build fails with the
 # message below. Rebuild procedure: nix/README.md, "Flint checkpoint".
 #
@@ -31,8 +31,9 @@ let
       is in no store or cache, and this flake cannot build it.
       Copy it from a host that has it (c4130, r440):
         nix copy --from ssh://<host> ${expectedOutPath}
-      or regenerate it with the fork's converter (charlie-horse/vLLM at
-      cf9492a, or an offline copy of it if the fork repo is gone) and add it:
+      or regenerate it with the in-repo copy of the fork's converter,
+      sm70/tools/flint/convert_gguf.py (from charlie-horse/vLLM cf9492a;
+      inputs and env: sm70/tools/flint/PROVENANCE.md), and add it:
         nix-store --add-fixed --recursive sha256 <dir>
       where <dir> is named flint-nvfp4-modelopt. Steps: nix/README.md,
       "Flint checkpoint".

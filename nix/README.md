@@ -36,24 +36,26 @@ sha256 `sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=`), so its path is
 always `/nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`,
 the same as the old flake's. It is a `requireFile`: Nix substitutes it from a
 store or cache, and the build fails if it is in none. This flake has no
-recipe for it, because the converter (`vllm.models.flint.convert_gguf`)
-exists only in the fork (charlie-horse/vLLM), and this flake no longer
-depends on the fork.
+recipe for it and no longer depends on the fork (charlie-horse/vLLM).
 
 If the path is missing from every store:
 
 1. Copy it from a host that still has it (c4130, r440):
    `nix copy --from ssh://<host> /nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`.
-2. Otherwise regenerate it with the fork at cf9492a
-   (`cf9492a01eeca0cac731c0fa62015e2c85aaf272`). If the fork repo has been
-   deleted, this needs an offline copy of that tree (an archived checkout or
-   tarball); nothing in this repo replaces the converter. The fork's
-   `nix/package.nix` provides `flintConverter` (Python env), `gguf` and
-   `hfConfig`. Convert (~15 min, ~25 GB RAM, ~23 GB output):
+2. Otherwise regenerate it with the in-repo copy of the fork's converter,
+   `sm70/tools/flint/convert_gguf.py` (+ `gguf_nvfp4.py`), copied unchanged
+   from the fork at cf9492a (`cf9492a01eeca0cac731c0fa62015e2c85aaf272`; the
+   two files are identical at the fork's converter pin f66728d).
+   `sm70/tools/flint/PROVENANCE.md` lists the pinned GGUF and `--hf-config`
+   files (Hugging Face revs and sha256s) and what the converter needs: the
+   `.#vllm` Python plus `gguf==0.19.0`, which that env does not ship. Put the
+   GGUF at `$gguf`, the config files in a directory `$hfConfig`, and set
+   `$python` to a Python that has those packages; then, from the repo root,
+   convert (~15 min, ~25 GB RAM, ~23 GB output):
 
    ```sh
    export HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1
-   $flintConverter/bin/python -m vllm.models.flint.convert_gguf \
+   PYTHONPATH=sm70/tools $python -m flint.convert_gguf \
      $gguf ./flint-nvfp4-modelopt --hf-config $hfConfig --device cpu
    rm -f ./flint-nvfp4-modelopt/conversion_report.json  # run metadata, not reproducible
    nix-store --add-fixed --recursive sha256 ./flint-nvfp4-modelopt
@@ -61,7 +63,8 @@ If the path is missing from every store:
 
    The directory must be named `flint-nvfp4-modelopt`. `nix-store` must print
    the path above; a different path means the output differs and the module
-   will not use it.
+   will not use it. A full conversion with the in-repo copy has not been run
+   yet (only the fork's converter unit tests, on CPU).
 
 ## Fork-only settings left out for now
 
