@@ -1,0 +1,32 @@
+{
+ "version": 1,
+ "created": "2026-11-16",
+ "note": "Recreated greedy-identity prompt set; the Nov 8 S1c-base1 set was deleted with charlie's home. Send each with temperature 0, max_tokens 256, seed 0; compare reasoning+content text.",
+ "params": {
+  "temperature": 0,
+  "max_tokens": 256,
+  "seed": 0
+ },
+ "prompts": [
+  {
+   "id": "math",
+   "content": "A train leaves at 09:40 and travels 237 km at 79 km/h, then waits 18 minutes, then travels 156 km at 104 km/h. At what time does it arrive? Show the arithmetic briefly."
+  },
+  {
+   "id": "code",
+   "content": "Write a Python function that returns the longest strictly increasing contiguous subarray of a list of integers, with a short docstring and two asserts."
+  },
+  {
+   "id": "long_context",
+   "content": "Record 1: node c4130 reported temperature 41 C and fan speed 3037 rpm. Record 2: node c4130 reported temperature 42 C and fan speed 3074 rpm. Record 3: node c4130 reported temperature 43 C and fan speed 3111 rpm. Record 4: node c4130 reported temperature 44 C and fan speed 3148 rpm. Record 5: node c4130 reported temperature 45 C and fan speed 3185 rpm. Record 6: node c4130 reported temperature 46 C and fan speed 3222 rpm. Record 7: node c4130 reported temperature 47 C and fan speed 3259 rpm. Record 8: node c4130 reported temperature 48 C and fan speed 3296 rpm. Record 9: node c4130 reported temperature 49 C and fan speed 3333 rpm. Record 10: node c4130 reported temperature 50 C and fan speed 3370 rpm. Record 11: node c4130 reported temperature 51 C and fan speed 3407 rpm. Record 12: node c4130 reported temperature 52 C and fan speed 3444 rpm. Record 13: node c4130 reported temperature 53 C and fan speed 3481 rpm. Record 14: node c4130 reported temperature 54 C and fan speed 3518 rpm. Record 15: node c4130 reported temperature 55 C and fan speed 3555 rpm. Record 16: node c4130 reported temperature 56 C and fan speed 3592 rpm. Record 17: node c4130 reported temperature 40 C and fan speed 3629 rpm. Record 18: node c4130 reported temperature 41 C and fan speed 3666 rpm. Record 19: node c4130 reported temperature 42 C and fan speed 3703 rpm. Record 20: node c4130 reported temperature 43 C and fan speed 3740 rpm. Record 21: node c4130 reported temperature 44 C and fan speed 3777 rpm. Record 22: node c4130 reported temperature 45 C and fan speed 3814 rpm. Record 23: node c4130 reported temperature 46 C and fan speed 3851 rpm. Record 24: node c4130 reported temperature 47 C and fan speed 3888 rpm. Record 25: node c4130 reported temperature 48 C and fan speed 3025 rpm. Record 26: node c4130 reported temperature 49 C and fan speed 3062 rpm. Record 27: node c4130 reported temperature 50 C and fan speed 3099 rpm. Record 28: node c4130 reported temperature 51 C and fan speed 3136 rpm. Record 29: node c4130 reported temperature 52 C and fan speed 3173 rpm. Record 30: node c4130 reported temperature 53 C and fan speed 3210 rpm. Record 31: node c4130 reported temperature 54 C and fan speed 3247 rpm. Record 32: node c4130 reported temperature 55 C and fan speed 3284 rpm. Record 33: node c4130 reported temperature 56 C and fan speed 3321 rpm. Record 34: node c4130 reported temperature 40 C and fan speed 3358 rpm. Record 35: node c4130 reported temperature 41 C and fan speed 3395 rpm. Record 36: node c4130 reported temperature 42 C and fan speed 3432 rpm. Record 37: node c4130 reported temperature 43 C and fan speed 3469 rpm. Record 38: node c4130 reported temperature 44 C and fan speed 3506 rpm. Record 39: node c4130 reported temperature 45 C and fan speed 3543 rpm. Record 40: node c4130 reported temperature 46 C and fan speed 3580 rpm. Record 41: node c4130 reported temperature 47 C and fan speed 3617 rpm. Record 42: node c4130 reported temperature 48 C and fan speed 3654 rpm. Record 43: node c4130 reported temperature 49 C and fan speed 3691 rpm. Record 44: node c4130 reported temperature 50 C and fan speed 3728 rpm. Record 45: node c4130 reported temperature 51 C and fan speed 3765 rpm. Record 46: node c4130 reported temperature 52 C and fan speed 3802 rpm. Record 47: node c4130 reported temperature 53 C and fan speed 3839 rpm. Record 48: node c4130 reported temperature 54 C and fan speed 3876 rpm. Record 49: node c4130 reported temperature 55 C and fan speed 3013 rpm. Record 50: node c4130 reported temperature 56 C and fan speed 3050 rpm. Record 51: node c4130 reported temperature 40 C and fan speed 3087 rpm. Record 52: node c4130 reported temperature 41 C and fan speed 3124 rpm. Record 53: node c4130 reported temperature 42 C and fan speed 3161 rpm. Record 54: node c4130 reported temperature 43 C and fan speed 3198 rpm. Record 55: node c4130 reported temperature 44 C and fan speed 3235 rpm. Record 56: node c4130 reported temperature 45 C and fan speed 3272 rpm. Record 57: node c4130 reported temperature 46 C and fan speed 3309 rpm. Record 58: node c4130 reported temperature 47 C and fan speed 3346 rpm. Record 59: node c4130 reported temperature 48 C and fan speed 3383 rpm. Record 60: node c4130 reported temperature 49 C and fan speed 3420 rpm.\nWhich record has the highest fan speed, and what is its temperature?"
+  },
+  {
+   "id": "explain",
+   "content": "Explain in four sentences why tensor parallelism across two GPUs without NVLink is limited by PCIe all-reduce bandwidth."
+  },
+  {
+   "id": "multilingual",
+   "content": "Translate into German and French: 'The cache keeps the first part of the prompt so the second request starts faster.'"
+  }
+ ]
+}

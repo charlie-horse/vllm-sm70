@@ -111,7 +111,12 @@ def fake_sm70(monkeypatch):
 
 
 @pytest.fixture
-def hook(fake_sm70):
+def hook(fake_sm70, monkeypatch):
+    # K16 alone: the F12 greedy route of the same hook is off here, so
+    # all-greedy batches still show K16's own rejection ("greedy" case).
+    # F12: test_f12_greedy_fastpath_cpu.py.
+    monkeypatch.setenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "0")
+
     def make(rows=1, top_k=20, fp64=False):
         h = Sm70HiddenStateSampler()
         runner = _Runner(rows, top_k)
@@ -486,6 +491,12 @@ def platform_cls(monkeypatch):
     return platform.Sm70CudaPlatform
 
 
+@pytest.fixture
+def k16_alone(monkeypatch):
+    """The getter and kernel_warmup answer for K16 alone (F12 off)."""
+    monkeypatch.setenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "0")
+
+
 def test_getter_returns_a_new_hook_by_default(platform_cls, monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FLINT_SAMPLER", raising=False)
     a = platform_cls.get_hidden_state_sampler()
@@ -494,12 +505,12 @@ def test_getter_returns_a_new_hook_by_default(platform_cls, monkeypatch):
 
 
 @pytest.mark.parametrize("value,on", [("0", False), ("1", True), ("", True)])
-def test_kill_switch(platform_cls, monkeypatch, value, on):
+def test_kill_switch(platform_cls, k16_alone, monkeypatch, value, on):
     monkeypatch.setenv("VLLM_SM70_FLINT_SAMPLER", value)
     assert (platform_cls.get_hidden_state_sampler() is not None) is on
 
 
-def test_kernel_warmup_prepares_the_runner_hook(platform_cls, monkeypatch):
+def test_kernel_warmup_prepares_the_runner_hook(platform_cls, k16_alone, monkeypatch):
     seen = []
     monkeypatch.setattr(sample_v1, "prepare_worker", lambda w: seen.append(w))
     monkeypatch.delenv("VLLM_SM70_FLINT_SAMPLER", raising=False)
@@ -511,7 +522,9 @@ def test_kernel_warmup_prepares_the_runner_hook(platform_cls, monkeypatch):
     assert seen == [worker]
 
 
-def test_kernel_warmup_raises_on_prepare_failure(platform_cls, monkeypatch):
+def test_kernel_warmup_raises_on_prepare_failure(
+    platform_cls, k16_alone, monkeypatch
+):
     # A rank that silently fell back would desync TP collectives (hang), so
     # a prepare failure must stop startup; the kill switch is the way out.
     def boom(worker):
@@ -529,7 +542,11 @@ def test_kernel_warmup_raises_on_prepare_failure(platform_cls, monkeypatch):
 def test_kill_switch_is_registered():
     from vllm_sm70 import envs
 
-    assert set(envs._SECTIONS["sampler"]) == {"VLLM_SM70_FLINT_SAMPLER"}
+    assert set(envs._SECTIONS["sampler"]) == {
+        "VLLM_SM70_FLINT_SAMPLER",
+        "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
+        "VLLM_SM70_TOP1_CUSTOM_AR",
+    }
 
 
 # --------------------------------------- shape guards: Flint TP2, vocab shard, k=20

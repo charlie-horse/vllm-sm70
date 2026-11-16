@@ -32,6 +32,8 @@ let
       lib.fileset.unions [
         (lib.fileset.maybeMissing (root + "/tests"))
         (lib.fileset.maybeMissing (root + "/tools"))
+        # Inert fork source kept for a later port; never compiled.
+        (lib.fileset.maybeMissing (root + "/reference"))
       ]
     );
   };

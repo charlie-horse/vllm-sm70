@@ -46,10 +46,18 @@ EFFECTIVE_DEFAULTS = {
     "fp8_block_qpn8_turbomind_copy": None,
     "dflash2_verifier": "auto",
     "shared_moe_overlap": False,
+    "greedy_token_fastpath": True,
 }
 
 # Our sections of K01's registry.
 OURS = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
+
+# Sm70Config fields whose kill switch is registered in Kai's "sampler"
+# section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
+# eagerly, outside the compiled graph. The path check is
+# tests/sampler/test_f12_greedy_fastpath_cpu.py.
+SAMPLER_FIELD_SWITCHES = {"VLLM_SM70_GREEDY_TOKEN_FASTPATH": "greedy_token_fastpath"}
+NON_GRAPH_FIELDS = set(SAMPLER_FIELD_SWITCHES.values())
 
 # Switches that are registered but whose path has not landed yet. Each must
 # name the patch that wires it, and the no-dead-switch test fails as soon
@@ -59,7 +67,7 @@ PENDING: dict[str, str] = {}
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in OURS:
+    for name in (*OURS, *SAMPLER_FIELD_SWITCHES):
         monkeypatch.delenv(name, raising=False)
     clear_cache()
     yield
@@ -153,7 +161,10 @@ def test_registered_names_are_exactly_ours():
         "quant_backend",
         "fp8_block_qpn8_turbomind_copy",
     }
-    assert set(KILL_SWITCHES) <= set(OURS)
+    assert set(KILL_SWITCHES) <= set(OURS) | set(SAMPLER_FIELD_SWITCHES)
+    assert set(SAMPLER_FIELD_SWITCHES) <= set(envs._SECTIONS["sampler"])
+    for name, field in SAMPLER_FIELD_SWITCHES.items():
+        assert KILL_SWITCHES[name] == (field, False)
     for name in (  # M10 and Kai own these; they must not be ours
         "VLLM_SM70_FLINT_FUSED_ROUTER",
         "VLLM_SM70_FLINT_SAMPLER",
@@ -399,9 +410,10 @@ def test_non_zero_values_keep_enabled(monkeypatch, name, value):
 
 @pytest.mark.parametrize("value", ["1", "true", "on"])
 def test_env_cannot_enable(monkeypatch, value):
-    for name in OURS:
+    for name in (*OURS, *SAMPLER_FIELD_SWITCHES):
         monkeypatch.setenv(name, value)
     off = {
+        "greedy_token_fastpath": False,
         "nvfp4_gemv": False,
         "flint_moe_qpn_decode": False,
         "flint_moe_compact": False,
@@ -471,7 +483,8 @@ def test_hash_changes_for_every_graph_field():
         "nvfp4_gemv": False,
         "shared_moe_overlap": True,  # the fork hashes it too
     }
-    assert set(flips) == set(GRAPH_FIELDS) == set(Sm70Config.model_fields)
+    assert set(flips) == set(GRAPH_FIELDS)
+    assert set(GRAPH_FIELDS) == set(Sm70Config.model_fields) - NON_GRAPH_FIELDS
     hashes = {compute_hash(Sm70Config(**{k: v})) for k, v in flips.items()}
     assert base not in hashes and len(hashes) == len(flips)
 
@@ -498,7 +511,9 @@ _ENABLED = {
 }
 
 
-@pytest.mark.parametrize("name", sorted(KILL_SWITCHES))
+@pytest.mark.parametrize(
+    "name", sorted(set(KILL_SWITCHES) - set(SAMPLER_FIELD_SWITCHES))
+)
 def test_graph_field_kill_switch_changes_hash(monkeypatch, name):
     field, _ = KILL_SWITCHES[name]
     assert field in GRAPH_FIELDS
@@ -509,6 +524,16 @@ def test_graph_field_kill_switch_changes_hash(monkeypatch, name):
     vc2 = _vc({field: _ENABLED[field]})
     assert compute_hash(vc2) != base
     assert compute_hash(sm70_config(vc2)) == compute_hash(vc2)
+
+
+@pytest.mark.parametrize("name", sorted(SAMPLER_FIELD_SWITCHES))
+def test_non_graph_kill_switch_keeps_hash(monkeypatch, name):
+    field = SAMPLER_FIELD_SWITCHES[name]
+    assert field not in GRAPH_FIELDS
+    base = compute_hash(None)
+    monkeypatch.setenv(name, "0")
+    assert getattr(sm70_config(None), field) is False
+    assert compute_hash(None) == base
 
 
 def test_hash_of_defaults_sees_kill_switch(monkeypatch):

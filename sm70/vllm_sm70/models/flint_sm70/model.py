@@ -23,7 +23,8 @@ Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
 kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
   :314-318
 layer_policy(...).value("flint_        supports_sm70_topk_sampler = True
-  sampler") :570-577                  (K16 on U4, M10)
+  sampler") :570-577, get_top_tokens  (K16 and F12 greedy top-1 on U4, M10)
+  :597-603
 AutoWeightsLoader(skip_prefixes=)      filter lm_head.* when tied (UP
   :629-632                             AutoWeightsLoader has no skip_prefixes,
                                        vllm/model_executor/models/
@@ -570,7 +571,10 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
     # M10: opt in to Kai's K16 top-k candidate sampler (vllm_sm70/sample_v1.py
     # MODEL_OPT_IN, replacing fork :570-577, :605-614). It samples from
     # self.lm_head and self.logits_processor. VLLM_SM70_FLINT_SAMPLER=0 is
-    # read in Sm70CudaPlatform.get_hidden_state_sampler.
+    # read in Sm70CudaPlatform.get_hidden_state_sampler. The same opt-in
+    # admits the F12 greedy top-1 (vllm_sm70/sample_greedy.py, replacing
+    # fork get_top_tokens :571-578, :597-603); its kill switch is
+    # VLLM_SM70_GREEDY_TOKEN_FASTPATH=0.
     supports_sm70_topk_sampler = True
 
     # fork :528-542 == UP models/flint/model.py:600-614

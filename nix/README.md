@@ -26,7 +26,7 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 | `vllm.nix` | build | `{ vllm, lmcacheUi }` (contract in the file) |
 | `lmcache-build.nix` | build | LMCache 0.5.6 from the sdist for sm_70, on the wrapper's PYTHONPATH (`packages.lmcache`) |
 | `patches/lmcache/` | integration | LMCache sdist patches (list in `default.nix`), applied by `lmcache-build.nix` |
-| `checkpoint.nix` | integration | `flintCheckpoint` FOD, recipe from input `vllm-legacy` |
+| `checkpoint.nix` | integration | `flintCheckpoint` (`requireFile`, fixed output; no build recipe) |
 | `checks.nix` | integration | flake checks |
 
 ## Flint checkpoint
@@ -34,10 +34,37 @@ host's `pkgs` (`packages-module.nix`), once for both modules.
 `flintCheckpoint` is fixed-output (`name = "flint-nvfp4-modelopt"`, recursive
 sha256 `sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=`), so its path is
 always `/nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`,
-the same as the old flake's. Upstream vLLM has no Flint converter, so the
-recipe (converter env, GGUF, HF config) comes from the old flake (input
-`vllm-legacy`, cf9492a) with its own locked nixpkgs/uv2nix; it only builds if
-the path is in no store or cache.
+the same as the old flake's. It is a `requireFile`: Nix substitutes it from a
+store or cache, and the build fails if it is in none. This flake has no
+recipe for it and no longer depends on the fork (charlie-horse/vLLM).
+
+If the path is missing from every store:
+
+1. Copy it from a host that still has it (c4130, r440):
+   `nix copy --from ssh://<host> /nix/store/0qxvf6z208m6bff62acgwfg6ajhbinpp-flint-nvfp4-modelopt`.
+2. Otherwise regenerate it with the in-repo copy of the fork's converter,
+   `sm70/tools/flint/convert_gguf.py` (+ `gguf_nvfp4.py`), copied unchanged
+   from the fork at cf9492a (`cf9492a01eeca0cac731c0fa62015e2c85aaf272`; the
+   two files are identical at the fork's converter pin f66728d).
+   `sm70/tools/flint/PROVENANCE.md` lists the pinned GGUF and `--hf-config`
+   files (Hugging Face revs and sha256s) and what the converter needs: the
+   `.#vllm` Python plus `gguf==0.19.0`, which that env does not ship. Put the
+   GGUF at `$gguf`, the config files in a directory `$hfConfig`, and set
+   `$python` to a Python that has those packages; then, from the repo root,
+   convert (~15 min, ~25 GB RAM, ~23 GB output):
+
+   ```sh
+   export HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1
+   PYTHONPATH=sm70/tools $python -m flint.convert_gguf \
+     $gguf ./flint-nvfp4-modelopt --hf-config $hfConfig --device cpu
+   rm -f ./flint-nvfp4-modelopt/conversion_report.json  # run metadata, not reproducible
+   nix-store --add-fixed --recursive sha256 ./flint-nvfp4-modelopt
+   ```
+
+   The directory must be named `flint-nvfp4-modelopt`. `nix-store` must print
+   the path above; a different path means the output differs and the module
+   will not use it. A full conversion with the in-repo copy has not been run
+   yet (only the fork's converter unit tests, on CPU).
 
 ## Fork-only settings left out for now
 
@@ -62,6 +89,61 @@ runs (they measured 12-27% slower per step): set
 `models."qwen3.8-27b".asyncScheduling = false` (plus `maxNumSeqs = 4`)
 in the host, and the same for `qwen3.6-35b-a3b`. The comment above `builtinModels` in
 `module.nix` has both entries.
+
+## TurboMind small-shape tuning and the GEMM LUT
+
+The fork timed TurboMind NVFP4/FP8 kernels for small shapes (M <= 64) at
+startup (`*_TUNE_SMALL_SHAPES=1`). Here that is off by default (#77): timing
+per instance made restarts, TP ranks, and eager vs graph decode pick different
+kernels. The way back to the fork's speed with fixed kernels is tuning on plus
+a LUT exported once, which the `services.vllm-sm70.turbomind` options set:
+
+| option | env | default |
+|---|---|---|
+| `tuneSmallShapes` | `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1` | `false` (C++ default 0 applies) |
+| `gemmLutPath` | `VLLM_SM70_GEMM_LUT_PATH` | `null` |
+| `gemmLutExportPath` | `VLLM_SM70_GEMM_LUT_EXPORT_PATH` | `null` |
+| `gemmLutStrict` | `VLLM_SM70_GEMM_LUT_STRICT=1` | `false` |
+
+A model's `env` still wins over these. The default stays off until the A/B
+below passes: no tuned+LUT run of T4c (two fresh instances bitwise equal) or
+of tok/s is recorded yet.
+
+**Export the LUT once on c4130** (as admin; outside the GPU window; the vllm
+user owns `/var/lib/vllm`). A runtime drop-in needs no rebuild and is gone
+after a reboot or `revert`:
+
+```sh
+sudo systemctl edit --runtime vllm
+#   [Service]
+#   Environment=VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=1 VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1
+#   Environment=VLLM_SM70_GEMM_LUT_EXPORT_PATH=/var/lib/vllm/tm-lut-flint-{arch}.bin
+sudo systemctl restart vllm
+# wait for "Application startup complete", then:
+sudo journalctl -u vllm -b | grep -E "TurboMind pre-capture warmup|LUT exported"
+ls -l /var/lib/vllm/tm-lut-flint-sm70.bin /var/lib/vllm/tm-lut-flint-sm70.bin.plan.json
+sudo systemctl revert vllm && sudo systemctl restart vllm
+```
+
+`{arch}` becomes `sm70`. Then (A/B and T4c, `docs/m5-calibration-nov7.md`
+"Tuning on with a LUT") start twice with tuning on, `VLLM_SM70_GEMM_LUT_PATH`
+set to the same template and `VLLM_SM70_GEMM_LUT_STRICT=1`: each start must
+log "tuned (measured) 0 calls on this rank" and "N/N calls covered", and the
+outputs must be bitwise equal. Measure decode tok/s at n = 1/4/8/20 against the
+default (tuning off). If both pass, the host sets:
+
+```nix
+services.vllm-sm70.turbomind = {
+  tuneSmallShapes = true;
+  gemmLutPath = "/var/lib/vllm/tm-lut-flint-{arch}.bin";
+};
+```
+
+Re-export after any change to the vLLM/`_sm70_C` build, the model, TP size,
+`maxNumSeqs` or the CUDA graph capture sizes (the warmup plans one call per
+capture size). A LUT from another build, GPU or knob setting is refused with a
+WARNING and the warmup tunes as without it (not reproducible until
+re-exported); `gemmLutStrict = true` makes that a startup failure instead.
 
 ## LMCache patches
 
@@ -112,6 +194,8 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_DFLASH2_EMULATION` | new |
 | `VLLM_SM70_DFLASH2_VERIFIER` | new |
 | `VLLM_SM70_SHARED_MOE_OVERLAP` | new |
+| `VLLM_SM70_GRAPH_CAPTURE_SIZES` | new switch for the fork's SM70 CUDA graph capture sizes (T8; the fork had no switch) |
+| `VLLM_SM70_GRAPH_MEMORY_POLICY` | new switch for the fork's `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` on V1 (T9) |
 
 To turn the whole plugin off, set `VLLM_PLUGINS` to a comma-separated list
 that leaves out `sm70`. vLLM then loads neither entry point

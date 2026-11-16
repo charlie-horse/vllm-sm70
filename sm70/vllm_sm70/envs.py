@@ -322,6 +322,18 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # the V1 runner keeps compute_logits + the upstream Sampler (read
         # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
         "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
+        # "0": Sm70Config.greedy_token_fastpath=False, so all-greedy batches
+        # take compute_logits (full-vocab all-gather) + the upstream Sampler
+        # again (vllm_sm70/sample_greedy.py). Fork name kept (F12).
+        "VLLM_SM70_GREEDY_TOKEN_FASTPATH": kill_switch(
+            "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
+        ),
+        # "0": the greedy top-1 fast path exchanges its (value, id) pairs with
+        # the NCCL all-gather (get_top_tokens) instead of the custom-AR kernel
+        # _sm70_C::custom_ar_top1_argmax. Read per greedy step by
+        # vllm_sm70/sample_greedy.py; env-only (no Sm70Config field). Fork
+        # name and default kept (FORK envs.py:8315, default on).
+        "VLLM_SM70_TOP1_CUSTOM_AR": kill_switch("VLLM_SM70_TOP1_CUSTOM_AR"),
     },
     # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
     # first runs on a graph (fork name kept).
@@ -359,6 +371,18 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # the WARNING + re-tune. Path unset: no effect. Kept out of "ops",
         # so it is not part of the LUT identity.
         "VLLM_SM70_GEMM_LUT_STRICT": opt_in("VLLM_SM70_GEMM_LUT_STRICT"),
+    },
+    # Tess (T8/T9 fork graph policy, vllm_sm70/graph_policy.py). Read once per
+    # VllmConfig in Sm70CudaPlatform.apply_config_platform_defaults.
+    "graph": {
+        # "0": upstream's CUDA graph capture sizes instead of the fork's SM70
+        # tables ({1, 2, 4, 8, 16, 32} <= max_num_seqs plus max_num_seqs;
+        # speculative: verifier, auxiliary and mixed sizes).
+        "VLLM_SM70_GRAPH_CAPTURE_SIZES": kill_switch("VLLM_SM70_GRAPH_CAPTURE_SIZES"),
+        # "0": upstream's CUDA graph memory estimate stays in the KV budget
+        # (V1 runner). Otherwise VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 is
+        # set when unset, as on the fork.
+        "VLLM_SM70_GRAPH_MEMORY_POLICY": kill_switch("VLLM_SM70_GRAPH_MEMORY_POLICY"),
     },
 }
 

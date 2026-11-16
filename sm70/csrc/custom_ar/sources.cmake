@@ -1,4 +1,8 @@
-# TP2 fused all-reduce + add + RMSNorm (C6, patch K17): source list for _sm70_C.
+# Kernels on upstream's CustomAllreduce: source list for _sm70_C.
+#   tp2_ar_fused_add_rms_norm.cu  TP2 all-reduce + add + RMSNorm (C6, K17)
+#   top1_custom_ar.cu             greedy top-1 pair exchange (F12,
+#                                 VLLM_SM70_TOP1_CUSTOM_AR)
+# Both include custom_ar_common.cuh (ABI pins, staged start barrier).
 #
 # sm70/CMakeLists.txt does `include(csrc/custom_ar/sources.cmake)` when this
 # file exists. Same contract as the other areas: append to SM70_CUDA_SRCS
@@ -8,9 +12,10 @@
 # _C_custom_ar), so it must be built against the exact csrc headers vLLM was
 # built from: $ENV{VLLM_SM70_VLLM_CSRC_DIR}, the patched tree's csrc/ (Nix
 # sets it in nix/sm70-ext.nix). That directory goes on the include path of
-# this source only, so upstream headers can never shadow ours elsewhere.
+# these sources only, so upstream headers can never shadow ours elsewhere.
 # Without it the area is skipped with a message; the Python side then finds
-# no _sm70_C::tp2_all_reduce_fused_add_rms_norm and leaves the fusion off.
+# no _sm70_C::tp2_all_reduce_fused_add_rms_norm (the fusion stays off) and
+# no _sm70_C::custom_ar_top1_argmax (greedy top-1 keeps the all-gather).
 #
 # nvcc flags: -O3 and the -U__CUDA_NO_HALF*__ flags (undo torch's defines;
 # _f16Vec and packed_assign_add use the half operators), as upstream vLLM
@@ -23,7 +28,8 @@ set(VLLM_SM70_VLLM_CSRC_DIR "$ENV{VLLM_SM70_VLLM_CSRC_DIR}")
 if(SM70_HAS_CUDA AND SM70_ARCHS)
   if(VLLM_SM70_VLLM_CSRC_DIR STREQUAL "")
     message(STATUS "vllm_sm70: VLLM_SM70_VLLM_CSRC_DIR is unset; skipping "
-                   "custom_ar (K17 TP2 all-reduce + RMSNorm stays off)")
+                   "custom_ar (K17 TP2 all-reduce + RMSNorm and the F12 custom-AR "
+                   "top-1 exchange stay off)")
   elseif(NOT EXISTS "${VLLM_SM70_VLLM_CSRC_DIR}/custom_all_reduce.cuh"
          OR NOT EXISTS "${VLLM_SM70_VLLM_CSRC_DIR}/custom_collective_common.cuh"
          OR NOT EXISTS "${VLLM_SM70_VLLM_CSRC_DIR}/type_convert.cuh")
@@ -47,7 +53,8 @@ if(SM70_HAS_CUDA AND SM70_ARCHS)
       endif()
     endforeach()
     set(VLLM_SM70_CUSTOM_AR_CUDA_SRCS
-      "${_VLLM_SM70_CUSTOM_AR_ROOT}/tp2_ar_fused_add_rms_norm.cu")
+      "${_VLLM_SM70_CUSTOM_AR_ROOT}/tp2_ar_fused_add_rms_norm.cu"
+      "${_VLLM_SM70_CUSTOM_AR_ROOT}/top1_custom_ar.cu")
     list(APPEND SM70_CUDA_SRCS ${VLLM_SM70_CUSTOM_AR_CUDA_SRCS})
     set_property(SOURCE ${VLLM_SM70_CUSTOM_AR_CUDA_SRCS} APPEND PROPERTY
       INCLUDE_DIRECTORIES "${VLLM_SM70_VLLM_CSRC_DIR}")
@@ -57,7 +64,7 @@ if(SM70_HAS_CUDA AND SM70_ARCHS)
         -U__CUDA_NO_HALF_OPERATORS__
         -U__CUDA_NO_HALF_CONVERSIONS__
         -U__CUDA_NO_HALF2_OPERATORS__)
-    message(STATUS "vllm_sm70: custom_ar (K17) against ${VLLM_SM70_VLLM_CSRC_DIR}")
+    message(STATUS "vllm_sm70: custom_ar (K17, F12 top-1) against ${VLLM_SM70_VLLM_CSRC_DIR}")
   endif()
 endif()
 

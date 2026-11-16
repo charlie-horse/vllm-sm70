@@ -271,6 +271,21 @@ let
     VLLM_NO_USAGE_STATS = "1";
     DO_NOT_TRACK = "1";
   };
+
+  # TurboMind small-shape autotune + persisted GEMM LUT (fork T2/T3; see the
+  # `turbomind` options). Nothing is set while the options are at their
+  # defaults, so the C++ defaults (tuning off since #77) apply.
+  tm = cfg.turbomind;
+  tmEnv =
+    lib.optionalAttrs tm.tuneSmallShapes {
+      VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES = "1";
+      VLLM_SM70_FP8_TUNE_SMALL_SHAPES = "1";
+    }
+    // lib.optionalAttrs (tm.gemmLutPath != null) { VLLM_SM70_GEMM_LUT_PATH = tm.gemmLutPath; }
+    // lib.optionalAttrs (tm.gemmLutExportPath != null) {
+      VLLM_SM70_GEMM_LUT_EXPORT_PATH = tm.gemmLutExportPath;
+    }
+    // lib.optionalAttrs tm.gemmLutStrict { VLLM_SM70_GEMM_LUT_STRICT = "1"; };
 in
 {
   imports = [
@@ -322,6 +337,66 @@ in
       description = "Interfaces on which the API port is opened (no authentication).";
     };
 
+    # Fork parity T2/T3 (docs/models/sm70-effective-defaults.md, "TurboMind
+    # small-shape autotune"). The fork tuned small shapes (M <= 64) by timing
+    # at startup; here that is off by default (#77) because per-instance
+    # timing made separate instances, and eager vs graph decode, pick
+    # different kernels. The intended production mode is tuning on with a
+    # LUT exported once (csrc/turbomind/PROVENANCE.md, "Pre-capture
+    # warmup"): every rank and every restart then use the same kernels.
+    # It stays off by default until the c4130 A/B (n = 1/4/8/20, tuned+LUT
+    # vs off) and the T4c determinism run pass; nix/README.md has the steps.
+    turbomind = {
+      tuneSmallShapes = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Time TurboMind NVFP4 and FP8 kernels for small shapes (M <= 64) at
+          startup, as the fork did (VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=1,
+          VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1). Without `gemmLutPath` each
+          start tunes on its own and may pick different kernels than the
+          last one (not bitwise reproducible across restarts).
+        '';
+      };
+
+      gemmLutPath = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/var/lib/vllm/tm-lut-flint-{arch}.bin";
+        description = ''
+          TurboMind GEMM LUT to import on every TP rank
+          (VLLM_SM70_GEMM_LUT_PATH; "{arch}", "{device}" and "{rank}" are
+          substituted). Calls its manifest covers are not timed. A LUT
+          written by another _sm70_C build, GPU or knob setting is refused
+          with a WARNING and the warmup tunes as without it. Read only when
+          `tuneSmallShapes` is on. Re-export after a change to the build,
+          model, TP size, max-num-seqs or capture sizes.
+        '';
+      };
+
+      gemmLutExportPath = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/var/lib/vllm/tm-lut-flint-{arch}.bin";
+        description = ''
+          Write the tuned TurboMind dispatch cache here after the pre-capture
+          warmup (VLLM_SM70_GEMM_LUT_EXPORT_PATH; atomic, plus
+          `<path>.plan.json`). For the one-off export start; unset it again
+          afterwards. The directory must be writable by the vllm user.
+        '';
+      };
+
+      gemmLutStrict = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Fail startup instead of re-tuning when the LUT is missing, stale
+          or mismatched (VLLM_SM70_GEMM_LUT_STRICT=1). For gate runs: in
+          production a rebuild would otherwise stop vllm until the LUT is
+          re-exported.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -341,6 +416,19 @@ in
     };
 
     environment.systemPackages = [ vllm ];
+
+    assertions = [
+      {
+        assertion = tm.gemmLutStrict -> tm.gemmLutPath != null;
+        message = "services.vllm-sm70.turbomind.gemmLutStrict needs gemmLutPath.";
+      }
+    ];
+    # With tuning off every TurboMind call takes the default kernel, and the
+    # warmup neither reads nor writes a LUT (PROVENANCE.md, "Pre-capture warmup").
+    warnings =
+      lib.optional
+        (!tm.tuneSmallShapes && (tm.gemmLutPath != null || tm.gemmLutExportPath != null))
+        "services.vllm-sm70.turbomind: gemmLutPath/gemmLutExportPath do nothing while tuneSmallShapes is false.";
 
     hardware.nvidia.nvidiaPersistenced = true;
 
@@ -399,6 +487,7 @@ in
         env
         // { HF_HUB_OFFLINE = "1"; }
         // lib.optionalAttrs (model.v2ModelRunner or false) { VLLM_USE_V2_MODEL_RUNNER = "1"; }
+        // tmEnv
         // (model.env or { });
       serviceConfig = {
         User = "vllm";

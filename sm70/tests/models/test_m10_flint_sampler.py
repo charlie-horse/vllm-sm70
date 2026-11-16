@@ -26,6 +26,14 @@ GPU (``-m gpu``), what K16's contract says is exact, and nothing more
   instances are not bitwise equal on every build (M5 T4c).
   Seeded top-k 20 / top-p 0.95 on vs off stays xfail until K16's RNG parity
   and engine-instance determinism are verified (see ``seeded_parity_unverified``).
+  These K16 engines run with the F12 greedy fast path off
+  (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0), so greedy requests take upstream.
+GPU, F12 (G5/G6): inside ONE engine with the greedy fast path on, a greedy
+  request (F12: vocab-parallel top-1) gives the tokens of the same greedy
+  request with logprobs=1 (F12 rejects logprobs, so compute_logits + the
+  upstream Sampler take it). Same hidden states, same LM-head GEMM; F12's
+  contract is the first maximal index, as upstream's argmax, so they must
+  be identical with no tie exception.
 
 K16 is a V1-runner hook (patches/0005, U4); the Flint wrapper sets
 VLLM_USE_V2_MODEL_RUNNER=0 (roadmap D2) and so do these tests.
@@ -48,10 +56,13 @@ import torch
 from vllm_sm70.models import flint_sm70
 
 SAMPLER_SWITCH = "VLLM_SM70_FLINT_SAMPLER"
+GREEDY_SWITCH = "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
 
 # Log lines (vllm_sm70/sample.py, sample_v1.py), once per process = per rank.
 SAMPLER_ON_LOG = "SM70 top-k candidate sampler enabled."
 SAMPLER_GREEDY_REJECT_LOG = "SM70 top-k candidate sampler rejected: sampling_mode"
+GREEDY_ON_LOG = "SM70 greedy top-1 fast path enabled."
+GREEDY_LOGPROBS_REJECT_LOG = "SM70 greedy top-1 fast path rejected: logprobs"
 
 
 # --------------------------------------------------------------------------
@@ -173,6 +184,10 @@ def test_k16_admits_the_flint_tp2_lm_head(tp, vllm_config):
 def test_sampler_kill_switch_only_zero(platform_cls, monkeypatch, raw, on):
     from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
 
+    # The same hook carries the F12 greedy fast path; turn it off so the
+    # getter answers for K16 alone (F12: tests/sampler/
+    # test_f12_greedy_fastpath_cpu.py).
+    monkeypatch.setenv(GREEDY_SWITCH, "0")
     monkeypatch.delenv(SAMPLER_SWITCH, raising=False)
     if raw is not None:
         monkeypatch.setenv(SAMPLER_SWITCH, raw)
@@ -191,6 +206,7 @@ def test_kernel_warmup_prepares_the_sampler_only_when_on(
     and #86; here (1) is stubbed and (2) skipped (no get_model)."""
     from vllm_sm70 import sample_v1, warmup
 
+    monkeypatch.setenv(GREEDY_SWITCH, "0")  # K16 alone (see above)
     if sampler_off:
         monkeypatch.setenv(SAMPLER_SWITCH, "0")
     else:
@@ -329,6 +345,12 @@ def _greedy_params(n):
     return SamplingParams(temperature=0, max_tokens=n, ignore_eos=True)
 
 
+def _greedy_logprobs_params(n):
+    from vllm import SamplingParams
+
+    return SamplingParams(temperature=0, max_tokens=n, ignore_eos=True, logprobs=1)
+
+
 def _top1_params(n):
     from vllm import SamplingParams
 
@@ -387,11 +409,12 @@ def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     caching off so both prefill the same rows: identical tokens. "off" engine: K16 never engaged; its greedy is printed next to
     the "on" engine's greedy, not gated (engine-instance noise, M5 T4c)."""
     reqs = [(prompts, _greedy_params(n)), (prompts, _top1_params(n))]
+    no_f12 = {**V1_RUNNER, GREEDY_SWITCH: "0"}  # greedy -> upstream, not F12
     on, on_logs = _run(
-        make_llm, {**V1_RUNNER, SAMPLER_SWITCH: None}, reqs, monkeypatch, capfd
+        make_llm, {**no_f12, SAMPLER_SWITCH: None}, reqs, monkeypatch, capfd
     )
     off, off_logs = _run(
-        make_llm, {**V1_RUNNER, SAMPLER_SWITCH: "0"}, reqs[:1], monkeypatch, capfd
+        make_llm, {**no_f12, SAMPLER_SWITCH: "0"}, reqs[:1], monkeypatch, capfd
     )
     assert on_logs.count(SAMPLER_ON_LOG) == tp, "K16 enabled line not once per rank"
     assert on_logs.count(SAMPLER_GREEDY_REJECT_LOG) == tp, (
@@ -409,6 +432,41 @@ def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     for i, (a, b) in enumerate(zip(greedy, off[0])):
         print(
             f"info request {i}: greedy on-engine vs off-engine common prefix "
+            f"{_common_prefix(a, b)}/{n}"
+        )
+
+
+def _greedy_fastpath_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
+    """F12's exact contract inside one engine, plus F12 absent when killed.
+
+    "on" engine (defaults): greedy (F12) then greedy with logprobs=1
+    (upstream: F12 rejects logprobs), same prompts and batch shapes, prefix
+    caching off: identical tokens. "off" engine
+    (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0): F12 never engaged; its greedy is
+    printed next to the "on" engine's, not gated (M5 T4c)."""
+    reqs = [(prompts, _greedy_params(n)), (prompts, _greedy_logprobs_params(n))]
+    on, on_logs = _run(
+        make_llm, {**V1_RUNNER, GREEDY_SWITCH: None}, reqs, monkeypatch, capfd
+    )
+    off, off_logs = _run(
+        make_llm, {**V1_RUNNER, GREEDY_SWITCH: "0"}, reqs[:1], monkeypatch, capfd
+    )
+    assert on_logs.count(GREEDY_ON_LOG) == tp, "F12 enabled line not once per rank"
+    assert on_logs.count(GREEDY_LOGPROBS_REJECT_LOG) == tp, (
+        "logprobs rows did not take the upstream path on every rank"
+    )
+    assert GREEDY_ON_LOG not in off_logs
+    assert "SM70 greedy top-1 fast path rejected" not in off_logs
+    fast, upstream = on
+    assert all(len(t) == n for t in fast + upstream)
+    for i, (f, u) in enumerate(zip(fast, upstream)):
+        assert f == u, (
+            f"request {i}: F12 greedy differs from upstream greedy in the same "
+            f"engine at token {_common_prefix(f, u)}/{n}"
+        )
+    for i, (a, b) in enumerate(zip(fast, off[0])):
+        print(
+            f"info request {i}: F12 on-engine vs off-engine common prefix "
             f"{_common_prefix(a, b)}/{n}"
         )
 
@@ -492,3 +550,23 @@ def test_g4_ckpt_tp2_sampler_seeded_on_off(monkeypatch, capfd):
     """G4 (2 GPUs): checkpoint TP2: one seeded top-k 20 / top-p 0.95 request,
     K16 on vs off."""
     _sampler_seeded_on_off(_ckpt_llm, PROMPTS[1], 64, monkeypatch, capfd)
+
+
+@pytest.mark.gpu
+@one_gpu
+def test_g5_tiny_greedy_fastpath_equals_upstream(tmp_path, monkeypatch, capfd):
+    """G5 (1 GPU): tiny Flint TP1, V1 runner, CUDA graphs: in one engine, F12
+    greedy gives upstream greedy's tokens; F12 absent when killed."""
+    path = _tiny_flint_dir(tmp_path)
+    _greedy_fastpath_exact(
+        lambda: _tiny_llm(path), _tiny_prompts(), 16, monkeypatch, capfd, tp=1
+    )
+
+
+@pytest.mark.gpu
+@two_gpus
+@needs_ckpt
+def test_g6_ckpt_tp2_greedy_fastpath_equals_upstream(monkeypatch, capfd):
+    """G6 (2 GPUs): checkpoint TP2: as G5, with the F12 lines once on each
+    rank (the pair all-gather runs across both GPUs)."""
+    _greedy_fastpath_exact(_ckpt_llm, PROMPTS, 64, monkeypatch, capfd, tp=2)

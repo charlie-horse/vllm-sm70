@@ -1,3 +1,15 @@
+# csrc/custom_ar: provenance
+
+Two kernels on upstream's `CustomAllreduce`, built into `_sm70_C`:
+
+* `tp2_ar_fused_add_rms_norm.cu`: TP2 all-reduce + add + RMSNorm (K17), below.
+* `top1_custom_ar.cu`: the F12 greedy top-1 pair exchange
+  (`VLLM_SM70_TOP1_CUSTOM_AR`), section "F12 custom-AR top-1 exchange".
+
+Both include `custom_ar_common.cuh`: the ABI pins (`static_assert`s) and
+`staged_barrier_at_start`, moved there unchanged from the K17 file when the
+second kernel arrived.
+
 # TP2 all-reduce + add + RMSNorm: provenance (patch K17, carry-map C6/U5/I17)
 
 Source: charlie-horse/vLLM at **cf9492a01**. Feature commits `45896b591`
@@ -17,7 +29,7 @@ kernel is in `_sm70_C` and is built against upstream's own
 | here | fork (cf9492a) | status |
 |---|---|---|
 | `tp2_ar_fused_add_rms_norm.cu: tp2_cross_device_reduce_fused_add_rms_norm<Sum2>` | `csrc/custom_all_reduce.cu:505-651` `sm70_tp2_cross_device_reduce_fused_add_rms_norm` | adapted: `vllm::` qualifiers; `_f16Vec`/`_typeConvert<c10::Half>` -> `<torch::headeronly::Half>`; `barrier_at_start` -> `staged_barrier_at_start` (below) |
-| `staged_barrier_at_start<ngpus>` | `csrc/custom_all_reduce.cuh:617-631` `barrier_at_start` (+ `st_flag_sys_visible` :560, `membar_sys` :575) | adapted: upstream's `barrier_at_start` has no system fence; the fork's does, and the staged kernel needs it |
+| `staged_barrier_at_start<ngpus>` (`custom_ar_common.cuh`) | `csrc/custom_all_reduce.cuh:617-631` `barrier_at_start` (+ `st_flag_sys_visible` :560, `membar_sys` :575) | adapted: upstream's `barrier_at_start` has no system fence; the fork's does, and the staged kernel needs it |
 | `tp2_all_reduce_fused_add_rms_norm` (host) | `csrc/custom_all_reduce.cu:1011-1095` | adapted: ROCm branch dropped; `int64_t` handle |
 | `TORCH_LIBRARY_FRAGMENT(_sm70_C)` def | `csrc/torch_bindings.cpp:1689-1695` (`_C_custom_ar`) | adapted: `Tensor!` -> `Tensor(a!)`/`Tensor(b!)` |
 | `vllm_sm70/ar_rms_fusion.py: Tp2AllReduceFusedAddRMSNormPattern` | `vllm/compilation/passes/fusion/allreduce_rms_fusion.py:757-848` | adapted: `torch.ops.vllm.all_reduce` called directly; replacement is `torch.ops.vllm_sm70.*` |
@@ -66,7 +78,8 @@ unfused ops. Same set as the fork.
 
 * `static_assert`s on `sizeof`/`offsetof` of `vllm::Signal`,
   `RankData`, `RankSignals`, `CustomAllreduce` (v0.33.0, x86_64 libstdc++),
-  checked with clang `-fsyntax-only`.
+  in `custom_ar_common.cuh` (every `.cu` here includes it; the header test
+  checks that), checked with clang `-fsyntax-only`.
 * `UPSTREAM_HEADERS.sha256`: CMake refuses other header bytes;
   `sm70/tests/compile/test_k17_custom_ar_headers.py` checks the same pins,
   `patches/BASE`, and that no patch in `patches/series` edits the headers.
@@ -81,3 +94,62 @@ Inductor (UP platforms/cuda.py:712-734), which keeps the residual sum in FP32
 hook (UP platforms/interface.py:1452, merged at config/kernel.py:461-478), so
 the unfused graph (switch off, prefill rows) and the fused collective round
 the same way. A user-set priority still comes first.
+
+# F12 custom-AR top-1 exchange: provenance (`VLLM_SM70_TOP1_CUSTOM_AR`)
+
+Source: charlie-horse/vLLM at **cf9492a01**. Fork default on
+(`VLLM_SM70_TOP1_CUSTOM_AR=1`, envs.py:8315; `CommunicationPolicy.
+top1_custom_ar`, hashed pre-Ampere TP>1, policy_defaults.py:328). The
+Python side (switch, admission, fallback to the all-gather) is in
+`vllm_sm70/sample_greedy.py`; see `csrc/sampler/PROVENANCE.md` (F12).
+
+## Function map
+
+| here | fork (cf9492a) | status |
+|---|---|---|
+| `top1_custom_ar.cu: staged_cross_device_top1_argmax<ngpus>` | `csrc/custom_all_reduce.cuh:1720-1750` `cross_device_top1_argmax<ngpus>` | adapted: staged (below); tie rule (`top1_better`: NaN first, larger value, lowest id) and `llrintf` id decode verbatim |
+| `custom_ar_top1_argmax` (host) | `csrc/custom_all_reduce.cu:1449-1475` `top1_argmax` + `custom_all_reduce.cuh:3072-3106` `CustomAllreduce::top1_argmax` | adapted: one function on upstream's handle; same checks (FP32 pair, 2-256 values, int64 output of numel/2), same 1x128 launch and 2/4/6/8 rank cases; `int64_t` handle |
+| `TORCH_LIBRARY_FRAGMENT(_sm70_C)` def `custom_ar_top1_argmax` | `csrc/torch_bindings.cpp:1762-1765` (`_C_custom_ar` `top1_argmax`) | renamed in `_sm70_C`; `Tensor!` -> `Tensor(a!)` |
+| `vllm_sm70/sample_greedy.py: exchange_custom_ar` | `vllm/_custom_ops.py:3267-3274`, `CustomAllreduce.top1_argmax`/`custom_top1_argmax` (custom_all_reduce.py:771-790, :977-998) | adapted: called with `ca._ptr`, `ca.buffer_ptrs[ca.rank]`, `ca.max_size` of upstream's `get_tp_group().device_communicator.ca_comm`, as `ar_rms_fusion` reaches it |
+
+## Staged exchange instead of graph buffers (R5 design)
+
+The fork copied the pair into the registered eager buffer with
+`cudaMemcpyAsync` out of capture and pushed the caller's pair tensor onto
+`graph_unreg_buffers_` under capture (warmup took the all-gather). Here,
+as in K17 after R5, each thread stores its row's pair into the rank's own
+staging buffer (upstream's eager buffer, `buffers_`, registered at init)
+inside the kernel, the block publishes the start flag behind
+`membar.sys` (`staged_barrier_at_start`), reads every rank's staging copy
+in rank order, and publishes/awaits the end flag after the reads, so no rank
+rewrites its staging buffer while a peer reads it. One launch, no memcpy,
+nothing added to the graph-buffer list. F12 runs only eagerly (the U4 hook
+rejects capture), so the capture branch is not needed.
+
+Signal protocol: block 0's `start`/`end` counters and `_flag[0]`, advanced
+exactly as upstream's kernels and K17 advance them (start +1, end +1), so the
+exchange interleaves with upstream's custom all-reduce and K17 on the same
+communicator. The end-flag value is read after a `__syncthreads` that
+follows thread 0's `_flag` update in the start barrier.
+
+## Admitted set
+
+Kernel: FP32 contiguous pair `[rows, 2]`, 1-128 rows, int64 output, 2/4/6/8
+ranks, the registered staging buffer. Python (`custom_ar_reject_reason`,
+same on all ranks): switch on, TP > 1, CUDA, rows 1-128, upstream
+`CustomAllreduce` present and enabled with world size = TP size and distinct
+peer buffers (one node), `_sm70_C` built with this area. Otherwise the
+all-gather in upstream `get_top_tokens`.
+
+Not ported: the fork's `CudaCommunicator` creating a `CustomAllreduce` only
+for this exchange when `disable_custom_all_reduce=True` (would need an
+upstream patch); then the all-gather runs.
+
+## Build and test status
+
+Compiled for sm_70 (device: clang 18 CUDA + CUDA 12.6 headers, ptxas 12.6,
+21-30 registers, no stack; host: clang 18 against torch 2.14 headers and the
+pinned v0.33.0 csrc headers), together with the refactored K17 file. Not
+yet built by nvcc in the Nix build and not yet run on a V100:
+`pytest -m gpu sm70/tests/distributed/test_f12_top1_custom_ar_gpu.py`
+compares it with the NCCL all-gather on two ranks.

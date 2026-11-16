@@ -136,6 +136,18 @@ class Sm70CudaPlatform(CudaPlatform):
         return path
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        # T8/T9: the fork's SM70 CUDA graph capture sizes and graph-memory
+        # profiling (vllm_sm70/graph_policy.py). Runs before upstream's
+        # _set_cudagraph_sizes (UP config/vllm.py:1825 vs :2013); explicit
+        # user sizes win. Off with VLLM_SM70_GRAPH_CAPTURE_SIZES=0 /
+        # VLLM_SM70_GRAPH_MEMORY_POLICY=0.
+        super().apply_config_platform_defaults(vllm_config)
+        from vllm_sm70 import graph_policy
+
+        graph_policy.apply(vllm_config)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         super().check_and_update_config(vllm_config)
         _ensure_areas_imported()
@@ -205,13 +217,14 @@ class Sm70CudaPlatform(CudaPlatform):
                     "VLLM_SM70_FLINT_FUSED_ROUTER=0 to use the upstream gate "
                     "and select_experts"
                 ) from e
-        # (3) K16: bind the V1 hidden-state sampler and create its device
-        #     counter here, never lazily during capture (R4).
+        # (3) K16 / F12: bind the V1 hidden-state sampler and create its
+        #     device counter here, never lazily during capture (R4).
         #     A failure raises: if one TP rank silently fell back to upstream
         #     sampling while the other used K16, their collectives would no
         #     longer match and the engine would hang.
-        #     VLLM_SM70_FLINT_SAMPLER=0 is the way to run without it.
-        if _flint_sampler_enabled():
+        #     VLLM_SM70_FLINT_SAMPLER=0 VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 is
+        #     the way to run without it.
+        if _hidden_state_sampler_enabled():
             from vllm_sm70 import sample_v1
 
             try:
@@ -219,20 +232,28 @@ class Sm70CudaPlatform(CudaPlatform):
             except Exception as e:
                 raise RuntimeError(
                     "vllm_sm70: preparing the K16 top-k sampler failed; set "
-                    "VLLM_SM70_FLINT_SAMPLER=0 to use upstream sampling"
+                    "VLLM_SM70_FLINT_SAMPLER=0 VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 "
+                    "to use upstream sampling"
                 ) from e
         return None
 
     # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
     @classmethod
     def get_hidden_state_sampler(cls) -> Any:
-        # K16: TP-local exact top-k (k <= 20) sampling for models that opt in
-        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 -> upstream.
-        if not _flint_sampler_enabled():
+        # K16: TP-local exact top-k (k <= 20) sampling, and F12: vocab-
+        # parallel top-1 for all-greedy batches, for models that opt in
+        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 turns K16 off,
+        # VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 (or Sm70Config, read in
+        # prepare) turns F12 off; with both off there is no hook (upstream).
+        if not _hidden_state_sampler_enabled():
             return None
+        from vllm_sm70 import envs
         from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
 
-        return Sm70HiddenStateSampler()
+        return Sm70HiddenStateSampler(
+            topk=_flint_sampler_enabled(),
+            greedy=bool(envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH),
+        )
 
     # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
     # the gate; the provider caches its route per layer (vllm_sm70/router.py).
@@ -285,6 +306,13 @@ def _flint_sampler_enabled() -> bool:
     from vllm_sm70 import envs
 
     return bool(envs.VLLM_SM70_FLINT_SAMPLER)
+
+
+def _hidden_state_sampler_enabled() -> bool:
+    """K16 or the F12 greedy fast path is on (env kill switches only)."""
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_FLINT_SAMPLER or envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH)
 
 
 def _has_module(name: str) -> bool:
