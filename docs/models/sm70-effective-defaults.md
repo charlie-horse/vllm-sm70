@@ -64,7 +64,7 @@ When an env var is unset, the native ABI tuple passes `UNSET` and the **C++ defa
 | F16_DENSE_MAX_M | 64 (envs.py:8354) | 64 | no |
 | NVFP4_MOE_TUNE_MAX_TOKENS | 128 | 128 | no |
 | NVFP4_QPN2_PREFILL_MIN_M | 256 | 256 (QPN2 off) | no |
-| FP8/NVFP4_TUNE_SMALL_SHAPES; AWQ_TUNE_SMALL_SHAPES (fp8 family) | 1; 0 | 1; 0 | no |
+| FP8/NVFP4_TUNE_SMALL_SHAPES; AWQ_TUNE_SMALL_SHAPES (fp8 family) | 1; 0 | 1; 0 | no (vllm-sm70: 0 since #77; see "How vllm-sm70 carries T2, T8 and T9") |
 | FP8 native: GROUPED_BMM_DECODE, PREFILL_FAST_SELECTOR, PREFILL_CUTLASS, PRESERVE_DEFAULT_SPLITS, QPN8_M16, QPN8_M32_CHUNKED, QPN8_M32_NATIVE | 1 | 1 | no (QPN8_* matter only on Qwen3.8, where qpn8 is on) |
 | FP8 native: PRESERVE_DEFAULT_SPLITS_ONLY, REUSE_IMPORTED_CACHE, SAFE_FAST_SELECTOR | 0 | 0 | no |
 | FP8 native: 0DOT3_DENSE_SELECTOR, MOE_PREPARE_VEC, MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH | None | C++ default | no (UNSET) |
@@ -93,6 +93,41 @@ These are all applied because the Flash-V100 baseline holds: cc 7.0, VLLM_SM70_F
 | capture sizes | None | SM70 no-MTP sizes for max_num_seqs; speculative sizes for k+1=8 ⚠ | :549-603 |
 | ir_op_priority rms_norm / fused_add_rms_norm | – | [vllm_c, native] ⚠ | :613-620 |
 | inductor combo_kernels / benchmark_combo_kernel | – | True / True ⚠ | :688-691 |
+
+### How vllm-sm70 carries T2, T8 and T9 (2026-11-16)
+
+| Fork row | vllm-sm70 | Default | Off / on |
+|---|---|---|---|
+| T8 capture sizes (`:200-251`, `:549-603`) | `vllm_sm70/graph_policy.py`, from `Sm70CudaPlatform.apply_config_platform_defaults` (UP `config/vllm.py:1825`, before `_set_cudagraph_sizes` at `:2013`) | **on**, fork tables | `VLLM_SM70_GRAPH_CAPTURE_SIZES=0` → upstream sizes |
+| T9 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` (`:636-642`, V1 only) | same hook; written to `os.environ` (the fork wrote PolicyDefaults) when unset, so the spawned workers read 0 | **on** (V1 runner only) | `VLLM_SM70_GRAPH_MEMORY_POLICY=0` → upstream estimate; an explicit `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` always wins |
+| T2 `{NVFP4,FP8}_TUNE_SMALL_SHAPES=1` | C++ default 0 since #77; `services.vllm-sm70.turbomind.{tuneSmallShapes,gemmLutPath}` (`nix/module.nix`) set it with a persisted LUT | **off** | needs the c4130 T4c + n = 1/4/8/20 A/B (`sm70/csrc/turbomind/PROVENANCE.md`, "Nix (fork parity T2/G3)") |
+
+T8/T9 apply under the fork's Flash-V100 baseline: Flash-V100 not killed
+(`VLLM_SM70_FLASH_V100`), no other `--attention-backend`, no
+`enforce_eager`, cudagraph mode not NONE, `TORCH_COMPILE_DISABLE` and
+`VLLM_USE_BREAKABLE_CUDAGRAPH` off. Explicit `cudagraph_capture_sizes` or
+`max_cudagraph_capture_size` in `--compilation-config` keep the user's sizes;
+a dynamic speculative-decoding schedule keeps upstream's.
+
+Sizes (`max-num-batched-tokens 8192`):
+
+| Engine | Upstream v0.33 | SM70 (fork) |
+|---|---|---|
+| Flint, `max-num-seqs 20` (prod) | 1, 2, 4, 8, 16, 20, 24, 32, 40 | 1, 2, 4, 8, 16, 20 |
+| no spec, `max-num-seqs 2` | 1, 2, 4 | 1, 2 |
+| no spec, `max-num-seqs 64` | 1, 2, 4, then every 8 up to 128 (19 sizes) | 1, 2, 4, 8, 16, 32 |
+| Qwen DFlash2 k=7, `max-num-seqs 8` (qwen3.8) | 1, 2, 4, then every 8 up to 128 (19 sizes) | 1, 2, 4, 8, 9, 16, 18, 24, 32, 48, 64, 96, 128, 160, 192, 256 |
+| Qwen DFlash2 k=7, `max-num-seqs 20` (qwen3.6) | 1, 2, 4, every 8 up to 256, every 16 up to 320 (39 sizes) | 1, 2, 4, 8, 9, 16, 18, 24, 32, 48, 64, 96, 128, 160, 192, 256 |
+
+Not ported: the fork's MTP split-draft sizes (`VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS`,
+default off there) and the Flash-V100 small-q auto-raise (only when k + 1 > 16).
+The V1 runner still rounds speculative sizes to multiples of k + 1 under FULL
+decode graphs (UP `config/compilation.py:1502-1508`).
+
+GPU gate before `latest`: Flint greedy identity and 4K/32K decode, n = 3..20
+decode, startup with LMCache at `gpu-mem 0.90` and a 32K prefill (T9 takes
+graph memory out of the 10% headroom that LMCache's ~2.2 GiB also uses), and
+the KV token count in the log (it grows with T9).
 
 ## Where effective ≠ default (summary)
 

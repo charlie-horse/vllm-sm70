@@ -1,0 +1,42 @@
+// EXCERPT, verbatim, from charlie-horse/vLLM commit cf9492a01 (Apache-2.0,
+// Copyright contributors to the vLLM project): how the fork declared,
+// registered and built the ops in csrc/sm70_turbomind/ops/ here
+// (gdn_verify_sm70.cu has no TORCH_LIBRARY block of its own).
+// Reference only; not compiled. See ../README.md.
+
+// ---- csrc/ops.h lines 1175-1185 ----
+void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
+                         torch::Tensor A_log, torch::Tensor dt_bias,
+                         torch::Tensor state, torch::Tensor o, torch::Tensor cu,
+                         torch::Tensor idx, std::optional<torch::Tensor> nacc,
+                         int64_t H, int64_t HV, double scale, int64_t cfg,
+                         std::optional<torch::Tensor> rbuf,
+                         std::optional<torch::Tensor> rn,
+                         std::optional<torch::Tensor> ctr, int64_t tmax,
+                         std::optional<torch::Tensor> rmap,
+                         std::optional<torch::Tensor> ckt,
+                         std::optional<torch::Tensor> cks);
+
+// ---- csrc/torch_bindings.cpp lines 140-146 ----
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax, Tensor? rmap=None, "
+      "Tensor? ckt=None, Tensor? cks=None) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+
+// ---- CMakeLists.txt lines 406, 413, 417 and 444 (sources of _C) ----
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_verify_sm70.cu"
+
+// ---- CMakeLists.txt lines 863-869 (_sm70_exact_reduce_C) ----
+  define_extension_target(
+    _sm70_exact_reduce_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/exact_row_reduce.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS} "--fmad=false"
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)

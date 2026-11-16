@@ -118,6 +118,7 @@ Snapshot 2026-11-12. Source: Astro's and Quinn's notes; Quinn reviewed the cutov
   6. Open: C2 still partial (GPU smoke and `kvtier_test.py` open).
   7. Done: flake#4 merged with current flake main, and its c4130 toplevel re-diff passed (Quinn), re-checked at `cabeb9c`. The apiserver OIDC config from system-43 is kept.
 - **Still open after cutover:** the Qwen gate; fork archival (C4, Charlie's call per `docs/fork-retirement.md`).
+- Fork code that was never ported, for the Qwen DFlash2 verifier bundle (Q9, Q10) and the Flash-V100 Qwen XQA variants (Q13, gap G6), is kept unbuilt in `sm70/reference/fork-cf9492a/qwen-dflash2/` (README there). Port it when Qwen3.8 is activated (Phase 3 speed bar).
 
 ## Not verified in this doc
 - CPU counts beyond those stated in PR bodies; current main CI.
