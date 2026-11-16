@@ -1,0 +1,1604 @@
+# EXCERPT, verbatim, from charlie-horse/vLLM commit cf9492a01, file vllm/envs.py
+# (SPDX-License-Identifier: Apache-2.0; Copyright contributors to the vLLM project).
+# Only the env-knob definitions for the Qwen DFlash2 verifier bundle (parity rows
+# Q9/Q10) and the Flash-V100 XQA variants (Q13). Each block is preceded by its
+# original line range. Reference only: not importable, built, tested or linted.
+# See ../README.md.
+
+# ---- vllm/envs.py lines 5907-5942 (VLLM_SM70_DFLASH2_VERIFY_FASTPATH) ----
+    # Candidate-order tie handling is a benchmark-only experiment. Requiring
+    # a second opt-in prevents stale deployment scripts from silently trading
+    # scored quality for a small selector win.
+    # Umbrella gate for selector-based DFlash verification optimizations. Keep
+    # this default-off while each stage is checked against the unchanged path.
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.verify_fastpath. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.verify_fastpath; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: verify_fastpath",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason="The per-engine verifier config owns this policy",
+        deprecation_evidence=("docs/design/sm70_environment_surface.md",),
+        replacement="speculative_config.sm70_dflash2.verify_fastpath",
+    ),
+
+# ---- vllm/envs.py lines 5943-5981 (VLLM_SM70_DFLASH2_FUSED_GDN_METADATA) ----
+    # Build all selector-based DFlash target GDN state-index metadata with one
+    # pointer-table Triton launch. Keep separate from the shared-classification
+    # gate until the fixed-trajectory and mixed-batch Graph checks pass.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_metadata. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_metadata; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_metadata",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_metadata",
+    ),
+
+# ---- vllm/envs.py lines 6054-6092 (VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY) ----
+    # Selector-based DFlash packed GDN verification kernel. This is deliberately
+    # independent from the shared-metadata umbrella gate so each optimization
+    # can be paired against the unchanged verifier in isolation.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_verify. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_verify; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_verify",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_verify",
+    ),
+
+# ---- vllm/envs.py lines 6108-6144 (VLLM_SM70_DFLASH2_FUSED_GDN_NORM) ----
+    # Route compatible target GDN output gates through the existing one-pass
+    # CUDA RMSNormGated implementation. This remains an explicit opt-in.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_norm. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_norm; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_norm",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_norm",
+    ),
+
+# ---- vllm/envs.py lines 6145-6182 (VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT) ----
+    # Fuse compatible nonzero-offset GDN z/b/a materialization into one
+    # copy kernel. This must stay separate from the plain-view path because
+    # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_split. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_split; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_split",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_split",
+    ),
+
+# ---- vllm/envs.py lines 6183-6219 (VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT) ----
+    # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_combined_split. Unset "
+            "selects the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this alias "
+            "expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_combined_split; "
+            "the standalone compatibility getter retains its declared "
+            "default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_combined_split",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_combined_split",
+    ),
+
+# ---- vllm/envs.py lines 6334-6370 (VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS) ----
+    # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
+    # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gemma_rms. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gemma_rms; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fused_gemma_rms",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gemma_rms",
+    ),
+
+# ---- vllm/envs.py lines 6371-6409 (VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS) ----
+    # Fixed 8192/16-warp reduction for the FP16 no-residual and
+    # FP16-residual Gemma norms not covered by the existing FP32-residual path.
+    # Prevents per-rank/startup autotune from changing reduction order. Enabled
+    # by the SM70 DFlash2 profile; explicit zero retains the rollback path.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fixed_gemma_rms. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fixed_gemma_rms; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: fixed_gemma_rms",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fixed_gemma_rms",
+    ),
+
+# ---- vllm/envs.py lines 6410-6450 (VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION) ----
+    # Avoid materializing/gathering full-vocabulary target logits when the
+    # DFlash2 proposal and target sampling distributions both have compact
+    # top-k support. Default-off until paired output/acceptance and end-to-end
+    # V100 gates pass; unsupported sampling features fall back to dense logits.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.sparse_target_rejection. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.sparse_target_rejection; "
+            "the standalone compatibility getter retains its declared "
+            "default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: sparse_target_rejection",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.sparse_target_rejection",
+    ),
+
+# ---- vllm/envs.py lines 6451-6489 (VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC) ----
+    # Compute the compatible 25600->5120 target-hidden projection as four output
+    # shards, then all-gather only the 80-KiB block-eight result. The global
+    # default remains off; audited DFlash2 contracts enable it explicitly.
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.sharded_context_fc. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.sharded_context_fc; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: sharded_context_fc",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.sharded_context_fc",
+    ),
+
+# ---- vllm/envs.py lines 6490-6525 (VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH) ----
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.context_kv_graph. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.context_kv_graph; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: context_kv_graph",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.context_kv_graph",
+    ),
+
+# ---- vllm/envs.py lines 6526-6561 (VLLM_SM70_DFLASH2_CONTEXT_PIPELINE) ----
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.context_pipeline. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.context_pipeline; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: context_pipeline",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.context_pipeline",
+    ),
+
+# ---- vllm/envs.py lines 6831-6872 (VLLM_SM70_DFLASH2_QUANT_LM_HEAD) ----
+    # Allow DFlash2 candidate TopK when the shared target LM head is
+    # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose
+    # unquantized-head guard predates this deployment). The dense-logit
+    # fallback (quant_method.apply over the full vocabulary) produces the
+    # candidates instead of the QPN8 fast path. Opt-in because draft
+    # acceptance may differ from the unquantized baseline; quality gates
+    # must follow before broad rollout.
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QUANT_LM_HEAD", "0"))),
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.quant_lm_head. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.quant_lm_head; the "
+            "standalone compatibility getter retains its declared default."
+        ),
+        automatic_conditions=(
+            (
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier: quant_lm_head",),
+        user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.quant_lm_head",
+    ),
+
+# ---- vllm/envs.py lines 10152-10164 (VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN) ----
+    "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")),
+        description=(
+            "Flash-V100 attention: decode fp8 xqa min seq len. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16384",
+        effective_default="16384",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11114-11126 (VLLM_FLASH_V100_DECODE_USE_XQA) ----
+    "VLLM_FLASH_V100_DECODE_USE_XQA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))),
+        description=(
+            "Flash-V100 attention: decode use xqa. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11233-11245 (VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN) ----
+    "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")),
+        description=(
+            "Flash-V100 attention: decode xqa q4 min seq len. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11246-11258 (VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1"))),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11259-11273 (VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11274-11291 (VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN",
+                "111104",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p1024 mid seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="111104",
+        effective_default="111104",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11292-11309 (VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN",
+                "147841",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p256 long seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="147841",
+        effective_default="147841",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11310-11327 (VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN",
+                "258176",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p1024 final seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="258176",
+        effective_default="258176",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11328-11340 (VLLM_FLASH_V100_XQA_G6_QK_PIPELINE) ----
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11341-11353 (VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS) ----
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline warps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="8",
+        effective_default="8",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11354-11366 (VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE) ----
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11367-11379 (VLLM_FLASH_V100_XQA_G6_DUAL_CTA) ----
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))),
+        description=(
+            "Flash-V100 attention: xqa g6 dual cta. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11380-11392 (VLLM_FLASH_V100_XQA_SPLIT_REDUCE) ----
+    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa split reduce. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11393-11408 (VLLM_FLASH_V100_E4M3_BATCH_XQA) ----
+    # Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the scalar
+    # paged decoder for matched control runs or emergency rollback.
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1"))),
+        description=(
+            "Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the "
+            "scalar paged decoder for matched control runs or emergency "
+            "rollback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11409-11421 (VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED) ----
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))),
+        description=(
+            "Flash-V100 attention: e4m3 batch xqa optimized. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11450-11462 (VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING) ----
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))),
+        description=(
+            "Flash-V100 attention: xqa batch context routing. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11463-11477 (VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE) ----
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa batch context routing trace. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11478-11490 (VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA) ----
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 dual cta. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11491-11503 (VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE) ----
+    "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 split reduce. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11504-11516 (VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "61633")),
+        description=(
+            "Flash-V100 attention: xqa e5m2 p1024 begin. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="61633",
+        effective_default="61633",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11517-11531 (VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS) ----
+    "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa e5m2 partition page ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11532-11544 (VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD) ----
+    "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 pair load. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11545-11557 (VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD) ----
+    "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 batch wide load. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 11558-11570 (VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE) ----
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 dual cta trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17791-17805 (VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA) ----
+    "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA"),
+        description=(
+            "Flash-V100 attention: smallq decode use xqa. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/attention/backends/flash_attn_v100.py:__init__",
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17806-17823 (VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN) ----
+    "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN"),
+        description=(
+            "Flash-V100 attention: smallq decode xqa min seq len. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'4096' at vllm/v1/attention/backends/flash_attn_v100.py:_smallq_d"
+                "ecode_xqa_allowed"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17824-17841 (VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 p512 begin. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "str(_SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN) at "
+                "vllm/v1/cudagraph_dispatcher.py:__init__"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17842-17857 (VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 p64 p256 auto. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/cudagraph_dispatcher.py:__init__",
+            ("'1' at vllm/v1/attention/backends/flash_attn_v100.py:_flash_v100_decode"),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17858-17870 (VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 wave partitions. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/v1/cudagraph_dispatcher.py:__init__",),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17871-17888 (VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA) ----
+    "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA"),
+        description=(
+            "Flash-V100 attention: xqa mtp5 dual cta. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/attention/backends/flash_attn_v100.py:_mtp5_xqa_du"
+                "al_cta_partition_size_hint"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 17889-17906 (VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE) ----
+    "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"),
+        description=(
+            "Flash-V100 attention: xqa mtp5 partition size. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1024' at vllm/v1/attention/backends/flash_attn_v100.py:_mtp5_xqa"
+                "_dual_cta_partition_size_hint"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19632-19660 (VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM) ----
+    "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM"),
+        description=(
+            "Control the flash v100 xqa aligned padded smem native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:513; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:513; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:514; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19661-19689 (VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE) ----
+    "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE"),
+        description=(
+            "Trace the flash v100 xqa aligned padded smem native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:520; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:520; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:521; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19690-19718 (VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT) ----
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT"),
+        description=(
+            "Select native page-16 XQA layout mode 1 or 2; all other values select the "
+            "original mode."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 0.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:478; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:478; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:479; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19719-19747 (VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE) ----
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE"),
+        description=(
+            "Control the flash v100 xqa block16 layout require native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:487; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:487; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:488; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19748-19776 (VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE) ----
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE"),
+        description=(
+            "Trace the flash v100 xqa block16 layout native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:493; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:493; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:494; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19777-19805 (VLLM_FLASH_V100_XQA_BLOCK784_INDEX) ----
+    "VLLM_FLASH_V100_XQA_BLOCK784_INDEX": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX"),
+        description=(
+            "Control the flash v100 xqa block784 index native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:500; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:500; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:501; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19806-19834 (VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE) ----
+    "VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE"),
+        description=(
+            "Trace the flash v100 xqa block784 index native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:506; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:506; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:507; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19835-19863 (VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 dual-CTA XQA branch; overrides "
+            "clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 32768.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:296; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:296; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:297; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19864-19896 (VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH"),
+        description=(
+            "Control merged-wave launch in the E4M3 G6 XQA implementations. "
+            "Defaults currently differ between the bundled attention extension "
+            "and the standalone long-attention extension."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: False in "
+            "csrc/attention/sm70_grouped_long; True in flash-attention-v100."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:308; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:308; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:309; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19897-19925 (VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P1664 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 196608.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:323; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:323; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:324; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19926-19954 (VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P256 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 12288.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:291; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:291; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:292; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19955-19983 (VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE"),
+        description=(
+            "Trace the flash v100 xqa e4m3 g6 p64 p256 auto native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:284; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:284; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:285; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 19984-20012 (VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN) ----
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P896 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 98304.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:318; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:318; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:319; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 20013-20041 (VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE) ----
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE"),
+        description=(
+            "Control the flash v100 xqa g6 dual cta dense native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:254; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:254; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:255; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 20042-20070 (VLLM_FLASH_V100_XQA_G6_P1024_AUTO) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_AUTO": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO"),
+        description=(
+            "Control the flash v100 xqa g6 p1024 auto native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:259; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:259; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:260; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 20071-20099 (VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE) ----
+    "VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE"),
+        description=(
+            "Trace the flash v100 xqa g6 p1024 auto native branch without changing its "
+            "admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:265; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:265; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:266; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 20100-20128 (VLLM_FLASH_V100_XQA_PADDED_SMEM) ----
+    "VLLM_FLASH_V100_XQA_PADDED_SMEM": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM"),
+        description=(
+            "Control the flash v100 xqa padded smem native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:149; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:149; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:150; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
+
+# ---- vllm/envs.py lines 20129-20157 (VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE) ----
+    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE"),
+        description=(
+            "Select a supported native split-reduction dimension tile (8, 16 or 32); "
+            "invalid values retain the default."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 8.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:527; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:527; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:528; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
+    ),
