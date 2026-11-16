@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """M1 sm70-config: the typed SM70 policy for the plugin.
 
-What: ``Sm70Config``, a frozen pydantic model with 11 fields (extra keys are
+What: ``Sm70Config``, a frozen pydantic model with 13 fields (extra keys are
   rejected), and ``sm70_config(vllm_config)``. The helper reads
   ``additional_config["sm70"]`` (or ``kernel_config.sm70``), applies the
   kill-only env switches from ``vllm_sm70.envs``, and caches the result per
@@ -15,7 +15,8 @@ Why: the 1Cat fork (charlie-horse/vLLM cf9492a) resolved about 300 env knobs
   (FORK nix/module.nix:198-207, :329; HOST hosts/c4130/vllm/default.nix).
   The evidence chain is in docs/models/sm70-effective-defaults.md (repo root).
 Kill-switch: VLLM_SM70_<THING>=0, registered in the "quant" and "models"
-  sections of vllm_sm70/envs.py (K01 ``kill_switch``; only "0" acts) and read
+  sections of vllm_sm70/envs.py (VLLM_SM70_GREEDY_TOKEN_FASTPATH: in
+  "sampler") (K01 ``kill_switch``; only "0" acts) and read
   here only as ``vllm_sm70.envs.<NAME>``. It can only turn a field off.
   Configuration is the only way to turn something on.
 
@@ -175,6 +176,23 @@ class Sm70Config(BaseModel):
     runtime_defaults.py:110-111), which does not apply on c4130.
     Kill: VLLM_SM70_SHARED_MOE_OVERLAP=0."""
 
+    greedy_token_fastpath: bool = True
+    """Vocab-parallel top-1 for all-greedy batches (temperature 0): each TP
+    rank takes the argmax of its own LM-head logit shard and the ranks
+    all-gather only (value, token id) pairs, instead of all-gathering the
+    full-vocabulary logits and running the upstream Sampler. Same token as
+    upstream's argmax (first index on ties). Admitted only for models that
+    opt in (``supports_sm70_topk_sampler``), on SM70, without spec decode,
+    structured output, logprobs, penalties, allowed/bad words, thinking
+    budget or active non-argmax-invariant logits processors
+    (vllm_sm70/sample_greedy.py, on the U4 hook). Evidence: fork
+    VLLM_SM70_GREEDY_TOKEN_FASTPATH=1 (envs.py:7033) ->
+    kernel_config.layer_execution.greedy_token_fastpath; runner gate
+    gpu_model_runner.py:7646-7695, call :7845-7862; Flint get_top_tokens
+    models/flint/model.py:571-604. No override applies. Not a graph field:
+    sampling runs outside the compiled graph.
+    Kill: VLLM_SM70_GREEDY_TOKEN_FASTPATH=0."""
+
 
 GRAPH_FIELDS: tuple[str, ...] = (
     "quant_backend",
@@ -193,7 +211,8 @@ GRAPH_FIELDS: tuple[str, ...] = (
 """Fields that change the compiled graph. shared_moe_overlap is included
 because the fork always hashes it: all layer aliases pre-Ampere, this one
 alone elsewhere (policy_defaults.py:275-277).
-Keep nvfp4_gemv in until it is tested."""
+Keep nvfp4_gemv in until it is tested. greedy_token_fastpath is not one:
+sampling runs eagerly, outside the compiled graph."""
 
 # Kill switch name -> (field, value forced when engaged). VLLM_SM70_FP8_TURBOMIND,
 # VLLM_SM70_QUANT and VLLM_SM70_DFLASH2_EMULATION are env-only kills (no field).
@@ -208,6 +227,7 @@ KILL_SWITCHES: dict[str, tuple[str, Any]] = {
     "VLLM_SM70_FP8_BLOCK_QPN8": ("fp8_block_qpn8", False),
     "VLLM_SM70_DFLASH2_VERIFIER": ("dflash2_verifier", "off"),
     "VLLM_SM70_SHARED_MOE_OVERLAP": ("shared_moe_overlap", False),
+    "VLLM_SM70_GREEDY_TOKEN_FASTPATH": ("greedy_token_fastpath", False),
 }
 
 

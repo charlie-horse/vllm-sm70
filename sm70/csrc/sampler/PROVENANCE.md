@@ -1,4 +1,4 @@
-# Flint top-k candidate sampler: provenance (patch K16)
+# Flint top-k candidate sampler (K16) and greedy top-1 (F12): provenance
 
 Source: charlie-horse/vLLM at **cf9492a01**. Carry-map row K16 (C7 in the
 Flint section), plus I16 (V1 vs V2, `use_fp64_gumbel`) and R4 (capture-time
@@ -13,6 +13,10 @@ state). "Fork last-touch" is `git log -1 --format=%h -- <fork path>`.
 | `vllm/models/flint/model.py` | :570-577, :605-614 | — | opt-in attribute `supports_sm70_topk_sampler` (M10 sets it on the Flint model) |
 | `tests/kernels/core/test_sm70_topk_candidates_sampler.py` | 230 | `ae002efc7` | `tests/sampler/test_k16_topk_candidates_sampler_gpu.py` |
 | `tests/v1/sample/test_sm70_topk_candidates_admission.py` | 111 | `484216b2a` | `tests/sampler/test_k16_topk_candidates_admission.py` |
+| `vllm/envs.py` | :7028-7041 (`VLLM_SM70_GREEDY_TOKEN_FASTPATH`) | — | `vllm_sm70/envs.py` "sampler" + `Sm70Config.greedy_token_fastpath` (F12) |
+| `vllm/v1/worker/gpu_model_runner.py` | :1314-1318, :7129-7134, :7646-7695, :7819-7825, :7845-7862, :8846-8848 | — | `vllm_sm70/sample_v1.py` (greedy route) + `vllm_sm70/sample_greedy.py` (F12) |
+| `vllm/models/flint/model.py` | :571-578, :597-603 (`get_top_tokens`) | — | upstream `LogitsProcessor.get_top_tokens` behind the same opt-in (F12) |
+| `vllm/model_executor/layers/logits_processor.py` | :281-386 (`get_top_tokens`) | — | upstream v0.33 `LogitsProcessor.get_top_tokens` (UP :201-247), called as is (F12) |
 
 ## Function map
 
@@ -63,6 +67,60 @@ The two defs keep the fork schemas character for character; the namespace is
 | `Sm70HiddenStateSampler.try_sample` | runner :7104-7125 | returns `SamplerOutput(sampled[:, None], None)` instead of the runner doing it |
 | `Sm70HiddenStateSampler.prepare` / `prepare_worker` | — (new) | run from `Sm70CudaPlatform.kernel_warmup` (U1): bind the runner, read `use_fp64_gumbel`, create the overflow counter before capture (R4) |
 
+### Greedy top-1 (F12): `vllm_sm70/sample_greedy.py`, greedy route of `sample_v1.py`
+
+Ported 2026-11-16 (it was "Dropped" below until then). No upstream patch: it
+rides the U4 hook K16 already uses. `Sm70HiddenStateSampler.route()` sends an
+all-greedy batch to F12 when `greedy_token_fastpath` is on, everything else to
+K16 as before.
+
+| fork code | here | change |
+|---|---|---|
+| `VLLM_SM70_GREEDY_TOKEN_FASTPATH` (envs :7033, default 1) -> `layer_execution.greedy_token_fastpath` (runner :1314) | `Sm70Config.greedy_token_fastpath = True`; kill `VLLM_SM70_GREEDY_TOKEN_FASTPATH=0` (K01 `kill_switch`, "sampler" section, `KILL_SWITCHES`) | config holds the default; only "0" acts. Not a graph field |
+| `_can_use_greedy_token_fastpath` (runner :7646-7695) | `Sm70HiddenStateSampler.reject_reason` (shared checks) + `sample_greedy.metadata_reject_reason` / `device_reject_reason` / `lm_head_reject_reason` | same rejections (spec decode, pooling/PP broadcast by U4's placement, structured output, non-CUDA, non-SM70, no opt-in, non-greedy, logprobs, logprob token ids, penalties, allowed token ids, bad words, active non-argmax processors); adds thinking budget, CUDA graph capture, hidden rows vs `num_reqs`, and rank-uniform LM-head checks (logits as input, scale <= 0, added vocab, vocab size mismatch or > 2^24) |
+| `_trace_greedy_token_fastpath` (runner :7819-7825, `runtime_trace.greedy_token_trace`) | `_reject(route, reason)` logs each reason once at INFO; "SM70 greedy top-1 fast path enabled." once | always on, no trace switch |
+| `_sample_greedy_token_fastpath` (runner :7845-7862) | `try_sample` greedy branch | returns int32 `[rows, 1]`, as upstream's Sampler |
+| Flint `_get_top_tokens` -> `LogitsProcessor.get_top_tokens(fused_top1=False)` (model :571-578, :597-603; logits_processor :281-386) | upstream v0.33 `LogitsProcessor.get_top_tokens` (UP :201-247) | upstream's is the fork's with `fused_top1=False` minus: the margin dump and pre-gather sync (diagnostics, off by default), the `sm70_top1x` two-hop exchange (Qwen4Exp only, `kernel_config.sm70_top1x=False`), and the custom-AR pair reduction (`VLLM_SM70_TOP1_CUSTOM_AR`, see "Not ported"). Opt-in is the K16 attribute `supports_sm70_topk_sampler` instead of `hasattr(model, "get_top_tokens")` |
+
+Identity argument (module docstring of `sample_greedy.py`): FP16 -> FP32 is
+exact; each rank's `max` returns its first maximal index; shards are in vocab
+order (no added vocab); the cross-rank `argmax` takes the lowest rank on ties.
+So the token is the first maximal index of the gathered row, which is what
+`Sampler.greedy_sample` (`logits.argmax(-1)`) returns on CUDA.
+
+Tested: CPU, `tests/sampler/test_f12_greedy_fastpath_cpu.py`: fake 2-rank
+(and 1/4-rank) splits with real `ParallelLMHead` shards and `LogitsProcessor`
+vs argmax over the gathered logits, ties across and inside ranks, a poisoned
+padded last shard, the Flint vocabulary; hook admission and every upstream
+case; switch=0 by env and by `Sm70Config`; platform getter and kernel_warmup
+for each switch combination. GPU (`-m gpu`):
+`tests/sampler/test_f12_greedy_fastpath_gpu.py` (the same split on a V100,
+Flint vocab x 2048, rows 1..20) and `tests/models/test_m10_flint_sampler.py`
+G5 (tiny Flint TP1) / G6 (checkpoint TP2): in one engine, F12 greedy equals
+upstream greedy (the logprobs=1 request takes upstream).
+
+Not ported: the DDTree greedy branch (runner :6940-6962, :7150-7176) is spec
+decode, which U4 never calls; `maybe_get_sm70_lm_head_top1(_pair)` (the fused
+LM-head top-1, `VLLM_SM70_LM_HEAD_TOP1`) was off on Flint (`fused_top1=False`,
+and the cc 7.0 policy sets LM_HEAD_TOP1=0).
+
+**Open gap (follow-up, needs a GPU build):** the fork exchanged the per-rank
+(value, id) pairs with its own custom-all-reduce kernel instead of an NCCL
+all-gather: `VLLM_SM70_TOP1_CUSTOM_AR=1` (FORK envs.py:8315, default on,
+pre-Ampere TP > 1, policy_defaults.py:328) -> `LogitsProcessor.
+_maybe_custom_top1_argmax` (logits_processor.py:817-847) ->
+`CustomAllreduce.custom_top1_argmax` (custom_all_reduce.py:977-998) ->
+`cross_device_top1_argmax<ngpus>` (csrc/custom_all_reduce.cuh:1720-1750,
+host :3072-3106, custom_all_reduce.cu:1449-1475): one 128-thread CTA, the
+pair copied into the registered eager buffer, start/end barriers, and the
+same first-index tie rule. Here F12 uses upstream's
+`tensor_model_parallel_all_gather` of `[rows, 2]` FP32 (identical tokens; it
+costs one small NCCL all-gather per step instead of one IPC kernel, i.e.
+tens of microseconds). The port would be a second kernel in
+`csrc/custom_ar/` on K17's pinned upstream headers (`buffers_`, `sg_`,
+`self_sg_`, `rank_`) plus a call from `sample_greedy.py`; it was not written
+here because the custom_ar area cannot be compiled or run without CUDA.
+
 ## Dropped, and why
 
 | fork code | why |
@@ -72,7 +130,7 @@ The two defs keep the fork schemas character for character; the namespace is
 | runner `_can_use_sm70_compact_topk20_tokens` :7698-7768 (minus the :7703-7706 delegation) | the compact route above (fixed vocab 248320, top-p 0.95, temperature 1.0 only) |
 | fork `_sm70_sampler_C` module and its CMake (`CMakeLists.txt`:762-800) | one `.so` (`_sm70_C`); C++20 instead of the fork's C++17 target properties, no separate compilation |
 | `layer_policy(...).value("flint_sampler")` on the model | kill switch is read in the platform getter instead |
-| Flint greedy `get_top_tokens` fast path (FORK `gpu_model_runner.py:6950-6962` gate, `:7176` call; `sm70_greedy_token_fastpath`, DDTree greedy sampling) | not ported. It needs a model-side `get_top_tokens` and a second runner branch; K16 rejects temperature 0, so greedy requests take upstream's sampler. Revisit only if greedy decode shows up in a Flint profile after D2 |
+| DDTree greedy sampling from `get_top_tokens` (FORK `gpu_model_runner.py:6940-6962` gate, `:7150-7176` call) | spec decode (DFlash DDTree), which the U4 hook never sees. The non-spec greedy fast path itself is ported (F12, above) |
 
 Nothing in the kept code is TP4-only.
 

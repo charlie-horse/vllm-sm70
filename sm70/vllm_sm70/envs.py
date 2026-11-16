@@ -322,6 +322,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # the V1 runner keeps compute_logits + the upstream Sampler (read
         # once per runner, vllm_sm70/_cuda_platform.py). Fork name kept.
         "VLLM_SM70_FLINT_SAMPLER": kill_switch("VLLM_SM70_FLINT_SAMPLER"),
+        # "0": Sm70Config.greedy_token_fastpath=False, so all-greedy batches
+        # take compute_logits (full-vocab all-gather) + the upstream Sampler
+        # again (vllm_sm70/sample_greedy.py). Fork name kept (F12).
+        "VLLM_SM70_GREEDY_TOKEN_FASTPATH": kill_switch(
+            "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
+        ),
     },
     # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
     # first runs on a graph (fork name kept).
