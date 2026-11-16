@@ -1,0 +1,20 @@
+# Overlay on the official config. Use as:
+#   -c swebench.yaml -c /home/user/swe/flint.yaml
+model:
+  model_name: hosted_vllm/flint
+  model_class: flint_model.FlintModel   # needs PYTHONPATH=/home/user/swe/adapter
+  cost_tracking: ignore_errors
+  model_kwargs:
+    api_base: http://127.0.0.1:18000/v1
+    api_key: dummy
+    drop_params: true
+    parallel_tool_calls: true
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 65536  # NVFP4 card client budget; card min 32768
+    timeout: 1800
+environment:
+  # No internet inside the task container (card: "no internet access").
+  run_args: ["--rm", "--network=none"]
+  # Card blog: agent timeouts up to 5 hours.
+  container_timeout: "5h"
