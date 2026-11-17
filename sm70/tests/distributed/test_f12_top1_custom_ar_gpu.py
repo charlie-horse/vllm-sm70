@@ -145,6 +145,10 @@ def test_f12_top1_custom_ar_equals_all_gather(monkeypatch, tmp_path, expandable)
             "VLLM_SM70_VLLM_CSRC_DIR (csrc/custom_ar skipped)"
         )
     monkeypatch.delenv("VLLM_SM70_TOP1_CUSTOM_AR", raising=False)
+    # The test builds CustomAllreduce on a bare torch.distributed group, so
+    # vLLM's P2P check (which needs the world group) must stay skipped,
+    # whatever the caller's env says.
+    monkeypatch.setenv("VLLM_SKIP_P2P_CHECK", "1")
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     if expandable:
         monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
