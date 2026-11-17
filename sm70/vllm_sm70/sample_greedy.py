@@ -30,7 +30,7 @@ envs.py:7033, kernel_config.layer_execution.greedy_token_fastpath, runner
 is ``Sm70HiddenStateSampler`` in vllm_sm70/sample_v1.py (patch U4).
 
 Pair exchange over the custom all-reduce buffers (fork
-``VLLM_SM70_TOP1_CUSTOM_AR``, default on): instead of the NCCL all-gather,
+``VLLM_SM70_TOP1_CUSTOM_AR``; here opt-in with ``=1``, default off): instead of the NCCL all-gather,
 each rank writes its pairs into upstream's ``CustomAllreduce`` eager buffer
 and one IPC kernel (``_sm70_C::custom_ar_top1_argmax``, csrc/custom_ar/
 top1_custom_ar.cu) reduces them with the same first-index tie rule. Port of
@@ -41,7 +41,7 @@ FORK ``LogitsProcessor._maybe_custom_top1_argmax`` (logits_processor.py:
 (``custom_ar_reject_reason``): the switch, TP > 1, CUDA, 1-128 rows, an
 enabled single-node custom all-reduce of 2/4/6/8 ranks on the TP group
 and a ``_sm70_C`` built with the kernel. Anything else, including
-``VLLM_SM70_TOP1_CUSTOM_AR=0``, TP1, CPU, or a custom all-reduce that was
+the switch unset (anything but ``1``), TP1, CPU, or a custom all-reduce that was
 never initialised or is disabled, takes ``get_top_tokens`` and its
 all-gather as before.
 """
@@ -49,6 +49,7 @@ all-gather as before.
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 from typing import Any
 
@@ -240,6 +241,55 @@ def exchange_custom_ar(ca: Any, pair: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Debug log (VLLM_SM70_TOP1_DEBUG=1)
+# ---------------------------------------------------------------------------
+
+_debug_steps = itertools.count()
+
+
+@functools.cache
+def debug_on() -> bool:
+    """VLLM_SM70_TOP1_DEBUG, read once per process."""
+    from vllm_sm70 import envs
+
+    return bool(envs.VLLM_SM70_TOP1_DEBUG)
+
+
+def _debug_log(
+    path: str,
+    logits_processor: Any,
+    lm_head: Any,
+    hidden_states: torch.Tensor,
+    pair: torch.Tensor | None,
+    tokens: torch.Tensor,
+) -> None:
+    """Log this rank's local pairs and the exchanged tokens of one step.
+
+    Syncs the device (.tolist()); skipped under stream capture. The
+    all-gather path does not build the pair, so it is recomputed here.
+    """
+    if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    step = next(_debug_steps)
+    if pair is None:
+        pair = local_pair(logits_processor, lm_head, hidden_states)
+    rank = getattr(lm_head, "tp_rank", 0)
+    rows = [
+        f"({value!r}, {int(index)}) -> {int(token)}"
+        for (value, index), token in zip(pair.tolist(), tokens.tolist())
+    ]
+    logger.warning(
+        "SM70 top1 debug: rank=%s step=%d rows=%d path=%s "
+        "local (max, global id) -> token: %s",
+        rank,
+        step,
+        len(rows),
+        path,
+        "; ".join(rows),
+    )
+
+
 def greedy_tokens(
     logits_processor: Any, lm_head: Any, hidden_states: torch.Tensor
 ) -> torch.Tensor:
@@ -261,6 +311,10 @@ def greedy_tokens(
                 )
             else:
                 _log_once(logging.INFO, "SM70 custom top1 argmax path enabled.")
+                if debug_on():
+                    _debug_log(
+                        "custom_ar", logits_processor, lm_head, hidden_states, pair, top
+                    )
                 return top.to(torch.int32)
     if reason not in (None, "switch_off", "tp1", "non_cuda", "rows"):
         _log_once(
@@ -269,4 +323,6 @@ def greedy_tokens(
             "greedy top-1 uses the all-gather.",
         )
     top = logits_processor.get_top_tokens(lm_head, hidden_states)
+    if debug_on():
+        _debug_log("all_gather", logits_processor, lm_head, hidden_states, None, top)
     return top.to(torch.int32)

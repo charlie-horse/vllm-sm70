@@ -546,6 +546,7 @@ def test_kill_switch_is_registered():
         "VLLM_SM70_FLINT_SAMPLER",
         "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
         "VLLM_SM70_TOP1_CUSTOM_AR",
+        "VLLM_SM70_TOP1_DEBUG",
     }
 
 

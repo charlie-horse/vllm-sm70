@@ -113,9 +113,19 @@ the NCCL all-gather; so does `sample_greedy.greedy_tokens` now. Kernel:
 `csrc/custom_ar/top1_custom_ar.cu` (provenance in
 `csrc/custom_ar/PROVENANCE.md`, next to K17).
 
+Default off, opt-in with `VLLM_SM70_TOP1_CUSTOM_AR=1`: on c4130 (TP2, 2x
+V100) the custom-AR exchange returned a different greedy token than the
+all-gather on a checkpoint near-tie (m10 G3: 11749 with the exchange,
+3426 = the full-logit argmax with either switch off); the cause is not
+found. The all-gather costs within noise (32K greedy decode 162.3 vs
+164.0 tok/s). `VLLM_SM70_TOP1_DEBUG=1` logs, per greedy step and rank,
+each row's local (max, global id) pair and the exchanged token, on either
+path (syncs the device; skipped under stream capture, which the U4 hook
+already rejects).
+
 | fork code | here | change |
 |---|---|---|
-| `VLLM_SM70_TOP1_CUSTOM_AR` (envs :8315, default 1; `CommunicationPolicy.top1_custom_ar` execution_policy.py:662/:723; hashed pre-Ampere TP>1 policy_defaults.py:328) | kill switch `VLLM_SM70_TOP1_CUSTOM_AR` in the "sampler" section of `vllm_sm70/envs.py`, next to `VLLM_SM70_GREEDY_TOKEN_FASTPATH`; default on, only "0" acts | env-only (no `Sm70Config` field, not a graph field: sampling is eager) |
+| `VLLM_SM70_TOP1_CUSTOM_AR` (envs :8315, default 1; `CommunicationPolicy.top1_custom_ar` execution_policy.py:662/:723; hashed pre-Ampere TP>1 policy_defaults.py:328) | opt-in `VLLM_SM70_TOP1_CUSTOM_AR` in the "sampler" section of `vllm_sm70/envs.py`, next to `VLLM_SM70_GREEDY_TOKEN_FASTPATH`; default off, only "1" acts | env-only (no `Sm70Config` field, not a graph field: sampling is eager) |
 | `LogitsProcessor._maybe_custom_top1_argmax` (logits_processor.py:817-847) | `sample_greedy.custom_ar_reject_reason` + `greedy_tokens` | same checks (switch, SM70 via the F12 device gate, FP32, 1-128 rows), plus TP>1, world size = TP size, single-node peers, `_sm70_C` op present. Same fallback: a raising kernel logs a warning once and takes the all-gather. Logs "SM70 custom top1 argmax path enabled." once, and once per reason when unavailable |
 | `get_top_tokens` pair build (logits_processor.py:304-352, `fused_top1=False`) | `sample_greedy.local_pair` | the first half of upstream's `get_top_tokens` (UP :213-241), line for line; the CPU test checks the pair is bitwise the one upstream all-gathers |
 | `CustomAllreduce.custom_top1_argmax` / `top1_argmax` (custom_all_reduce.py:977-998, :771-790) | `sample_greedy.exchange_custom_ar` on upstream's `get_tp_group().device_communicator.ca_comm` (`_ptr`, `buffer_ptrs[rank]`, `max_size`), as `ar_rms_fusion` reaches it | no capture branch (the U4 hook rejects capture), no graph buffers (staged, see custom_ar/PROVENANCE.md) |
@@ -128,12 +138,9 @@ on ties, first NaN), i.e. the all-gather path's token. Tested: CPU
 `tests/sampler/test_f12_top1_custom_ar_cpu.py` (switch, every admission
 reason, dispatch and fallbacks with a stand-in kernel on real `ParallelLMHead`
 shards, the tie rule against upstream's reduction on ties/NaN/-inf, source
-pins) and `tests/sampler/test_f12_top1_custom_ar_emulation_cpu.py` (each
-rank's real `local_pair` through emulated staging buffers whose unfenced
-rows read stale pairs, as the kernel source fences them: every rank returns
-the full-vocabulary argmax as a global id); GPU (`-m gpu`)
+pins, the debug log); GPU (`-m gpu`)
 `tests/distributed/test_f12_top1_custom_ar_gpu.py`
-(2 ranks: kernel vs NCCL all-gather reference, 1-128 rows, ties/NaN/-inf,
+(2 ranks, switch set to 1: kernel vs NCCL all-gather reference, 1-128 rows, ties/NaN/-inf,
 stale staging poisoned before each exchange, every winner on rank 1 at a
 local id valid on rank 0,
 default and expandable-segments allocator, interleaved with upstream's

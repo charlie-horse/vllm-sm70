@@ -99,7 +99,8 @@ the same way. A user-set priority still comes first.
 
 Source: charlie-horse/vLLM at **cf9492a01**. Fork default on
 (`VLLM_SM70_TOP1_CUSTOM_AR=1`, envs.py:8315; `CommunicationPolicy.
-top1_custom_ar`, hashed pre-Ampere TP>1, policy_defaults.py:328). The
+top1_custom_ar`, hashed pre-Ampere TP>1, policy_defaults.py:328); here
+default off, opt-in with `=1` (see `csrc/sampler/PROVENANCE.md`, F12). The
 Python side (switch, admission, fallback to the all-gather) is in
 `vllm_sm70/sample_greedy.py`; see `csrc/sampler/PROVENANCE.md` (F12).
 
@@ -119,12 +120,14 @@ The fork copied the pair into the registered eager buffer with
 `graph_unreg_buffers_` under capture (warmup took the all-gather). Here,
 as in K17 after R5, each thread stores its row's pair into the rank's own
 staging buffer (upstream's eager buffer, `buffers_`, registered at init)
-inside the kernel and fences it with its own `membar.sys` (a fence orders
-only the executing thread's stores, and the start barrier fences in threads
-`0..ngpus-1` alone), the block publishes the start flag behind
+inside the kernel, the block publishes the start flag behind
 `membar.sys` (`staged_barrier_at_start`), reads every rank's staging copy
 in rank order, and publishes/awaits the end flag after the reads, so no rank
-rewrites its staging buffer while a peer reads it. One launch, no memcpy,
+rewrites its staging buffer while a peer reads it. The `__syncthreads`
+before the start barrier orders every thread's staging store before the
+flag thread's `membar.sys` (bar.sync synchronizes-with, and fence.sc is
+cumulative over it in the PTX memory model), as in K17 and upstream's
+two-stage kernel: no per-thread fence is needed. One launch, no memcpy,
 nothing added to the graph-buffer list. F12 runs only eagerly (the U4 hook
 rejects capture), so the capture branch is not needed.
 

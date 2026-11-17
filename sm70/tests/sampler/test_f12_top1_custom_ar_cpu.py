@@ -2,11 +2,12 @@
 """F12 custom-AR pair exchange (VLLM_SM70_TOP1_CUSTOM_AR): CPU checks.
 
 * Switch: registered in the "sampler" section next to
-  VLLM_SM70_GREEDY_TOKEN_FASTPATH, default on (fork default), only "0" acts.
+  VLLM_SM70_GREEDY_TOKEN_FASTPATH, opt-in: default off (fork: on), only "1"
+  acts.
 * Admission (``custom_ar_reject_reason``): every reason, from rank-uniform
   inputs only.
 * Dispatch (``greedy_tokens``): admitted -> the kernel, and never the
-  all-gather; switch 0, TP1, CPU, no or disabled custom all-reduce, missing
+  all-gather; switch unset or 0, TP1, CPU, no or disabled custom all-reduce, missing
   kernel, too many rows -> upstream ``get_top_tokens`` (the all-gather);
   a failing kernel -> the all-gather with a warning.
 * Identity: the pair ``local_pair`` builds is bitwise the one upstream
@@ -68,9 +69,10 @@ def test_switch_registered_next_to_greedy_fastpath():
 
 
 @pytest.mark.parametrize(
-    "value, on", [(None, True), ("1", True), ("", True), ("true", True), ("0", False)]
+    "value, on",
+    [(None, False), ("1", True), ("", False), ("true", False), ("0", False)],
 )
-def test_switch_default_on_only_zero_acts(monkeypatch, value, on):
+def test_switch_default_off_only_one_acts(monkeypatch, value, on):
     if value is None:
         monkeypatch.delenv(SWITCH, raising=False)
     else:
@@ -97,7 +99,7 @@ def _ca(world_size=2, rank=0, **kw):
 
 @pytest.fixture
 def kernel_built(monkeypatch):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     monkeypatch.setattr(sample_greedy, "custom_ar_kernel_available", lambda: True)
 
 
@@ -138,6 +140,8 @@ def test_switch_off_and_missing_kernel(kernel_built, monkeypatch):
     monkeypatch.setenv(SWITCH, "0")
     assert sample_greedy.custom_ar_reject_reason(_ca(), 1, 2, CUDA) == "switch_off"
     monkeypatch.delenv(SWITCH)
+    assert sample_greedy.custom_ar_reject_reason(_ca(), 1, 2, CUDA) == "switch_off"
+    monkeypatch.setenv(SWITCH, "1")
     monkeypatch.setattr(sample_greedy, "custom_ar_kernel_available", lambda: False)
     assert sample_greedy.custom_ar_reject_reason(_ca(), 1, 2, CUDA) == "kernel"
 
@@ -353,7 +357,7 @@ def _setup(monkeypatch, vllm_env, tp_size=2, vocab=509, rows=3, seed=0, **kw):
 def test_admitted_takes_the_kernel_and_equals_argmax(
     monkeypatch, vllm_env, caplog, tp_size, rows
 ):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     lp, heads, hidden, ex = _setup(
         monkeypatch, vllm_env, tp_size, rows=rows, poison_padding=True
     )
@@ -390,8 +394,12 @@ def _fallback_case(monkeypatch, vllm_env, ca_for_rank, **kw):
     return ex
 
 
-def test_switch_zero_uses_the_all_gather(monkeypatch, vllm_env):
-    monkeypatch.setenv(SWITCH, "0")
+@pytest.mark.parametrize("value", [None, "0"])
+def test_switch_unset_or_zero_uses_the_all_gather(monkeypatch, vllm_env, value):
+    if value is None:
+        monkeypatch.delenv(SWITCH, raising=False)
+    else:
+        monkeypatch.setenv(SWITCH, value)
     ex = _fallback_case(monkeypatch, vllm_env, lambda: _ca())
     assert ex.kernel_calls == [] and ex.gathers == 4
 
@@ -407,7 +415,7 @@ def test_switch_zero_uses_the_all_gather(monkeypatch, vllm_env):
 def test_uninitialised_or_disabled_custom_ar_uses_the_all_gather(
     monkeypatch, vllm_env, caplog, ca, reason
 ):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     with caplog.at_level(logging.INFO, logger="vllm.sm70"):
         ex = _fallback_case(monkeypatch, vllm_env, lambda: ca)
     assert ex.kernel_calls == [] and ex.gathers == 4
@@ -415,7 +423,7 @@ def test_uninitialised_or_disabled_custom_ar_uses_the_all_gather(
 
 
 def test_missing_kernel_uses_the_all_gather(monkeypatch, vllm_env):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     lp, heads, hidden, ex = _setup(monkeypatch, vllm_env)
     monkeypatch.setattr(sample_greedy, "custom_ar_kernel_available", lambda: False)
     _route_to_cuda(monkeypatch, lambda: _ca())
@@ -424,14 +432,14 @@ def test_missing_kernel_uses_the_all_gather(monkeypatch, vllm_env):
 
 
 def test_too_many_rows_use_the_all_gather(monkeypatch, vllm_env):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     ex = _fallback_case(monkeypatch, vllm_env, lambda: _ca(), rows=129)
     assert ex.kernel_calls == [] and ex.gathers == 4
 
 
 def test_cpu_tensors_never_look_up_the_communicator(monkeypatch, vllm_env):
     # The real admission on CPU tensors: non_cuda before any TP-group lookup.
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     lp, heads, hidden, ex = _setup(monkeypatch, vllm_env)
 
     def boom():
@@ -443,7 +451,7 @@ def test_cpu_tensors_never_look_up_the_communicator(monkeypatch, vllm_env):
 
 
 def test_tp1_has_no_exchange(monkeypatch, vllm_env):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     lp, heads, hidden, ex = _setup(monkeypatch, vllm_env, tp_size=1)
     _route_to_cuda(monkeypatch, lambda: _ca())
     got = _run(vllm_env, ex, lp, heads, hidden)
@@ -452,7 +460,7 @@ def test_tp1_has_no_exchange(monkeypatch, vllm_env):
 
 
 def test_kernel_failure_falls_back_with_a_warning(monkeypatch, vllm_env, caplog):
-    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.setenv(SWITCH, "1")
     lp, heads, hidden, ex = _setup(monkeypatch, vllm_env)
     ex.fail = True
     _route_to_cuda(monkeypatch, lambda: _ca(rank=ex.rank))
@@ -464,6 +472,72 @@ def test_kernel_failure_falls_back_with_a_warning(monkeypatch, vllm_env, caplog)
     assert len(ex.kernel_calls) == 4 and ex.gathers == 4
     assert "falling back to all_gather" in caplog.text
     assert "path enabled" not in caplog.text
+
+
+# -------------------------------------------------------------- debug log
+
+DEBUG = "VLLM_SM70_TOP1_DEBUG"
+
+
+@pytest.fixture
+def debug_env(monkeypatch):
+    def set_debug(value):
+        if value is None:
+            monkeypatch.delenv(DEBUG, raising=False)
+        else:
+            monkeypatch.setenv(DEBUG, value)
+        sample_greedy.debug_on.cache_clear()
+
+    yield set_debug
+    sample_greedy.debug_on.cache_clear()
+
+
+@pytest.mark.parametrize("switch, path", [("1", "custom_ar"), (None, "all_gather")])
+def test_debug_logs_pairs_and_tokens(
+    monkeypatch, vllm_env, caplog, debug_env, switch, path
+):
+    debug_env("1")
+    if switch is None:
+        monkeypatch.delenv(SWITCH, raising=False)
+    else:
+        monkeypatch.setenv(SWITCH, switch)
+    lp, heads, hidden, ex = _setup(monkeypatch, vllm_env)
+    _route_to_cuda(monkeypatch, lambda: _ca(rank=ex.rank))
+    with caplog.at_level(logging.INFO, logger="vllm.sm70"):
+        got = _run(vllm_env, ex, lp, heads, hidden)
+    lines = [r.getMessage() for r in caplog.records if "top1 debug" in r.getMessage()]
+    # Two passes x two ranks; the last two are the exchange pass.
+    assert len(lines) == 4
+    for rank, line in enumerate(lines[2:]):
+        assert f"rank={rank} " in line and "rows=3 " in line
+        assert f"path={path} " in line
+        pair = sample_greedy.local_pair(lp, heads[rank], hidden)
+        for (value, index), token in zip(pair.tolist(), got[rank].tolist()):
+            assert f"({value!r}, {int(index)}) -> {token}" in line
+
+
+def test_debug_off_logs_nothing_and_builds_no_extra_pair(
+    monkeypatch, vllm_env, caplog, debug_env
+):
+    debug_env(None)
+    monkeypatch.delenv(SWITCH, raising=False)
+    lp, heads, hidden, ex = _setup(monkeypatch, vllm_env)
+    _route_to_cuda(monkeypatch, lambda: _ca(rank=ex.rank))
+
+    def boom(*a, **k):
+        raise AssertionError("local_pair built with the debug log off")
+
+    monkeypatch.setattr(sample_greedy, "local_pair", boom)
+    with caplog.at_level(logging.DEBUG, logger="vllm.sm70"):
+        _run(vllm_env, ex, lp, heads, hidden)
+    assert "top1 debug" not in caplog.text
+
+
+def test_debug_skipped_under_capture(monkeypatch, debug_env):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    hidden = SimpleNamespace(is_cuda=True)
+    # Would raise on the namespaces if it went past the capture check.
+    sample_greedy._debug_log("custom_ar", None, None, hidden, None, None)
 
 
 # ------------------------------------------------------------ source pins

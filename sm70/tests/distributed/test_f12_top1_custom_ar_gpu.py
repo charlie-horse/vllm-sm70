@@ -177,7 +177,8 @@ def test_f12_top1_custom_ar_equals_all_gather(monkeypatch, tmp_path, expandable)
             "_sm70_C lacks custom_ar_top1_argmax: built without "
             "VLLM_SM70_VLLM_CSRC_DIR (csrc/custom_ar skipped)"
         )
-    monkeypatch.delenv("VLLM_SM70_TOP1_CUSTOM_AR", raising=False)
+    # Opt-in switch (default off): set it so the kernel path is exercised.
+    monkeypatch.setenv("VLLM_SM70_TOP1_CUSTOM_AR", "1")
     # The test builds CustomAllreduce on a bare torch.distributed group, so
     # vLLM's P2P check (which needs the world group) must stay skipped,
     # whatever the caller's env says.
