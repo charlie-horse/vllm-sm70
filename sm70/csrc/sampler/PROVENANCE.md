@@ -97,7 +97,8 @@ for each switch combination. GPU (`-m gpu`):
 `tests/sampler/test_f12_greedy_fastpath_gpu.py` (the same split on a V100,
 Flint vocab x 2048, rows 1..20) and `tests/models/test_m10_flint_sampler.py`
 G5 (tiny Flint TP1) / G6 (checkpoint TP2): in one engine, F12 greedy equals
-upstream greedy (the logprobs=1 request takes upstream).
+upstream greedy (the logprobs=2 request takes upstream), up to that file's
+near-tie rule.
 
 Not ported: the DDTree greedy branch (runner :6940-6962, :7150-7176) is spec
 decode, which U4 never calls; `maybe_get_sm70_lm_head_top1(_pair)` (the fused
