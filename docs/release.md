@@ -35,6 +35,7 @@ Record each move in the table below, in the same PR or straight after it.
 |---|---|---|---|---|---|
 | 2026-11-05 | `3869cd6` | green | – | – | Astro (bootstrap only) |
 | 2026-11-12 | `cef0f9e` | green (four jobs) | PASS (2026-11-09, after the `glm47_sm70` rerun; review 5833861019) | PASS with accepted deviations (see below; Quinn's verdict) | granted by Charlie; Astro's OK (gate 4), 2026-11-12 |
+| 2026-11-17 | `48a111b` | green | PASS (same-night bench vs the fork's build `6sf22d6x`, 2026-11-16) | PASS with accepted deviations (see below) | Charlie, 2026-11-17 |
 
 **Gate 3 record, `cef0f9e` (build `aczb9zwk`), 2026-11-12.** Accepted deviations, all under Quinn's verdict:
 
@@ -44,5 +45,14 @@ Record each move in the table below, in the same PR or straight after it.
 4. **Waiver for one `capture_bench` assert.** `ws-env MiB >= ws-ctx MiB` fails in both cases (B=1, B=8) of `sm70/tests/attention/test_fv100_capture_bench_gpu.py` at flint-tp2, mml 32768, ctx 16384. The cause is a test bug: it compares bytes across different partition sizes (1024 vs 256). Replacement evidence: #118 at `9c96f0e` (now in main `32250ff`), 2/2 on `aczb9zwk` (`GATE/capb/capb.log`). Granted by Charlie; Astro's OK (gate 4), 2026-11-12.
 
 **Numbers gate 3 asks for, `cef0f9e` at prod args:** 4K decode 174.6 tok/s (≥ 170). 32K decode 157.1 tok/s default and 157.5 greedy (rerun 158.0 / 153.7 / 157.8), against C1's fork numbers at prod args: 163.0 default and 165.6 greedy.
+
+**Gate 3 record, `48a111b` (build `vllg0nl2`, same tree as `3dc2ae1`), 2026-11-16/17.** Run on c4130 with prod stopped (no GPU window since flake#57). Same harness for every arm: `vllm bench serve` random, 256 out, ignore-eos, concurrency 1, 1 warmup + 3 measured, median 1/TPOT.
+
+- Decode, default / greedy: `48a111b` 4K 177.6 / 177.2, 32K 164.5 / 164.0. Same night, `cef0f9e` 176.8 / 176.3 and 163.2 / 162.3; fork 180.5 / 180.0 and 165.9 / 165.8.
+- Greedy tokens byte-identical with `VLLM_SM70_GREEDY_TOKEN_FASTPATH=0` and `VLLM_SM70_TOP1_CUSTOM_AR=0`, cold and cached, on `scripts/checks/greedy/`. Cold-vs-cached divergence on near-tie tokens is the same on the fork.
+- LMCache on at gpu-mem 0.90: started, check5 5/5, `external_kv_transfer` seen.
+- `pytest -m gpu` per file, 37 files: all pass. Deviations: `test_f12_top1_custom_ar_gpu.py` needs vLLM's default `VLLM_SKIP_P2P_CHECK` (the prod env's `=0` asserts on an uninitialised world group; the test now sets it); `test_k11_nvfp4_tm_gemv_gpu.py[shared_down-1]` failed its path assert once in the gate env and passed 28/28 in a clean env on both `48a111b` and `cef0f9e` (not from this release).
+- T2 A/B (tuning + LUT vs off, 4K): per-stream +12% at n=4, +39% at n=8, neutral at n=1 and n=20. Default stays off in the module; hosts opt in with `services.vllm-sm70.turbomind.*`.
+- Logs: c4130 `~admin/cutover-checks/gate-7a25cbe/logs/`; summary `gate-48a111b-2026-11-16.md` in the project files.
 
 The first entry is a **bootstrap**. It created the branch so the host flake has something to lock, and it has not passed C1 or the GPU gate. Don't deploy it: the cutover (C3) waits until `latest` has been fast-forwarded to a commit that passed all four gates.

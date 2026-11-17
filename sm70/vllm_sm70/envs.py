@@ -6,8 +6,9 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  One reviewed exception selects a kernel, off by default:
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32). See its comment.
+  Two reviewed exceptions select a kernel, off by default:
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32) and
+  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange). See their comments.
   (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
   now a kill switch.)
 - Each area adds its variables to its own section in `_SECTIONS`.
@@ -56,7 +57,8 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_FP8_QPN8_M32 (K09), opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09) and VLLM_SM70_TOP1_CUSTOM_AR (F12),
+    opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -328,12 +330,19 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_GREEDY_TOKEN_FASTPATH": kill_switch(
             "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
         ),
-        # "0": the greedy top-1 fast path exchanges its (value, id) pairs with
-        # the NCCL all-gather (get_top_tokens) instead of the custom-AR kernel
-        # _sm70_C::custom_ar_top1_argmax. Read per greedy step by
+        # "1": the greedy top-1 fast path exchanges its (value, id) pairs with
+        # the custom-AR kernel _sm70_C::custom_ar_top1_argmax instead of the
+        # NCCL all-gather (get_top_tokens). Read per greedy step by
         # vllm_sm70/sample_greedy.py; env-only (no Sm70Config field). Fork
-        # name and default kept (FORK envs.py:8315, default on).
-        "VLLM_SM70_TOP1_CUSTOM_AR": kill_switch("VLLM_SM70_TOP1_CUSTOM_AR"),
+        # name kept; default off, unlike the fork (FORK envs.py:8315): on
+        # c4130 it returned a different token than the all-gather on a
+        # checkpoint near-tie, cause not found (csrc/sampler/PROVENANCE.md).
+        "VLLM_SM70_TOP1_CUSTOM_AR": opt_in("VLLM_SM70_TOP1_CUSTOM_AR"),
+        # Diagnostics: any value but "" / "0" logs, per greedy fast-path step,
+        # each rank's local (max, global id) pairs and the exchanged tokens
+        # (vllm_sm70/sample_greedy.py; read once per process; syncs the
+        # device, so off in production).
+        "VLLM_SM70_TOP1_DEBUG": _debug_flag("VLLM_SM70_TOP1_DEBUG"),
     },
     # Kai (K17). Read by vllm_sm70.ar_rms_fusion when the composite pass
     # first runs on a graph (fork name kept).

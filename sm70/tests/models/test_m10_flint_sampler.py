@@ -18,9 +18,8 @@ GPU (``-m gpu``), what K16's contract says is exact, and nothing more
   v1/sample/ops/sm70_topk_candidates.py docstring; vllm_sm70/sample.py).
   So inside ONE engine with K16 on, a top_k=1 request (K16 samples it) gives
   the greedy request's tokens (upstream samples it: K16 rejects temperature
-  0 as ``sampling_mode``). Same hidden states, same logits; only an exact
-  FP16 tie at the top logit could differ (top-k keeps ties and both K16 and
-  upstream top_k=1 race them, greedy takes the lowest id).
+  0 as ``sampling_mode``; the greedy request asks logprobs=2 for the
+  near-tie rule below).
   The "off" engine (VLLM_SM70_FLINT_SAMPLER=0) only shows K16 absent; its
   greedy tokens next to the "on" engine's are printed, not gated: two engine
   instances are not bitwise equal on every build (M5 T4c).
@@ -30,10 +29,15 @@ GPU (``-m gpu``), what K16's contract says is exact, and nothing more
   (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0), so greedy requests take upstream.
 GPU, F12 (G5/G6): inside ONE engine with the greedy fast path on, a greedy
   request (F12: vocab-parallel top-1) gives the tokens of the same greedy
-  request with logprobs=1 (F12 rejects logprobs, so compute_logits + the
-  upstream Sampler take it). Same hidden states, same LM-head GEMM; F12's
-  contract is the first maximal index, as upstream's argmax, so they must
-  be identical with no tie exception.
+  request with logprobs=2 (F12 rejects logprobs, so compute_logits + the
+  upstream Sampler take it). F12's contract is the first maximal index, as
+  upstream's argmax.
+Near-tie rule (G1, G3, G5, G6): the two requests run as separate batches, and
+  the engine's decode is not batch-invariant on this stack (the G2/G4 xfail),
+  so their logits can differ by noise. A request may diverge only at its
+  first differing token, only to the reference's (logprobs=2 request's) #2
+  token, and only if the reference's #1 - #2 logprob gap is <= NEAR_TIE_NATS;
+  the rest of that request is not compared. Anything else fails.
 
 K16 is a V1-runner hook (patches/0005, U4); the Flint wrapper sets
 VLLM_USE_V2_MODEL_RUNNER=0 (roadmap D2) and so do these tests.
@@ -346,9 +350,10 @@ def _greedy_params(n):
 
 
 def _greedy_logprobs_params(n):
+    """Greedy with the top-2 logprobs per token (the near-tie reference)."""
     from vllm import SamplingParams
 
-    return SamplingParams(temperature=0, max_tokens=n, ignore_eos=True, logprobs=1)
+    return SamplingParams(temperature=0, max_tokens=n, ignore_eos=True, logprobs=2)
 
 
 def _top1_params(n):
@@ -366,8 +371,9 @@ def _seeded_params(n):
 
 
 def _run(make_llm, env, requests, monkeypatch, capfd):
-    """One LLM under ``env``: [(prompts, params)] -> per-request token lists,
-    plus the worker log (capfd reads the inherited worker stdout/stderr)."""
+    """One LLM under ``env``: [(prompts, params)] -> per call, per prompt
+    (token ids, logprobs: [{token id: logprob}] per token or None), plus the
+    worker log (capfd reads the inherited worker stdout/stderr)."""
     import vllm.envs
 
     for name, value in env.items():
@@ -382,7 +388,7 @@ def _run(make_llm, env, requests, monkeypatch, capfd):
         toks = []
         for prompts, params in requests:
             outs = llm.generate(prompts, params)
-            toks.append([list(o.outputs[0].token_ids) for o in outs])
+            toks.append([_tokens_and_logprobs(o.outputs[0]) for o in outs])
     finally:
         _shutdown(llm)
     out, err = capfd.readouterr()
@@ -401,14 +407,90 @@ def _common_prefix(a, b):
     )
 
 
+def _tokens_and_logprobs(completion):
+    lps = completion.logprobs
+    if lps is not None:
+        lps = [{t: lp.logprob for t, lp in d.items()} for d in lps]
+    return list(completion.token_ids), lps
+
+
+# Largest reference #1 - #2 logprob gap (nats) at which a candidate may take
+# the reference's #2 token. Below the fork's eager_vs_graphs decode set-mean
+# anchor (~0.024 nats: T4d's 1.5x limit is 0.0363, docs/m5-calibration-nov7.md),
+# i.e. under the per-token noise two kernel schedules of the same model show,
+# and about one FP16 ulp of a logit in [16, 32) (1/64).
+NEAR_TIE_NATS = 0.02
+
+
+def _near_tie_check(ref, ref_logprobs, cand):
+    """The near-tie rule (module docstring). ref, cand: token ids;
+    ref_logprobs: the reference's [{token id: logprob}] (top-2 + sampled).
+    Returns (ok, message); message is None on an exact match."""
+    n = len(ref)
+    if len(cand) != n:
+        return False, f"lengths differ: {len(cand)} vs reference {n}"
+    j = _common_prefix(ref, cand)
+    if j == n:
+        return True, None
+    where = f"token {j}/{n}: candidate {cand[j]} vs reference {ref[j]}"
+    lps = ref_logprobs[j] if ref_logprobs is not None else None
+    if not lps or ref[j] not in lps:
+        return False, f"{where}; no reference logprobs there"
+    others = [(lp, t) for t, lp in lps.items() if t != ref[j]]
+    if not others:
+        return False, f"{where}; reference has no #2 logprob"
+    lp2, top2 = max(others, key=lambda x: (x[0], -x[1]))
+    gap = lps[ref[j]] - lp2
+    head = f"{where}; reference #2 {top2}, #1-#2 gap {gap:.4f} nats"
+    if cand[j] != top2:
+        return False, f"{head}; candidate is not the reference's #2"
+    if not gap <= NEAR_TIE_NATS:
+        return False, f"{head} > {NEAR_TIE_NATS}"
+    return True, f"{head} <= {NEAR_TIE_NATS}: near tie, rest not compared"
+
+
+def _assert_same_tokens(refs, cands, what):
+    """refs, cands: per prompt (token ids, logprobs) from _run; refs carry
+    logprobs=2. Exact match, or one near-tie divergence per request."""
+    fails = []
+    for i, ((ref, ref_lps), (cand, _)) in enumerate(zip(refs, cands)):
+        ok, msg = _near_tie_check(ref, ref_lps, cand)
+        if msg is not None:
+            print(f"{'info' if ok else 'FAIL'} request {i}: {what}: {msg}")
+        if not ok:
+            fails.append(f"request {i}: {msg}")
+    assert not fails, f"{what}: " + "; ".join(fails)
+
+
+def test_near_tie_check():
+    lps = [{5: -0.1, 6: -3.0}, {7: -0.70, 8: -0.71}, {9: -0.5, 1: -1.5}]
+    ref = [5, 7, 9]
+    assert _near_tie_check(ref, lps, [5, 7, 9]) == (True, None)
+    ok, msg = _near_tie_check(ref, lps, [5, 8, 3])  # gap 0.01, rest ignored
+    assert ok and "near tie" in msg
+    assert not _near_tie_check(ref, lps, [6, 7, 9])[0]  # gap 2.9
+    assert not _near_tie_check(ref, lps, [5, 4, 9])[0]  # not the #2
+    assert not _near_tie_check(ref, None, [5, 8, 9])[0]  # no logprobs
+    assert not _near_tie_check(ref, lps, [5, 7])[0]  # length
+    wide = [lps[0], {7: -0.70, 8: -0.73}, lps[2]]  # gap 0.03 > 0.02
+    assert not _near_tie_check(ref, wide, [5, 8, 9])[0]
+    # Exact tie: the #2 is the other tied id; the sampled token may also
+    # appear outside the top-2 (3 entries): the best non-reference one counts.
+    tie = [lps[0], {7: -0.7, 8: -0.7, 2: -0.9}, lps[2]]
+    assert _near_tie_check(ref, tie, [5, 8, 0])[0]
+    assert not _near_tie_check(ref, tie, [5, 2, 0])[0]
+
+
 def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     """K16's exact contract inside one engine, plus K16 absent when killed.
 
     "on" engine: greedy (upstream, K16 rejects sampling_mode) then top_k=1 at
     temperature 1 (K16 samples), same prompts, same batch shapes, prefix
-    caching off so both prefill the same rows: identical tokens. "off" engine: K16 never engaged; its greedy is printed next to
-    the "on" engine's greedy, not gated (engine-instance noise, M5 T4c)."""
-    reqs = [(prompts, _greedy_params(n)), (prompts, _top1_params(n))]
+    caching off so both prefill the same rows: identical tokens up to the
+    near-tie rule (greedy carries logprobs=2 as its reference). "off"
+    engine: K16 never engaged; its greedy is printed next to the "on"
+    engine's greedy, not gated (engine-instance noise, M5 T4c)."""
+    reqs = [(prompts, _greedy_logprobs_params(n)), (prompts, _top1_params(n))]
     no_f12 = {**V1_RUNNER, GREEDY_SWITCH: "0"}  # greedy -> upstream, not F12
     on, on_logs = _run(
         make_llm, {**no_f12, SAMPLER_SWITCH: None}, reqs, monkeypatch, capfd
@@ -423,13 +505,9 @@ def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     assert SAMPLER_ON_LOG not in off_logs
     assert "SM70 top-k candidate sampler rejected" not in off_logs
     greedy, top1 = on
-    assert all(len(t) == n for t in greedy + top1)
-    for i, (g, k) in enumerate(zip(greedy, top1)):
-        assert g == k, (
-            f"request {i}: K16 top_k=1 differs from upstream greedy in the same "
-            f"engine at token {_common_prefix(g, k)}/{n}"
-        )
-    for i, (a, b) in enumerate(zip(greedy, off[0])):
+    assert all(len(t) == n for t, _ in greedy + top1)
+    _assert_same_tokens(greedy, top1, "K16 top_k=1 vs upstream greedy, same engine")
+    for i, ((a, _), (b, _)) in enumerate(zip(greedy, off[0])):
         print(
             f"info request {i}: greedy on-engine vs off-engine common prefix "
             f"{_common_prefix(a, b)}/{n}"
@@ -440,8 +518,9 @@ def _greedy_fastpath_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     """F12's exact contract inside one engine, plus F12 absent when killed.
 
     "on" engine (defaults): greedy (F12) then greedy with logprobs=1
-    (upstream: F12 rejects logprobs), same prompts and batch shapes, prefix
-    caching off: identical tokens. "off" engine
+    (upstream: F12 rejects logprobs; logprobs=2 is the near-tie reference),
+    same prompts and batch shapes, prefix caching off: identical tokens up
+    to the near-tie rule. "off" engine
     (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0): F12 never engaged; its greedy is
     printed next to the "on" engine's, not gated (M5 T4c)."""
     reqs = [(prompts, _greedy_params(n)), (prompts, _greedy_logprobs_params(n))]
@@ -458,13 +537,9 @@ def _greedy_fastpath_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
     assert GREEDY_ON_LOG not in off_logs
     assert "SM70 greedy top-1 fast path rejected" not in off_logs
     fast, upstream = on
-    assert all(len(t) == n for t in fast + upstream)
-    for i, (f, u) in enumerate(zip(fast, upstream)):
-        assert f == u, (
-            f"request {i}: F12 greedy differs from upstream greedy in the same "
-            f"engine at token {_common_prefix(f, u)}/{n}"
-        )
-    for i, (a, b) in enumerate(zip(fast, off[0])):
+    assert all(len(t) == n for t, _ in fast + upstream)
+    _assert_same_tokens(upstream, fast, "F12 greedy vs upstream greedy, same engine")
+    for i, ((a, _), (b, _)) in enumerate(zip(fast, off[0])):
         print(
             f"info request {i}: F12 on-engine vs off-engine common prefix "
             f"{_common_prefix(a, b)}/{n}"
