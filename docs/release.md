@@ -55,4 +55,6 @@ Record each move in the table below, in the same PR or straight after it.
 - T2 A/B (tuning + LUT vs off, 4K): per-stream +12% at n=4, +39% at n=8, neutral at n=1 and n=20. Default stays off in the module; hosts opt in with `services.vllm-sm70.turbomind.*`.
 - Logs: c4130 `~admin/cutover-checks/gate-7a25cbe/logs/`; summary `gate-48a111b-2026-11-16.md` in the project files.
 
+**Gate 3 addendum for the next move (`0350304`, PR #124), 2026-11-17.** The checkpoint test m10 G3 failed on `48a111b`: with `VLLM_SM70_TOP1_CUSTOM_AR` on, greedy picked a different token than the full-logit argmax at a near tie (request 2, token 5). Either switch off restored it; cause not found. `0350304` makes the switch opt-in. On c4130: top-1 2-rank test 2/2, G3 and G6 pass at defaults, greedy set byte-identical to `48a111b`, verify_flint 5/5, decode 4K 176.7 and 32K 164.0 tok/s.
+
 The first entry is a **bootstrap**. It created the branch so the host flake has something to lock, and it has not passed C1 or the GPU gate. Don't deploy it: the cutover (C3) waits until `latest` has been fast-forwarded to a commit that passed all four gates.
