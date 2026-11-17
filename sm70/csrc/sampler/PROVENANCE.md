@@ -128,8 +128,14 @@ on ties, first NaN), i.e. the all-gather path's token. Tested: CPU
 `tests/sampler/test_f12_top1_custom_ar_cpu.py` (switch, every admission
 reason, dispatch and fallbacks with a stand-in kernel on real `ParallelLMHead`
 shards, the tie rule against upstream's reduction on ties/NaN/-inf, source
-pins); GPU (`-m gpu`) `tests/distributed/test_f12_top1_custom_ar_gpu.py`
+pins) and `tests/sampler/test_f12_top1_custom_ar_emulation_cpu.py` (each
+rank's real `local_pair` through emulated staging buffers whose unfenced
+rows read stale pairs, as the kernel source fences them: every rank returns
+the full-vocabulary argmax as a global id); GPU (`-m gpu`)
+`tests/distributed/test_f12_top1_custom_ar_gpu.py`
 (2 ranks: kernel vs NCCL all-gather reference, 1-128 rows, ties/NaN/-inf,
+stale staging poisoned before each exchange, every winner on rank 1 at a
+local id valid on rank 0,
 default and expandable-segments allocator, interleaved with upstream's
 custom all-reduce, 200 skewed back-to-back steps). Compiled for sm_70 with
 clang 18 + CUDA 12.6 headers/ptxas only; **not yet run on a V100**, and not

@@ -119,7 +119,9 @@ The fork copied the pair into the registered eager buffer with
 `graph_unreg_buffers_` under capture (warmup took the all-gather). Here,
 as in K17 after R5, each thread stores its row's pair into the rank's own
 staging buffer (upstream's eager buffer, `buffers_`, registered at init)
-inside the kernel, the block publishes the start flag behind
+inside the kernel and fences it with its own `membar.sys` (a fence orders
+only the executing thread's stores, and the start barrier fences in threads
+`0..ngpus-1` alone), the block publishes the start flag behind
 `membar.sys` (`staged_barrier_at_start`), reads every rank's staging copy
 in rank order, and publishes/awaits the end flag after the reads, so no rank
 rewrites its staging buffer while a peer reads it. One launch, no memcpy,

@@ -63,8 +63,12 @@ __global__ void __launch_bounds__(kTop1Threads, 1)
   if (row < rows) {
     own[2 * row] = pair[2 * row];
     own[2 * row + 1] = pair[2 * row + 1];
+    // membar orders only the executing thread's stores, and the start
+    // barrier fences in threads 0..ngpus-1 alone: without this, a peer can
+    // read row >= ngpus before it lands (stale staging bytes win the row).
+    membar_sys();
   }
-  // Every thread's staging store precedes the fenced flag publish.
+  // Every thread's fenced staging store precedes the flag publish.
   __syncthreads();
   staged_barrier_at_start<ngpus>(sg, self_sg, rank);
 
