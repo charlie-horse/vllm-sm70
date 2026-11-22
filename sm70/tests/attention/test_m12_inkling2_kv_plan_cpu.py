@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """M12 CPU checks: KV planning for Inkling 2 Mini's 96 cache layers at TP2.
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). No model
-code: the specs are built from the vendored config.json the way the cache
-owners publish them (48 fp16 attention passes, 48 conv-state passes with
-the hidden streams replicated per rank) and fed to upstream's planner.
+Needs upstream v0.33.0's Python importable (skipped otherwise). The specs
+come from the model's cache owners (models/inkling2_sm70/cache.py) built for
+the vendored config.json (48 fp16 attention passes, 48 conv-state passes
+with the hidden streams replicated per rank) and are fed to upstream's
+planner.
 Covers the group plan, page sizes, the scheduler and hash blocks, and the
 per-request admission caps at the batched-token budgets the port serves.
 """
@@ -13,9 +14,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import json
 import math
-import pathlib
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -24,13 +24,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-CONFIG = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "models"
-    / "data"
-    / "inkling2_mini"
-    / "config.json"
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _inkling2_owners import build
+
 TP = 2
 PAGE = 65_536
 LAYER_OUTER = "LBNHC"  # Flash-V100's layout
@@ -60,60 +56,10 @@ def _stub_stable_libtorch(monkeypatch):
         )
 
 
-def _text_config() -> dict:
-    return json.loads(CONFIG.read_text())["text_config"]
-
-
-def _passes(cfg: dict) -> list[tuple[int, int]]:
-    """(layer, pass) of every layer visit, pass 0 first."""
-    loop = cfg["loop_config"]
-    core = range(loop["core_start"], loop["core_end"])
-    visits = [(layer, 0) for layer in range(cfg["num_hidden_layers"])]
-    for p in range(1, loop["num_passes"]):
-        visits += [(layer, p) for layer in core]
-    return visits
-
-
-def _conv_head_size(cfg: dict, tp: int) -> int:
-    """K + V + attn-output + mlp-output per local head, hidden replicated."""
-    heads = cfg["num_key_value_heads"] // tp
-    raw = 2 * cfg["head_dim"] + 2 * (cfg["hidden_size"] // heads)
-    return 1 << (raw - 1).bit_length()
-
-
 def _specs(block_size: int, tp: int = TP, dtype=torch.float16) -> dict:
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
-
-    cfg = _text_config()
-    heads = cfg["num_key_value_heads"] // tp
-    local = set(cfg["local_layer_ids"])
-    kernel = cfg["sconv_kernel_size"]
-    specs: dict = {}
-    for layer, p in _passes(cfg):
-        name = f"model.layers.{layer}.attn" + (f".pass{p}" if p else "")
-        common = {
-            "block_size": block_size,
-            "num_kv_heads": heads,
-            "head_size": cfg["head_dim"],
-            "dtype": dtype,
-        }
-        if layer in local:
-            specs[name] = SlidingWindowSpec(
-                **common, sliding_window=cfg["sliding_window_size"]
-            )
-        else:
-            specs[name] = FullAttentionSpec(**common)
-    for layer, p in _passes(cfg):
-        name = f"model.layers.{layer}.conv_state" + (f".pass{p}" if p else "")
-        specs[name] = SlidingWindowSpec(
-            block_size=kernel,
-            num_kv_heads=heads,
-            head_size=_conv_head_size(cfg, tp),
-            head_size_v=0,
-            dtype=dtype,
-            sliding_window=kernel,
-        )
-    return specs
+    """The specs the model's cache owners publish."""
+    owners, vllm_config = build(block_size, tp, dtype)
+    return owners.kv_cache_specs(vllm_config)
 
 
 def _vllm_config(block_size: int, layout: str, batched_tokens: int = 8192):
