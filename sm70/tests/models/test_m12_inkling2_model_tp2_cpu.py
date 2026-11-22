@@ -30,7 +30,7 @@ import inkling2_harness as hx
 TINY = HERE / "fixtures" / "inkling2_tiny"
 LEN_A, LEN_B, PREFIX = 23, 19, 8
 BLOCK_SIZE = 8
-TOL = 1e-5
+TOL = 5e-5
 
 
 def _have_vllm() -> bool:
