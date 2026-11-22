@@ -328,6 +328,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # Sm70Config field), read per call (inkling2_sm70/norms.py); default
         # off: the kernels have not run on a GPU.
         "VLLM_SM70_INKLING_TRITON_NORMS": opt_in("VLLM_SM70_INKLING_TRITON_NORMS"),
+        # "0": the Inkling 2 paged short convs and the prologue's K/V convs
+        # take the torch ops instead of one Triton kernel per call. Env-only
+        # (no Sm70Config field), read per call (inkling2_sm70/sconv.py);
+        # tensors off the GPU always take the torch ops.
+        "VLLM_SM70_INKLING_TRITON_SCONV": kill_switch("VLLM_SM70_INKLING_TRITON_SCONV"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

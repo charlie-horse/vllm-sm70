@@ -164,6 +164,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_DFLASH2_EMULATION",
         "VLLM_SM70_SHARED_MOE_OVERLAP",
         "VLLM_SM70_INKLING_TRITON_NORMS",
+        "VLLM_SM70_INKLING_TRITON_SCONV",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -397,6 +398,19 @@ def _inkling_triton_norms_off(name):
     assert norms.on_triton(gpu) is False
 
 
+def _inkling_triton_sconv_off(name):
+    """A GPU tensor takes the torch convs of inkling2_sm70/sconv.py; the
+    kernels' own checks are tests/ops/test_m12_inkling2_triton_sconv_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import sconv
+
+    assert sconv.SWITCH == name
+    with mock.patch.object(sconv._compat, "AVAILABLE", True):
+        assert sconv.on_triton(SimpleNamespace(is_cuda=True)) is False
+
+
 OPT_IN_OFF = {
     "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
 }
@@ -445,6 +459,8 @@ def _path_off(name):
         _dflash2_emulation_off(name)
     elif name == "VLLM_SM70_INKLING_NVFP4_TM":
         _inkling_nvfp4_tm_off(name)
+    elif name == "VLLM_SM70_INKLING_TRITON_SCONV":
+        _inkling_triton_sconv_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

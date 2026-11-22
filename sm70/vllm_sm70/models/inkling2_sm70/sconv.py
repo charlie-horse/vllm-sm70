@@ -23,6 +23,10 @@ request stays out of the sum.
 Shapes: T batch tokens (padded), C = heads * stream width channels, K taps.
 The metadata covers the first n = ``num_actual_tokens`` tokens (backend.py);
 the ops read those rows of `x` and return zero rows after them.
+
+Switch: ``short_conv`` and the prologue's K/V convs run one Triton kernel per
+call (ops/paged_conv.py) unless VLLM_SM70_INKLING_TRITON_SCONV=0. Tensors off
+the GPU take the torch ops below, except in Triton's interpreter.
 """
 
 from __future__ import annotations
@@ -33,15 +37,31 @@ from typing import Any
 import torch
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from vllm_sm70 import envs
+
 from .backend import cache_metadata
+from .ops import _compat
+from .ops import paged_conv as kernels
 
 __all__ = [
+    "SWITCH",
     "conv_taps",
     "dynamic_conv",
+    "on_triton",
     "short_conv",
     "static_conv",
     "store_taps",
 ]
+
+SWITCH = "VLLM_SM70_INKLING_TRITON_SCONV"
+_enabled = envs.environment_variables()[SWITCH]
+
+
+def on_triton(x: torch.Tensor) -> bool:
+    """Whether the convs on `x` run the Triton kernels."""
+    if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
+        return False
+    return _enabled()
 
 
 def _block_tokens(cache: torch.Tensor, metadata: Any) -> int:
@@ -53,6 +73,14 @@ def _block_tokens(cache: torch.Tensor, metadata: Any) -> int:
             f"metadata has block size {metadata.block_size}."
         )
     return cache.shape[2]
+
+
+def _check_channels(channels: int, cache: torch.Tensor, width: int) -> None:
+    if channels != cache.shape[1] * width:
+        raise ValueError(
+            f"vllm_sm70: {channels} conv channels do not fill "
+            f"{cache.shape[1]} heads of width {width}."
+        )
 
 
 def _real_rows(x: torch.Tensor, metadata: Any) -> int:
@@ -92,11 +120,7 @@ def conv_taps(
     num_tokens, channels = x.shape
     offset, width = stream
     block_tokens = _block_tokens(cache, metadata)
-    if channels != cache.shape[1] * width:
-        raise ValueError(
-            f"vllm_sm70: {channels} conv channels do not fill "
-            f"{cache.shape[1]} heads of width {width}."
-        )
+    _check_channels(channels, cache, width)
     positions = metadata.positions[:num_tokens]
     seq_idx = metadata.seq_idx[:num_tokens]
     query_start = metadata.query_start[:num_tokens]
@@ -210,6 +234,20 @@ def short_conv(
         out.copy_(x)
         return
     stream_range = owner.stream_ranges[stream]
+    if on_triton(x):
+        _block_tokens(owner.kv_cache, metadata)
+        _check_channels(x.shape[1], owner.kv_cache, stream_range[1])
+        kernels.short_conv(
+            x,
+            weight,
+            dynamic_taps,
+            owner.kv_cache,
+            metadata,
+            stream_range,
+            _real_rows(x, metadata),
+            out,
+        )
+        return
     if dynamic_taps is None:
         static_conv(x, weight, owner.kv_cache, metadata, stream_range, out)
     else:
