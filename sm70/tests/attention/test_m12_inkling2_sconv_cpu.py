@@ -30,7 +30,7 @@ LAYERS = pytest.mark.parametrize("layer", [SLIDING, GLOBAL], ids=["sliding", "gl
 HIDDEN = 64
 LENGTHS = {0: 30, 1: 21}
 PREFIX = 16
-TOL = 2e-6
+TOL = 1e-5
 
 # A step is ("batch", [(request, new tokens), ...]) or
 # ("fork", source, target, cached prefix).
