@@ -47,6 +47,7 @@ EFFECTIVE_DEFAULTS = {
     "dflash2_verifier": "auto",
     "shared_moe_overlap": False,
     "greedy_token_fastpath": True,
+    "inkling2": {"visit_dump_dir": None},
 }
 
 # Our sections of K01's registry.
@@ -57,7 +58,8 @@ OURS = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # eagerly, outside the compiled graph. The path check is
 # tests/sampler/test_f12_greedy_fastpath_cpu.py.
 SAMPLER_FIELD_SWITCHES = {"VLLM_SM70_GREEDY_TOKEN_FASTPATH": "greedy_token_fastpath"}
-NON_GRAPH_FIELDS = set(SAMPLER_FIELD_SWITCHES.values())
+# "inkling2" is the M12 debug section: no kill switch, read eagerly.
+NON_GRAPH_FIELDS = set(SAMPLER_FIELD_SWITCHES.values()) | {"inkling2"}
 
 # Switches that are registered but whose path has not landed yet. Each must
 # name the patch that wires it, and the no-dead-switch test fails as soon
@@ -160,6 +162,7 @@ def test_registered_names_are_exactly_ours():
     assert {f for f, _ in KILL_SWITCHES.values()} == set(Sm70Config.model_fields) - {
         "quant_backend",
         "fp8_block_qpn8_turbomind_copy",
+        "inkling2",
     }
     assert set(KILL_SWITCHES) <= set(OURS) | set(SAMPLER_FIELD_SWITCHES)
     assert set(SAMPLER_FIELD_SWITCHES) <= set(envs._SECTIONS["sampler"])
@@ -426,6 +429,7 @@ def test_env_cannot_enable(monkeypatch, value):
         "dflash2_verifier": "off",
         "shared_moe_overlap": False,
         "quant_backend": "turbomind",
+        "inkling2": {"visit_dump_dir": "/dump"},
     }
     assert sm70_config(_vc(off)).model_dump() == off
 

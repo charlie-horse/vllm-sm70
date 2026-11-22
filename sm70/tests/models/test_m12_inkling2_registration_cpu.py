@@ -67,6 +67,7 @@ def _raw(mapping) -> dict:
 def registry(monkeypatch):
     """Both registries without the Inkling 2 entries; restored afterwards."""
     from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     saved_model = ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
@@ -74,8 +75,10 @@ def registry(monkeypatch):
         k: dict.pop(_CONFIG_REGISTRY, k) for k in CONFIG_TYPES if k in _CONFIG_REGISTRY
     }
     monkeypatch.setattr(inkling2_sm70, "_registered", False)
+    monkeypatch.delitem(MODELS_CONFIG_MAP, inkling2_sm70.ARCH, raising=False)
     yield ModelRegistry, _CONFIG_REGISTRY
     ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
+    MODELS_CONFIG_MAP.pop(inkling2_sm70.ARCH, None)
     if saved_model is not None:
         ModelRegistry.models[inkling2_sm70.ARCH] = saved_model
     for k in CONFIG_TYPES:
@@ -107,7 +110,9 @@ def test_register_at_cc70(device, registry):
     assert inkling2_sm70.register() is True  # idempotent
     # Nothing else moved: Flint, Qwen and every other entry are the same objects.
     assert {k: v for k, v in reg.models.items() if k != inkling2_sm70.ARCH} == models
-    assert dict(MODELS_CONFIG_MAP) == cfg_map
+    hook = MODELS_CONFIG_MAP[inkling2_sm70.ARCH]
+    assert hook is inkling2_sm70.Inkling2Sm70ModelConfig
+    assert dict(MODELS_CONFIG_MAP) == {**cfg_map, inkling2_sm70.ARCH: hook}
     assert {k: v for k, v in _raw(cfg_reg).items() if k not in CONFIG_TYPES} == cfgs
     assert reg.models["FlintForCausalLM"].module_name == "vllm.models.flint"
 
@@ -250,11 +255,15 @@ def test_metadata_fixtures_are_the_checkpoint_layout():
 
 
 def test_registration_imports_no_model_triton_or_cuda():
-    """In a fresh process without GPUs. vLLM's own config module (which the
-    registration needs) is imported first: it already pulls in torch and,
-    through it, Triton, so the check is on what registration adds."""
+    """In a fresh process without GPUs. vLLM's own config, renderer registry
+    and parser manager modules (which the registration needs) are imported
+    first: they already pull in torch and, through it, Triton, and the
+    parser managers pull in the model registry, so the check is on what
+    registration adds."""
     code = (
         "import sys, torch, vllm.transformers_utils.config as c\n"
+        "import vllm.renderers.registry, vllm.tokenizers.registry\n"
+        "import vllm.reasoning, vllm.tool_parsers\n"
         "before = set(sys.modules)\n"
         "from vllm_sm70.models import inkling2_sm70\n"
         "assert inkling2_sm70.register() is False\n"
@@ -264,6 +273,9 @@ def test_registration_imports_no_model_triton_or_cuda():
         "bad = sorted(m for m in added if m.startswith(heavy))\n"
         "assert not bad, bad\n"
         "assert 'vllm_sm70.models.inkling2_sm70.model' not in sys.modules\n"
+        "assert 'vllm_sm70.models.inkling2_sm70.renderer' not in sys.modules\n"
+        "assert 'vllm_sm70.models.inkling2_sm70.parsers' not in sys.modules\n"
+        "assert 'xgrammar' not in added and 'vllm.parser.inkling' not in added\n"
         "assert not torch.cuda.is_initialized()\n"
         "assert type(c._CONFIG_REGISTRY['inkling2_loop']).__name__ == 'type'\n"
         "import vllm_sm70\n"
