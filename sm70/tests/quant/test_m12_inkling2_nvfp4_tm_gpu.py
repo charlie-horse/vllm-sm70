@@ -192,7 +192,7 @@ def test_real_shape_bank_layout_and_bytes(real_pair):
     assert route.w13.weight.dtype == route.w2.weight.dtype == torch.int32
     assert route.w13.scales.dtype == route.w2.scales.dtype == torch.float16
     banks = moe_tm.layer_nbytes(EXPERTS, HIDDEN, local)
-    assert banks == 318_504_960 * (INTERMEDIATE // local)
+    assert banks == 318_504_960 * (2 * local // INTERMEDIATE)  # TP2 local = 576
     pointer_tables = route.nbytes() - banks
     assert 0 < pointer_tables <= 4 * EXPERTS * 64
 

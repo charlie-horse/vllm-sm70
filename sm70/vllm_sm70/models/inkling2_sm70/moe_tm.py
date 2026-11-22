@@ -13,9 +13,12 @@ chunk: up to ``COMPACT_MAX_SLOTS`` slots each slot is its own one-row group
 (one launch per stage; ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off);
 above that the groups are the per-expert offsets over all experts.
 
-Switch: the route runs only with ``VLLM_SM70_INKLING_NVFP4_TM=1``. Without it
-every layer stays on the torch path of moe.py, which holds all experts in
-fp16; see ``rejection`` for the other reasons a layer stays on it.
+Every routed slot runs, so ``expert_sum`` reads nothing back to the host: a
+slot with no expert (padding) is computed on expert E - 1 and zeroed.
+
+Switch: the route is on where ``rejection`` admits a layer;
+``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer on the torch path of
+moe.py, which holds all experts in fp16.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from .ops import torch_ref
 logger = init_logger("vllm.sm70.models.inkling2.moe_tm")
 
 SWITCH: Final = "VLLM_SM70_INKLING_NVFP4_TM"
-SWITCHED_OFF: Final = f"{SWITCH} is not 1"
+SWITCHED_OFF: Final = f"{SWITCH}=0"
 REQUIRED_OPS: Final = (
     "nvfp4_sm70_prepare",
     "awq_moe_build_strided_ptrs",
@@ -60,7 +63,7 @@ class Rejected(ValueError):
 
 
 def enabled() -> bool:
-    """True only when VLLM_SM70_INKLING_NVFP4_TM=1."""
+    """False only when VLLM_SM70_INKLING_NVFP4_TM=0."""
     return bool(envs.VLLM_SM70_INKLING_NVFP4_TM)
 
 
@@ -242,6 +245,7 @@ class Workspace:
         self.dense_expert_ids = torch.arange(experts, **i32)
         self.compact_offsets = torch.arange(COMPACT_MAX_SLOTS + 1, **i32)
         self.compact_expert_ids = torch.zeros(COMPACT_MAX_SLOTS, **i32)
+        self.expert_bounds = torch.arange(experts, dtype=torch.int64, device=device)
         self.reserve(COMPACT_MAX_SLOTS)
 
     @classmethod
@@ -316,15 +320,17 @@ class Nvfp4TmExperts:
         self, sorted_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """(offsets, expert ids, group count) for `sorted_ids`, the ascending
-        expert ids of the routed slots (no padding slots)."""
+        expert ids 0..E-1 of the slots."""
         ws = self.workspace
         slots = sorted_ids.numel()
         if self.compact and slots <= COMPACT_MAX_SLOTS:
             ids = ws.compact_expert_ids[:slots]
             ids.copy_(sorted_ids)
             return ws.compact_offsets[: slots + 1], ids, slots
-        counts = torch.bincount(sorted_ids, minlength=self.num_experts)
-        ws.expert_offsets[1:] = torch.cumsum(counts, 0)
+        # cumsum(bincount) without bincount's host sync on CUDA.
+        ws.expert_offsets[1:] = torch.searchsorted(
+            sorted_ids, ws.expert_bounds, right=True
+        )
         return ws.expert_offsets, ws.dense_expert_ids, self.num_experts
 
     def expert_sum(
@@ -346,21 +352,22 @@ class Nvfp4TmExperts:
         top_k = top_k_index.shape[-1]
         none = self.num_experts
         flat = top_k_index.reshape(-1)
-        flat = flat.masked_fill((flat < 0) | (flat > none), none)
-        sorted_ids, order = torch.sort(flat, stable=True)
-        slots = int((sorted_ids < none).sum())
+        slots = flat.numel()
         if not slots:
             output.zero_()
             return
-        order, sorted_ids = order[:slots], sorted_ids[:slots]
+        flat = flat.masked_fill((flat < 0) | (flat > none), none)
+        sorted_ids, order = torch.sort(flat, stable=True)
+        skip = sorted_ids == none
+        sorted_ids = sorted_ids.clamp(max=none - 1)
         tokens = order // top_k
         weights = top_k_weights.reshape(-1)[order].float()
         total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         self.workspace.reserve(slots)
         for start in range(0, slots, CHUNK_ROWS):
-            end = min(start + CHUNK_ROWS, slots)
+            part = slice(start, min(start + CHUNK_ROWS, slots))
             self._chunk(
-                x, tokens[start:end], sorted_ids[start:end], weights[start:end], total
+                x, tokens[part], sorted_ids[part], weights[part], skip[part], total
             )
         output.copy_(total)
 
@@ -370,10 +377,12 @@ class Nvfp4TmExperts:
         tokens: torch.Tensor,
         sorted_ids: torch.Tensor,
         weights: torch.Tensor,
+        skip: torch.Tensor,
         total: torch.Tensor,
     ) -> None:
         """Add the weighted expert outputs of up to CHUNK_ROWS slots, sorted
-        by expert, into the fp32 `total` [M, H]."""
+        by expert, into the fp32 `total` [M, H]; slots where the bool `skip`
+        is set add zero."""
         ws = self.workspace
         slots = tokens.numel()
         rows, gate_up, act, sorted_out = (
@@ -398,7 +407,8 @@ class Nvfp4TmExperts:
             self.w2.ptrs_w, self.w2.ptrs_s,
             groups, self.local_intermediate, self.hidden_size, NVFP4_BLOCK,
         )  # fmt: skip
-        total.index_add_(0, tokens, sorted_out.float() * weights[:, None])
+        weighted = sorted_out.float() * weights[:, None]
+        total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
 
 
 def build(

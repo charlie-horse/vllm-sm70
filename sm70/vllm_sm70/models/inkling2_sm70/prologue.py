@@ -17,6 +17,10 @@ is the bias of query t on the key d tokens back.
 
 The K/V cache is vLLM's [blocks, kv_heads, tokens, 2 * D]: keys in the first
 D values of a head, values in the rest.
+
+On the Triton route of sconv.py (``sconv.on_triton``) the K and V convs, the
+clip, the norm and the K/V store run as one kernel launch
+(ops/paged_conv.py ``key_value_conv``); q and r stay on torch.
 """
 
 from __future__ import annotations
@@ -29,8 +33,9 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from .backend import cache_metadata
 from .cache import STREAM_K, STREAM_V
+from .ops import paged_conv
 from .ops.torch_ref import l2_clip, log_scale_tau, rms_norm
-from .sconv import dynamic_conv, static_conv
+from .sconv import _block_tokens, dynamic_conv, on_triton, static_conv
 
 __all__ = [
     "attention_prologue",
@@ -191,6 +196,28 @@ def attention_prologue(
             f"vllm_sm70: attention metadata of {n} tokens, conv-state metadata "
             f"of {conv_metadata.num_actual_tokens}."
         )
+    k_stream = conv_owner.stream_ranges[STREAM_K]
+    v_stream = conv_owner.stream_ranges[STREAM_V]
+    if on_triton(k):
+        _block_tokens(conv_owner.kv_cache, conv_metadata)
+        paged_conv.key_value_conv(
+            k,
+            v,
+            k_conv,
+            v_conv,
+            k_taps,
+            v_taps,
+            conv_owner.kv_cache,
+            conv_metadata,
+            k_stream,
+            v_stream,
+            attn_owner.kv_cache,
+            attn_metadata.slot_mapping,
+            n,
+            qk_clip=qk_clip,
+            eps=eps,
+        )
+        return
     key, value = key_value_states(
         k[:n],
         v[:n],
@@ -198,8 +225,8 @@ def attention_prologue(
         v_conv,
         conv_owner.kv_cache,
         conv_metadata,
-        conv_owner.stream_ranges[STREAM_K],
-        conv_owner.stream_ranges[STREAM_V],
+        k_stream,
+        v_stream,
         qk_clip=qk_clip,
         eps=eps,
         k_taps=None if k_taps is None else k_taps[:n],

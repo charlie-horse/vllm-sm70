@@ -189,14 +189,15 @@ def test_switch_is_registered_in_models():
     assert SWITCH == moe_tm.SWITCH and SWITCH in envs._SECTIONS["models"]
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "true", "on", " 1"])
-def test_only_one_enables(monkeypatch, tm, value):
-    assert moe_tm.enabled()
-    assert moe_tm.rejection(REAL, 2, torch.float16) is None
+@pytest.mark.parametrize("value", [None, "", "1", "true", "off", " 0"])
+def test_only_zero_disables(monkeypatch, tm, value):
     if value is None:
         monkeypatch.delenv(SWITCH)
     else:
         monkeypatch.setenv(SWITCH, value)
+    assert moe_tm.enabled()
+    assert moe_tm.rejection(REAL, 2, torch.float16) is None
+    monkeypatch.setenv(SWITCH, "0")
     assert not moe_tm.enabled()
     assert moe_tm.rejection(REAL, 2, torch.float16) == moe_tm.SWITCHED_OFF
 
@@ -261,7 +262,7 @@ def test_tiny_shape_is_not_admitted_by_default(config, monkeypatch):
     assert not mock.prepared and module.w13.shape[0] == 8
 
 
-def test_route_is_off_by_default(config, monkeypatch):
+def test_route_is_on_by_default(config, monkeypatch):
     mock = make_mock_tm()
     ops = types.ModuleType("vllm_sm70.ops")
     ops.tm = mock
@@ -270,9 +271,28 @@ def test_route_is_off_by_default(config, monkeypatch):
     monkeypatch.setattr(
         moe_tm, "INKLING_CONTRACTS", moe_tm.INKLING_CONTRACTS | {TINY_CONTRACT}
     )
-    module = build(config)
+    module = build(config, tp_size=2)
+    assert module.tm_route is not None and module.tm_rejection is None
+    assert mock.prepared and module.w13.numel() == 0
+    monkeypatch.setenv(SWITCH, "0")
+    module = build(config, tp_size=2)
     assert module.tm_route is None and module.tm_rejection == moe_tm.SWITCHED_OFF
-    assert not mock.prepared and module.w13.shape == (8, 64, 64)
+    assert module.w13.shape == (8, 32, 64)
+
+
+def test_default_falls_back_to_torch_without_the_ops(config, monkeypatch):
+    """CPU without the extension: the shape is admitted, the ops are not."""
+    if moe_tm.turbomind() is not None:
+        pytest.skip("the TurboMind ops are loaded")
+    monkeypatch.setattr(
+        moe_tm, "INKLING_CONTRACTS", moe_tm.INKLING_CONTRACTS | {TINY_CONTRACT}
+    )
+    assert moe_tm.enabled()
+    module = build(config, tp_size=2)
+    assert module.tm_route is None and "lacks" in module.tm_rejection
+    assert module.w13.shape == (8, 32, 64)
+    reason = moe_tm.rejection(REAL, 2, torch.float16, torch.device("cpu"))
+    assert "lacks" in reason
 
 
 def test_range_check_sees_the_casts_of_both_routes(tm, config, monkeypatch):
@@ -460,7 +480,7 @@ def test_compact_bound_is_the_turbomind_limit():
 
 
 @pytest.mark.parametrize("m,pad", [(8, [0, 5]), (48, [1, 2, 47]), (64, [0, 63])])
-def test_padding_rows_are_zero_and_skipped(tm, config, monkeypatch, m, pad):
+def test_padding_rows_are_zero(tm, config, monkeypatch, m, pad):
     module = build(config)
     oracle = build_torch(config, monkeypatch)
     x = hidden(m)
@@ -469,16 +489,41 @@ def test_padding_rows_are_zero_and_skipped(tm, config, monkeypatch, m, pad):
     out, ref = run(module, x, is_padding), run(oracle, x, is_padding)
     assert bool((out[is_padding] == 0).all()) and bool(torch.isfinite(out).all())
     assert max_abs_rel(out, ref) < TOL
+    # Padding slots run on expert E - 1 and add zero: no host count.
     for rows, _, _, _, offsets, ids in tm.stages:
-        assert rows == int(offsets[-1]) == 2 * (m - len(pad))
+        assert rows == int(offsets[-1]) == 2 * m
         assert int(ids.max()) < 8 and int(ids.min()) >= 0
 
 
 @pytest.mark.parametrize("m", [1, 64])
-def test_all_padding_launches_nothing(tm, config, m):
+def test_all_padding_is_zero(tm, config, m):
     module = build(config)
-    out = run(module, hidden(m), torch.ones(m, dtype=torch.bool))
-    assert not tm.stages and bool((out == 0).all())
+    x = hidden(m)
+    x[0] = float("nan")
+    out = run(module, x, torch.ones(m, dtype=torch.bool))
+    assert len(tm.stages) == 2 and bool((out == 0).all())
+
+
+@pytest.mark.parametrize("m", [1, 8, 41])
+def test_expert_sum_has_no_host_sync(tm, config, m):
+    """The mock stage stands in for a kernel; its own reads are exempt."""
+    sys.path.insert(0, str(TINY.parents[1]))
+    from inkling2_sync_guard import allowed, no_host_sync
+
+    module = build(config)
+    route = module.tm_route
+    route.tm = types.SimpleNamespace(
+        nvfp4_moe_dense_stage_sm70_out=allowed(tm.nvfp4_moe_dense_stage_sm70_out)
+    )
+    x = hidden(m)
+    is_padding = torch.arange(m) == m - 1
+    _, weights, indices = module.route(x, is_padding)
+    want = torch.full_like(x, float("nan"))
+    route.expert_sum(x, indices, weights, want)
+    got = torch.full_like(x, float("nan"))
+    with no_host_sync():
+        route.expert_sum(x, indices, weights, got)
+    assert torch.equal(got, want) and bool((got[-1] == 0).all())
 
 
 def test_input_contract(tm, config):
