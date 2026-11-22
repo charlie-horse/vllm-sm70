@@ -16,7 +16,8 @@
   admission caps), the KV cache in the model dtype, no pipeline parallelism.
 * CUDA graphs: an unset ``cudagraph_mode`` becomes PIECEWISE with
   ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` and NONE without it; a mode with FULL
-  graphs is refused. The model's ops are eager breaks (UP
+  graphs is refused, and an explicit PIECEWISE without the variable logs
+  a warning. The model's ops are eager breaks (UP
   compilation/breakable_cudagraph.py ``eager_break_during_capture``): a FULL
   capture runs them inline and would freeze the batch they branch on, and
   without the breakable runner PIECEWISE pads the batches and captures
@@ -151,6 +152,17 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 f"PIECEWISE CUDA graphs, got cudagraph_mode "
                 f"{cudagraph_mode.name}; use -cc.cudagraph_mode=piecewise or "
                 "none."
+            )
+        elif (
+            cudagraph_mode == CUDAGraphMode.PIECEWISE
+            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        ):
+            logger.warning(
+                "%s: cudagraph_mode PIECEWISE without "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=1 captures no graph (the "
+                "model's ops are eager breaks); set it to 1 or use "
+                "-cc.cudagraph_mode=none.",
+                ARCH,
             )
         inkling2 = sm70_config(vllm_config).inkling2
         hf_config = getattr(model_config, "hf_config", None)

@@ -6,8 +6,8 @@ signatures (prepare packs 8 codes per int32, the dense stage dequantizes a
 bank and runs one GEMM per group). They check the bank layout against a torch
 dequant, the route against the torch path of moe.py and the reference
 recording on the tiny checkpoint (models/fixtures/inkling2_tiny/), the two
-stage call forms, padding, the scale audit, the admission rules, the kill
-switch and the memory accounting. The real ops run in
+stage call forms, the slot chunks, padding, the scale audit, the admission
+rules, the kill switch and the memory accounting. The real ops run in
 test_m12_inkling2_nvfp4_tm_gpu.py.
 Kill-switch: VLLM_SM70_INKLING_NVFP4_TM covered below.
 """
@@ -40,6 +40,7 @@ SWITCH = "VLLM_SM70_INKLING_NVFP4_TM"
 REAL = (2304, 1152, 128, 8)
 # The tiny checkpoint: (hidden, global intermediate, experts, top-k).
 TINY_CONTRACT = (64, 32, 8, 2)
+ADMITTED_TP = moe_tm.INKLING_TP_SIZES
 NVFP4_LAYER, MXFP8_LAYER = 1, 23
 SIZES = [1, 2, 8, 40, 41, 64]  # 41 tokens x top-2 is the first dense-form size
 TOL = 1e-2  # max-abs-rel, TurboMind NVFP4 against the fp16 dequant
@@ -124,8 +125,8 @@ def _env(monkeypatch):
 
 @pytest.fixture
 def tm(monkeypatch):
-    """The pure-torch tm, installed, with the tiny shape admitted and the
-    route switched on."""
+    """The pure-torch tm, installed, with the tiny shape admitted at TP1 and
+    TP2 and the route switched on."""
     monkeypatch.setenv(SWITCH, "1")
     mock = make_mock_tm()
     ops = types.ModuleType("vllm_sm70.ops")
@@ -135,6 +136,7 @@ def tm(monkeypatch):
     monkeypatch.setattr(
         moe_tm, "INKLING_CONTRACTS", moe_tm.INKLING_CONTRACTS | {TINY_CONTRACT}
     )
+    monkeypatch.setattr(moe_tm, "INKLING_TP_SIZES", (1, 2))
     return mock
 
 
@@ -199,11 +201,23 @@ def test_only_one_enables(monkeypatch, tm, value):
     assert moe_tm.rejection(REAL, 2, torch.float16) == moe_tm.SWITCHED_OFF
 
 
-@pytest.mark.parametrize("tp", moe_tm.INKLING_TP_SIZES)
-def test_real_shape_is_admitted(tm, tp):
+@pytest.mark.parametrize("tp", ADMITTED_TP)
+def test_real_shape_is_admitted(tm, tp, monkeypatch):
+    monkeypatch.setattr(moe_tm, "INKLING_TP_SIZES", ADMITTED_TP)
     assert moe_tm.INKLING_CONTRACTS >= {REAL}
     assert moe_tm.rejection(REAL, tp, torch.float16) is None
     assert moe_tm.rejection(REAL, tp, torch.float16, torch.device("cpu")) is None
+
+
+def test_only_tp2_shapes_are_admitted(tm, config, monkeypatch):
+    assert ADMITTED_TP == (2,)
+    monkeypatch.setattr(moe_tm, "INKLING_TP_SIZES", ADMITTED_TP)
+    reason = moe_tm.rejection(REAL, 1, torch.float16)
+    assert reason == "TP size 1 is not in (2,), the GPU-checked bank shapes"
+    module = build(config, tp_size=1)
+    assert module.tm_route is None and module.tm_rejection == reason
+    assert module.w13.shape == (8, 64, 64) and not tm.prepared
+    assert build(config, tp_size=2).tm_route is not None
 
 
 def test_rejections(monkeypatch, tm):
@@ -296,7 +310,7 @@ def test_banks_match_the_torch_dequant(tm, config, tp_size, tp_rank):
     for bank, codes, (k, n) in zip(
         (route.w13, route.w2), layer.nvfp4_codes(), ((h, 2 * i), (i, h))
     ):
-        assert (bank.k, bank.n, bank.num_experts, bank.scale) == (k, n, e, 1.0)
+        assert (bank.k, bank.n, bank.num_experts) == (k, n, e)
         assert bank.weight.shape == (e, k, n // 8) and bank.weight.dtype == torch.int32
         assert bank.scales.shape == (e, k // 16, n)
         assert bank.scales.dtype == torch.float16
@@ -554,32 +568,41 @@ def test_unfittable_scale_range_raises():
         moe_tm.prepared_scales(wide)
 
 
-def test_subnormal_scales_are_pre_shifted_and_compensated(tm):
-    e, h, i, top_k, m = 8, 64, 32, 2, 24
+def test_subnormal_scales_take_a_shift_that_the_route_refuses(tm):
+    e, h, i = 8, 64, 32
     # 2**-9 * 0.02 = 3.9e-5 is below the smallest normal fp16 (6.1e-5).
     w13 = with_block(random_codes("w13", e, 2 * i, h, 1), 2.0**-9, (0, 0, 0))
-    w2 = with_block(random_codes("w2", e, h, i, 2), 2.0**-9, (3, 1, 1))
-    for codes in (w13, w2):
-        scales, shift = moe_tm.prepared_scales(codes)
-        assert shift == 1
-        nonzero = scales.float().abs()
-        assert bool((nonzero >= 2.0**-14).all())
-        exact = codes.block_scale.float() * 0.02 * 2.0
-        assert torch.equal(scales, exact.half().transpose(1, 2))
-    route = moe_tm.Nvfp4TmExperts(
-        tm, w13, w2, device=torch.device("cpu"), gate_cap=4.0, up_cap=25.0
-    )
-    assert route.w13.scale == route.w2.scale == 0.5
-    g = torch.Generator().manual_seed(3)
-    x = (torch.randn(m, h, generator=g) * 0.5).half()
-    indices = torch.stack([torch.randperm(e, generator=g)[:top_k] for _ in range(m)])
-    weights = torch.rand(m, top_k, generator=g)
-    out = torch.full_like(x, float("nan"))
-    route.expert_sum(x, indices, weights, out)
-    ref = torch_ref.experts(
-        x.float(), indices, weights, codes_dequant(w13), codes_dequant(w2), 4.0, 25.0
-    )
-    assert max_abs_rel(out, ref) < TOL
+    w2 = random_codes("w2", e, h, i, 2)
+    scales, shift = moe_tm.prepared_scales(w13)
+    assert shift == 1
+    assert bool((scales.float().abs() >= 2.0**-14).all())
+    exact = w13.block_scale.float() * 0.02 * 2.0
+    assert torch.equal(scales, exact.half().transpose(1, 2))
+    with pytest.raises(moe_tm.Rejected, match="w13: .* 2\\*\\*1 pre-shift"):
+        moe_tm.Nvfp4TmExperts(
+            tm, w13, w2, device=torch.device("cpu"), gate_cap=4.0, up_cap=25.0
+        )
+    assert not tm.prepared
+
+
+@pytest.mark.parametrize("bank", [0, 1])  # W13, W2: the order Bank sees them
+def test_a_shifted_layer_falls_back_to_torch(tm, config, monkeypatch, bank):
+    unshifted = moe_tm.prepared_scales
+    calls = []
+
+    def shifted(codes, range_check=None):
+        scales, shift = unshifted(codes, range_check)
+        calls.append(codes.name)
+        return scales, shift + (len(calls) - 1 == bank)
+
+    monkeypatch.setattr(moe_tm, "prepared_scales", shifted)
+    module = build(config)
+    assert module.tm_route is None and "2**1 pre-shift" in module.tm_rejection
+    assert module.w13.shape == (8, 64, 64) and module.w2.shape == (8, 64, 32)
+    oracle = build_torch(config, monkeypatch)
+    x = hidden(20)
+    assert torch.equal(run(module, x), run(oracle, x))
+    assert not tm.stages
 
 
 def test_mismatched_pair_raises(tm):
@@ -591,6 +614,72 @@ def test_mismatched_pair_raises(tm):
         )  # fmt: skip
     with pytest.raises(ValueError, match="K % 16"):
         moe_tm.Bank(tm, random_codes("w", 2, 12, 32, 0), torch.device("cpu"))
+
+
+# --------------------------------------------------------------------------
+# Slot chunks and the compact switch
+# --------------------------------------------------------------------------
+def random_route(tm, **kwargs):
+    return moe_tm.Nvfp4TmExperts(
+        tm, random_codes("w13", 8, 64, 64, 1), random_codes("w2", 8, 64, 32, 2),
+        device=torch.device("cpu"), gate_cap=4.0, up_cap=25.0, **kwargs,
+    )  # fmt: skip
+
+
+def random_batch(m, seed=3, e=8, top_k=2):
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.randn(m, 64, generator=g) * 0.5).half()
+    indices = torch.stack([torch.randperm(e, generator=g)[:top_k] for _ in range(m)])
+    return x, indices, torch.rand(m, top_k, generator=g)
+
+
+def test_workspace_is_bounded_independent_of_the_batch(tm, monkeypatch):
+    assert moe_tm.CHUNK_ROWS == 4096
+    # TP2 real shape: 4096 x (2304 + 1152 + 576 + 2304) fp16 per device.
+    assert moe_tm.CHUNK_ROWS * (2304 + 1152 + 576 + 2304) * 2 == 51_904_512
+    route = random_route(tm, max_slots=8192 * 8)
+    ws = route.workspace
+    assert ws.rows == moe_tm.CHUNK_ROWS and ws.nbytes() == 4096 * 224 * 2
+    monkeypatch.setattr(moe_tm, "CHUNK_ROWS", 24)
+    moe_tm.Workspace.clear()
+    route = random_route(tm, max_slots=10**6)
+    for m in (5, 40, 300):
+        route.expert_sum(*random_batch(m), torch.empty(m, 64, dtype=torch.float16))
+        assert route.workspace.rows == 24
+    assert max(stage[0] for stage in tm.stages) == 24
+
+
+@pytest.mark.parametrize("compact", [True, False])
+@pytest.mark.parametrize("m,chunk", [(40, 16), (64, 48), (300, 80), (7, 14)])
+def test_chunked_output_equals_unchunked(tm, monkeypatch, compact, m, chunk):
+    x, indices, weights = random_batch(m)
+    whole = torch.full_like(x, float("nan"))
+    random_route(tm, max_slots=2 * m, compact=compact).expert_sum(
+        x, indices, weights, whole
+    )
+    assert [stage[0] for stage in tm.stages] == [2 * m, 2 * m]
+    tm.stages.clear()
+    moe_tm.Workspace.clear()
+    monkeypatch.setattr(moe_tm, "CHUNK_ROWS", chunk)
+    route = random_route(tm, max_slots=2 * m, compact=compact)
+    chunked = torch.full_like(x, float("nan"))
+    route.expert_sum(x, indices, weights, chunked)
+    sizes = [min(chunk, 2 * m - start) for start in range(0, 2 * m, chunk)]
+    assert [stage[0] for stage in tm.stages[::2]] == sizes
+    assert route.workspace.rows == min(chunk, 2 * m)
+    for rows, ne, *_ in tm.stages:
+        assert ne == (rows if compact and rows <= 80 else 8)
+    assert torch.allclose(chunked, whole, rtol=0, atol=2e-3)
+
+
+def test_compact_switch_turns_the_compact_form_off(tm, config, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "0")
+    module = build(config)
+    assert module.tm_route.compact is False
+    run(module, hidden(8))
+    assert all(ne == 8 for _, ne, *_ in tm.stages)
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_COMPACT")
+    assert build(config).tm_route.compact is True
 
 
 # --------------------------------------------------------------------------
@@ -629,4 +718,8 @@ def test_workspace_is_shared_and_grows(tm, config):
     run(build(config), hidden(8))
     assert all(ws.buffers[name] is buffers[name] for name in buffers)
     ws.reserve(rows + 1)
-    assert ws.rows == rows + 1 and ws.nbytes() == (rows + 1) * 224 * 2
+    assert ws.rows == rows == moe_tm.CHUNK_ROWS  # max_batched_tokens * top-k
+    fresh = moe_tm.Workspace(torch.device("cpu"), 8, 64, 32)
+    assert fresh.rows == moe_tm.COMPACT_MAX_SLOTS
+    fresh.reserve(100)
+    assert fresh.rows == 100 and fresh.nbytes() == 100 * 224 * 2

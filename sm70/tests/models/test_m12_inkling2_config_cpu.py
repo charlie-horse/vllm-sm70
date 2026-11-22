@@ -199,6 +199,45 @@ def test_hook_captures_only_with_breakable_cuda_graphs(
     assert f"cudagraph_mode {want};" in route_log[0]
 
 
+@pytest.mark.parametrize(
+    "breakable, given, warns",
+    [
+        (None, "PIECEWISE", True),
+        ("0", "PIECEWISE", True),
+        ("1", "PIECEWISE", False),
+        (None, "NONE", False),
+        (None, None, False),
+    ],
+)
+def test_hook_warns_on_piecewise_without_breakable_cuda_graphs(
+    device, route_log, monkeypatch, caplog, breakable, given, warns
+):
+    from vllm.config.compilation import CUDAGraphMode
+
+    if breakable is None:
+        monkeypatch.delenv(BREAKABLE, raising=False)
+    else:
+        monkeypatch.setenv(BREAKABLE, breakable)
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
+    # The "vllm" logger may not propagate to the root, where caplog listens.
+    icfg.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("WARNING", logger=icfg.logger.name):
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    finally:
+        icfg.logger.removeHandler(caplog.handler)
+    warnings = list(
+        {id(r): r for r in caplog.records if r.levelname == "WARNING"}.values()
+    )
+    assert len(warnings) == int(warns)
+    if warns:
+        assert "PIECEWISE without VLLM_USE_BREAKABLE_CUDAGRAPH=1 captures no" in (
+            warnings[0].getMessage()
+        )
+        assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
 @pytest.fixture
 def registered(monkeypatch, device):
     """The architecture, its configs and the quant config registered as at
