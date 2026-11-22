@@ -42,6 +42,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
+from . import act_quant
 from .expert_weights import Inkling2ExpertLoader
 from .fp16_audit import walk_process_weights_after_loading
 from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
@@ -167,6 +168,9 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
             soft_cap=text_config.final_logit_softcapping,
         )
         inkling2 = sm70_config(vllm_config).inkling2
+        act_quant.install(
+            self.model.layers, self.expert_formats, inkling2.expert_act_fake_quant
+        )
         if inkling2.visit_dump_dir:
             self.model.visit_hook = VisitDump(inkling2.visit_dump_dir, tp_rank)
             self.model.partial_audit = PartialAudit(

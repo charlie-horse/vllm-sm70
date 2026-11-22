@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
-from . import moe_tm
+from . import act_quant, moe_tm
 from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
 from .ops import torch_ref
 
@@ -101,6 +101,8 @@ class Inkling2Sm70Experts(nn.Module):
         self.contract = (self.hidden_size, intermediate, self.num_experts, self.top_k)
         self.tm_rejection = moe_tm.rejection(self.contract, tp_size, dtype)
         self.tm_route: moe_tm.Nvfp4TmExperts | None = None
+        # Expert activation fake-quant (act_quant.install), None when off.
+        self.act_quant: act_quant.ActQuant | None = None
         e, h, i = self.num_experts, self.hidden_size, self.local_intermediate
         self.weight_shapes = {"w13": (e, 2 * i, h), "w2": (e, h, i)}
         for name, shape in self.weight_shapes.items():
@@ -207,8 +209,11 @@ class Inkling2Sm70Experts(nn.Module):
         0..E-1 select no expert. `rowwise`: the torch path sums each token
         on its own, without a host sync.
         """
+        x = act_quant.apply(self.act_quant, x)
         if self.tm_route is not None:
-            self.tm_route.expert_sum(x, top_k_index, top_k_weights, output)
+            self.tm_route.expert_sum(
+                x, top_k_index, top_k_weights, output, self.act_quant
+            )
             return
         self.torch_expert_sum(x, top_k_index, top_k_weights, output, rowwise)
 
@@ -260,6 +265,7 @@ class Inkling2Sm70Experts(nn.Module):
             rows = tokens[start : start + count]
             gate, up = F.linear(x[rows], self.w13[expert]).chunk(2, dim=-1)
             act = torch_ref.softcapped_swiglu(gate, up, self.gate_cap, self.up_cap)
+            act = act_quant.apply(self.act_quant, act)
             out = F.linear(act, self.w2[expert]).float()
             total.index_add_(0, rows, out * weights[start : start + count, None])
             start += count
@@ -289,6 +295,7 @@ class Inkling2Sm70Experts(nn.Module):
         gate_up = torch.cat([F.linear(row, w13[slot]) for slot in range(k)])
         gate, up = gate_up.chunk(2, dim=-1)
         act = torch_ref.softcapped_swiglu(gate, up, self.gate_cap, self.up_cap)
+        act = act_quant.apply(self.act_quant, act)
         out = torch.cat([F.linear(act[slot : slot + 1], w2[slot]) for slot in range(k)])
         weights = top_k_weights.reshape(-1)[order].float()
         out = (out.float() * weights[:, None]).masked_fill_(skip, 0.0)

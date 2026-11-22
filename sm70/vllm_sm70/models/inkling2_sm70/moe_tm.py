@@ -23,6 +23,7 @@ moe.py, which holds all experts in fp16.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, ClassVar, Final
 
 import torch
@@ -346,10 +347,12 @@ class Nvfp4TmExperts:
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
         output: torch.Tensor,
+        act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         """Write this rank's weighted expert sum of x [M, H] fp16 into `output`.
 
         top_k_index, top_k_weights [M, k]; ids outside 0..E-1 select no expert.
+        `act_quant` (act_quant.py) rewrites the SwiGLU output before W2.
         """
         if x.dtype != torch.float16 or x.ndim != 2 or x.shape[1] != self.hidden_size:
             raise TypeError(
@@ -374,8 +377,9 @@ class Nvfp4TmExperts:
         for start in range(0, slots, CHUNK_ROWS):
             part = slice(start, min(start + CHUNK_ROWS, slots))
             self._chunk(
-                x, tokens[part], sorted_ids[part], weights[part], skip[part], total
-            )
+                x, tokens[part], sorted_ids[part], weights[part], skip[part], total,
+                act_quant,
+            )  # fmt: skip
         output.copy_(total)
 
     def _chunk(
@@ -386,6 +390,7 @@ class Nvfp4TmExperts:
         weights: torch.Tensor,
         skip: torch.Tensor,
         total: torch.Tensor,
+        act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         """Add the weighted expert outputs of up to CHUNK_ROWS slots, sorted
         by expert, into the fp32 `total` [M, H]; slots where the bool `skip`
@@ -409,6 +414,8 @@ class Nvfp4TmExperts:
             * torch.sigmoid(gate)
             * torch_ref.softcap(up, self.up_cap)
         )
+        if act_quant is not None:
+            act.copy_(act_quant(act))
         stage(
             sorted_out, act, offsets, expert_ids,
             self.w2.ptrs_w, self.w2.ptrs_s,
