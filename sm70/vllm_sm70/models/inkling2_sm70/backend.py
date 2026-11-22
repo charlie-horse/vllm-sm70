@@ -11,8 +11,13 @@ per-batch ``CommonAttentionMetadata`` into the metadata the model's ops read:
 The runner stores one metadata object per cache owner under the owner's
 forward-context name; ``cache_metadata(owner)`` reads it back.
 
-Token tensors cover the padded batch. A padding token has slot -1 and
-zeros elsewhere. The builders sort decode requests first.
+Token tensors cover the padded batch. A padding token has slot -1; its
+other values are unspecified (``positions`` is the runner's tensor when the
+batch has one), so ops select tokens with ``slot_mapping >= 0``. The builders
+sort decode requests first.
+
+Cache views are logical (blocks, heads, tokens, width) in every layout; the
+backends declare LBNHC, the layout Flash-V100 uses.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -87,14 +93,9 @@ class Inkling2AttentionMetadata(Inkling2SconvMetadata):
 
 class _TokenIndex:
     """Per-token request index, query start and position of a batch, in
-    buffers every builder on a device shares."""
+    buffers one builder owns for its lifetime (CUDA graphs capture them)."""
 
     def __init__(self, device: torch.device, size: int) -> None:
-        self.device = device
-        self._allocate(size)
-
-    def _allocate(self, size: int) -> None:
-        device = self.device
         self.size = size
         self.arange = torch.arange(size, dtype=torch.int32, device=device)
         self.seq_idx = torch.zeros(size, dtype=torch.int32, device=device)
@@ -111,7 +112,10 @@ class _TokenIndex:
                 f"batch has {num_actual}."
             )
         if num_padded > self.size:
-            self._allocate(num_padded)
+            raise ValueError(
+                f"vllm_sm70: a batch of {num_padded} tokens exceeds "
+                f"max_num_batched_tokens {self.size}."
+            )
         seq_idx = self.seq_idx[:num_padded]
         query_start = self.query_start[:num_padded]
         positions = self.positions[:num_padded]
@@ -139,19 +143,6 @@ class _TokenIndex:
         }
 
 
-_TOKEN_INDEX: dict[torch.device, _TokenIndex] = {}
-
-
-def _token_index(device: torch.device, vllm_config: Any) -> _TokenIndex:
-    size = int(vllm_config.scheduler_config.max_num_batched_tokens)
-    index = _TOKEN_INDEX.get(device)
-    if index is None:
-        index = _TOKEN_INDEX[device] = _TokenIndex(device, size)
-    elif index.size < size:
-        index._allocate(size)
-    return index
-
-
 class _Builder(AttentionMetadataBuilder):
     """Common part of both builders. The metadata of two groups with equal
     specs differs in the block table and slot mapping only."""
@@ -168,7 +159,10 @@ class _Builder(AttentionMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = int(kv_cache_spec.block_size)
-        self.token_index = _token_index(torch.device(device), vllm_config)
+        self.token_index = _TokenIndex(
+            torch.device(device),
+            int(vllm_config.scheduler_config.max_num_batched_tokens),
+        )
         self._init_reorder_batch_threshold(1)
 
     def update_block_table(
@@ -256,6 +250,10 @@ class _OwnedBackend(AttentionBackend):
             "vllm_sm70: Inkling 2 cache backends have no attention impl; the "
             "model runs attention and the short convs itself."
         )
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
 
 
 class Inkling2AttentionBackend(_OwnedBackend):

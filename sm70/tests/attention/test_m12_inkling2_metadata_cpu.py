@@ -168,7 +168,6 @@ def test_owners_resolve_their_backends(built):
         spec = owner.get_kv_cache_spec(owner_config)
         assert cls.customize_spec(spec) is spec
         assert cls.get_supported_kernel_block_sizes(spec) == [MultipleOf(1)]
-        assert cls.supported_kv_cache_layouts() is None
 
 
 def test_builder_flags(built):
@@ -279,21 +278,38 @@ def test_runner_positions_are_passed_through(built):
         assert md.positions.tolist() == POSITIONS
 
 
-def test_token_buffers_are_shared_and_grow(built, monkeypatch):
-    from vllm_sm70.models.inkling2_sm70 import backend
-
-    monkeypatch.setattr(backend, "_TOKEN_INDEX", {})
+def test_token_buffers_belong_to_one_builder(built):
+    """Two builders (two ubatches) of one group keep separate buffers, sized
+    once from max_num_batched_tokens."""
     owners, owner_config = built
-    small = _builder(owners.conv[0, 0], owner_config, _vllm_config(4))
-    assert small.token_index.size == 4
-    md = small.build(0, _common(CONV_TABLE, CONV_SLOTS))
+    owner = owners.conv[0, 0]
+    first = _builder(owner, owner_config, _vllm_config(8))
+    second = _builder(owner, owner_config, _vllm_config(8))
+    assert first.token_index.size == 8
+    md = first.build(0, _common(CONV_TABLE, CONV_SLOTS))
+    ptr = md.seq_idx.data_ptr()
+    shifted = [[row[0] + 1] + row[1:] for row in CONV_TABLE]
+    other = second.build(0, _common(shifted, CONV_SLOTS[:1] * 7))
+    assert other.seq_idx.data_ptr() != ptr
+    assert other.query_start.data_ptr() != md.query_start.data_ptr()
     _check_tokens(md, CONV_TABLE, CONV_SLOTS, CONV_BLOCK)
-    assert small.token_index.size == 7
-    large = _builder(owners.attn[0, 0], owner_config, _vllm_config(64))
-    assert large.token_index is small.token_index
-    assert small.token_index.size == 64
-    other = large.build(0, _common(ATTN_TABLE, ATTN_SLOTS))
-    assert other.seq_idx.data_ptr() == small.token_index.seq_idx.data_ptr()
+    assert first.build(0, _common(CONV_TABLE, CONV_SLOTS)).seq_idx.data_ptr() == ptr
+    small = _builder(owner, owner_config, _vllm_config(4))
+    with pytest.raises(ValueError, match="max_num_batched_tokens 4"):
+        small.build(0, _common(CONV_TABLE, CONV_SLOTS))
+
+
+def test_backends_declare_the_lbnhc_layout(built):
+    from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    owners, _ = built
+    backends = [
+        owners.attn[0, 0].get_attn_backend(),
+        owners.conv[0, 0].get_attn_backend(),
+    ]
+    assert get_supported_kv_cache_layouts(backends) == [KVCacheLayout.LBNHC]
+    assert KVCacheLayout.LBNHC.is_block_compact
 
 
 def test_slot_mapping_shorter_than_the_batch_is_rejected(built):

@@ -77,7 +77,15 @@ def route_log(monkeypatch):
 
 
 def _vllm_config(
-    dtype=torch.float16, backend=None, spec=None, prompt_embeds=False, sm70=None
+    dtype=torch.float16,
+    backend=None,
+    spec=None,
+    prompt_embeds=False,
+    sm70=None,
+    cache_dtype="auto",
+    block_size=None,
+    pp=1,
+    async_scheduling=None,
 ):
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -87,10 +95,15 @@ def _vllm_config(
             get_hidden_size=lambda: HIDDEN,
         ),
         attention_config=SimpleNamespace(backend=backend),
-        cache_config=SimpleNamespace(cache_dtype="auto", block_size=32),
-        parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, disable_custom_all_reduce=False
+        cache_config=SimpleNamespace(
+            cache_dtype=cache_dtype,
+            block_size=block_size or 16,
+            user_specified_block_size=block_size is not None,
         ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp, disable_custom_all_reduce=False
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=spec,
         additional_config=None if sm70 is None else {"sm70": sm70},
         kernel_config=None,
@@ -109,6 +122,10 @@ def _vllm_config(
         ((7, 0), {"dtype": torch.float32}, "--dtype half"),
         ((7, 0), {"spec": object()}, "speculative decoding"),
         ((7, 0), {"prompt_embeds": True}, "prompt embeddings"),
+        ((7, 0), {"cache_dtype": "fp8"}, "--kv-cache-dtype fp8"),
+        ((7, 0), {"block_size": 16}, "--block-size 32"),
+        ((7, 0), {"pp": 2}, "pipeline parallelism"),
+        ((7, 0), {"async_scheduling": True}, "--no-async-scheduling"),
     ],
 )
 def test_hook_refuses(device, route_log, cc, kw, match):
@@ -124,6 +141,25 @@ def test_hook_refuses_on_cpu_platform(monkeypatch, route_log):
     monkeypatch.setattr(vllm.platforms, "_current_platform", cpu)
     with pytest.raises(ValueError, match="compute capability 7.0 GPU.*got None"):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(_vllm_config())
+
+
+@pytest.mark.parametrize("block_size", [None, 32])
+@pytest.mark.parametrize("async_scheduling", [None, False])
+@pytest.mark.parametrize("cache_dtype", ["auto", "float16"])
+def test_hook_fixes_the_kv_plan(
+    device, route_log, block_size, async_scheduling, cache_dtype
+):
+    device(7, 0)
+    cfg = _vllm_config(
+        block_size=block_size,
+        async_scheduling=async_scheduling,
+        cache_dtype=cache_dtype,
+    )
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.block_size == icfg.KV_BLOCK_SIZE == 32
+    assert cfg.cache_config.user_specified_block_size is True
+    assert cfg.scheduler_config.async_scheduling is False
+    assert cfg.cache_config.cache_dtype == cache_dtype
 
 
 def test_hook_selects_no_attention_backend(device, route_log):
