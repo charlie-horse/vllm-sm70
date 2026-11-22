@@ -323,6 +323,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_DFLASH2_EMULATION": kill_switch("VLLM_SM70_DFLASH2_EMULATION"),
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
+        # "1": the Inkling 2 norms, AttnRes mixes and message blends run the
+        # vendored Triton kernels instead of the torch ops. Env-only (no
+        # Sm70Config field), read per call (inkling2_sm70/norms.py); default
+        # off: the kernels have not run on a GPU.
+        "VLLM_SM70_INKLING_TRITON_NORMS": opt_in("VLLM_SM70_INKLING_TRITON_NORMS"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

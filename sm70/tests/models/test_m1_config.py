@@ -53,7 +53,7 @@ EFFECTIVE_DEFAULTS = {
 # Our sections of K01's registry.
 REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # Routes that run only when their variable is "1" (envs.opt_in).
-OPT_IN = {"VLLM_SM70_INKLING_NVFP4_TM"}
+OPT_IN = {"VLLM_SM70_INKLING_NVFP4_TM", "VLLM_SM70_INKLING_TRITON_NORMS"}
 # The kill switches: only "0" acts.
 OURS = {name: get for name, get in REGISTERED.items() if name not in OPT_IN}
 
@@ -100,7 +100,9 @@ def test_none_additional_config_returns_defaults():
 
 
 def test_additional_config_parse_and_cache():
-    vc = _vc({"quant_backend": "turbomind", "flint_qk_rope_kv": False, "fp8_qpn8": True})
+    vc = _vc(
+        {"quant_backend": "turbomind", "flint_qk_rope_kv": False, "fp8_qpn8": True}
+    )
     cfg = sm70_config(vc)
     assert cfg.quant_backend == "turbomind"
     assert cfg.flint_qk_rope_kv is False
@@ -161,6 +163,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_DFLASH2_VERIFIER",
         "VLLM_SM70_DFLASH2_EMULATION",
         "VLLM_SM70_SHARED_MOE_OVERLAP",
+        "VLLM_SM70_INKLING_TRITON_NORMS",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -286,9 +289,10 @@ def _dflash2_emulation_off(name):
     before = ModelRegistry.models[dflash_sm70.DRAFT_ARCH]
     from vllm_sm70 import _ext
 
-    with mock.patch.object(
-        sm70_platform, "all_visible_gpus_are_sm70", lambda: True
-    ), mock.patch.object(_ext, "is_loaded", lambda: True):
+    with (
+        mock.patch.object(sm70_platform, "all_visible_gpus_are_sm70", lambda: True),
+        mock.patch.object(_ext, "is_loaded", lambda: True),
+    ):
         assert dflash_sm70.register() is False
     assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
 
@@ -382,7 +386,21 @@ def _inkling_nvfp4_tm_off(name):
             assert moe_tm.rejection(contract, tp, torch.float16) == moe_tm.SWITCHED_OFF
 
 
-OPT_IN_OFF = {"VLLM_SM70_INKLING_NVFP4_TM": _inkling_nvfp4_tm_off}
+def _inkling_triton_norms_off(name):
+    """A GPU tensor takes the torch ops of inkling2_sm70/norms.py; the
+    kernels' own checks are tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import norms
+
+    assert norms.SWITCH == name
+    gpu = SimpleNamespace(is_cuda=True)
+    assert norms.on_triton(gpu) is False
+
+
+OPT_IN_OFF = {
+    "VLLM_SM70_INKLING_NVFP4_TM": _inkling_nvfp4_tm_off,
+    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
+}
 
 
 @pytest.mark.parametrize("value", [None, "", "0", "true", "on", "yes", " 1"])

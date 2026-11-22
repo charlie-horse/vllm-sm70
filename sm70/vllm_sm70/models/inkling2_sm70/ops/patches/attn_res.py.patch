@@ -1,0 +1,270 @@
+Upstream: https://github.com/vllm-project/vllm
+Path: vllm/models/inkling2/nvidia/ops/attn_res.py
+Commit: c32251b5d192f0f72f9ca8c5595d1d43f1dd37b8
+sha256: 39f8392a06c76980ebf7b1981894451ecf74501fa5b43791c1e46cf185589981
+
+--- a/vllm/models/inkling2/nvidia/ops/attn_res.py
++++ b/sm70/vllm_sm70/models/inkling2_sm70/ops/attn_res.py
+@@ -4,24 +4,35 @@
+ 
+ For each token, sources `x_n` (stored blocks, then the partial block plus an
+ optional addend, all in fp32) are scored as `(q . x_n) * rsqrt(mean(x_n^2) +
+-eps)` per pseudo-query `q`; the output is `sum_n softmax_n * x_n`, with
+-`x_n` RMS-normalized when `normalize_values` is set. The fp32 mix then
++eps) * q_scale` per pseudo-query `q`; the output is `sum_n softmax_n * x_n`,
++with `x_n` RMS-normalized when `normalize_values` is set. Stored blocks that
++are RMS-normalized already (`stack_normed`) are taken as they are. The fp32 mix then
+ goes through the following sublayer's RMSNorm in the same kernel, or is
+ returned as is (fp32) without a norm weight.
+ """
+ 
+ import torch
+ 
+-from vllm.models.inkling2.nvidia.ops.norm import rsqrt
+-from vllm.triton_utils import tl, tldevice, triton
++from ._compat import exp, tl, triton, use_gdc
++from .norm import rsqrt
+ 
+ 
+ @triton.jit
+ def _load_source(
+-    Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK, HAS_ADDEND
++    Stack,
++    stride_s,
++    Last,
++    Addend,
++    stack_off,
++    row_off,
++    offs,
++    mask,
++    n,
++    N_STACK,
++    HAS_ADDEND,
+ ):
+     if n < N_STACK:
+-        x = tl.load(Stack + n * stride_s + row_off + offs, mask, other=0)
++        x = tl.load(Stack + n * stride_s + stack_off + offs, mask, other=0)
+         x = x.to(tl.float32)
+     else:
+         x = tl.load(Last + row_off + offs, mask, other=0).to(tl.float32)
+@@ -36,6 +47,7 @@
+     stride_s,
+     Last,
+     Addend,
++    stack_off,
+     row_off,
+     offs,
+     mask,
+@@ -48,7 +60,17 @@
+     acc = tl.zeros((BLOCK_D,), tl.float32)
+     for n in tl.static_range(N_STACK + 1):
+         x = _load_source(
+-            Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK, HAS_ADDEND
++            Stack,
++            stride_s,
++            Last,
++            Addend,
++            stack_off,
++            row_off,
++            offs,
++            mask,
++            n,
++            N_STACK,
++            HAS_ADDEND,
+         )
+         acc = tl.fma(tl.sum(tl.where(n_idx == n, probs, 0.0)), x, acc)
+     return acc
+@@ -63,22 +85,28 @@
+     NormW,
+     Out,
+     stride_s,
++    stride_t,
+     T,
+     eps,
+     norm_eps,
++    q_scale,
+     D: tl.constexpr,
+     N_STACK: tl.constexpr,
+     HAS_ADDEND: tl.constexpr,
+     NORMALIZE: tl.constexpr,
+     APPLY_NORM: tl.constexpr,
++    STACK_NORMED: tl.constexpr,
++    USE_GDC: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+ ):
+-    tl.extra.cuda.gdc_wait()
++    if USE_GDC:
++        tl.extra.cuda.gdc_wait()
+     # One program per (token, query).
+     t = tl.program_id(1).to(tl.int64)
+     q_off = tl.program_id(0) * D
+     row_off = t * D
++    stack_off = t * stride_t
+     n_idx = tl.arange(0, BLOCK_N)
+     d_idx = tl.arange(0, BLOCK_D)
+ 
+@@ -96,6 +124,7 @@
+                 stride_s,
+                 Last,
+                 Addend,
++                stack_off,
+                 row_off,
+                 offs,
+                 mask,
+@@ -106,11 +135,14 @@
+             q = tl.load(Queries + q_off + offs, mask, other=0)
+             sum_sq = tl.fma(x, x, sum_sq)
+             dots = tl.fma(q, x, dots)
+-        rstd = rsqrt(tl.fma(tl.sum(sum_sq), 1.0 / D, eps))
++        if STACK_NORMED and n < N_STACK:
++            rstd = 1.0
++        else:
++            rstd = rsqrt(tl.fma(tl.sum(sum_sq), 1.0 / D, eps))
+         inv_rms = tl.where(n_idx == n, rstd, inv_rms)
+-        logits = tl.where(n_idx == n, tl.sum(dots) * rstd, logits)
++        logits = tl.where(n_idx == n, tl.sum(dots) * rstd * q_scale, logits)
+ 
+-    probs = tldevice.exp(logits - tl.max(logits))
++    probs = exp(logits - tl.max(logits))
+     inv_sum = tl.div_rn(1.0, tl.sum(probs))
+     if NORMALIZE:
+         probs = probs * inv_rms
+@@ -127,6 +159,7 @@
+                     stride_s,
+                     Last,
+                     Addend,
++                    stack_off,
+                     row_off,
+                     offs,
+                     offs < D,
+@@ -150,6 +183,7 @@
+                 stride_s,
+                 Last,
+                 Addend,
++                stack_off,
+                 row_off,
+                 offs,
+                 mask,
+@@ -176,25 +210,31 @@
+     NormW,
+     Out,
+     stride_s,
++    stride_t,
+     T,
+     eps,
+     norm_eps,
++    q_scale,
+     D: tl.constexpr,
+     N_STACK: tl.constexpr,
+     HAS_ADDEND: tl.constexpr,
+     NORMALIZE: tl.constexpr,
+     APPLY_NORM: tl.constexpr,
++    STACK_NORMED: tl.constexpr,
++    USE_GDC: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_A: tl.constexpr,
+     BLOCK_B: tl.constexpr,
+ ):
+-    tl.extra.cuda.gdc_wait()
++    if USE_GDC:
++        tl.extra.cuda.gdc_wait()
+     # Small batches: one program per (token, query) holds the row in registers
+     # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
+     # sources are read twice instead of three times.
+     t = tl.program_id(1).to(tl.int64)
+     q_off = tl.program_id(0) * D
+     row_off = t * D
++    stack_off = t * stride_t
+     da = tl.arange(0, BLOCK_A)
+     db = BLOCK_A + tl.arange(0, BLOCK_B)
+     mask_a = da < D
+@@ -202,19 +242,22 @@
+     n_idx = tl.arange(0, BLOCK_N)
+     qa = tl.load(Queries + q_off + da, mask_a, other=0)
+     qb = tl.load(Queries + q_off + db, mask_b, other=0)
+-    src = (Stack, stride_s, Last, Addend, row_off)
++    src = (Stack, stride_s, Last, Addend, stack_off, row_off)
+ 
+     logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
+     inv_rms = tl.zeros((BLOCK_N,), tl.float32)
+     for n in tl.static_range(N_STACK + 1):
+         xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
+         xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
+-        rstd = rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
++        if STACK_NORMED and n < N_STACK:
++            rstd = 1.0
++        else:
++            rstd = rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
+         inv_rms = tl.where(n_idx == n, rstd, inv_rms)
+         dot = tl.sum(qa * xa) + tl.sum(qb * xb)
+-        logits = tl.where(n_idx == n, dot * rstd, logits)
++        logits = tl.where(n_idx == n, dot * rstd * q_scale, logits)
+ 
+-    probs = tldevice.exp(logits - tl.max(logits))
++    probs = exp(logits - tl.max(logits))
+     inv_sum = tl.div_rn(1.0, tl.sum(probs))
+     if NORMALIZE:
+         probs = probs * inv_rms
+@@ -250,26 +293,31 @@
+     norm_eps: float,
+     normalize_values: bool,
+     eps: float = 1e-6,
++    *,
++    stack_normed: bool = False,
++    q_scale: float = 1.0,
++    out_dtype: torch.dtype | None = None,
+ ) -> torch.Tensor:
+     """Mix `[*stack, last (+ addend)]` with each pseudo-query.
+ 
+-    `queries` are fp32 `(Q, D)`, already scaled by `D**-0.5`; each fp32
+-    mix is RMS-normalized with its row of `norm_weight` `(Q, D)`. Returns
+-    `(Q, T, D)` in `last.dtype`, or the fp32 mixes without `norm_weight`.
++    `queries` are fp32 `(Q, D)`; `queries * q_scale` is scaled by `D**-0.5`.
++    Each fp32 mix is RMS-normalized with its row of `norm_weight` `(Q, D)`.
++    `stack` is `(N, T, D)` with any strides over N and T. Returns `(Q, T, D)`
++    in `out_dtype` (`last.dtype`), or the fp32 mixes without `norm_weight`.
+     """
+     num_tokens, d = last.shape
+     num_stack = stack.shape[0]
+     num_q = queries.shape[0]
+     assert last.is_contiguous() and queries.is_contiguous()
+     assert queries.dtype == torch.float32
+-    assert stack.stride(1) == d and stack.stride(2) == 1
++    assert stack.shape[1:] == last.shape and stack.stride(2) == 1
+     if addend is not None:
+         assert addend.is_contiguous() and addend.shape == last.shape
+     apply_norm = norm_weight is not None
+     if norm_weight is None:
+         norm_weight = queries  # unread
+     assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
+-    out_dtype = last.dtype if apply_norm else torch.float32
++    out_dtype = (out_dtype or last.dtype) if apply_norm else torch.float32
+     out = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=last.device)
+     args = (
+         stack,
+@@ -279,9 +327,11 @@
+         norm_weight,
+         out,
+         stack.stride(0),
++        stack.stride(1),
+         num_tokens,
+         eps,
+         norm_eps,
++        q_scale,
+     )
+     meta = dict(
+         D=d,
+@@ -289,9 +339,11 @@
+         HAS_ADDEND=addend is not None,
+         NORMALIZE=normalize_values,
+         APPLY_NORM=apply_norm,
++        STACK_NORMED=stack_normed,
++        USE_GDC=use_gdc(),
+         BLOCK_N=triton.next_power_of_2(num_stack + 1),
+         enable_fp_fusion=False,
+-        launch_pdl=True,
++        launch_pdl=use_gdc(),
+     )
+     # The queries of a token run back to back and share its sources in L2.
+     grid = (num_q, num_tokens)
