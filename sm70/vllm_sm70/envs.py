@@ -346,6 +346,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/
         # config.py, backend.py). Env-only (no Sm70Config field).
         "VLLM_SM70_INKLING_DECODE_GRAPH": kill_switch("VLLM_SM70_INKLING_DECODE_GRAPH"),
+        # "0": the Inkling 2 experts held in the model dtype take the torch
+        # expert sum (a host sync per batch, row by row in decode-only
+        # batches) instead of the sync-free grouped route. Env-only (no
+        # Sm70Config field), read per eager call (inkling2_sm70/moe.py) and
+        # fixed at capture in a replayed CUDA graph; tensors off the GPU
+        # always take the torch expert sum.
+        "VLLM_SM70_INKLING_GROUPED_MOE": kill_switch("VLLM_SM70_INKLING_GROUPED_MOE"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

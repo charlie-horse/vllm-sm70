@@ -171,6 +171,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
+        "VLLM_SM70_INKLING_GROUPED_MOE",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -431,6 +432,19 @@ def _inkling_triton_decode_attn_off(name):
         assert attention_torch.on_triton(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_grouped_moe_off(name):
+    """A GPU tensor takes the torch expert sum of inkling2_sm70/moe.py; the
+    route's own checks are tests/quant/test_m12_inkling2_grouped_moe_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import moe
+
+    assert moe.SWITCH == name
+    with mock.patch.object(moe._compat, "AVAILABLE", True):
+        assert moe.on_grouped(SimpleNamespace(is_cuda=True)) is False
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -502,6 +516,8 @@ def _path_off(name):
         _inkling_triton_decode_attn_off(name)
     elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
         _inkling_decode_graph_off(name)
+    elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
+        _inkling_grouped_moe_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

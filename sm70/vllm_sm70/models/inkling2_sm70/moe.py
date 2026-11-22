@@ -15,6 +15,14 @@ the sum over a token's experts in fp32, rounded once to the model dtype.
 The NVFP4 layers that ``moe_tm.rejection`` admits run on the TurboMind
 dense stage instead (moe_tm.py) and hold no fp16 expert weights;
 ``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer here.
+
+Switch: the layers held in the model dtype take ``ops/grouped_gemm.py``
+(no host sync at any batch size, one Triton GEMV launch per projection for
+the slots outside the per-expert capacity) unless
+VLLM_SM70_INKLING_GROUPED_MOE=0, which sends them back to the torch expert
+sum below. Tensors off the GPU take the torch expert sum, except in
+Triton's interpreter. The switch is read on every eager call; a replayed
+CUDA graph keeps the route it was captured with.
 """
 
 from __future__ import annotations
@@ -26,9 +34,22 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from vllm_sm70 import envs
+
 from . import act_quant, moe_tm
 from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
-from .ops import torch_ref
+from .ops import _compat, grouped_gemm, torch_ref
+
+SWITCH = "VLLM_SM70_INKLING_GROUPED_MOE"
+_enabled = envs.environment_variables()[SWITCH]
+
+
+def on_grouped(x: torch.Tensor) -> bool:
+    """Whether the experts held in the model dtype run on `x` through
+    ops/grouped_gemm.py with its Triton kernels."""
+    if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
+        return False
+    return _enabled()
 
 
 def _text_config(config: Any) -> Any:
@@ -207,13 +228,19 @@ class Inkling2Sm70Experts(nn.Module):
 
         top_k_index, top_k_weights [M, k] as `route` returns them; ids outside
         0..E-1 select no expert. `rowwise`: the torch path sums each token
-        on its own, without a host sync.
+        on its own, without a host sync; the other routes never sync.
         """
         x = act_quant.apply(self.act_quant, x)
         if self.tm_route is not None:
             self.tm_route.expert_sum(
                 x, top_k_index, top_k_weights, output, self.act_quant
             )
+            return
+        if on_grouped(x):
+            grouped_gemm.grouped_expert_sum(
+                x, top_k_index, top_k_weights, self.w13, self.w2,
+                self.gate_cap, self.up_cap, output, act_hook=self.act_quant,
+            )  # fmt: skip
             return
         self.torch_expert_sum(x, top_k_index, top_k_weights, output, rowwise)
 

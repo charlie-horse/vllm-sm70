@@ -2,10 +2,11 @@
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
-norm.py, attn_res.py, loop.py) goes through Triton's compiler and ptxas for
-GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
-128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps), with the constexprs and
-launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
+norm.py, attn_res.py, loop.py, activation.py, grouped_gemm.py) goes through
+Triton's compiler and ptxas for GPUTarget("cuda", 70, 32) at Inkling 2 Mini
+sizes (hidden 2304, head dim 128, 12 query and 4 KV heads per rank at TP2,
+KV block 32, 4 conv taps, expert intermediate 576 per rank), with the
+constexprs and launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
 This catches what the interpreter tests cannot: Triton's constexpr and
 static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
 """
@@ -306,5 +307,48 @@ def test_loop_kernels():
             "BLOCK": 4096,
         },
         num_warps=8,
+        enable_fp_fusion=False,
+    )
+
+
+# --- activation.py, grouped_gemm.py -------------------------------------------------
+
+LOCAL_INTERMEDIATE = 576  # per rank at TP2
+
+
+def test_softcapped_swiglu_kernel():
+    _check(
+        _ops("activation")._softcapped_swiglu_kernel,
+        {
+            "gate_up_ptr": "*fp16",
+            "out_ptr": "*fp16",
+            **_i32("stride_g", "stride_o", "units"),
+            "gate_cap": "fp32",
+            "up_cap": "fp32",
+            "BLOCK": 1024,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_div", "k_in"), [(8, HIDDEN), (1, LOCAL_INTERMEDIATE)], ids=["w13", "w2"]
+)
+def test_slot_gemv_kernel(row_div, k_in):
+    grouped_gemm = _ops("grouped_gemm")
+    _check(
+        grouped_gemm._slot_gemv_kernel,
+        {
+            "in_ptr": "*fp16",
+            "w_ptr": "*fp16",
+            "out_ptr": "*fp16",
+            "expert_ptr": "*i32",
+            **_i32(
+                "stride_in", "stride_we", "stride_wn", "stride_out", "n_out", "k_in"
+            ),
+            "ROW_DIV": row_div,
+            "BLOCK_N": grouped_gemm.BLOCK_N,
+            "BLOCK_K": grouped_gemm.BLOCK_K,
+        },
         enable_fp_fusion=False,
     )
