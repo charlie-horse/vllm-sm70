@@ -186,12 +186,10 @@ def test_models_area_calls_inkling2_beside_flint(monkeypatch):
     assert calls == ["flint", "inkling2", "qwen"]
 
 
-def test_stub_model_refuses_construction():
+def test_model_class_is_the_lazy_target():
     cls = inkling2_sm70.Inkling2LoopSm70ForConditionalGeneration
     assert cls.__name__ == inkling2_sm70.ARCH
     assert inkling2_sm70.LAZY_TARGET == f"{cls.__module__.rpartition('.')[0]}:{cls.__name__}"
-    with pytest.raises(NotImplementedError, match="no model body"):
-        cls(vllm_config=None, prefix="")
     with pytest.raises(AttributeError):
         inkling2_sm70.NoSuchName  # noqa: B018
 
