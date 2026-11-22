@@ -126,10 +126,17 @@ class PagedVisit:
             pages.table[target] = shared
         self.lengths[target] = prefix
 
-    def batch(self, parts: list[tuple[int, int]], pad_tokens: int = 0):
+    def batch(
+        self,
+        parts: list[tuple[int, int]],
+        pad_tokens: int = 0,
+        pad_metadata: bool = True,
+    ):
         """Schedule `count` new tokens of each (request, count). Returns the
         metadata per owner name and the (request, first position, count) of
-        each batch row range."""
+        each batch row range. `pad_tokens` rows follow the batch; the slot
+        mapping covers them (-1) with `pad_metadata`, as in a FULL graph, and
+        ends at the scheduled tokens without it."""
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
         rows = []
@@ -143,6 +150,7 @@ class PagedVisit:
         qsl = torch.tensor(starts, dtype=torch.int32)
         seq_lens = torch.tensor([s + c for _, s, c in rows], dtype=torch.int32)
         metadata = {}
+        seen_pad = pad_tokens if pad_metadata else 0
         for pages in (self.attn_pages, self.conv_pages):
             slots = []
             for seq, start, count in rows:
@@ -158,11 +166,11 @@ class PagedVisit:
                 query_start_loc_cpu=qsl,
                 seq_lens=seq_lens,
                 num_reqs=len(rows),
-                num_actual_tokens=starts[-1] + pad_tokens,
+                num_actual_tokens=starts[-1] + seen_pad,
                 max_query_len=max(c for _, _, c in rows),
                 max_seq_len=int(seq_lens.max()),
                 block_table_tensor=torch.tensor(table, dtype=torch.int32),
-                slot_mapping=torch.tensor(slots + [-1] * pad_tokens, dtype=torch.int64),
+                slot_mapping=torch.tensor(slots + [-1] * seen_pad, dtype=torch.int64),
                 seq_lens_cpu_upper_bound=seq_lens.clone(),
             )
             metadata[pages.owner.prefix] = pages.builder.build(0, common)

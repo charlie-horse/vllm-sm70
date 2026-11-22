@@ -199,7 +199,16 @@ def _rows(x: torch.Tensor, rows, pad: int) -> torch.Tensor:
 
 
 def _run_prologue(
-    layer, steps, inputs, *, tp=1, rank=0, pad=0, weights=None, whole=False
+    layer,
+    steps,
+    inputs,
+    *,
+    tp=1,
+    rank=0,
+    pad=0,
+    pad_metadata=True,
+    weights=None,
+    whole=False,
 ):
     """Run the prologue over `steps`. Returns the visit and per request the
     q_out and rel_out rows by position. `whole` projects each request's whole
@@ -232,7 +241,7 @@ def _run_prologue(
         if step[0] == "fork":
             visit.fork(*step[1:])
             continue
-        metadata, rows = visit.batch(step[1], pad_tokens=pad)
+        metadata, rows = visit.batch(step[1], pad_tokens=pad, pad_metadata=pad_metadata)
         x_q, x_k, x_v = (
             _rows({s: x[i] for s, x in inputs.items()}, rows, pad) for i in range(3)
         )
@@ -261,6 +270,8 @@ def _run_prologue(
                 eps=config.rms_norm_eps,
                 log_scaling=log_scaling,
             )  # fmt: skip
+        if pad:
+            assert not q_out[-pad:].any() and not rel_out[-pad:].any()
         row = 0
         for seq, start, count in rows:
             for i in range(count):
@@ -282,13 +293,20 @@ def _scheduled(steps) -> dict[int, int]:
     return first
 
 
-def _check_prologue(layer, steps, *, tp=1, rank=0, pad=0):
+def _check_prologue(layer, steps, *, tp=1, rank=0, pad=0, pad_metadata=True):
     from vllm_sm70.models.inkling2_sm70.cache import STREAM_K, STREAM_V
 
     inputs = _inputs(layer)
     weights = _weights(layer)
     visit, out = _run_prologue(
-        layer, steps, inputs, tp=tp, rank=rank, pad=pad, weights=weights
+        layer,
+        steps,
+        inputs,
+        tp=tp,
+        rank=rank,
+        pad=pad,
+        pad_metadata=pad_metadata,
+        weights=weights,
     )
     kv_heads = visit.attn.num_kv_heads * tp
     for seq, first in _scheduled(steps).items():
@@ -329,8 +347,9 @@ def test_prologue_matches_dense_reference(layer, scenario):
 
 
 @LAYERS
-def test_prologue_skips_padding_tokens(layer):
-    _check_prologue(layer, SCENARIOS["interleaved"], pad=2)
+@pytest.mark.parametrize("pad_metadata", [True, False])
+def test_prologue_skips_padding_tokens(layer, pad_metadata):
+    _check_prologue(layer, SCENARIOS["interleaved"], pad=2, pad_metadata=pad_metadata)
 
 
 @LAYERS
@@ -341,8 +360,9 @@ def test_prologue_tp2_rank_is_a_head_slice(layer, rank):
 
 
 @SCENARIO
+@pytest.mark.parametrize("pad_metadata", [True, False])
 @pytest.mark.parametrize("stream_name", ["STREAM_ATTN", "STREAM_MLP"])
-def test_short_conv_matches_dense_reference(scenario, stream_name):
+def test_short_conv_matches_dense_reference(scenario, stream_name, pad_metadata):
     """The post-attention and post-MLP convs over the hidden-wide streams."""
     from vllm_sm70.models.inkling2_sm70 import cache, sconv
     from vllm_sm70.models.inkling2_sm70.ops import torch_ref
@@ -358,7 +378,7 @@ def test_short_conv_matches_dense_reference(scenario, stream_name):
         if step[0] == "fork":
             visit.fork(*step[1:])
             continue
-        metadata, rows = visit.batch(step[1], pad_tokens=1)
+        metadata, rows = visit.batch(step[1], pad_tokens=1, pad_metadata=pad_metadata)
         x = _rows(inputs, rows, 1)
         out = torch.full_like(x, float("nan"))
         with visit.forward(metadata):
@@ -368,8 +388,8 @@ def test_short_conv_matches_dense_reference(scenario, stream_name):
             for i in range(count):
                 got[seq][start + i] = out[row]
                 row += 1
-        # A padding row has no taps: the scaled residual.
-        torch.testing.assert_close(out[-1], x[-1] / 5**0.5)
+        # A row after the scheduled tokens is zero.
+        assert not out[-1].any()
     for seq, first in _scheduled(steps).items():
         length = visit.lengths[seq]
         want = torch_ref.static_conv(inputs[seq][None, :length], weight)[0]
@@ -547,3 +567,64 @@ def test_fp16_caches_round_like_the_reference(layer):
     assert got_key.dtype == torch.float16
     torch.testing.assert_close(got_key, key, rtol=0, atol=2e-3)
     torch.testing.assert_close(got_value, value, rtol=0, atol=2e-3)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_non_finite_row_of_another_request_stays_out_of_the_taps(dynamic):
+    """Request 1 starts in the batch row after request 0's row, which holds
+    inf: its first token has no taps, and its output stays finite."""
+    from vllm_sm70.models.inkling2_sm70 import cache, sconv
+
+    visit = PagedVisit(SLIDING)
+    conv = visit.conv
+    stream = conv.stream_ranges[cache.STREAM_ATTN]
+    metadata, _ = visit.batch([(0, 1), (1, 1)])
+    md = metadata[conv.prefix]
+    gen = torch.Generator().manual_seed(5)
+    x = torch.randn(2, HIDDEN, generator=gen)
+    x[0, 3] = float("inf")
+    if dynamic:
+        heads = conv.kv_cache.shape[1]
+        weight = torch.randn(4, HIDDEN, generator=gen)
+        taps = torch.randn(2, heads * 4, generator=gen)
+        y = sconv.dynamic_conv(x, weight, taps, conv.kv_cache, md, stream)
+        want = (
+            x[1]
+            / 9**0.5
+            * (
+                1
+                + weight[0]
+                + taps[1].view(heads, 4)[:, 0].repeat_interleave(HIDDEN // heads)
+            )
+        )
+    else:
+        weight = torch.randn(HIDDEN, 4, generator=gen)
+        y = sconv.static_conv(x, weight, conv.kv_cache, md, stream)
+        want = x[1] * (1 + weight[:, 3]) / 5**0.5
+    assert torch.isfinite(y[1]).all()
+    torch.testing.assert_close(y[1], want, rtol=0, atol=TOL)
+
+
+def test_ops_refuse_a_cache_with_another_block_size(monkeypatch):
+    from vllm_sm70.models.inkling2_sm70 import cache, sconv
+
+    visit = PagedVisit(SLIDING)
+    conv = visit.conv
+    stream = conv.stream_ranges[cache.STREAM_ATTN]
+    metadata, _ = visit.batch([(0, 3)])
+    md = metadata[conv.prefix]
+    md.block_size += 1
+    x = torch.zeros(3, HIDDEN)
+    with pytest.raises(ValueError, match="conv-state blocks hold"):
+        sconv.static_conv(x, torch.zeros(HIDDEN, 4), conv.kv_cache, md, stream)
+
+    batch = PagedVisit.batch
+
+    def tampered(self, *args, **kwargs):
+        metadata, rows = batch(self, *args, **kwargs)
+        metadata[self.attn.prefix].block_size += 1
+        return metadata, rows
+
+    monkeypatch.setattr(PagedVisit, "batch", tampered)
+    with pytest.raises(ValueError, match="K/V cache blocks hold"):
+        _run_prologue(SLIDING, [("batch", [(0, 3)])], _inputs(SLIDING))

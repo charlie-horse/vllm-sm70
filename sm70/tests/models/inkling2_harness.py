@@ -26,6 +26,12 @@ Fidelity:
   Sliding-window owners lose the blocks before the window at the start of a
   step, as upstream's SlidingWindowManager frees them.
 - Requests of one token come first in a batch.
+- A padded step gives the builders what the v0.33 runner gives them
+  (v1/worker/gpu_model_runner.py ``_build_attention_metadata``). `metadata`
+  "full", a FULL graph: padded slot mapping (-1), positions and request rows,
+  and the padded count as ``num_actual_tokens``. `metadata` "unpadded", a
+  PIECEWISE graph: slot mapping, positions and request rows of the scheduled
+  tokens only. The batch tensors (`HarnessBatch`) are padded in both.
 - At TP > 1 the ranks run in lockstep and `all_reduce` / `all_gather` of the
   TP group combine their tensors.
 """
@@ -576,6 +582,7 @@ class PagedHarness:
         *,
         pad_tokens: int = 0,
         pad_reqs: int = 0,
+        metadata: str = "full",
         tamper: Callable[[int, dict[str, Any]], None] | None = None,
     ) -> list[Any]:
         """Compute the next `n` tokens of every scheduled request and return
@@ -583,12 +590,16 @@ class PagedHarness:
 
         pad_tokens, pad_reqs: padding tokens (slot -1) and empty requests
             appended to the batch.
+        metadata: "full" or "unpadded", what the builders see of the padding
+            (module docstring).
         tamper: called with (rank, owner name -> metadata) before the
             forward, to inject faults.
         """
         from vllm.forward_context import ForwardContext
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
+        if metadata not in ("full", "unpadded"):
+            raise ValueError(f"unknown metadata mode {metadata!r}")
         pairs = _pairs(schedule)
         if not pairs or any(count < 1 for _, count in pairs):
             raise ValueError("a step schedules at least one token per request")
@@ -645,19 +656,26 @@ class PagedHarness:
             block_tables[name] = torch.from_numpy(block_table)
             slot_mappings[name] = torch.from_numpy(slots)
 
+        seen_reqs, seen_tokens = num_reqs + pad_reqs, num_padded
+        if metadata == "unpadded":
+            seen_reqs, seen_tokens = num_reqs, num_tokens
+            for name in block_tables:
+                block_tables[name] = block_tables[name][:num_reqs]
+                slot_mappings[name] = slot_mappings[name][:num_tokens]
+
         def common(name: str) -> CommonAttentionMetadata:
             return CommonAttentionMetadata(
-                query_start_loc=query_start_loc.clone(),
-                query_start_loc_cpu=query_start_loc,
-                seq_lens=seq_lens,
-                num_reqs=num_reqs + pad_reqs,
-                num_actual_tokens=num_padded,
+                query_start_loc=query_start_loc[: seen_reqs + 1].clone(),
+                query_start_loc_cpu=query_start_loc[: seen_reqs + 1],
+                seq_lens=seq_lens[:seen_reqs],
+                num_reqs=seen_reqs,
+                num_actual_tokens=seen_tokens,
                 max_query_len=max(counts),
                 max_seq_len=int(seq_lens.max()),
                 block_table_tensor=block_tables[name],
                 slot_mapping=slot_mappings[name],
-                seq_lens_cpu_upper_bound=seq_lens.clone(),
-                positions=positions,
+                seq_lens_cpu_upper_bound=seq_lens[:seen_reqs].clone(),
+                positions=positions[:seen_tokens],
             )
 
         # As the runner: one build per builder, then a block-table update

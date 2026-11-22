@@ -113,10 +113,10 @@ class Engine:
         for req_id in list(self.harness.requests):
             self.harness.free_request(req_id)
 
-    def run(self, plan, sequences) -> dict[str, torch.Tensor]:
+    def run(self, plan, sequences, **step_kwargs) -> dict[str, torch.Tensor]:
         self.reset()
         self.sequences = sequences
-        return self.harness.run(plan, self.forward)
+        return self.harness.run(plan, self.forward, **step_kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -214,11 +214,21 @@ def test_embed_input_ids_applies_embed_norm(engine, oracle, sequences):
 SCENARIOS = ("prefill", "decode", "chunk1", "chunk3", "chunk7", "resume", "interleaved")
 
 
+# Every step padded as a graph capture size is: metadata of a FULL graph and
+# of a PIECEWISE graph (inkling2_harness.py).
+PADDING = {
+    "exact": {},
+    "full": {"pad_tokens": 3, "pad_reqs": 1, "metadata": "full"},
+    "unpadded": {"pad_tokens": 3, "pad_reqs": 1, "metadata": "unpadded"},
+}
+
+
+@pytest.mark.parametrize("padding", PADDING)
 @pytest.mark.parametrize("name", SCENARIOS)
-def test_visits_and_logits_match_oracle(engine, sequences, expected, name):
+def test_visits_and_logits_match_oracle(engine, sequences, expected, name, padding):
     plans = hx.scenarios(LEN_A, LEN_B, prefix_len=PREFIX)
     assert PREFIX % engine.harness.prefix_alignment == 0
-    got = engine.run(plans[name], sequences)
+    got = engine.run(plans[name], sequences, **PADDING[padding])
     assert got, name
     for req_id, rows in got.items():
         first = PREFIX if (name, req_id) == ("resume", "b") else 0
@@ -232,8 +242,9 @@ def test_visits_and_logits_match_oracle(engine, sequences, expected, name):
         assert got["a"].shape[0] == LEN_A
 
 
+@pytest.mark.parametrize("metadata", ["full", "unpadded"])
 def test_padding_tokens_and_requests_do_not_change_real_rows(
-    engine, sequences, expected
+    engine, sequences, expected, metadata
 ):
     engine.reset()
     engine.sequences = sequences
@@ -242,9 +253,14 @@ def test_padding_tokens_and_requests_do_not_change_real_rows(
     harness.add_request("b")
     rows = {"a": [], "b": []}
     for schedule in ([("a", 5), ("b", 3)], [("a", 1), ("b", 1)], [("a", 4), ("b", 1)]):
-        out = harness.step(schedule, engine.forward, pad_tokens=3, pad_reqs=1)[0]
+        out = harness.step(
+            schedule, engine.forward, pad_tokens=3, pad_reqs=1, metadata=metadata
+        )[0]
         assert out.shape[0] == harness.batch.num_padded
         assert torch.isfinite(out).all()
+        num_tokens = harness.batch.num_tokens
+        slots = harness.metadata[0]["model.layers.0.attn"].slot_mapping
+        assert slots.shape[0] == num_tokens + (3 if metadata == "full" else 0)
         for req_id, part in harness.batch.split(out).items():
             rows[req_id].append(part)
     for req_id, parts in rows.items():
@@ -393,14 +409,34 @@ def test_no_dump_hook_by_default(engine):
 
 
 def test_fp16_model_loads_and_runs(sequences):
+    """With the reference's softmax-weight rounding (`hf_rounding`), the fp16
+    model is bit-equal to the fp16 oracle in a prefill: every visit, the
+    final state and the logits."""
     engine = Engine(torch.float16)
     for name, param in engine.model.named_parameters():
         spec = engine.model.model.weight_map.params[name]
         assert param.dtype == spec.dtype, name
     assert engine.model.lm_head.weight.dtype == torch.float16
+    ids = sequences["a"]
+    ref = Inkling2Oracle.from_checkpoint(TINY, dtype=torch.float16).forward(ids[None])
+    want = torch.cat(
+        [
+            ref.visit_states[:, 0].transpose(0, 1).flatten(1).float(),
+            ref.final_hidden_state[0].float(),
+            ref.logits[0].float(),
+        ],
+        dim=1,
+    )
+    for layer in engine.model.model.layers:
+        layer.attn.hf_rounding = True
+    for padding in PADDING.values():
+        got = engine.run(hx.prefill_plan("a", LEN_A), sequences, **padding)["a"]
+        assert engine.states[0].dtype == torch.float16
+        assert torch.equal(got, want)
+    for layer in engine.model.model.layers:
+        layer.attn.hf_rounding = False
     got = engine.run(hx.decode_plan("a", 12, 9), sequences)["a"]
     assert got.shape[0] == 12 and torch.isfinite(got).all()
-    assert engine.states[0].dtype == torch.float16
     cap = engine.model.text_config.final_logit_softcapping
     assert got[:, -engine.model.lm_head.weight.shape[0] :].abs().max() <= cap
 

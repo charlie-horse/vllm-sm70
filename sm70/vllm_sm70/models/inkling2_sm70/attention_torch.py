@@ -18,7 +18,22 @@ Keys are gathered through the block table in steps of at most `key_chunk`
 key tokens and folded into a running fp32 softmax, so memory does not grow
 with the context. A request with more than one query shares one key range
 per `query_chunk` queries (a sliding layer reads the window only); requests
-with one query are batched with a key range each.
+with one query are batched with a key range each, `OWN_KEY_STEPS *
+key_chunk` gathered keys per step.
+
+Transient memory of one step, beside the op's inputs and output:
+
+    scores  at most 4 live tensors of query_chunk * key_chunk * heads fp32
+            values: 4 * 4 B * 256 * 1024 * 24 = 101 MB at the defaults with
+            the 24 heads of an Inkling 2 Mini global layer
+    K | V   the gathered keys in the cache dtype and the values in fp32,
+            kv_heads * D * 8 B per key: 8 MB for key_chunk keys of a request
+            with several queries, 67 MB for the single-query requests
+
+`hf_rounding` is a debug switch: the softmax of all keys runs in one step and
+its weights are rounded to the value dtype before they multiply V, as the
+reference does (transformers modeling_inkling2_loop.py). Memory then grows
+with the context.
 
 Shapes: P padded batch tokens, T real tokens, R requests, D head dim.
 """
@@ -38,6 +53,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_KEY_CHUNK",
     "DEFAULT_QUERY_CHUNK",
+    "OWN_KEY_STEPS",
     "attention_with_metadata",
     "gate_and_project",
     "gather_attention",
@@ -46,7 +62,11 @@ __all__ = [
 ]
 
 DEFAULT_QUERY_CHUNK = 256
-DEFAULT_KEY_CHUNK = 8192
+DEFAULT_KEY_CHUNK = 1024
+# Single-query requests gather this many key chunks per step between them.
+OWN_KEY_STEPS = 8
+# Key chunk of `hf_rounding`: every key in one step.
+_ALL_KEYS = 1 << 62
 
 
 def kv_cache_views(
@@ -65,14 +85,23 @@ def kv_cache_views(
 
 class _Softmax:
     """Running softmax of a set of queries over key steps, in fp32. It starts
-    at the sink column, whose value is zero."""
+    at the sink column, whose value is zero. With `hf_rounding` it takes one
+    step and rounds the weights to the value dtype."""
 
-    def __init__(self, query: torch.Tensor, sinks: torch.Tensor, groups: int) -> None:
+    def __init__(
+        self,
+        query: torch.Tensor,
+        sinks: torch.Tensor,
+        groups: int,
+        hf_rounding: bool = False,
+    ) -> None:
         # query [B, heads, Q, D] -> [B, kv_heads, groups * Q, D]
         self.groups = groups
         self.num_queries = query.shape[2]
         self.query = query.unflatten(1, (-1, groups)).flatten(2, 3)
         self.scaling = query.shape[-1] ** -0.5
+        self.hf_rounding = hf_rounding
+        self.exact: torch.Tensor | None = None
         self.peak = sinks.float()  # [B, heads, Q]
         self.total = torch.ones_like(self.peak)
         self.acc = self.peak.new_zeros((*self.peak.shape, query.shape[-1]))
@@ -88,9 +117,20 @@ class _Softmax:
         [B, heads, Q, N]; allowed bool, broadcastable to the bias."""
         scores = torch.matmul(self.query, key.transpose(2, 3)) * self.scaling
         scores = scores.unflatten(2, (self.groups, self.num_queries)).flatten(1, 2)
-        scores = (scores + bias).float().masked_fill(~allowed, float("-inf"))
+        scores = (scores + bias).float().masked_fill_(~allowed, float("-inf"))
+        if self.hf_rounding:
+            if self.exact is not None:
+                raise ValueError("vllm_sm70: hf_rounding takes one key step.")
+            full = torch.cat([scores, self.peak.unsqueeze(-1)], dim=-1)
+            weights = torch.softmax(full, dim=-1)[..., :-1].to(value.dtype)
+            exact = torch.matmul(
+                weights.unflatten(1, (-1, self.groups)).flatten(2, 3), value
+            )
+            exact = exact.unflatten(2, (self.groups, self.num_queries))
+            self.exact = exact.flatten(1, 2)
+            return
         peak = torch.maximum(self.peak, scores.amax(-1))
-        probs = torch.exp(scores - peak.unsqueeze(-1))
+        probs = scores.sub_(peak.unsqueeze(-1)).exp_()
         carry = torch.exp(self.peak - peak)
         weighted = torch.matmul(
             probs.unflatten(1, (-1, self.groups)).flatten(2, 3), value.float()
@@ -102,6 +142,8 @@ class _Softmax:
 
     def result(self) -> torch.Tensor:
         """[B, heads, Q, D], fp32."""
+        if self.exact is not None:
+            return self.exact.float()
         return self.acc / self.total.unsqueeze(-1)
 
 
@@ -119,6 +161,7 @@ def _shared_keys(
     first_position: int,
     query_chunk: int,
     key_chunk: int,
+    hf_rounding: bool = False,
 ) -> None:
     """Batch tokens [start, stop) of one request: each query chunk reads one
     key range, from the first key any of its queries may see to its last
@@ -137,6 +180,7 @@ def _shared_keys(
             query[lo:hi].transpose(0, 1).unsqueeze(0),
             sinks[lo:hi].t().unsqueeze(0),
             groups,
+            hf_rounding,
         )
         bias_rows = rel_logits[lo:hi]
         key_stop = first_position + hi - start
@@ -176,6 +220,7 @@ def _own_keys(
     tokens: torch.Tensor,
     max_seq_len: int,
     key_chunk: int,
+    hf_rounding: bool = False,
 ) -> None:
     """Batch tokens `tokens`, one per request: each query reads its own keys,
     newest first, so key column j is at distance j."""
@@ -187,12 +232,14 @@ def _own_keys(
     if md.sliding_window is not None:
         num_keys = min(num_keys, md.sliding_window)
     step = min(num_keys, key_chunk)
-    rows_per_step = max(1, key_chunk // max(step, 1))
+    rows_per_step = max(1, OWN_KEY_STEPS * key_chunk // max(step, 1))
     for row in range(0, tokens.shape[0], rows_per_step):
         chunk = tokens[row : row + rows_per_step]
         positions = md.positions[chunk].unsqueeze(1)
         requests = md.seq_idx[chunk].long().unsqueeze(1)
-        state = _Softmax(query[chunk].unsqueeze(2), sinks[chunk].unsqueeze(2), groups)
+        state = _Softmax(
+            query[chunk].unsqueeze(2), sinks[chunk].unsqueeze(2), groups, hf_rounding
+        )
         bias_rows = rel_logits[chunk]
         for j0 in range(0, num_keys, step):
             j1 = min(j0 + step, num_keys)
@@ -227,6 +274,7 @@ def gather_attention(
     *,
     query_chunk: int = DEFAULT_QUERY_CHUNK,
     key_chunk: int = DEFAULT_KEY_CHUNK,
+    hf_rounding: bool = False,
 ) -> torch.Tensor:
     """Attention output before the gate, written to `out` [P, heads, D].
 
@@ -244,6 +292,13 @@ def gather_attention(
             f"vllm_sm70: K/V cache {tuple(kv_cache.shape)} does not fit "
             f"{heads} query heads of size {head_dim}."
         )
+    if kv_cache.shape[2] != md.block_size:
+        raise ValueError(
+            f"vllm_sm70: K/V cache blocks hold {kv_cache.shape[2]} tokens, "
+            f"the metadata has block size {md.block_size}."
+        )
+    if hf_rounding:
+        key_chunk = _ALL_KEYS
     num_tokens = md.num_actual_tokens
     out[num_tokens:] = 0
     query_lens = np.asarray(md.query_lens_cpu[: md.num_reqs])
@@ -261,6 +316,7 @@ def gather_attention(
             tokens=torch.as_tensor(starts[single], device=query.device),
             max_seq_len=int(seq_lens[single].max()),
             key_chunk=key_chunk,
+            hf_rounding=hf_rounding,
         )
     for request in np.flatnonzero(query_lens > 1).tolist():
         start, stop = int(starts[request]), int(starts[request + 1])
@@ -277,6 +333,7 @@ def gather_attention(
             first_position=int(seq_lens[request]) - (stop - start),
             query_chunk=query_chunk,
             key_chunk=key_chunk,
+            hf_rounding=hf_rounding,
         )
     return out
 
@@ -314,10 +371,12 @@ def attention_with_metadata(
     *,
     query_chunk: int = DEFAULT_QUERY_CHUNK,
     key_chunk: int = DEFAULT_KEY_CHUNK,
+    hf_rounding: bool = False,
 ) -> torch.Tensor:
     """One attention layer visit over `kv_cache` and its metadata, written to
     `output`. Arguments as `paged_attention`. Without metadata or a bound
-    cache the output is zero."""
+    cache the output is zero. `hf_rounding` (debug): one key step with the
+    softmax weights rounded to the value dtype."""
     if md is None or kv_cache.numel() == 0:
         return output.zero_()
     attn_output = gather_attention(
@@ -329,6 +388,7 @@ def attention_with_metadata(
         query.new_empty(query.shape),
         query_chunk=query_chunk,
         key_chunk=key_chunk,
+        hf_rounding=hf_rounding,
     )
     return gate_and_project(attn_output, gate, output, out_weight)
 
@@ -344,6 +404,7 @@ def paged_attention(
     out_weight: torch.Tensor | None = None,
     query_chunk: int = DEFAULT_QUERY_CHUNK,
     key_chunk: int = DEFAULT_KEY_CHUNK,
+    hf_rounding: bool = False,
 ) -> None:
     """One attention layer visit of the cache owner `owner`, written to
     `output`. The metadata is the current forward's, read on every call.
@@ -367,4 +428,5 @@ def paged_attention(
         out_weight,
         query_chunk=query_chunk,
         key_chunk=key_chunk,
+        hf_rounding=hf_rounding,
     )

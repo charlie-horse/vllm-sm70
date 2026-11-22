@@ -16,9 +16,13 @@ position. One call convolves the tokens of a batch and stores their inputs:
 
 The sums run in fp32; `y` is rounded to the dtype of `x`. Taps are read
 before the batch is stored. Tap rule as upstream's Triton kernels
-(UP models/inkling2/nvidia/ops/sconv.py ``_tap_sum``).
+(UP models/inkling2/nvidia/ops/sconv.py ``_tap_sum``). A tap that is zero by
+the rule is selected, not multiplied, so a non-finite value of another
+request stays out of the sum.
 
 Shapes: T batch tokens (padded), C = heads * stream width channels, K taps.
+The metadata covers the first n = ``num_actual_tokens`` tokens (backend.py);
+the ops read those rows of `x` and return zero rows after them.
 """
 
 from __future__ import annotations
@@ -40,6 +44,40 @@ __all__ = [
 ]
 
 
+def _block_tokens(cache: torch.Tensor, metadata: Any) -> int:
+    """Tokens per cache block; the metadata's block table and slots must
+    count in the same blocks."""
+    if cache.shape[2] != metadata.block_size:
+        raise ValueError(
+            f"vllm_sm70: conv-state blocks hold {cache.shape[2]} tokens, the "
+            f"metadata has block size {metadata.block_size}."
+        )
+    return cache.shape[2]
+
+
+def _real_rows(x: torch.Tensor, metadata: Any) -> int:
+    """n: the batch tokens the metadata covers."""
+    num_tokens = metadata.num_actual_tokens
+    if not 0 <= num_tokens <= min(x.shape[0], metadata.slot_mapping.shape[0]):
+        raise ValueError(
+            f"vllm_sm70: metadata of {num_tokens} tokens "
+            f"({metadata.slot_mapping.shape[0]} slots) for {x.shape[0]} rows."
+        )
+    return num_tokens
+
+
+def _padded(y: torch.Tensor, x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+    """`y` [n, C] in rows [0, n) of `out` (new when None), zero after."""
+    num_tokens = y.shape[0]
+    if out is None:
+        if num_tokens == x.shape[0]:
+            return y
+        out = x.new_empty(x.shape)
+    out[:num_tokens] = y
+    out[num_tokens:] = 0
+    return out
+
+
 def conv_taps(
     x: torch.Tensor,
     kernel_size: int,
@@ -47,12 +85,13 @@ def conv_taps(
     metadata: Any,
     stream: tuple[int, int],
 ) -> list[torch.Tensor]:
-    """fp32 taps of `x` [T, C]: entry `lag` is the conv input `lag` tokens
-    back, [T, C]. `metadata` is the batch's ``Inkling2SconvMetadata``,
-    `stream` the (offset, width) of the stream inside a cache head."""
+    """fp32 taps of the real tokens `x` [n, C]: entry `lag` is the conv input
+    `lag` tokens back, [n, C]. `metadata` is the batch's
+    ``Inkling2SconvMetadata``, `stream` the (offset, width) of the stream
+    inside a cache head."""
     num_tokens, channels = x.shape
     offset, width = stream
-    block_tokens = cache.shape[2]
+    block_tokens = _block_tokens(cache, metadata)
     if channels != cache.shape[1] * width:
         raise ValueError(
             f"vllm_sm70: {channels} conv channels do not fill "
@@ -65,12 +104,13 @@ def conv_taps(
     block_table = metadata.block_table
     row = torch.arange(num_tokens, device=x.device)
     current = x.to(cache.dtype).float()
-    taps = [current * valid[:, None]]
+    zero = current.new_zeros(())
+    taps = [torch.where(valid[:, None], current, zero)]
     for lag in range(1, kernel_size):
         source = positions - lag
         inside = valid & (source >= 0)
         same_batch = inside & (row - lag >= query_start)
-        tap = current[(row - lag).clamp(min=0)] * same_batch[:, None]
+        tap = torch.where(same_batch[:, None], current[(row - lag).clamp(min=0)], zero)
         cached = (inside & ~same_batch).nonzero().squeeze(1)
         if cached.numel():
             source = source[cached]
@@ -86,10 +126,10 @@ def conv_taps(
 def store_taps(
     x: torch.Tensor, cache: torch.Tensor, metadata: Any, stream: tuple[int, int]
 ) -> None:
-    """Store the conv inputs `x` [T, C] at the tokens' cache slots; tokens
-    with a negative slot are skipped."""
+    """Store the conv inputs of the real tokens `x` [n, C] at their cache
+    slots; tokens with a negative slot are skipped."""
     offset, width = stream
-    block_tokens = cache.shape[2]
+    block_tokens = _block_tokens(cache, metadata)
     slots = metadata.slot_mapping[: x.shape[0]]
     rows = (slots >= 0).nonzero().squeeze(1)
     slots = slots[rows]
@@ -109,6 +149,7 @@ def static_conv(
     """Static conv of `x` [T, C] over one stream of the conv-state cache;
     stores `x`. weight [C, K] or [C, 1, K], oldest tap first. The result is
     written to `out` when given."""
+    full, x = x, x[: _real_rows(x, metadata)]
     weight = weight.float().reshape(weight.shape[0], -1)
     kernel_size = weight.shape[-1]
     taps = conv_taps(x, kernel_size, cache, metadata, stream)
@@ -117,7 +158,7 @@ def static_conv(
         acc = acc + taps[kernel_size - 1 - k] * weight[:, k]
     store_taps(x, cache, metadata, stream)
     y = ((acc + x.to(cache.dtype).float()) / math.sqrt(kernel_size + 1)).to(x.dtype)
-    return y if out is None else out.copy_(y)
+    return _padded(y, full, out)
 
 
 def dynamic_conv(
@@ -133,10 +174,12 @@ def dynamic_conv(
     stores `x`. static_weight [K, C] and dynamic_taps [T, heads, K] or
     [T, heads * K], newest tap first; a head's taps apply to its C / heads
     channels. The result is written to `out` when given."""
+    full, x = x, x[: _real_rows(x, metadata)]
     kernel_size, channels = static_weight.shape
     heads = cache.shape[1]
     static_weight = static_weight.float()
-    dynamic_taps = dynamic_taps.float().reshape(x.shape[0], heads, kernel_size)
+    dynamic_taps = dynamic_taps[: x.shape[0]].float()
+    dynamic_taps = dynamic_taps.reshape(x.shape[0], heads, kernel_size)
     taps = conv_taps(x, kernel_size, cache, metadata, stream)
     acc = None
     for lag in range(kernel_size):
@@ -146,8 +189,7 @@ def dynamic_conv(
         acc = taps[lag] * weight if acc is None else acc + taps[lag] * weight
     store_taps(x, cache, metadata, stream)
     y = (acc + x.to(cache.dtype).float()) / math.sqrt(2 * kernel_size + 1)
-    y = y.to(x.dtype)
-    return y if out is None else out.copy_(y)
+    return _padded(y.to(x.dtype), full, out)
 
 
 @eager_break_during_capture

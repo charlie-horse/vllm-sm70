@@ -50,6 +50,7 @@ __all__ = [
     "Inkling2Sm70MessageGate",
     "PARTIAL_SITES",
     "Weights",
+    "Bank",
     "all_reduce",
     "mix",
     "normed_state",
@@ -90,21 +91,57 @@ def normed_state(x: torch.Tensor) -> torch.Tensor:
     return rms_norm(x.float()).unsqueeze(-2)
 
 
-def mix(bank: torch.Tensor, partial: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
-    """AttnRes mix [T, Q, H] fp32 of the normed block states `bank`
-    [T, N, H] and the current state `partial` [T, H] by `query` [Q, H]."""
-    return attn_res_mix(torch.cat([bank, normed_state(partial)], dim=-2), query)
+class Bank:
+    """The normed block states of one forward, fp32, in one buffer
+    [T, capacity, H]: `count` states are kept and the slot after them is
+    scratch for the current state of a mix, so no visit copies the bank."""
+
+    def __init__(self, like: torch.Tensor, capacity: int) -> None:
+        num_tokens, hidden_size = like.shape
+        self.buffer = like.new_empty(
+            (num_tokens, capacity + 1, hidden_size), dtype=torch.float32
+        )
+        self.count = 0
+
+    def states(self, start: int = 0) -> torch.Tensor:
+        """[T, count - start, H]: the kept states from `start` on, a view."""
+        return self.buffer[:, start : self.count]
+
+    def with_state(self, x: torch.Tensor) -> torch.Tensor:
+        """[T, count + 1, H]: the kept states and the normed `x` [T, H], a
+        view that is valid until the next call or append."""
+        self.buffer[:, self.count] = rms_norm(x.float())
+        return self.buffer[:, : self.count + 1]
+
+    def append(self, x: torch.Tensor) -> None:
+        """Keep the normed `x` [T, H] as the next block state."""
+        self.with_state(x)
+        self.count += 1
+
+
+def mix(bank: Bank, partial: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """AttnRes mix [T, Q, H] fp32 of the block states of `bank` and the
+    current state `partial` [T, H] by `query` [Q, H]."""
+    return attn_res_mix(bank.with_state(partial), query)
 
 
 @eager_break_during_capture
 def padding_mask(owner: Any, out: torch.Tensor) -> None:
-    """Write into the bool `out` [T] which batch tokens are padding (no slot
-    in the cache of `owner`). All false in a forward without metadata."""
+    """Write into the bool `out` [T] which batch tokens are padding: the
+    rows after the metadata's ``num_actual_tokens`` and those with no slot
+    in the cache of `owner`. All false in a forward without metadata."""
     metadata = cache_metadata(owner)
     if metadata is None:
         out.zero_()
-    else:
-        out.copy_(metadata.slot_mapping[: out.shape[0]] < 0)
+        return
+    n = metadata.num_actual_tokens
+    if n > out.shape[0] or n > metadata.slot_mapping.shape[0]:
+        raise ValueError(
+            f"vllm_sm70: metadata of {n} tokens "
+            f"({metadata.slot_mapping.shape[0]} slots) for {out.shape[0]} rows."
+        )
+    out[:n] = metadata.slot_mapping[:n] < 0
+    out[n:] = True
 
 
 class Inkling2Sm70Attention(nn.Module):
@@ -121,6 +158,8 @@ class Inkling2Sm70Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.is_local = is_local
+        # Debug: softmax weights rounded as the reference (attention_torch.py).
+        self.hf_rounding = False
         self.sizes = qkvr_sizes(config, is_local, tp_size)
         self.num_heads = self.sizes[3]
         self.head_dim = self.sizes[0] // self.num_heads
@@ -191,7 +230,14 @@ class Inkling2Sm70Attention(nn.Module):
         )
         output = x_q.new_empty((num_tokens, self.hidden_size))
         paged_attention(
-            q_out, rel_out, sink, gate, attn_owner, output, self.wo_ud.weight
+            q_out,
+            rel_out,
+            sink,
+            gate,
+            attn_owner,
+            output,
+            self.wo_ud.weight,
+            hf_rounding=self.hf_rounding,
         )
         return output
 
@@ -258,7 +304,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
     def _attention_inputs(
         self,
         hidden: torch.Tensor,
-        bank: torch.Tensor,
+        bank: Bank,
         attn_query: torch.Tensor | None,
         messages: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -287,7 +333,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        bank: torch.Tensor,
+        bank: Bank,
         attn_query: torch.Tensor | None,
         mlp_query: torch.Tensor,
         messages: torch.Tensor | None,
@@ -295,15 +341,16 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         conv_owner: Any,
         is_padding: torch.Tensor,
         partial_hook: PartialHook | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """One visit of the layer over the caches of the visit's owners.
 
-        hidden [T, H]: the residual stream, model dtype. bank [T, N, H] fp32:
-        the normed block states, the same on every rank. attn_query [1 or 3, H], None in the first
-        layer; mlp_query [1, H]. messages [T, 4, H] fp32 in the order of
+        hidden [T, H]: the residual stream, model dtype. bank: the normed
+        block states, the same on every rank; a layer that starts a block
+        appends its input. attn_query [1 or 3, H], None in the first layer;
+        mlp_query [1, H]. messages [T, 4, H] fp32 in the order of
         ``MESSAGE_STREAMS``, None in a first pass. is_padding [T] bool.
         partial_hook gets this rank's o_proj and expert partials.
-        Returns the new residual stream and the bank.
+        Returns the new residual stream.
         """
         dtype = hidden.dtype
         x_q, x_k, x_v = self._attention_inputs(hidden, bank, attn_query, messages)
@@ -315,7 +362,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         short_conv(attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out)
         # A block boundary restarts the residual from the attention output.
         if self.starts_block:
-            bank = torch.cat([bank, normed_state(hidden)], dim=-2)
+            bank.append(hidden)
             residual = attn_out.float()
         else:
             residual = hidden.float() + attn_out.float()
@@ -331,7 +378,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         expert_sum = all_reduce(partial, self.tp_size)
         mlp_out = expert_sum.new_empty(expert_sum.shape)
         short_conv(expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out)
-        return (residual + mlp_out).to(dtype), bank
+        return (residual + mlp_out).to(dtype)
 
 
 class Inkling2Sm70AttnRes(nn.Module):

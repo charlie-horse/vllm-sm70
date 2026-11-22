@@ -14,6 +14,12 @@
 * KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), no async
   scheduling (turned off when unset: it doubles the conv and sliding-window
   admission caps), the KV cache in the model dtype, no pipeline parallelism.
+* CUDA graphs: PIECEWISE when ``cudagraph_mode`` is unset; a mode with FULL
+  graphs is refused. A FULL capture runs the model's eager-break ops inline
+  (UP compilation/breakable_cudagraph.py ``eager_break_during_capture``) and
+  would freeze the batch they branch on. UP applies its default,
+  FULL_AND_PIECEWISE, after this hook and only to an unset mode
+  (UP config/vllm.py ``_apply_optimization_level_defaults``).
 * Copies ``sm70.inkling2.max_image_encoder_tokens`` onto the model's
   ``hf_config``, where the image processor reads it (processing.py).
 * Logs the routes once per process.
@@ -58,6 +64,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         """Raises ValueError for an engine this model can't serve."""
         import torch
 
+        from vllm.config.compilation import CUDAGraphMode
         from vllm.platforms import current_platform
         from vllm_sm70.config import sm70_config
 
@@ -125,6 +132,17 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 "flight doubles the per-request KV reservation."
             )
         scheduler_config.async_scheduling = False
+        compilation_config = vllm_config.compilation_config
+        cudagraph_mode = compilation_config.cudagraph_mode
+        if cudagraph_mode is None:
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        elif cudagraph_mode.has_full_cudagraphs():
+            raise ValueError(
+                f"{ARCH} runs its attention and conv ops as eager breaks of "
+                f"PIECEWISE CUDA graphs, got cudagraph_mode "
+                f"{cudagraph_mode.name}; use -cc.cudagraph_mode=piecewise or "
+                "none."
+            )
         inkling2 = sm70_config(vllm_config).inkling2
         hf_config = getattr(model_config, "hf_config", None)
         if hf_config is not None:

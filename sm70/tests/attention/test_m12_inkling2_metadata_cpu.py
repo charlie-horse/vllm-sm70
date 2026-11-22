@@ -180,7 +180,7 @@ def test_builder_flags(built):
         assert builder.supports_update_block_table is True
         spec = owner.get_kv_cache_spec(owner_config)
         assert type(builder).get_cudagraph_support(None, spec) is (
-            AttentionCGSupport.UNIFORM_BATCH
+            AttentionCGSupport.NEVER
         )
 
 

@@ -109,8 +109,8 @@ def store_key_value(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Store `key`, `value` [T, kv_heads, D] at the tokens' slots of the K/V
-    cache; tokens with a negative slot are skipped."""
+    """Store `key`, `value` [n, kv_heads, D] of the real tokens at their
+    slots of the K/V cache; tokens with a negative slot are skipped."""
     block_tokens = kv_cache.shape[2]
     head_dim = key.shape[-1]
     slots = slot_mapping[: key.shape[0]]
@@ -155,22 +155,45 @@ def attention_prologue(
     `log_scaling` (alpha, n_floor). Writes `q_out` [T, heads, D] and `rel_out`
     [T, heads, extent] and stores K, V and the conv inputs.
 
-    The metadata is the current forward's. A forward without it stores
-    nothing and applies no tau.
+    The metadata is the current forward's and covers the first n =
+    ``num_actual_tokens`` rows: rows after them are zero in `q_out` and
+    `rel_out` and are not stored. A forward without metadata stores nothing
+    and applies no tau.
     """
     attn_metadata = cache_metadata(attn_owner)
     conv_metadata = cache_metadata(conv_owner)
-    tau = None
-    if log_scaling is not None and attn_metadata is not None:
-        positions = attn_metadata.positions[: q.shape[0]]
-        tau = log_scale_tau(positions, *log_scaling)
-    q_out.copy_(query_states(q, q_scale, qk_clip, tau))
-    torch.matmul(query_states(r, rel_scale, rel_clip, tau), rel_proj, out=rel_out)
-    if attn_metadata is None or conv_metadata is None:
+    if attn_metadata is None:
+        q_out.copy_(query_states(q, q_scale, qk_clip))
+        torch.matmul(query_states(r, rel_scale, rel_clip), rel_proj, out=rel_out)
         return
+    n = attn_metadata.num_actual_tokens
+    if n > q.shape[0] or n > attn_metadata.positions.shape[0]:
+        raise ValueError(
+            f"vllm_sm70: metadata of {n} tokens "
+            f"({attn_metadata.positions.shape[0]} positions) for {q.shape[0]} rows."
+        )
+    if attn_owner.kv_cache.shape[2] != attn_metadata.block_size:
+        raise ValueError(
+            f"vllm_sm70: K/V cache blocks hold {attn_owner.kv_cache.shape[2]} "
+            f"tokens, the metadata has block size {attn_metadata.block_size}."
+        )
+    tau = None
+    if log_scaling is not None:
+        tau = log_scale_tau(attn_metadata.positions[:n], *log_scaling)
+    q_out[:n] = query_states(q[:n], q_scale, qk_clip, tau)
+    q_out[n:] = 0
+    rel_out[:n] = torch.matmul(query_states(r[:n], rel_scale, rel_clip, tau), rel_proj)
+    rel_out[n:] = 0
+    if conv_metadata is None:
+        return
+    if conv_metadata.num_actual_tokens != n:
+        raise ValueError(
+            f"vllm_sm70: attention metadata of {n} tokens, conv-state metadata "
+            f"of {conv_metadata.num_actual_tokens}."
+        )
     key, value = key_value_states(
-        k,
-        v,
+        k[:n],
+        v[:n],
         k_conv,
         v_conv,
         conv_owner.kv_cache,
@@ -179,7 +202,7 @@ def attention_prologue(
         conv_owner.stream_ranges[STREAM_V],
         qk_clip=qk_clip,
         eps=eps,
-        k_taps=k_taps,
-        v_taps=v_taps,
+        k_taps=None if k_taps is None else k_taps[:n],
+        v_taps=None if v_taps is None else v_taps[:n],
     )
     store_key_value(key, value, attn_owner.kv_cache, attn_metadata.slot_mapping)

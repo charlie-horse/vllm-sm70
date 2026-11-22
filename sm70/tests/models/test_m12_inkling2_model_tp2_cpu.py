@@ -267,7 +267,8 @@ def test_visits_and_logits_match_tp1(tp1, tp2, sequences, name):
         assert torch.equal(rank0, rank1), (name, step)
 
 
-def test_padding_does_not_change_real_rows_at_tp2(tp1, tp2, sequences):
+@pytest.mark.parametrize("metadata", ["full", "unpadded"])
+def test_padding_does_not_change_real_rows_at_tp2(tp1, tp2, sequences, metadata):
     rows = {}
     for engine in (tp1, tp2):
         engine.reset()
@@ -277,7 +278,9 @@ def test_padding_does_not_change_real_rows_at_tp2(tp1, tp2, sequences):
         harness.add_request("b")
         parts = {"a": [], "b": []}
         for schedule in ([("a", 5), ("b", 3)], [("a", 1), ("b", 1)]):
-            out = harness.step(schedule, engine.forward, pad_tokens=3, pad_reqs=1)
+            out = harness.step(
+                schedule, engine.forward, pad_tokens=3, pad_reqs=1, metadata=metadata
+            )
             assert all(torch.isfinite(o).all() for o in out)
             for req_id, part in harness.batch.split(out[0]).items():
                 parts[req_id].append(part)

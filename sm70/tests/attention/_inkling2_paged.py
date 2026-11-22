@@ -66,10 +66,18 @@ class FakePagedKV:
             slots = self.slots(request, torch.arange(stop))
             self.kv_cache.transpose(1, 2).flatten(0, 1)[slots] = float("nan")
 
-    def metadata(self, batch: list[tuple[int, int, int]], pad_tokens: int = 0):
+    def metadata(
+        self,
+        batch: list[tuple[int, int, int]],
+        pad_tokens: int = 0,
+        pad_metadata: bool = True,
+    ):
         """Metadata of a batch of (request, first position, tokens) entries,
         in batch order (decode-first is the caller's order). Batch row r uses
-        the block table row of its request."""
+        the block table row of its request. The token tensors cover
+        `pad_tokens` padding rows with `pad_metadata` only."""
+        if not pad_metadata:
+            pad_tokens = 0
         from vllm_sm70.models.inkling2_sm70.backend import Inkling2AttentionMetadata
 
         query_lens = [n for _, _, n in batch]

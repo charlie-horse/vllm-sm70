@@ -168,7 +168,17 @@ class Layer:
         )
 
 
-def run_batch(layer, cache, sequences, batch, *, pad_tokens=0, dtype=None, **chunks):
+def run_batch(
+    layer,
+    cache,
+    sequences,
+    batch,
+    *,
+    pad_tokens=0,
+    pad_metadata=True,
+    dtype=None,
+    **chunks,
+):
     """Write the batch's K/V, run the paged op, and return (output, expected)
     over the real tokens. `batch` holds (request, first position, tokens)."""
     from vllm_sm70.models.inkling2_sm70.attention_torch import attention_with_metadata
@@ -196,7 +206,7 @@ def run_batch(layer, cache, sequences, batch, *, pad_tokens=0, dtype=None, **chu
         inputs["sinks"].to(dtype),
         inputs["gate"].to(dtype),
         cache.kv_cache,
-        cache.metadata(batch, pad_tokens=pad_tokens),
+        cache.metadata(batch, pad_tokens=pad_tokens, pad_metadata=pad_metadata),
         output,
         layer.w.out.to(dtype),
         **chunks,
@@ -269,8 +279,9 @@ def test_chunked_gather_equals_unchunked(kind, chunks):
 
 
 @pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("pad_metadata", [True, False])
 @pytest.mark.parametrize("chunks", [{}, {"query_chunk": 2, "key_chunk": 5}])
-def test_mixed_batch_decode_first_with_padding(kind, chunks):
+def test_mixed_batch_decode_first_with_padding(kind, chunks, pad_metadata):
     """Two decodes at different depths, a short and a long prefill chunk and
     two padding tokens in one batch; every request keeps to its own blocks."""
     layer = Layer(kind)
@@ -280,7 +291,15 @@ def test_mixed_batch_decode_first_with_padding(kind, chunks):
     run_batch(layer, cache, sequences, [(1, 0, 2)])
     run_batch(layer, cache, sequences, [(2, 0, 6)])
     batch = [(0, 39, 1), (1, 2, 1), (2, 6, 17), (3, 0, 12)]
-    output, expected = run_batch(layer, cache, sequences, batch, pad_tokens=2, **chunks)
+    output, expected = run_batch(
+        layer,
+        cache,
+        sequences,
+        batch,
+        pad_tokens=2,
+        pad_metadata=pad_metadata,
+        **chunks,
+    )
     assert (output - expected).abs().max() < TOL
     # Batch rows need not be in request order.
     batch = [(3, 0, 12), (1, 3, 1)]
@@ -414,6 +433,12 @@ def test_rejects_bad_arguments():
         gather_attention(*args, cache.kv_cache, md, out, key_chunk=0)
     with pytest.raises(ValueError, match="does not fit"):
         gather_attention(*args, cache.kv_cache[..., :6], md, out)
+    other_block = cache.metadata([(0, 0, 4)])
+    other_block.block_size = BLOCK * 2
+    with pytest.raises(
+        ValueError, match=f"hold {BLOCK} tokens.*block size {BLOCK * 2}"
+    ):
+        gather_attention(*args, cache.kv_cache, other_block, out)
     with pytest.raises(ValueError, match="expected a K/V cache"):
         kv_cache_views(cache.kv_cache, HEAD_DIM + 1)
     key_cache, value_cache = kv_cache_views(cache.kv_cache, HEAD_DIM)
@@ -456,3 +481,89 @@ def test_eager_op_reads_the_owner_metadata_of_the_current_forward(monkeypatch):
     for first, n in ((0, 5), (5, 6), (11, 1)):
         context.attn_metadata = {owner.prefix: cache.metadata([(0, first, n)])}
         assert (call(first, n) - seq.expected[first : first + n]).abs().max() < TOL
+
+
+# --- memory bound and the reference-rounding switch --------------------------
+
+
+def test_default_chunks_bound_the_score_transient():
+    from vllm_sm70.models.inkling2_sm70 import attention_torch as at
+
+    # Inkling 2 Mini global layer: 24 heads, 8 KV heads of 128.
+    scores = at.DEFAULT_QUERY_CHUNK * at.DEFAULT_KEY_CHUNK * 24 * 4
+    assert 4 * scores <= 101 << 20
+    own_keys = at.OWN_KEY_STEPS * at.DEFAULT_KEY_CHUNK * 8 * 128 * 8
+    assert own_keys <= 64 << 20
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_decodes_above_the_key_chunk_share_a_step(kind, monkeypatch):
+    """Five decode rows with more keys than the key chunk run as one batch
+    of rows, not one row at a time."""
+    from vllm_sm70.models.inkling2_sm70 import attention_torch as at
+
+    layer = Layer(kind)
+    sequences = [layer.sequence(30, seed=n) for n in range(5)]
+    cache = layer.cache(sequences)
+    for request in range(5):
+        run_batch(layer, cache, sequences, [(request, 0, 29)])
+    states = []
+    init = at._Softmax.__init__
+
+    def counted(self, *args, **kwargs):
+        states.append(args[0].shape[0])
+        init(self, *args, **kwargs)
+
+    monkeypatch.setattr(at._Softmax, "__init__", counted)
+    batch = [(request, 29, 1) for request in range(5)]
+    output, expected = run_batch(layer, cache, sequences, batch, key_chunk=4)
+    assert (output - expected).abs().max() < TOL
+    assert states == [5]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_hf_rounding_is_one_key_step_with_weights_in_the_value_dtype(kind):
+    from vllm_sm70.models.inkling2_sm70.attention_torch import gather_attention
+
+    layer = Layer(kind)
+    seq = layer.sequence(40, seed=6)
+    for dtype in (torch.float32, torch.float16):
+        cache = layer.cache([seq], dtype=dtype)
+        output, expected = run_batch(
+            layer,
+            cache,
+            [seq],
+            [(0, 0, 33)],
+            dtype=dtype,
+            key_chunk=4,
+            hf_rounding=True,
+        )
+        assert (output.float() - expected).abs().max() < (
+            TOL if dtype == torch.float32 else 3e-2
+        )
+    # Before the gate, a query's fp16 output is the fp16 matmul of the rounded
+    # weights: the dense form of the reference.
+    cache = layer.cache([seq], dtype=torch.float16)
+    cache.write(0, 0, seq.key[:9], seq.value[:9])
+    md = cache.metadata([(0, 0, 9)])
+    half = [t[:9].half() for t in (seq.query, seq.rel_logits, seq.sinks)]
+    got = gather_attention(
+        *half, cache.kv_cache, md, torch.empty(9, layer.heads, HEAD_DIM).half(),
+        hf_rounding=True,
+    )  # fmt: skip
+    query, rel, sinks = half
+    key, value = seq.key[:9].half(), seq.value[:9].half()
+    groups = layer.heads // KV_HEADS
+    distance = torch.arange(9)[:, None] - torch.arange(9)[None]
+    allowed = distance >= 0
+    if layer.window is not None:
+        allowed &= distance < layer.window
+    for head in range(layer.heads):
+        k, v = key[:, head // groups], value[:, head // groups]
+        scores = (query[:, head] @ k.T) * HEAD_DIM**-0.5
+        bias = rel[:, head].gather(1, distance.clamp(0, rel.shape[-1] - 1))
+        bias = bias.masked_fill((distance < 0) | (distance >= rel.shape[-1]), 0.0)
+        scores = (scores + bias).float().masked_fill(~allowed, float("-inf"))
+        full = torch.cat([scores, sinks[:, head, None].float()], dim=-1)
+        weights = torch.softmax(full, dim=-1)[:, :-1].half()
+        assert (got[:, head].float() - (weights @ v).float()).abs().max() < 2e-3

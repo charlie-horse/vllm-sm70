@@ -11,10 +11,19 @@ per-batch ``CommonAttentionMetadata`` into the metadata the model's ops read:
 The runner stores one metadata object per cache owner under the owner's
 forward-context name; ``cache_metadata(owner)`` reads it back.
 
-Token tensors cover the padded batch. A padding token has slot -1; its
-other values are unspecified (``positions`` is the runner's tensor when the
-batch has one), so ops select tokens with ``slot_mapping >= 0``. The builders
-sort decode requests first.
+``num_actual_tokens`` is n, the scheduled tokens of the batch:
+``query_start_loc_cpu[num_reqs]``, not the runner's
+``CommonAttentionMetadata.num_actual_tokens``, which is the padded count in a
+FULL graph (UP v1/worker/gpu_model_runner.py ``_build_attention_metadata``).
+Token tensors have P >= n rows. The runner gives P = n except in a FULL
+graph, where P is the padded batch, while the model's tensors are always
+padded to the capture size. So an op reads rows [0, n) only and treats the
+model rows after them as padding; inside [0, n) a token with a negative slot
+is padding too. The builders sort decode requests first.
+
+The ops branch in Python on the batch (numpy request lengths, nonzero), so
+they are correct only as eager breaks of a PIECEWISE graph or without graphs;
+the engine-config hook (config.py) refuses a mode with FULL graphs.
 
 Cache views are logical (blocks, heads, tokens, width) in every layout; the
 backends declare LBNHC, the layout Flash-V100 uses.
@@ -60,9 +69,9 @@ SCONV_BACKEND_NAME = "INKLING2_SM70_SCONV"
 
 @dataclass
 class Inkling2SconvMetadata(AttentionMetadata):
-    """Metadata of one conv-state cache group. R requests, P padded tokens."""
+    """Metadata of one conv-state cache group. R requests, P >= n tokens."""
 
-    num_actual_tokens: int  # tokens without padding
+    num_actual_tokens: int  # n: scheduled tokens, without padding
     block_size: int  # tokens per block of this group's block table
     block_table: torch.Tensor  # [R, max_blocks] int32 physical block per request
     slot_mapping: torch.Tensor  # [P] int64 cache slot of each token, -1 = skip
@@ -147,7 +156,7 @@ class _Builder(AttentionMetadataBuilder):
     """Common part of both builders. The metadata of two groups with equal
     specs differs in the block table and slot mapping only."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
     supports_update_block_table: bool = True
 
     def __init__(

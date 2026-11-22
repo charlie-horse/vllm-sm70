@@ -30,6 +30,7 @@ from vllm_sm70.config import Sm70Config, clear_cache, compute_hash, sm70_config
 from vllm_sm70.models import inkling2_sm70
 from vllm_sm70.models.inkling2_sm70 import config as icfg
 
+DATA = pathlib.Path(__file__).parent / "data" / "inkling2_mini"
 # Inkling 2 Mini (tests/models/data/inkling2_mini/config.json), TP2.
 HIDDEN = 2304
 EXPERTS = 128
@@ -88,6 +89,7 @@ def _vllm_config(
     block_size=None,
     pp=1,
     async_scheduling=None,
+    cudagraph_mode=None,
 ):
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -106,6 +108,7 @@ def _vllm_config(
             pipeline_parallel_size=pp, disable_custom_all_reduce=False
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
         speculative_config=spec,
         additional_config=None if sm70 is None else {"sm70": sm70},
         kernel_config=None,
@@ -162,6 +165,46 @@ def test_hook_fixes_the_kv_plan(
     assert cfg.cache_config.user_specified_block_size is True
     assert cfg.scheduler_config.async_scheduling is False
     assert cfg.cache_config.cache_dtype == cache_dtype
+
+
+@pytest.mark.parametrize(
+    "given, want", [(None, "PIECEWISE"), ("PIECEWISE", "PIECEWISE"), ("NONE", "NONE")]
+)
+def test_hook_keeps_cuda_graphs_piecewise(device, route_log, given, want):
+    from vllm.config.compilation import CUDAGraphMode
+
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode[want]
+
+
+@pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_hook_refuses_full_cuda_graphs(device, route_log, mode):
+    from vllm.config.compilation import CUDAGraphMode
+
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=CUDAGraphMode[mode])
+    with pytest.raises(ValueError, match=f"cudagraph_mode {mode};"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
+def test_released_index_keeps_the_mtp_file_out_of_the_weights(tmp_path):
+    """The default loader drops safetensors files the index does not name
+    (UP model_loader/default_loader.py ``_prepare_weights``)."""
+    import shutil
+
+    from vllm.model_executor.model_loader.weight_utils import (
+        filter_duplicate_safetensors_files,
+    )
+
+    index = "model.safetensors.index.json"
+    shutil.copy(DATA / index, tmp_path / index)
+    names = sorted(set(json.loads((DATA / index).read_text())["weight_map"].values()))
+    assert names == ["model-00001-of-00001.safetensors"]
+    files = [str(tmp_path / name) for name in [*names, "mtp.safetensors"]]
+    kept = filter_duplicate_safetensors_files(files, str(tmp_path), index)
+    assert kept == files[:1]
 
 
 def test_hook_selects_no_attention_backend(device, route_log):

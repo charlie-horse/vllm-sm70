@@ -34,6 +34,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from .cache import build_cache_owners
 from .layers import (
     PARTIAL_SITES,
+    Bank,
     Inkling2Sm70AttnRes,
     Inkling2Sm70DecoderLayer,
     Weights,
@@ -202,25 +203,26 @@ class Inkling2Sm70LoopModel(nn.Module):
         that]). Token positions come from the caches' metadata."""
         core = self.config.loop_core_layers
         hidden = inputs_embeds
-        num_tokens, hidden_size = hidden.shape
-        bank = hidden.new_zeros((num_tokens, 0, hidden_size), dtype=torch.float32)
+        num_tokens = hidden.shape[0]
+        bank = Bank(hidden, sum(layer.starts_block for layer in self.layers))
         is_padding = torch.empty(num_tokens, dtype=torch.bool, device=hidden.device)
         padding_mask(self.caches.conv[0, 0], is_padding)
         aux: list[torch.Tensor] = []
         audit = self.partial_audit
-        entry_hidden = entry_bank = message_bank = None
+        entry_hidden = message_bank = None
+        entry_count = 0
         for visit, (layer_idx, pass_idx) in enumerate(self.visits):
             if layer_idx == core.start:
                 if pass_idx == 0:
-                    entry_hidden, entry_bank = hidden, bank
+                    entry_hidden, entry_count = hidden, bank.count
                 else:
                     # The previous pass's own block states after the entry
                     # one, and its output.
                     message_bank = torch.cat(
-                        [bank[:, entry_bank.shape[1] + 1 :], normed_state(hidden)],
+                        [bank.states(entry_count + 1), normed_state(hidden)],
                         dim=-2,
                     )
-                    hidden, bank = entry_hidden, entry_bank
+                    hidden, bank.count = entry_hidden, entry_count
             messages = None
             if pass_idx:
                 messages = attn_res_mix(
@@ -228,7 +230,7 @@ class Inkling2Sm70LoopModel(nn.Module):
                 )
             if visit in self.aux_hidden_state_layers:
                 aux.append(self._capture(hidden))
-            hidden, bank = self.layers[layer_idx](
+            hidden = self.layers[layer_idx](
                 hidden,
                 bank,
                 self.attn_res.attn_queries[layer_idx - 1] if layer_idx else None,
