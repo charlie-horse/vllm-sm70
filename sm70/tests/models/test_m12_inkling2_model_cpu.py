@@ -408,8 +408,3 @@ def test_fp16_model_loads_and_runs(sequences):
 def test_refuses_head_dtype_other_than_the_model_dtype():
     with pytest.raises(ValueError, match="head_dtype"):
         Engine(torch.float16, head_dtype=torch.float32)
-
-
-def test_refuses_more_than_one_tp_rank():
-    with pytest.raises(ValueError, match="one TP rank"):
-        Engine(tp_size=2)

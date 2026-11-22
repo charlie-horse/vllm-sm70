@@ -9,7 +9,9 @@
                        dtype, cast to fp32, then the soft cap
 
 Weights load through weights.py (parameters) and expert_weights.py (experts,
-into each layer's ``mlp``). One TP rank.
+into each layer's ``mlp``). Each TP rank builds this class and loads its own
+shards: a slice of the attention heads and of the expert intermediate units;
+embedding, norms, convs, routers and the LM head are whole on every rank.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from torch import nn
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from .expert_weights import Inkling2ExpertLoader
-from .loop import Inkling2Sm70LoopModel, VisitDump
+from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
 
 __all__ = [
     "Inkling2LoopSm70ForConditionalGeneration",
@@ -87,11 +89,6 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module):
         dtype = model_config.dtype
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
-        if tp_size != 1:
-            raise ValueError(
-                f"vllm_sm70: Inkling 2 runs on one TP rank, got "
-                f"--tensor-parallel-size {tp_size}."
-            )
         if getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) != 1:
             raise ValueError("vllm_sm70: Inkling 2 does not support pipeline parallel.")
         if model_config.head_dtype != dtype:
@@ -124,6 +121,9 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module):
         dump_dir = sm70_config(vllm_config).inkling2.visit_dump_dir
         if dump_dir:
             self.model.visit_hook = VisitDump(dump_dir, tp_rank)
+            self.model.partial_audit = PartialAudit(
+                len(self.model.visits), dump_dir, tp_rank
+            )
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = tuple(layers)

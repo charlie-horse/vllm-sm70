@@ -11,6 +11,12 @@ Parameters carry the names, shapes and dtypes of the weight map
 (weights.py); every module creates them from the map's specs. Tensors are
 [T, ...] over the padded batch tokens, no batch dim.
 
+At TP > 1 a rank holds a contiguous slice of the query heads (with their
+relative, gate and sink rows), of the KV heads and of the expert
+intermediate units. A layer has two all-reduces: the o_proj partials and the
+expert partials. Everything else, both short convs included, runs on the
+replicated hidden state.
+
 Rounding as the reference (transformers modeling_inkling2_loop.py): the
 residual stream and the block states are in the model dtype between visits;
 AttnRes mixes, message gates, norms and residual adds run in fp32; each norm
@@ -20,7 +26,7 @@ before the fp32 add.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -42,6 +48,7 @@ __all__ = [
     "Inkling2Sm70AttnRes",
     "Inkling2Sm70DecoderLayer",
     "Inkling2Sm70MessageGate",
+    "PARTIAL_SITES",
     "Weights",
     "all_reduce",
     "mix",
@@ -50,6 +57,9 @@ __all__ = [
 ]
 
 Specs = Mapping[str, ParamSpec]
+# (site, this rank's partial [T, H] before the all-reduce) -> None
+PartialHook = Callable[[str, torch.Tensor], None]
+PARTIAL_SITES = ("attn", "mlp")
 
 
 def _parameter(specs: Specs, name: str) -> nn.Parameter:
@@ -284,20 +294,23 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         attn_owner: Any,
         conv_owner: Any,
         is_padding: torch.Tensor,
+        partial_hook: PartialHook | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One visit of the layer over the caches of the visit's owners.
 
         hidden [T, H]: the residual stream, model dtype. bank [T, N, H] fp32:
-        the normed block states. attn_query [1 or 3, H], None in the first
+        the normed block states, the same on every rank. attn_query [1 or 3, H], None in the first
         layer; mlp_query [1, H]. messages [T, 4, H] fp32 in the order of
         ``MESSAGE_STREAMS``, None in a first pass. is_padding [T] bool.
+        partial_hook gets this rank's o_proj and expert partials.
         Returns the new residual stream and the bank.
         """
         dtype = hidden.dtype
         x_q, x_k, x_v = self._attention_inputs(hidden, bank, attn_query, messages)
-        attn = all_reduce(
-            self.attn(x_q, x_k, x_v, attn_owner, conv_owner), self.tp_size
-        )
+        partial = self.attn(x_q, x_k, x_v, attn_owner, conv_owner)
+        if partial_hook is not None:
+            partial_hook(PARTIAL_SITES[0], partial)
+        attn = all_reduce(partial, self.tp_size)
         attn_out = attn.new_empty(attn.shape)
         short_conv(attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out)
         # A block boundary restarts the residual from the attention output.
@@ -313,6 +326,8 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         x = rms_norm(x, self.mlp_norm.weight[0], self.eps).to(dtype)
         partial = x.new_empty(x.shape)
         self.mlp(x, partial, is_padding)
+        if partial_hook is not None:
+            partial_hook(PARTIAL_SITES[1], partial)
         expert_sum = all_reduce(partial, self.tp_size)
         mlp_out = expert_sum.new_empty(expert_sum.shape)
         short_conv(expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out)

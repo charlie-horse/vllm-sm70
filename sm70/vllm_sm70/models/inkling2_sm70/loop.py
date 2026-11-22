@@ -21,6 +21,7 @@ T is the padded batch; the caches hold everything before it.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from .cache import build_cache_owners
 from .layers import (
+    PARTIAL_SITES,
     Inkling2Sm70AttnRes,
     Inkling2Sm70DecoderLayer,
     Weights,
@@ -42,7 +44,7 @@ from .layers import (
 from .ops.torch_ref import attn_res_mix, rms_norm
 from .weights import build_weight_map
 
-__all__ = ["Inkling2Sm70LoopModel", "VisitDump", "layer_visits"]
+__all__ = ["Inkling2Sm70LoopModel", "PartialAudit", "VisitDump", "layer_visits"]
 
 # (visit index, layer, pass, residual stream after the visit) -> None
 VisitHook = Callable[[int, int, int, torch.Tensor], None]
@@ -82,12 +84,51 @@ def _save_visit(
     torch.save(state.detach().cpu(), folder / name)
 
 
+class PartialAudit(nn.Module):
+    """Running maxima of this rank's partials before the all-reduces.
+
+    ``maxima`` [visits, 2] fp32: max |x| over every forward so far, per visit
+    and site (``layers.PARTIAL_SITES``: the o_proj partial, the expert
+    partial). A non-finite partial makes its entry inf or NaN. With a
+    `directory`, ``save`` writes it to ``rank<r>/partial_maxima.pt``.
+    """
+
+    def __init__(
+        self, num_visits: int, directory: str | None = None, rank: int = 0
+    ) -> None:
+        super().__init__()
+        self.path = Path(directory) / f"rank{rank}" if directory else None
+        self.register_buffer(
+            "maxima", torch.zeros(num_visits, len(PARTIAL_SITES)), persistent=False
+        )
+
+    def record(self, visit: int, site: str, partial: torch.Tensor) -> None:
+        entry = self.maxima[visit, PARTIAL_SITES.index(site)]
+        entry.copy_(torch.maximum(entry, partial.detach().abs().amax().float()))
+
+    def report(self) -> dict[str, float]:
+        """Site -> the largest entry over the visits."""
+        return dict(zip(PARTIAL_SITES, self.maxima.amax(0).tolist()))
+
+    def save(self) -> None:
+        if self.path is not None:
+            _save_partials(self)
+
+
+@eager_break_during_capture
+def _save_partials(audit: PartialAudit) -> None:
+    audit.path.mkdir(parents=True, exist_ok=True)
+    torch.save(audit.maxima.detach().cpu(), audit.path / "partial_maxima.pt")
+
+
 class Inkling2Sm70LoopModel(nn.Module):
     """Embedding, decoder layers, AttnRes queries, message queries and the
-    final norm of one TP rank, with the cache owners of every visit.
+    final norm of one TP rank, with the cache owners of every visit. The
+    ranks' residual streams are the same; a layer sums the partials.
 
     `aux_hidden_state_layers`: visit indices whose input is returned beside
-    the output. `visit_hook`: called after every visit.
+    the output. `visit_hook`: called after every visit. `partial_audit`: a
+    ``PartialAudit`` that records the partials of every visit, or None.
     """
 
     def __init__(
@@ -142,6 +183,7 @@ class Inkling2Sm70LoopModel(nn.Module):
         self.visits = layer_visits(config)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.visit_hook: VisitHook | None = None
+        self.partial_audit: PartialAudit | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Normed token embeddings [T, H]. Image features replace rows of it."""
@@ -165,6 +207,7 @@ class Inkling2Sm70LoopModel(nn.Module):
         is_padding = torch.empty(num_tokens, dtype=torch.bool, device=hidden.device)
         padding_mask(self.caches.conv[0, 0], is_padding)
         aux: list[torch.Tensor] = []
+        audit = self.partial_audit
         entry_hidden = entry_bank = message_bank = None
         for visit, (layer_idx, pass_idx) in enumerate(self.visits):
             if layer_idx == core.start:
@@ -194,9 +237,12 @@ class Inkling2Sm70LoopModel(nn.Module):
                 self.caches.attn[layer_idx, pass_idx],
                 self.caches.conv[layer_idx, pass_idx],
                 is_padding,
+                None if audit is None else functools.partial(audit.record, visit),
             )
             if self.visit_hook is not None:
                 self.visit_hook(visit, layer_idx, pass_idx, hidden)
+        if audit is not None:
+            audit.save()
         final = mix(bank, hidden, self.attn_res.output_query)[:, 0]
         final = rms_norm(final, self.norm.weight[0], self.eps).to(hidden.dtype)
         if self.aux_hidden_state_layers:
