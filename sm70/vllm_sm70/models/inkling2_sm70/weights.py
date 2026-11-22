@@ -478,7 +478,8 @@ class Inkling2WeightMap:
         return value
 
     def _write(self, route: Route, target: torch.Tensor, tensor: torch.Tensor) -> None:
-        value = self.localize(route, tensor)
+        # Index writes need the value on the parameter's device.
+        value = self.localize(route, tensor).to(target.device)
         if route.index is None:
             target.copy_(value.reshape(target.shape))
         else:

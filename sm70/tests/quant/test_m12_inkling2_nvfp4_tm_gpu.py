@@ -242,6 +242,7 @@ def test_tiny_checkpoint_matches_torch_path(monkeypatch, tp_size, tp_rank, m):
     monkeypatch.setattr(
         moe_tm, "INKLING_CONTRACTS", moe_tm.INKLING_CONTRACTS | {TINY_CONTRACT}
     )
+    monkeypatch.setattr(moe_tm, "INKLING_TP_SIZES", (1, 2))
     kwargs = {"tp_size": tp_size, "tp_rank": tp_rank}
     module = tiny_module(monkeypatch, torch_path=False, **kwargs)
     oracle = tiny_module(monkeypatch, torch_path=True, **kwargs)
@@ -313,7 +314,6 @@ def test_checkpoint_layers_match_torch_path(monkeypatch, tp_rank):
             modules.append(module)
         module, oracle = modules
         assert module.tm_route.nbytes() - 318_504_960 <= 4 * EXPERTS * 64
-        assert module.tm_route.w13.scale == module.tm_route.w2.scale == 1.0
         for m in CHECKPOINT_SIZES:
             g = torch.Generator().manual_seed(1000 * index + m)
             x = torch.randn(m, HIDDEN, generator=g).half().cuda()

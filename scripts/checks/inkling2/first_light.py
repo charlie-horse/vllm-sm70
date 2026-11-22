@@ -6,7 +6,8 @@ Replays the short text cases of a golden run file teacher-forced (one
 and compares:
 
   logprobs  top-1 agreement, flips with a reference top-1/top-2 gap at or
-            above --gap-max, mean KL over the reference's top tokens, and the
+            above --gap-max, a mean top-20 truncated KL (over the reference's
+            listed tokens; not S5's full-vocabulary KL), and the
             |logprob delta| of the reference top-1 (max and p99), pooled over
             the output positions of all cases.
   states    the per-visit dump of `sm70.inkling2.visit_dump_dir`
@@ -17,7 +18,9 @@ and compares:
 
 The server must run with --max-num-seqs 1 and nothing else may send requests:
 the forwards a request adds to the dump directory are taken as that request's
-token rows, in order. Run it where the dump directory is readable.
+token rows, in order. Run it where the dump directory is readable. Give each
+server start a fresh dump directory: a restarted server numbers its forwards
+from 0 again and overwrites the old ones, which the script refuses.
 
 Exit status 1 when a threshold fails or a file is missing.
 
@@ -62,9 +65,9 @@ VISIT_FILE = re.compile(r"visit(\d+)_layer(\d+)_pass(\d+)\.pt")
 
 def position_kl(ref_top: list, cand_top: list) -> tuple[float, int]:
     """(sum over the reference's listed tokens of p * (log p - log q), how
-    many of them the candidate does not list). A token the candidate does not
-    list gets the candidate's smallest listed logprob, an upper bound of its
-    own, so the sum is a lower bound then."""
+    many of them the candidate does not list): a top-N truncated KL, not
+    S5's full-vocabulary metric. A token the candidate does not list gets the
+    candidate's smallest listed logprob."""
     cand = {int(tok): lp for tok, lp in cand_top}
     floor = min(cand.values())
     kl, missing = 0.0, 0
@@ -250,6 +253,38 @@ def forward_dirs(dump_dir: pathlib.Path) -> dict[str, list[pathlib.Path]]:
     }
 
 
+class DumpReused(Exception):
+    """The dump directory holds forwards of an earlier server start."""
+
+
+def reused_ranks(dump_dir: pathlib.Path) -> list[str]:
+    """Ranks whose forwards were not written in forward order: a later
+    server start overwrote the low forward numbers of an earlier one."""
+    reused = []
+    for rank, forwards in forward_dirs(dump_dir).items():
+        last = -1
+        for forward in forwards:
+            times = [p.stat().st_mtime_ns for p in forward.glob("visit*.pt")]
+            if not times:
+                continue
+            if min(times) < last:
+                reused.append(rank)
+                break
+            last = max(times)
+    return reused
+
+
+def check_fresh(dump_dir: pathlib.Path) -> None:
+    """Raise DumpReused when `dump_dir` holds an earlier server's forwards."""
+    reused = reused_ranks(dump_dir)
+    if reused:
+        raise DumpReused(
+            f"{dump_dir} ({', '.join(reused)}) holds forwards of an earlier "
+            "server start, which the running server overwrites; start the "
+            "server with a fresh, empty sm70.inkling2.visit_dump_dir per start"
+        )
+
+
 def load_forwards(forwards: list[pathlib.Path], num_tokens: int) -> dict:
     """visit index -> [num_tokens, H]: the rows of a request's forwards, in
     order. One forward may carry padded rows after the request's; several
@@ -353,6 +388,8 @@ def run_cases(args: argparse.Namespace, cases: list[dict], bands: list) -> dict:
     dump_dir = pathlib.Path(args.dump_dir) if args.dump_dir else None
     states_dir = pathlib.Path(args.states_dir or pathlib.Path(args.goldens) / "cases")
     served, states = [], {}
+    if dump_dir is not None:
+        check_fresh(dump_dir)
     for case in cases:
         before = forward_dirs(dump_dir) if dump_dir else {}
         response = request(args.base_url, args.model, case, args.top, args.timeout)
@@ -378,6 +415,8 @@ def run_cases(args: argparse.Namespace, cases: list[dict], bands: list) -> dict:
         golden = {name: value[kept] for name, value in golden.items()}
         ranks = {}
         new = new_forwards(before, dump_dir, len(golden), args.settle)
+        if not all(new.values()):
+            check_fresh(dump_dir)
         if not new:
             ranks["rank0"] = {"pass": False, "error": f"no dump under {dump_dir}"}
         for rank, forwards in new.items():
@@ -493,7 +532,11 @@ def main(argv: list[str] | None = None) -> int:
         served = {"cases": [c for c in served["cases"] if c["id"] in wanted]}
         states = {}
     else:
-        result = run_cases(args, cases, bands)
+        try:
+            result = run_cases(args, cases, bands)
+        except DumpReused as error:
+            print(f"{error}: FAIL")
+            return 1
         served, states = result["run"], result["states"]
         if args.save_run:
             with open(args.save_run, "w") as f:

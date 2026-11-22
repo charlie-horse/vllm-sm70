@@ -123,8 +123,9 @@ class Inkling2Sm70Experts(nn.Module):
                 self.contract, self.tp_size, self.dtype, device
             )
             if self.tm_rejection is None:
-                self._load_tm(layer, device, range_check)
-                return
+                self.tm_rejection = self._load_tm(layer, device, range_check)
+                if self.tm_rejection is None:
+                    return
         if layer.format == NVFP4 and moe_tm.enabled():
             moe_tm.logger.warning_once(
                 "Inkling 2 NVFP4 experts stay on the fp16 torch path: %s.",
@@ -149,7 +150,8 @@ class Inkling2Sm70Experts(nn.Module):
         layer: ExpertLayer,
         device: torch.device,
         range_check: RangeCheck | None,
-    ) -> None:
+    ) -> str | None:
+        """Build the banks; the reason they were refused, or None."""
         w13, w2 = layer.nvfp4_codes()
         for name, codes in (("w13", w13), ("w2", w2)):
             expected = self.weight_shapes[name]
@@ -158,11 +160,14 @@ class Inkling2Sm70Experts(nn.Module):
                     f"Inkling 2: layer {layer.layer} {name} has shape "
                     f"{tuple(codes.codes.shape)}, expected {expected}"
                 )
-        self.tm_route = moe_tm.build(
-            w13, w2,
-            device=device, gate_cap=self.gate_cap, up_cap=self.up_cap,
-            top_k=self.top_k, range_check=range_check,
-        )  # fmt: skip
+        try:
+            self.tm_route = moe_tm.build(
+                w13, w2,
+                device=device, gate_cap=self.gate_cap, up_cap=self.up_cap,
+                top_k=self.top_k, range_check=range_check,
+            )  # fmt: skip
+        except moe_tm.Rejected as error:
+            return str(error)
         for name, shape in self.weight_shapes.items():
             setattr(self, name, torch.empty((0, *shape[1:]), dtype=self.dtype))
         moe_tm.logger.info_once(
@@ -170,6 +175,7 @@ class Inkling2Sm70Experts(nn.Module):
             self.contract,
             moe_tm.SWITCH,
         )
+        return None
 
     def route(
         self, x: torch.Tensor, is_padding: torch.Tensor | None = None

@@ -7,9 +7,11 @@ pointer tables. ``expert_sum`` sorts the routed slots by expert, runs W13
 (k = H, n = 2 * I / tp), the soft-capped SwiGLU in fp32, W2 (k = I / tp,
 n = H), and sums a token's experts in fp32, as the torch path of moe.py does.
 
-Stage call forms: up to ``COMPACT_MAX_SLOTS`` routed slots each slot is its own
-one-row group (one launch per stage); above that the groups are the per-expert
-offsets over all experts.
+The slots run in chunks of at most ``CHUNK_ROWS`` rows, so the stage scratch
+and the fp32 temporaries do not grow with the batch. Stage call forms per
+chunk: up to ``COMPACT_MAX_SLOTS`` slots each slot is its own one-row group
+(one launch per stage; ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off);
+above that the groups are the per-expert offsets over all experts.
 
 Switch: the route runs only with ``VLLM_SM70_INKLING_NVFP4_TM=1``. Without it
 every layer stays on the torch path of moe.py, which holds all experts in
@@ -40,13 +42,21 @@ REQUIRED_OPS: Final = (
 )
 # (hidden, global intermediate, experts, top-k)
 INKLING_CONTRACTS: Final = frozenset({(2304, 1152, 128, 8)})
-INKLING_TP_SIZES: Final = (1, 2)
+# Only the TP2 bank shapes (W13 n=1152, W2 k=576) have run on a GPU.
+INKLING_TP_SIZES: Final = (2,)
 # tm.nvfp4_sm70_prepare packs 8 codes of the output axis into one int32.
 CODES_PER_WORD: Final = 8
 FP16_MIN_NORMAL: Final = 2.0**-14
 FP16_MAX: Final = 65504.0
+# Routed slots per stage call: bounds the workspace (TP2: 4096 x 6336 fp16,
+# 52 MB per device) and the fp32 temporaries of one call.
+CHUNK_ROWS: Final = 4096
 
 Contract = tuple[int, int, int, int]
+
+
+class Rejected(ValueError):
+    """A layer whose banks the route refuses at load; it stays on torch."""
 
 
 def enabled() -> bool:
@@ -90,7 +100,10 @@ def rejection(
     if dtype != torch.float16:
         return f"model dtype {dtype} is not float16"
     if tp_size not in INKLING_TP_SIZES:
-        return f"TP size {tp_size} is not in {INKLING_TP_SIZES}"
+        return (
+            f"TP size {tp_size} is not in {INKLING_TP_SIZES}, the GPU-checked "
+            "bank shapes"
+        )
     if contract not in INKLING_CONTRACTS:
         return f"shape {contract} is not in {sorted(INKLING_CONTRACTS)}"
     hidden, intermediate, _, _ = contract
@@ -126,9 +139,9 @@ def prepared_scales(
 
     The scales are block_scale * global_scale * 2**shift. ``shift`` is 0
     unless a nonzero scale would be subnormal in fp16; then it is the
-    smallest power of two that makes every nonzero scale normal, and the
-    stage output must be multiplied by 2**-shift. Raises ValueError when a
-    scale is not finite or no shift fits the fp16 range.
+    smallest power of two that makes every nonzero scale normal (``Bank``
+    refuses it). Raises ValueError when a scale is not finite or no shift
+    fits the fp16 range.
     ``range_check(name, fp32 scales, fp16 scales)`` sees the cast.
     """
     scales = codes.block_scale.float() * codes.global_scale.float().reshape(-1, 1, 1)
@@ -156,8 +169,9 @@ def prepared_scales(
 
 class Bank:
     """One stage's prepared experts: ``weight`` int32 [E, K, N/8], ``scales``
-    fp16 [E, K/16, N] and the pointer tables into them. ``scale`` is the
-    2**-shift the stage output is multiplied by."""
+    fp16 [E, K/16, N] and the pointer tables into them. Raises Rejected when
+    the scales need a pre-shift: the fp16 stage output would carry the
+    2**shift and could overflow before any compensation."""
 
     def __init__(
         self,
@@ -174,14 +188,13 @@ class Bank:
             )
         scales, shift = prepared_scales(codes, range_check)
         if shift:
-            logger.warning(
-                "%s: NVFP4 scales pre-shifted by 2**%d to stay normal in fp16.",
-                codes.name,
-                shift,
+            raise Rejected(
+                f"{codes.name}: NVFP4 scales below the fp16 normal range need "
+                f"a 2**{shift} pre-shift, which the fp16 stage output could "
+                "overflow with"
             )
         self.name = codes.name
         self.k, self.n, self.num_experts = k, n, experts
-        self.scale = 2.0**-shift
         qweight = codes.codes.to(device)
         scales = scales.to(device)
         weights, prepared, meta = [], [], None
@@ -207,7 +220,8 @@ class Bank:
 
 class Workspace:
     """Stage scratch of one device and shape, shared by its layers (they run
-    one after another). Rows grow on demand; ``reserve`` sizes them at load."""
+    one after another). Rows grow on demand up to ``CHUNK_ROWS``; ``reserve``
+    sizes them at load."""
 
     _CACHE: ClassVar[dict[tuple[str, int, int, int], Workspace]] = {}
 
@@ -245,6 +259,7 @@ class Workspace:
         cls._CACHE.clear()
 
     def reserve(self, rows: int) -> None:
+        rows = min(rows, CHUNK_ROWS)
         if rows <= self.rows:
             return
         self.buffers = {}
@@ -271,9 +286,11 @@ class Nvfp4TmExperts:
         gate_cap: float,
         up_cap: float,
         max_slots: int = 0,
+        compact: bool = True,
         range_check: RangeCheck | None = None,
     ) -> None:
         self.tm = tm
+        self.compact = compact
         self.w13 = Bank(tm, w13, device, range_check)
         self.w2 = Bank(tm, w2, device, range_check)
         hidden, local = self.w13.k, self.w2.k
@@ -302,7 +319,7 @@ class Nvfp4TmExperts:
         expert ids of the routed slots (no padding slots)."""
         ws = self.workspace
         slots = sorted_ids.numel()
-        if slots <= COMPACT_MAX_SLOTS:
+        if self.compact and slots <= COMPACT_MAX_SLOTS:
             ids = ws.compact_expert_ids[:slots]
             ids.copy_(sorted_ids)
             return ws.compact_offsets[: slots + 1], ids, slots
@@ -337,8 +354,28 @@ class Nvfp4TmExperts:
             return
         order, sorted_ids = order[:slots], sorted_ids[:slots]
         tokens = order // top_k
+        weights = top_k_weights.reshape(-1)[order].float()
+        total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        self.workspace.reserve(slots)
+        for start in range(0, slots, CHUNK_ROWS):
+            end = min(start + CHUNK_ROWS, slots)
+            self._chunk(
+                x, tokens[start:end], sorted_ids[start:end], weights[start:end], total
+            )
+        output.copy_(total)
+
+    def _chunk(
+        self,
+        x: torch.Tensor,
+        tokens: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        weights: torch.Tensor,
+        total: torch.Tensor,
+    ) -> None:
+        """Add the weighted expert outputs of up to CHUNK_ROWS slots, sorted
+        by expert, into the fp32 `total` [M, H]."""
         ws = self.workspace
-        ws.reserve(slots)
+        slots = tokens.numel()
         rows, gate_up, act, sorted_out = (
             ws.buffers[name][:slots] for name in ws.widths
         )
@@ -350,10 +387,7 @@ class Nvfp4TmExperts:
             self.w13.ptrs_w, self.w13.ptrs_s,
             groups, self.hidden_size, 2 * self.local_intermediate, NVFP4_BLOCK,
         )  # fmt: skip
-        wide = gate_up.float()
-        if self.w13.scale != 1.0:
-            wide.mul_(self.w13.scale)
-        gate, up = wide.chunk(2, dim=-1)
+        gate, up = gate_up.float().chunk(2, dim=-1)
         act.copy_(
             torch_ref.softcap(gate, self.gate_cap)
             * torch.sigmoid(gate)
@@ -364,10 +398,7 @@ class Nvfp4TmExperts:
             self.w2.ptrs_w, self.w2.ptrs_s,
             groups, self.local_intermediate, self.hidden_size, NVFP4_BLOCK,
         )  # fmt: skip
-        weights = top_k_weights.reshape(-1)[order].float() * self.w2.scale
-        total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         total.index_add_(0, tokens, sorted_out.float() * weights[:, None])
-        output.copy_(total)
 
 
 def build(
@@ -380,8 +411,10 @@ def build(
     top_k: int,
     range_check: RangeCheck | None = None,
 ) -> Nvfp4TmExperts:
-    """Banks of one layer on `device`, with scratch for the engine's batch."""
+    """Banks of one layer on `device`, with scratch for the engine's batch.
+    Raises Rejected for banks the route refuses."""
     from vllm_sm70.fused_moe.method import max_batched_tokens
+    from vllm_sm70.quant.nvfp4_moe import compact_policy_enabled
 
     tm = turbomind()
     if tm is None:
@@ -392,5 +425,6 @@ def build(
     return Nvfp4TmExperts(
         tm, w13, w2,
         device=device, gate_cap=gate_cap, up_cap=up_cap,
-        max_slots=max_batched_tokens() * top_k, range_check=range_check,
+        max_slots=max_batched_tokens() * top_k,
+        compact=compact_policy_enabled(), range_check=range_check,
     )  # fmt: skip

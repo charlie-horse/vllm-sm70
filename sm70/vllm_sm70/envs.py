@@ -308,8 +308,9 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": Sm70Config.flint_moe_qpn_decode=False (Flint NVFP4 M<=2 decode).
         "VLLM_SM70_FLINT_MOE_QPN_DECODE": kill_switch("VLLM_SM70_FLINT_MOE_QPN_DECODE"),
         # "0": Sm70Config.flint_moe_compact=False (Flint NVFP4 MoE dense stage
-        # with M*top_k <= 80 slots goes back to per-expert offsets). New name:
-        # the fork's compact slot route has no switch.
+        # with M*top_k <= 80 slots goes back to per-expert offsets; also the
+        # Inkling 2 TurboMind experts). New name: the fork's compact slot
+        # route has no switch.
         "VLLM_SM70_FLINT_MOE_COMPACT": kill_switch("VLLM_SM70_FLINT_MOE_COMPACT"),
         # "1": Inkling 2 NVFP4 experts run on the TurboMind dense stage instead
         # of the fp16 torch path (models/inkling2_sm70/moe_tm.py). Env-only, no

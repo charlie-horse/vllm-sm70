@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import math
+import os
 import pathlib
 
 import pytest
@@ -110,6 +111,9 @@ def test_kl_of_a_position_is_the_sum_over_the_reference_tokens():
         for tok, lp in ref
     )
     assert got == pytest.approx(want) and missing == 1
+    doc = " ".join(fl.position_kl.__doc__.split())
+    assert "top-N truncated KL, not S5's full-vocabulary metric" in doc
+    assert "lower bound" not in doc
 
 
 def _shift(amount, where):
@@ -397,6 +401,24 @@ def test_new_forwards_are_the_ones_after_the_snapshot(tmp_path):
     }
 
 
+def _touch(folder, seconds):
+    for path in folder.iterdir():
+        os.utime(path, ns=(seconds * 10**9, seconds * 10**9))
+
+
+def test_forwards_out_of_write_order_mark_a_reused_directory(tmp_path):
+    states = _states(3, 7)
+    folders = [_write_forward(tmp_path, r, f, states) for r in (0, 1) for f in range(3)]
+    for at, folder in zip([10, 11, 12, 10, 11, 12], folders):
+        _touch(folder, at)
+    assert fl.reused_ranks(tmp_path) == []
+    fl.check_fresh(tmp_path)
+    _touch(folders[4], 20)  # rank1 forward 1 rewritten by a later server
+    assert fl.reused_ranks(tmp_path) == ["rank1"]
+    with pytest.raises(fl.DumpReused, match="fresh, empty .*visit_dump_dir"):
+        fl.check_fresh(tmp_path)
+
+
 # --- end to end against a fake server ----------------------------------------
 
 
@@ -533,3 +555,45 @@ def test_end_to_end_fails_on_logprobs_and_on_missing_files(
     assert status == 1 and report["logprobs"]["pass"]
     assert "two.states.npz" in report["states"]["two"]["error"]
     assert "no dump" in report["states"]["one"]["ranks"]["rank0"]["error"]
+
+
+def test_end_to_end_refuses_a_reused_dump_directory(
+    monkeypatch, bundle, tmp_path, capsys
+):
+    goldens, dump, cases, states = bundle
+    # An earlier server's forwards 1..2, then this server's startup forward 0.
+    for rank in (0, 1):
+        for forward in (1, 2):
+            _touch(_write_forward(dump, rank, forward, _states(3, 98)), 100 + forward)
+        _touch(dump / f"rank{rank}" / "forward000000", 200)
+    server = _Server(cases, dump, states)
+    monkeypatch.setattr(fl.urllib.request, "urlopen", server)
+    argv = ["--base-url", "http://h:1/", "--model", "m", "--goldens", str(goldens)]
+    assert fl.main(argv + ["--settle", "0", "--dump-dir", str(dump)]) == 1
+    assert not server.bodies
+    out = capsys.readouterr().out
+    assert "holds forwards of an earlier server start" in out and "FAIL" in out
+
+
+def test_end_to_end_refuses_a_forward_overwritten_during_the_run(
+    monkeypatch, bundle, tmp_path, capsys
+):
+    goldens, dump, cases, states = bundle
+    # An earlier server's forwards 0..2, in order: nothing to see before the run.
+    for rank in (0, 1):
+        _touch(dump / f"rank{rank}" / "forward000000", 100)
+        for forward in (1, 2):
+            _touch(_write_forward(dump, rank, forward, _states(3, 98)), 100 + forward)
+    fake = _Server(cases, None, states)
+
+    def overwriting(request, timeout=None):
+        response = fake(request, timeout)
+        for rank in (0, 1):
+            _touch(dump / f"rank{rank}" / "forward000001", 300)
+        return response
+
+    monkeypatch.setattr(fl.urllib.request, "urlopen", overwriting)
+    argv = ["--base-url", "http://h:1/", "--model", "m", "--goldens", str(goldens)]
+    assert fl.main(argv + ["--settle", "0", "--dump-dir", str(dump)]) == 1
+    assert len(fake.bodies) == 1
+    assert "holds forwards of an earlier server start" in capsys.readouterr().out
