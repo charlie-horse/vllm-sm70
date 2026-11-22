@@ -355,6 +355,9 @@ class PagedHarness:
     check_writes: fail a step in which a rank writes a slot outside the
         batch's slot mapping, or writes only part of an owner's slots.
     vllm_configs: one config per rank to use instead of the stand-ins.
+    device: where the caches and the metadata tensors live.
+    cudagraph_mode: the stand-ins' CUDAGraphMode name; FULL_DECODE_ONLY
+        builds the steps a FULL decode graph would replay as decode-only.
     """
 
     def __init__(
@@ -369,9 +372,12 @@ class PagedHarness:
         poison: float | None = float("nan"),
         check_writes: bool = True,
         seed: int = 0,
+        device: torch.device | str = "cpu",
         vllm_configs: Sequence[Any] | None = None,
+        cudagraph_mode: str = "NONE",
     ) -> None:
         self.tp_size = tp_size
+        self.cudagraph_mode = cudagraph_mode
         self.block_size = block_size
         self.conv_block_size = conv_block_size
         self.dtype = dtype
@@ -379,6 +385,7 @@ class PagedHarness:
         self.poison = poison
         self.check_writes = check_writes and poison is not None and math.isnan(poison)
         self.seed = seed
+        self.device = torch.device(device)
         if vllm_configs is None:
             vllm_configs = [
                 self._stand_in(max_num_batched_tokens) for _ in range(tp_size)
@@ -398,13 +405,20 @@ class PagedHarness:
 
     def _stand_in(self, max_num_batched_tokens: int) -> SimpleNamespace:
         """The config fields the owners and the builders read."""
+        from vllm.config.compilation import CUDAGraphMode
+
+        from vllm_sm70.models.inkling2_sm70.config import DECODE_GRAPH_MAX_BATCH
+
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 block_size=self.block_size, cache_dtype="auto"
             ),
             model_config=SimpleNamespace(dtype=self.dtype, max_model_len=1_048_576),
             compilation_config=SimpleNamespace(
-                static_forward_context={}, fast_moe_cold_start=False
+                static_forward_context={},
+                fast_moe_cold_start=False,
+                cudagraph_mode=CUDAGraphMode[self.cudagraph_mode],
+                max_cudagraph_capture_size=DECODE_GRAPH_MAX_BATCH,
             ),
             scheduler_config=SimpleNamespace(
                 disable_hybrid_kv_cache_manager=False,
@@ -496,6 +510,7 @@ class PagedHarness:
                     ),
                     0.0 if self.poison is None else self.poison,
                     dtype=spec.dtype,
+                    device=self.device,
                 )
                 owner.kv_cache = caches[name]
             self.caches.append(caches)
@@ -653,8 +668,8 @@ class PagedHarness:
                 block.astype(np.int64) * table.block_size
                 + real_positions % table.block_size
             )
-            block_tables[name] = torch.from_numpy(block_table)
-            slot_mappings[name] = torch.from_numpy(slots)
+            block_tables[name] = torch.from_numpy(block_table).to(self.device)
+            slot_mappings[name] = torch.from_numpy(slots).to(self.device)
 
         seen_reqs, seen_tokens = num_reqs + pad_reqs, num_padded
         if metadata == "unpadded":
@@ -663,11 +678,13 @@ class PagedHarness:
                 block_tables[name] = block_tables[name][:num_reqs]
                 slot_mappings[name] = slot_mappings[name][:num_tokens]
 
+        device_starts = query_start_loc[: seen_reqs + 1].clone().to(self.device)
+
         def common(name: str) -> CommonAttentionMetadata:
             return CommonAttentionMetadata(
-                query_start_loc=query_start_loc[: seen_reqs + 1].clone(),
+                query_start_loc=device_starts,
                 query_start_loc_cpu=query_start_loc[: seen_reqs + 1],
-                seq_lens=seq_lens[:seen_reqs],
+                seq_lens=seq_lens[:seen_reqs].to(self.device),
                 num_reqs=seen_reqs,
                 num_actual_tokens=seen_tokens,
                 max_query_len=max(counts),
@@ -675,7 +692,7 @@ class PagedHarness:
                 block_table_tensor=block_tables[name],
                 slot_mapping=slot_mappings[name],
                 seq_lens_cpu_upper_bound=seq_lens[:seen_reqs].clone(),
-                positions=positions[:seen_tokens],
+                positions=positions[:seen_tokens].to(self.device),
             )
 
         # As the runner: one build per builder, then a block-table update
@@ -691,7 +708,7 @@ class PagedHarness:
                 key = (builder_cls, spec)
                 builder = self._builders[rank].get(key)
                 if builder is None:
-                    builder = builder_cls(spec, [name], config, torch.device("cpu"))
+                    builder = builder_cls(spec, [name], config, self.device)
                     self._builders[rank][key] = builder
                 if key not in built:
                     built[key] = builder.build(0, common(name))

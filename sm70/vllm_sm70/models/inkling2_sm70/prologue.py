@@ -31,11 +31,18 @@ import torch
 import torch.nn.functional as F
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
-from .backend import cache_metadata
+from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_K, STREAM_V
 from .ops import paged_conv
 from .ops.torch_ref import l2_clip, log_scale_tau, rms_norm
-from .sconv import _block_tokens, dynamic_conv, on_triton, static_conv
+from .sconv import (
+    _block_tokens,
+    _real_rows,
+    _store_rows,
+    dynamic_conv,
+    on_triton,
+    static_conv,
+)
 
 __all__ = [
     "attention_prologue",
@@ -113,12 +120,18 @@ def store_key_value(
     value: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    decode_only: bool = False,
 ) -> None:
     """Store `key`, `value` [n, kv_heads, D] of the real tokens at their
-    slots of the K/V cache; tokens with a negative slot are skipped."""
+    slots of the K/V cache; tokens with a negative slot are skipped, without
+    a host sync in a decode-only batch (sconv.py)."""
     block_tokens = kv_cache.shape[2]
     head_dim = key.shape[-1]
     slots = slot_mapping[: key.shape[0]]
+    if decode_only:
+        rows = torch.cat([key, value], dim=-1).to(kv_cache.dtype)
+        _store_rows(kv_cache, slots, rows)
+        return
     rows = (slots >= 0).nonzero().squeeze(1)
     slots = slots[rows]
     block, token = slots // block_tokens, slots % block_tokens
@@ -161,9 +174,10 @@ def attention_prologue(
     [T, heads, extent] and stores K, V and the conv inputs.
 
     The metadata is the current forward's and covers the first n =
-    ``num_actual_tokens`` rows: rows after them are zero in `q_out` and
-    `rel_out` and are not stored. A forward without metadata stores nothing
-    and applies no tau.
+    ``num_actual_tokens`` rows (the slot-mapping rows of a decode-only
+    batch, sconv.py): rows after them are zero in `q_out` and `rel_out` and
+    are not stored. A forward without metadata stores nothing and applies no
+    tau.
     """
     attn_metadata = cache_metadata(attn_owner)
     conv_metadata = cache_metadata(conv_owner)
@@ -171,8 +185,8 @@ def attention_prologue(
         q_out.copy_(query_states(q, q_scale, qk_clip))
         torch.matmul(query_states(r, rel_scale, rel_clip), rel_proj, out=rel_out)
         return
-    n = attn_metadata.num_actual_tokens
-    if n > q.shape[0] or n > attn_metadata.positions.shape[0]:
+    n = _real_rows(q, attn_metadata)
+    if n > attn_metadata.positions.shape[0]:
         raise ValueError(
             f"vllm_sm70: metadata of {n} tokens "
             f"({attn_metadata.positions.shape[0]} positions) for {q.shape[0]} rows."
@@ -189,12 +203,16 @@ def attention_prologue(
     q_out[n:] = 0
     rel_out[:n] = torch.matmul(query_states(r[:n], rel_scale, rel_clip, tau), rel_proj)
     rel_out[n:] = 0
+    if is_decode_only(attn_metadata):
+        padding = (attn_metadata.slot_mapping[:n] < 0)[:, None, None]
+        q_out[:n].masked_fill_(padding, 0.0)
+        rel_out[:n].masked_fill_(padding, 0.0)
     if conv_metadata is None:
         return
-    if conv_metadata.num_actual_tokens != n:
+    if _real_rows(k, conv_metadata) != n:
         raise ValueError(
             f"vllm_sm70: attention metadata of {n} tokens, conv-state metadata "
-            f"of {conv_metadata.num_actual_tokens}."
+            f"of {_real_rows(k, conv_metadata)}."
         )
     k_stream = conv_owner.stream_ranges[STREAM_K]
     v_stream = conv_owner.stream_ranges[STREAM_V]
@@ -232,4 +250,10 @@ def attention_prologue(
         k_taps=None if k_taps is None else k_taps[:n],
         v_taps=None if v_taps is None else v_taps[:n],
     )
-    store_key_value(key, value, attn_owner.kv_cache, attn_metadata.slot_mapping)
+    store_key_value(
+        key,
+        value,
+        attn_owner.kv_cache,
+        attn_metadata.slot_mapping,
+        is_decode_only(attn_metadata),
+    )

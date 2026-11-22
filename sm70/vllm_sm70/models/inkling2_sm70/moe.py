@@ -199,16 +199,18 @@ class Inkling2Sm70Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
         output: torch.Tensor,
+        rowwise: bool = False,
     ) -> None:
         """Write this rank's weighted expert sum of x [M, H] into `output`.
 
         top_k_index, top_k_weights [M, k] as `route` returns them; ids outside
-        0..E-1 select no expert.
+        0..E-1 select no expert. `rowwise`: the torch path sums each token
+        on its own, without a host sync.
         """
         if self.tm_route is not None:
             self.tm_route.expert_sum(x, top_k_index, top_k_weights, output)
             return
-        self.torch_expert_sum(x, top_k_index, top_k_weights, output)
+        self.torch_expert_sum(x, top_k_index, top_k_weights, output, rowwise)
 
     def torch_expert_sum(
         self,
@@ -216,11 +218,19 @@ class Inkling2Sm70Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
         output: torch.Tensor,
+        rowwise: bool = False,
     ) -> None:
-        """`expert_sum` on the dequantized w13 and w2. One token runs without
-        a host sync; a batch reads its per-expert counts on the host once."""
-        if x.shape[0] == 1:
-            self._token_expert_sum(x, top_k_index, top_k_weights, output)
+        """`expert_sum` on the dequantized w13 and w2. One token, or every
+        token with `rowwise`, runs without a host sync; a batch reads its
+        per-expert counts on the host once."""
+        if x.shape[0] == 1 or rowwise:
+            for row in range(x.shape[0]):
+                self._token_expert_sum(
+                    x[row : row + 1],
+                    top_k_index[row : row + 1],
+                    top_k_weights[row : row + 1],
+                    output[row : row + 1],
+                )
         else:
             self._grouped_expert_sum(x, top_k_index, top_k_weights, output)
 
@@ -293,10 +303,12 @@ class Inkling2Sm70Experts(nn.Module):
         x: torch.Tensor,
         output: torch.Tensor,
         is_padding: torch.Tensor | None = None,
+        rowwise: bool = False,
     ) -> None:
         """x [M, H] in the model dtype -> `output` [M, H], this rank's partial.
 
         `output` must not alias `x`. Padding rows are written as zeros.
+        `rowwise` as `expert_sum` (a decode-only batch).
         """
         _, weights, indices = self.route(x, is_padding)
-        self.expert_sum(x, indices, weights, output)
+        self.expert_sum(x, indices, weights, output, rowwise)

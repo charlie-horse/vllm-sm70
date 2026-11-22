@@ -35,7 +35,7 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from .attention_torch import paged_attention
-from .backend import cache_metadata
+from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_ATTN, STREAM_MLP
 from .moe import Inkling2Sm70Experts
 from .norms import Bank, normed_state, sublayer_inputs
@@ -89,13 +89,16 @@ def all_reduce(x: torch.Tensor, tp_size: int) -> torch.Tensor:
 @eager_break_during_capture
 def padding_mask(owner: Any, out: torch.Tensor) -> None:
     """Write into the bool `out` [T] which batch tokens are padding: the
-    rows after the metadata's ``num_actual_tokens`` and those with no slot
-    in the cache of `owner`. All false in a forward without metadata."""
+    rows after the metadata's ``num_actual_tokens`` (after its slot mapping
+    in a decode-only batch) and those with no slot in the cache of `owner`.
+    All false in a forward without metadata."""
     metadata = cache_metadata(owner)
     if metadata is None:
         out.zero_()
         return
     n = metadata.num_actual_tokens
+    if is_decode_only(metadata):
+        n = min(out.shape[0], metadata.slot_mapping.shape[0])
     if n > out.shape[0] or n > metadata.slot_mapping.shape[0]:
         raise ValueError(
             f"vllm_sm70: metadata of {n} tokens "
@@ -341,7 +344,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
             first=3,
         )
         partial = x.new_empty(x.shape)
-        self.mlp(x, partial, is_padding)
+        self.mlp(x, partial, is_padding, is_decode_only(cache_metadata(conv_owner)))
         if partial_hook is not None:
             partial_hook(PARTIAL_SITES[1], partial)
         expert_sum = all_reduce(partial, self.tp_size)

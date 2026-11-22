@@ -72,8 +72,14 @@ def built():
     return build(BLOCK, TP, torch.float16)
 
 
-def _vllm_config(batched_tokens: int = 64):
+def _vllm_config(
+    batched_tokens: int = 64,
+    cudagraph_mode: str = "FULL_DECODE_ONLY",
+    capture_size: int = 8,
+    enforce_eager: bool = False,
+):
     from vllm.config import CacheConfig
+    from vllm.config.compilation import CUDAGraphMode
 
     cache_config = CacheConfig(block_size=BLOCK, enable_prefix_caching=True)
     cache_config.kv_cache_layout = "LBNHC"
@@ -86,7 +92,13 @@ def _vllm_config(batched_tokens: int = 64):
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1, tensor_parallel_size=TP
         ),
-        model_config=SimpleNamespace(max_model_len=1_048_576),
+        model_config=SimpleNamespace(
+            max_model_len=1_048_576, enforce_eager=enforce_eager
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode[cudagraph_mode],
+            max_cudagraph_capture_size=capture_size,
+        ),
         kv_transfer_config=None,
         speculative_config=None,
         max_in_flight_tokens=batched_tokens,
@@ -170,18 +182,28 @@ def test_owners_resolve_their_backends(built):
         assert cls.get_supported_kernel_block_sizes(spec) == [MultipleOf(1)]
 
 
-def test_builder_flags(built):
+@pytest.mark.parametrize("switch", [None, "0"])
+def test_builder_flags(built, monkeypatch, switch):
+    """Graphs of uniform one-token decodes, none with
+    VLLM_SM70_INKLING_DECODE_GRAPH=0."""
     from vllm.v1.attention.backend import AttentionCGSupport
 
+    if switch is None:
+        monkeypatch.delenv("VLLM_SM70_INKLING_DECODE_GRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_INKLING_DECODE_GRAPH", switch)
+    want = (
+        AttentionCGSupport.NEVER
+        if switch == "0"
+        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
     owners, owner_config = built
     for owner in (owners.attn[0, 0], owners.attn[5, 0], owners.conv[0, 0]):
         builder = _builder(owner, owner_config)
         assert builder.reorder_batch_threshold == 1
         assert builder.supports_update_block_table is True
         spec = owner.get_kv_cache_spec(owner_config)
-        assert type(builder).get_cudagraph_support(None, spec) is (
-            AttentionCGSupport.NEVER
-        )
+        assert type(builder).get_cudagraph_support(None, spec) is want
 
 
 @pytest.mark.parametrize("layer", [0, 5], ids=["sliding", "global"])
@@ -191,6 +213,7 @@ def test_attention_metadata(built, layer):
         0, _common(ATTN_TABLE, ATTN_SLOTS)
     )
     _check_tokens(md, ATTN_TABLE, ATTN_SLOTS, BLOCK)
+    assert md.decode_only is False
     assert md.sliding_window == (1024 if layer == 0 else None)
     assert md.num_reqs == 3
     assert md.max_query_len == 5
@@ -217,6 +240,63 @@ def test_sconv_metadata(built):
     _check_tokens(md, CONV_TABLE, CONV_SLOTS, CONV_BLOCK)
 
 
+@pytest.mark.parametrize("kind", ["attn", "conv"])
+@pytest.mark.parametrize(
+    "switch, config, replays",
+    [
+        (None, {}, True),
+        (None, {"cudagraph_mode": "FULL_AND_PIECEWISE"}, True),
+        (None, {"capture_size": 4}, True),
+        ("0", {}, False),
+        (None, {"cudagraph_mode": "NONE"}, False),
+        (None, {"cudagraph_mode": "PIECEWISE"}, False),
+        (None, {"enforce_eager": True}, False),
+        (None, {"capture_size": 2}, False),
+    ],
+)
+def test_a_replayed_decode_batch_is_decode_only(
+    built, monkeypatch, kind, switch, config, replays
+):
+    """decode_only exactly when a FULL decode graph of the padded size
+    replays the step; every other decode batch takes the bounded path."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    if switch is None:
+        monkeypatch.delenv("VLLM_SM70_INKLING_DECODE_GRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_INKLING_DECODE_GRAPH", switch)
+    owners, owner_config = built
+    table, slots = (
+        (ATTN_TABLE, ATTN_SLOTS)
+        if kind == "attn"
+        else (
+            CONV_TABLE,
+            CONV_SLOTS,
+        )
+    )
+    qsl = torch.tensor([0, 1, 2, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([40, 7, 0], dtype=torch.int32)
+    cm = CommonAttentionMetadata(
+        query_start_loc=qsl.clone(),
+        query_start_loc_cpu=qsl,
+        seq_lens=seq_lens,
+        num_reqs=3,
+        num_actual_tokens=4,
+        max_query_len=1,
+        max_seq_len=40,
+        block_table_tensor=torch.tensor(table[:2] + [[0] * len(table[0])]).int(),
+        slot_mapping=torch.tensor(slots[:2] + [-1, -1], dtype=torch.int64),
+        seq_lens_cpu_upper_bound=seq_lens.clone(),
+    )
+    vllm_config = _vllm_config(**config)
+    md = _builder(getattr(owners, kind)[0, 0], owner_config, vllm_config).build(0, cm)
+    assert md.decode_only is replays
+    assert md.num_actual_tokens == 2
+    # A padded FULL-graph batch: P = 4 rows, the last two padding.
+    assert md.slot_mapping.tolist() == slots[:2] + [-1, -1]
+    assert md.seq_idx.tolist() == [0, 1, 0, 0]
+
+
 def test_all_decode_batch(built):
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -236,6 +316,7 @@ def test_all_decode_batch(built):
         seq_lens_cpu_upper_bound=seq_lens.clone(),
     )
     md = _builder(owners.attn[0, 0], owner_config).build(0, cm)
+    assert md.decode_only is True
     assert (md.num_decodes, md.num_prefills) == (2, 0)
     assert (md.num_decode_tokens, md.num_prefill_tokens) == (2, 0)
     assert md.seq_idx.tolist() == [0, 1]

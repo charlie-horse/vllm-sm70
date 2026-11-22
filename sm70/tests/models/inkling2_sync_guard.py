@@ -9,6 +9,10 @@ ops whose output shape depends on tensor values (``nonzero``, one-argument
 ``repeat_interleave`` without an output size, boolean-mask indexing) and
 host data copied to a tensor (``torch.tensor``, ``torch.as_tensor``,
 ``torch.from_numpy``). ``allowed`` wraps a function whose syncs are exempt.
+``no_host_sync(trace)`` also appends every op it sees to the list `trace`,
+with the shapes and dtypes of its tensor outputs: two calls with equal
+traces launch the same ops on the same allocation sizes, as a CUDA graph
+replays them.
 """
 
 from __future__ import annotations
@@ -61,7 +65,19 @@ def _is_bool_index(value: Any) -> bool:
     return False
 
 
+def _signature(out: Any) -> tuple:
+    if isinstance(out, torch.Tensor):
+        return ((tuple(out.shape), out.dtype),)
+    if isinstance(out, (list, tuple)):
+        return tuple(sig for o in out for sig in _signature(o))
+    return ()
+
+
 class _Mode(TorchDispatchMode):
+    def __init__(self, trace: list | None = None) -> None:
+        super().__init__()
+        self.trace = trace
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if _armed():
@@ -72,7 +88,10 @@ class _Mode(TorchDispatchMode):
                 raise HostSync(f"{func} without output_size syncs with the host")
             if packet in _INDEX_OPS and _is_bool_index(args[1]):
                 raise HostSync(f"{func} with a boolean mask syncs with the host")
-        return func(*args, **kwargs)
+        out = func(*args, **kwargs)
+        if self.trace is not None:
+            self.trace.append((str(func), _signature(out)))
+        return out
 
 
 def _guarded(name: str, original: Callable) -> Callable:
@@ -100,14 +119,14 @@ def allowed(fn: Callable) -> Callable:
 
 
 @contextlib.contextmanager
-def no_host_sync() -> Iterator[None]:
+def no_host_sync(trace: list | None = None) -> Iterator[None]:
     saved = [(torch.Tensor, n, getattr(torch.Tensor, n)) for n in _TENSOR_METHODS]
     saved += [(torch, n, getattr(torch, n)) for n in _TORCH_FUNCTIONS]
     for owner, name, original in saved:
         setattr(owner, name, _guarded(name, original))
     _state.update(active=True, exempt=0)
     try:
-        with _Mode():
+        with _Mode(trace):
             yield
     finally:
         _state.update(active=False, exempt=0)
