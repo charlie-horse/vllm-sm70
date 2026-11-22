@@ -9,8 +9,8 @@ control flow). `args` names every kernel argument: a type string ("*fp16",
 ``SM70_BANNED`` lists PTX that sm_70 lacks or runs slowly.
 
 ``skip_reason()`` is None when Triton's CUDA backend and its ptxas are there.
-Under TRITON_INTERPRET=1 the kernels are not JIT functions: compile in a
-process without it.
+Under TRITON_INTERPRET=1, or when vLLM falls back to its placeholder Triton,
+the kernels are not JIT functions and ``compile_ptx`` skips.
 """
 
 from __future__ import annotations
@@ -55,6 +55,10 @@ def compile_ptx(
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
+    if not hasattr(kernel, "arg_names"):
+        import pytest
+
+        pytest.skip("the kernels are not JIT functions (placeholder Triton)")
     names = list(kernel.arg_names)
     assert set(args) == set(names), (
         f"missing {sorted(set(names) - set(args))}, "
