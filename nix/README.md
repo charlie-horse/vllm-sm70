@@ -77,6 +77,15 @@ Attention needs no flag: the sm70 platform picks Flash-V100 (K06,
 `AttentionBackendEnum.CUSTOM`) for fp16 head-128/256 layers, target
 and DFlash draft alike, unless `VLLM_SM70_FLASH_V100=0`.
 
+## Per-model serve values
+
+A host overrides single fields of a built-in model, for example
+`services.vllm-sm70.models.flint.maxNumSeqs = 20`. `maxModelLen`,
+`maxNumSeqs`, `maxNumBatchedTokens` and `gpuMemoryUtilization` set
+`--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens` and
+`--gpu-memory-utilization`; unset, the module passes 262144, 4, 8192 and
+0.88. The comment above the `models` option in `module.nix` lists every field.
+
 ## Qwen serve flags
 
 The `qwen3.6-35b-a3b` and `qwen3.8-27b` entries use the flags measured on

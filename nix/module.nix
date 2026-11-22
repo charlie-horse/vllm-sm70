@@ -231,7 +231,7 @@ let
     "--dtype" "half"
     "--max-model-len" (toString (model.maxModelLen or 262144))
     "--max-num-seqs" (toString (model.maxNumSeqs or 4))
-    "--max-num-batched-tokens" "8192"
+    "--max-num-batched-tokens" (toString (model.maxNumBatchedTokens or 8192))
     # Leaves ~2.2 GiB per GPU outside vLLM's budget for the LMCache server's
     # CUDA context and its KV transfer staging during stores.
     "--gpu-memory-utilization" (toString (model.gpuMemoryUtilization or 0.88))
@@ -309,8 +309,9 @@ in
 
     # Served model name -> weights, either pinned HF `downloads` (a list of
     # { repo, revision, dir }; the first is the served checkpoint) or a Nix
-    # store `path`; optional maxModelLen / gpuMemoryUtilization / maxNumSeqs
-    # overrides; `lmcache` (default true) and its `lmcacheChunkSize`; `package`
+    # store `path`; optional maxModelLen / gpuMemoryUtilization / maxNumSeqs /
+    # maxNumBatchedTokens overrides (--max-num-batched-tokens, default 8192);
+    # `lmcache` (default true) and its `lmcacheChunkSize`; `package`
     # (the wrapped vllm to run, default this flake's `vllm`); extra service `env`
     # (a host value replaces the built-in one as a whole); `v2ModelRunner`
     # (default false: sets VLLM_USE_V2_MODEL_RUNNER=1, kept when `env` is
