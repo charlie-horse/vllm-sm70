@@ -209,7 +209,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | yes (Flint) |
 | `VLLM_SM70_FLINT_AR_RMSNORM` | yes (Flint) |
 | `VLLM_SM70_FLINT_MOE_COMPACT` | new, not in fork (the fork route has no switch); approved as the eighth Flint switch |
-| `VLLM_SM70_INKLING_NVFP4_TM` | new (Inkling 2; opt-in: only `1` enables the TurboMind expert route, default off keeps all experts in fp16) |
+| `VLLM_SM70_INKLING_NVFP4_TM` | new (Inkling 2; kill switch: `0` keeps all experts in fp16 on the torch path, default on runs the admitted NVFP4 layers on the TurboMind expert route) |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |
 | `VLLM_SM70_QUANT` | new |

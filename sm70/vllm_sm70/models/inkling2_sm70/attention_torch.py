@@ -306,6 +306,11 @@ def gather_attention(
     starts = np.concatenate(([0], np.cumsum(query_lens)))
     single = np.flatnonzero(query_lens == 1)
     if single.size:
+        if single[-1] == single.size - 1:
+            # Decode-first batch: the device copy of `starts` has the tokens.
+            tokens = md.query_start_loc[: single.size].long()
+        else:
+            tokens = torch.as_tensor(starts[single], device=query.device)
         _own_keys(
             query,
             rel_logits,
@@ -313,7 +318,7 @@ def gather_attention(
             kv_cache,
             md,
             out,
-            tokens=torch.as_tensor(starts[single], device=query.device),
+            tokens=tokens,
             max_seq_len=int(seq_lens[single].max()),
             key_chunk=key_chunk,
             hf_rounding=hf_rounding,

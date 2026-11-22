@@ -53,7 +53,7 @@ EFFECTIVE_DEFAULTS = {
 # Our sections of K01's registry.
 REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # Routes that run only when their variable is "1" (envs.opt_in).
-OPT_IN = {"VLLM_SM70_INKLING_NVFP4_TM", "VLLM_SM70_INKLING_TRITON_NORMS"}
+OPT_IN = {"VLLM_SM70_INKLING_TRITON_NORMS"}
 # The kill switches: only "0" acts.
 OURS = {name: get for name, get in REGISTERED.items() if name not in OPT_IN}
 
@@ -373,8 +373,8 @@ def _flint_qk_rope_kv_off():
 
 
 def _inkling_nvfp4_tm_off(name):
-    """M12: no Inkling 2 shape is admitted to the TurboMind dense stage; the
-    route-level check is in sm70/tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
+    """M12 "0": no Inkling 2 shape is admitted to the TurboMind dense stage;
+    the route-level check is in sm70/tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
     pytest.importorskip("vllm.envs")
     import torch
 
@@ -398,7 +398,6 @@ def _inkling_triton_norms_off(name):
 
 
 OPT_IN_OFF = {
-    "VLLM_SM70_INKLING_NVFP4_TM": _inkling_nvfp4_tm_off,
     "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
 }
 
@@ -444,6 +443,8 @@ def _path_off(name):
         _quant_registration_skipped(name)
     elif name == "VLLM_SM70_DFLASH2_EMULATION":
         _dflash2_emulation_off(name)
+    elif name == "VLLM_SM70_INKLING_NVFP4_TM":
+        _inkling_nvfp4_tm_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

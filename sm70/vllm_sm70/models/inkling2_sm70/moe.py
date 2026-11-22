@@ -12,9 +12,9 @@ Rounding follows the reference: routing in fp32, both GEMMs in the model
 dtype, the SwiGLU soft caps in fp32, the routing weight applied after W2 and
 the sum over a token's experts in fp32, rounded once to the model dtype.
 
-With ``VLLM_SM70_INKLING_NVFP4_TM=1`` the NVFP4 layers that
-``moe_tm.rejection`` admits run on the TurboMind dense stage instead
-(moe_tm.py) and hold no fp16 expert weights.
+The NVFP4 layers that ``moe_tm.rejection`` admits run on the TurboMind
+dense stage instead (moe_tm.py) and hold no fp16 expert weights;
+``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer here.
 """
 
 from __future__ import annotations
@@ -171,7 +171,8 @@ class Inkling2Sm70Experts(nn.Module):
         for name, shape in self.weight_shapes.items():
             setattr(self, name, torch.empty((0, *shape[1:]), dtype=self.dtype))
         moe_tm.logger.info_once(
-            "Inkling 2 NVFP4 experts %s run on the TurboMind dense stage (%s=1).",
+            "Inkling 2 NVFP4 experts %s run on the TurboMind dense stage "
+            "(%s=0 turns it off).",
             self.contract,
             moe_tm.SWITCH,
         )
@@ -216,7 +217,22 @@ class Inkling2Sm70Experts(nn.Module):
         top_k_weights: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """`expert_sum` on the dequantized w13 and w2."""
+        """`expert_sum` on the dequantized w13 and w2. One token runs without
+        a host sync; a batch reads its per-expert counts on the host once."""
+        if x.shape[0] == 1:
+            self._token_expert_sum(x, top_k_index, top_k_weights, output)
+        else:
+            self._grouped_expert_sum(x, top_k_index, top_k_weights, output)
+
+    def _grouped_expert_sum(
+        self,
+        x: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Each expert's tokens in one GEMM pair, the experts in ascending
+        order; a token's experts are summed in that order."""
         k = top_k_index.shape[-1]
         flat = top_k_index.reshape(-1)
         none = self.num_experts
@@ -224,10 +240,11 @@ class Inkling2Sm70Experts(nn.Module):
         order = torch.argsort(flat, stable=True)
         tokens = order // k
         weights = top_k_weights.reshape(-1)[order].float()
-        counts = torch.bincount(flat, minlength=self.num_experts + 1)
+        # torch.bincount syncs on CUDA (min and max); scatter_add_ does not.
+        counts = flat.new_zeros(none + 1).scatter_add_(0, flat, torch.ones_like(flat))
         total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         start = 0
-        for expert, count in enumerate(counts[: self.num_experts].tolist()):
+        for expert, count in enumerate(counts[:none].tolist()):
             if not count:
                 continue
             rows = tokens[start : start + count]
@@ -236,6 +253,38 @@ class Inkling2Sm70Experts(nn.Module):
             out = F.linear(act, self.w2[expert]).float()
             total.index_add_(0, rows, out * weights[start : start + count, None])
             start += count
+        output.copy_(total)
+
+    def _token_expert_sum(
+        self,
+        x: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """`_grouped_expert_sum` of x [1, H] without a host sync, bit-equal to
+        it: each slot's expert weights are gathered on the device, a slot
+        with no expert is computed on expert E - 1 and zeroed, and the slots
+        are summed in ascending expert order."""
+        k = top_k_index.shape[-1]
+        none = self.num_experts
+        ids = top_k_index.reshape(-1)
+        ids = ids.masked_fill((ids < 0) | (ids > none), none)
+        ids, order = torch.sort(ids, stable=True)
+        skip = (ids == none).unsqueeze(1)
+        ids = ids.clamp(max=none - 1)
+        w13 = self.w13.index_select(0, ids)
+        w2 = self.w2.index_select(0, ids)
+        row = x.contiguous()
+        gate_up = torch.cat([F.linear(row, w13[slot]) for slot in range(k)])
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = torch_ref.softcapped_swiglu(gate, up, self.gate_cap, self.up_cap)
+        out = torch.cat([F.linear(act[slot : slot + 1], w2[slot]) for slot in range(k)])
+        weights = top_k_weights.reshape(-1)[order].float()
+        out = (out.float() * weights[:, None]).masked_fill_(skip, 0.0)
+        total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        for slot in range(k):
+            total.add_(out[slot])
         output.copy_(total)
 
     @eager_break_during_capture
