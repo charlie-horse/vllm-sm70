@@ -33,6 +33,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -42,6 +43,7 @@ from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .expert_weights import Inkling2ExpertLoader
+from .fp16_audit import walk_process_weights_after_loading
 from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
 from .processing import (
     IMAGE_PLACEHOLDER,
@@ -50,6 +52,8 @@ from .processing import (
     Inkling2ProcessingInfo,
 )
 from .vision import Inkling2VisionEncoder
+
+logger = init_logger("vllm.sm70.inkling2")
 
 __all__ = [
     "Inkling2LoopSm70ForConditionalGeneration",
@@ -264,23 +268,42 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         layers = self.model.layers
+        audit = self.model.weight_map.audit
         experts = Inkling2ExpertLoader(
             self.text_config,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             formats=self.expert_formats,
-            sink=lambda layer: layers[layer.layer].mlp.load_expert_layer(layer),
+            sink=lambda layer: layers[layer.layer].mlp.load_expert_layer(
+                layer, range_check=audit.check
+            ),
         )
         visual: list[tuple[str, torch.Tensor]] = []
+
+        visual_dtypes = (
+            {}
+            if self.visual is None
+            else {n: p.dtype for n, p in self.visual.named_parameters()}
+        )
+
+        def keep_visual(name: str, tensor: torch.Tensor) -> None:
+            if visual_dtypes.get(name) == torch.float16:
+                audit.check(f"model.visual.{name}", tensor)
+            visual.append((name, tensor))
+
         loaded = self.model.weight_map.load_into(
             self,
             weights,
             expert_loader=experts,
-            visual_loader=None
-            if self.visual is None
-            else lambda name, tensor: visual.append((name, tensor)),
+            visual_loader=None if self.visual is None else keep_visual,
         )
         experts.finish()
         if self.visual is not None:
             loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual)}
+        logger.info("Inkling 2 rank %d %s", self.tp_rank, audit.summary())
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        """vLLM calls this on the top-level model only; it reaches the
+        submodules' hooks."""
+        walk_process_weights_after_loading(self)

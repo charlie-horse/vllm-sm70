@@ -60,7 +60,9 @@ def _weights():
 class Engine:
     """The model on one harness, with ``image_limit`` images per prompt."""
 
-    def __init__(self, *, image_limit: int | None = None, sm70=None):
+    def __init__(
+        self, *, image_limit: int | None = None, sm70=None, dtype=torch.float32
+    ):
         from vllm.config import set_current_vllm_config
         from vllm.config.multimodal import MultiModalConfig
 
@@ -69,7 +71,6 @@ class Engine:
             Inkling2LoopSm70MMConfig,
         )
 
-        dtype = torch.float32
         self.harness = hx.PagedHarness(1, block_size=BLOCK_SIZE, dtype=dtype)
         config = self.harness.vllm_config(0)
         model_config = config.model_config
@@ -404,3 +405,26 @@ def test_image_limit_zero_builds_no_encoder_and_skips_its_weights(case):
     with pytest.raises(ValueError, match="without its vision encoder"):
         model.embed_multimodal(vision_pixels=case.raw, vision_grid_thw=case.grid)
     assert model.embed_multimodal() == ()
+
+
+def test_vision_and_expert_casts_go_through_the_load_audit(monkeypatch):
+    from vllm_sm70.models.inkling2_sm70.fp16_audit import Fp16Audit
+
+    seen = []
+    check = Fp16Audit.check
+
+    def record(self, name, source, cast=None):
+        seen.append(name)
+        return check(self, name, source, cast)
+
+    monkeypatch.setattr(Fp16Audit, "check", record)
+    engine = Engine(dtype=torch.float16)
+    half = {
+        name
+        for name, param in engine.model.visual.named_parameters()
+        if param.dtype == torch.float16
+    }
+    assert half
+    assert {name.rpartition("visual.")[2] for name in seen if "visual." in name} == half
+    assert any(".mlp.experts.w13_weight" in name for name in seen)
+    assert any(".mlp.experts.w2_weight" in name for name in seen)

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
-from .expert_weights import ExpertLayer
+from .expert_weights import ExpertLayer, RangeCheck, check_cast_range
 from .ops import torch_ref
 
 
@@ -93,9 +93,12 @@ class Inkling2Sm70Experts(nn.Module):
         )
         self.register_buffer("w2", torch.empty(e, h, i, dtype=dtype), persistent=False)
 
-    def load_expert_layer(self, layer: ExpertLayer) -> None:
-        """Dequantize `layer` (already sliced to this rank) into w13 and w2."""
-        w13, w2 = layer.dequantize(self.w13.dtype)
+    def load_expert_layer(
+        self, layer: ExpertLayer, range_check: RangeCheck | None = check_cast_range
+    ) -> None:
+        """Dequantize `layer` (already sliced to this rank) into w13 and w2;
+        `range_check` sees every cast block (expert_weights.py)."""
+        w13, w2 = layer.dequantize(self.w13.dtype, range_check=range_check)
         for name, got, buffer in (("w13", w13, self.w13), ("w2", w2, self.w2)):
             if got.shape != buffer.shape:
                 raise ValueError(

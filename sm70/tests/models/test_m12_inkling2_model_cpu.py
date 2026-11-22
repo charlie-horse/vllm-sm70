@@ -405,6 +405,30 @@ def test_fp16_model_loads_and_runs(sequences):
     assert got[:, -engine.model.lm_head.weight.shape[0] :].abs().max() <= cap
 
 
+def test_out_of_range_expert_block_fails_the_fp16_load(monkeypatch):
+    from vllm_sm70.models.inkling2_sm70 import expert_weights
+
+    values = expert_weights.PackedExpertWeight._chunk_values
+    monkeypatch.setattr(
+        expert_weights.PackedExpertWeight,
+        "_chunk_values",
+        lambda self, experts: values(self, experts) * 1e6,
+    )
+    with pytest.raises(ValueError, match=r"experts\.w13_weight.*fit in fp16"):
+        Engine(torch.float16)
+
+
+def test_post_load_hook_reaches_submodule_hooks(engine):
+    calls = []
+    mlp = engine.model.model.layers[0].mlp
+    mlp.process_weights_after_loading = lambda: calls.append("mlp")
+    try:
+        engine.model.process_weights_after_loading()
+    finally:
+        del mlp.process_weights_after_loading
+    assert calls == ["mlp"]
+
+
 def test_refuses_head_dtype_other_than_the_model_dtype():
     with pytest.raises(ValueError, match="head_dtype"):
         Engine(torch.float16, head_dtype=torch.float32)
