@@ -77,10 +77,7 @@ def _conv_tile(
     cur = tl.load(x_rows, mask=row_col, other=0.0).to(dtype)
     acc = tl.zeros(cur.shape, dtype=tl.float32)
     for k in tl.static_range(W):
-        if DYNAMIC:
-            lag: tl.constexpr = k
-        else:
-            lag: tl.constexpr = W - 1 - k
+        lag = k if DYNAMIC else W - 1 - k
         if lag == 0:
             tap = tl.where(valid[:, None], cur.to(tl.float32), 0.0)
         else:
@@ -313,22 +310,25 @@ def _key_value_conv_kernel(
     BT: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # Programs (tile, head, 0 | 1): the K | V conv of one KV head.
-    shared = (
-        cache_ptr, kv_ptr, kv_slot_ptr, pos_ptr, seq_ptr, qstart_ptr, slot_ptr,
-        table_ptr, num_tokens, stride_cb, stride_ch, stride_cn, cache_block,
-        stride_bt, max_blocks, stride_kvb, stride_kvh, stride_kvn, kv_block,
-        divisor, clip, eps, D, H, W, DYNAMIC, BT, BLOCK_D,
-    )  # fmt: skip
+    # Programs (tile, head, 0 | 1): the K | V conv of one KV head; constexprs
+    # are passed by name because a tuple splat drops them.
     if tl.program_id(2) == 0:
         _key_value_tile(
             k_ptr, stride_k, wk_ptr, stride_wk0, stride_wk1, dk_ptr, stride_dk,
-            offset_k, *shared, False,
+            offset_k,
+            cache_ptr, kv_ptr, kv_slot_ptr, pos_ptr, seq_ptr, qstart_ptr, slot_ptr,
+            table_ptr, num_tokens, stride_cb, stride_ch, stride_cn, cache_block,
+            stride_bt, max_blocks, stride_kvb, stride_kvh, stride_kvn, kv_block,
+            divisor, clip, eps, D, H, W, DYNAMIC, BT, BLOCK_D, False,
         )  # fmt: skip
     else:
         _key_value_tile(
             v_ptr, stride_v, wv_ptr, stride_wv0, stride_wv1, dv_ptr, stride_dv,
-            offset_v, *shared, True,
+            offset_v,
+            cache_ptr, kv_ptr, kv_slot_ptr, pos_ptr, seq_ptr, qstart_ptr, slot_ptr,
+            table_ptr, num_tokens, stride_cb, stride_ch, stride_cn, cache_block,
+            stride_bt, max_blocks, stride_kvb, stride_kvh, stride_kvn, kv_block,
+            divisor, clip, eps, D, H, W, DYNAMIC, BT, BLOCK_D, True,
         )  # fmt: skip
 
 
