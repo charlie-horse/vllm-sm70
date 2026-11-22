@@ -197,7 +197,8 @@ def test_graph_capture_and_replay(real, m):
         eager = route(real, *static)
         assert torch.equal(out, eager)
         assert bool((out[0] == 0).all())
-        assert max_abs_rel(out, oracle(real, *static)) < TOL
+        if m > 1:  # with m == 1 the only row is padding and the oracle is 0
+            assert max_abs_rel(out, oracle(real, *static)) < TOL
 
 
 def _ms(fn, iters=20):
