@@ -9,6 +9,7 @@ module tree with hooks at several depths.
 
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -134,7 +135,9 @@ def test_one_flushed_weight_in_an_ordinary_tensor_is_counted():
 def test_flush_limit_is_relative_to_the_largest_weight():
     limit = fp16_audit.FLUSH_RELATIVE
     lost = 2.0**-26
-    Fp16Audit().check("ok", torch.tensor([lost, lost / limit]))
+    # At the limit the flush is tolerated; the tensor is still all subnormal.
+    with pytest.raises(ValueError, match="ok: max .* below the smallest normal"):
+        Fp16Audit().check("ok", torch.tensor([lost, lost / limit]))
     with pytest.raises(ValueError, match="bad: 1 nonzero values"):
         Fp16Audit().check("bad", torch.tensor([lost, 0.5 * lost / limit]))
 
@@ -173,6 +176,47 @@ def test_check_counts_subnormals_and_accepts_exact_zeros():
     audit.check("empty", torch.zeros(0))
     audit.check("not fp16", torch.tensor([1e30]), torch.tensor([1e30]))
     assert audit.tensors == 1
+
+
+@pytest.mark.parametrize("value", [1e-5, -3e-5, 2.0**-15])
+def test_tensor_of_subnormal_weights_fails_load_with_the_tensor_name(value):
+    cast = torch.tensor(value, dtype=torch.bfloat16).to(torch.float16)
+    assert cast != 0 and cast.abs() < fp16_audit.FP16_MIN_NORMAL
+    native = dict(NATIVE)
+    native[CAST] = torch.full_like(NATIVE[CAST], value)
+    with pytest.raises(ValueError, match="below the smallest normal fp16") as e:
+        _load(native)
+    assert CAST in str(e.value)
+
+
+def test_subnormal_limit_is_the_smallest_normal_value_and_zeros_pass():
+    audit = Fp16Audit()
+    low = fp16_audit.FP16_MIN_NORMAL
+    audit.check("normal", torch.tensor([0.0, low / 2, -low]))
+    audit.check("zeros", torch.zeros(4))
+    assert (audit.tensors, audit.subnormal) == (2, 1)
+    with pytest.raises(ValueError, match="tiny: max .* below the smallest normal"):
+        audit.check("tiny", torch.tensor([0.0, low / 2, -low * 0.99]))
+    with pytest.raises(ValueError, match="tiny: max .* below the smallest normal"):
+        audit.check("tiny", torch.tensor([low / 2]), torch.tensor([low / 2]).half())
+
+
+def test_subnormal_share_above_one_percent_is_logged_with_the_name(monkeypatch):
+    lines: list[str] = []
+    monkeypatch.setattr(
+        fp16_audit.logger, "warning", lambda msg, *args: lines.append(msg % args)
+    )
+    audit = Fp16Audit()
+    source = torch.ones(200)
+    source[:2] = 2.0**-16
+    audit.check("at the limit", source)
+    assert lines == [] and audit.subnormal == 2
+    source[2] = -(2.0**-16)
+    audit.check("layers.3.weight", source)
+    assert len(lines) == 1 and audit.subnormal == 5
+    assert "layers.3.weight has 3 of 200 values (1.50%) subnormal" in lines[0]
+    _load(NATIVE, audit)
+    assert len(lines) == 1
 
 
 def test_check_of_a_dequantized_block_without_a_cast_copy():
@@ -283,3 +327,49 @@ def test_walk_reaches_every_hook_once_children_first():
         if module is not model and isinstance(module, _Hooked)
     }
     assert set(reached) == expected
+
+
+def test_walk_reaches_every_hook_once_children_first_on_the_tiny_model():
+    pytest.importorskip("vllm")
+    from vllm.model_executor.layers.attention import is_deferred_attention_layer
+
+    sys.path.insert(0, str(HERE))
+    import test_m12_inkling2_model_cpu as body
+
+    model = body.Engine().model
+    log: list[str] = []
+    model.model.layers[0].probe = _Hooked(log, "probe", _Hooked(log, "kid"))
+    expected = {
+        name
+        for name, module in model.named_modules()
+        if module is not model
+        and callable(getattr(module, "process_weights_after_loading", None))
+        and not is_deferred_attention_layer(module)
+    }
+    assert {"model.layers.0.probe", "model.layers.0.probe.kids.0"} <= expected
+    calls = dict.fromkeys(expected, 0)
+
+    def counted(name, hook):
+        def wrapper():
+            calls[name] += 1
+            hook()
+
+        return wrapper
+
+    for name in expected:
+        module = model.get_submodule(name)
+        module.process_weights_after_loading = counted(
+            name, module.process_weights_after_loading
+        )
+    reached = fp16_audit.walk_process_weights_after_loading(model)
+    assert sorted(reached) == sorted(expected)
+    assert set(calls.values()) == {1} and log == ["kid", "probe"]
+    order = {name: i for i, name in enumerate(reached)}
+    for name in reached:
+        parent = name.rpartition(".")[0]
+        while parent:
+            assert order.get(parent, len(order)) > order[name], (name, parent)
+            parent = parent.rpartition(".")[0]
+    # The model's own hook, the one vLLM calls, runs the same walk.
+    model.process_weights_after_loading()
+    assert set(calls.values()) == {2} and log == ["kid", "probe"] * 2

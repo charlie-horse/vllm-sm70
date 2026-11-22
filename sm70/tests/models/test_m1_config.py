@@ -51,7 +51,11 @@ EFFECTIVE_DEFAULTS = {
 }
 
 # Our sections of K01's registry.
-OURS = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
+REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
+# Routes that run only when their variable is "1" (envs.opt_in).
+OPT_IN = {"VLLM_SM70_INKLING_NVFP4_TM", "VLLM_SM70_INKLING_TRITON_NORMS"}
+# The kill switches: only "0" acts.
+OURS = {name: get for name, get in REGISTERED.items() if name not in OPT_IN}
 
 # Sm70Config fields whose kill switch is registered in Kai's "sampler"
 # section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
@@ -69,7 +73,7 @@ PENDING: dict[str, str] = {}
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in (*OURS, *SAMPLER_FIELD_SWITCHES):
+    for name in (*REGISTERED, *SAMPLER_FIELD_SWITCHES):
         monkeypatch.delenv(name, raising=False)
     clear_cache()
     yield
@@ -96,7 +100,9 @@ def test_none_additional_config_returns_defaults():
 
 
 def test_additional_config_parse_and_cache():
-    vc = _vc({"quant_backend": "turbomind", "flint_qk_rope_kv": False, "fp8_qpn8": True})
+    vc = _vc(
+        {"quant_backend": "turbomind", "flint_qk_rope_kv": False, "fp8_qpn8": True}
+    )
     cfg = sm70_config(vc)
     assert cfg.quant_backend == "turbomind"
     assert cfg.flint_qk_rope_kv is False
@@ -152,10 +158,12 @@ def test_registered_names_are_exactly_ours():
     assert set(envs._SECTIONS["models"]) == {
         "VLLM_SM70_FLINT_MOE_QPN_DECODE",
         "VLLM_SM70_FLINT_MOE_COMPACT",
+        "VLLM_SM70_INKLING_NVFP4_TM",
         "VLLM_SM70_FLINT_QK_ROPE_KV",
         "VLLM_SM70_DFLASH2_VERIFIER",
         "VLLM_SM70_DFLASH2_EMULATION",
         "VLLM_SM70_SHARED_MOE_OVERLAP",
+        "VLLM_SM70_INKLING_TRITON_NORMS",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -174,7 +182,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_FLINT_ATTN_FUSED_DECODE",
         "VLLM_SM70_FLINT_AR_RMSNORM",
     ):
-        assert name not in OURS
+        assert name not in REGISTERED
 
 
 def _field_off(name):
@@ -281,9 +289,10 @@ def _dflash2_emulation_off(name):
     before = ModelRegistry.models[dflash_sm70.DRAFT_ARCH]
     from vllm_sm70 import _ext
 
-    with mock.patch.object(
-        sm70_platform, "all_visible_gpus_are_sm70", lambda: True
-    ), mock.patch.object(_ext, "is_loaded", lambda: True):
+    with (
+        mock.patch.object(sm70_platform, "all_visible_gpus_are_sm70", lambda: True),
+        mock.patch.object(_ext, "is_loaded", lambda: True),
+    ):
         assert dflash_sm70.register() is False
     assert ModelRegistry.models[dflash_sm70.DRAFT_ARCH] is before
 
@@ -361,6 +370,57 @@ def _flint_qk_rope_kv_off():
     assert enabled is False
     assert "VLLM_SM70_FLINT_QK_ROPE_KV=0" in reason(enabled)
     assert reason(True) is None  # the same layer fuses when the switch is unset
+
+
+def _inkling_nvfp4_tm_off(name):
+    """M12: no Inkling 2 shape is admitted to the TurboMind dense stage; the
+    route-level check is in sm70/tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
+    pytest.importorskip("vllm.envs")
+    import torch
+
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    assert moe_tm.SWITCH == name and not moe_tm.enabled()
+    for contract in moe_tm.INKLING_CONTRACTS:
+        for tp in moe_tm.INKLING_TP_SIZES:
+            assert moe_tm.rejection(contract, tp, torch.float16) == moe_tm.SWITCHED_OFF
+
+
+def _inkling_triton_norms_off(name):
+    """A GPU tensor takes the torch ops of inkling2_sm70/norms.py; the
+    kernels' own checks are tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import norms
+
+    assert norms.SWITCH == name
+    gpu = SimpleNamespace(is_cuda=True)
+    assert norms.on_triton(gpu) is False
+
+
+OPT_IN_OFF = {
+    "VLLM_SM70_INKLING_NVFP4_TM": _inkling_nvfp4_tm_off,
+    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
+}
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "true", "on", "yes", " 1"])
+@pytest.mark.parametrize("name", sorted(OPT_IN))
+def test_opt_in_route_is_off_unless_one(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert getattr(envs, name) is False
+    OPT_IN_OFF[name](name)
+    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
+    monkeypatch.setenv(name, "1")
+    assert getattr(envs, name) is True
+    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
+
+
+def test_opt_in_names_are_registered():
+    assert set(OPT_IN) == set(OPT_IN_OFF)
+    assert set(OPT_IN) <= set(envs._SECTIONS["models"])
 
 
 def _path_off(name):
@@ -455,13 +515,13 @@ def test_no_dead_switch():
     }
     consumed = {
         name
-        for name in OURS
+        for name in REGISTERED
         if any(
             re.search(rf"(envs\.{name}\b|[\"']{name}[\"'])", text)
             for text in sources.values()
         )
     }
-    dead = set(OURS) - consumed - set(PENDING)
+    dead = set(REGISTERED) - consumed - set(PENDING)
     assert not dead, f"registered but never read: {sorted(dead)}"
     stale = set(PENDING) & consumed
     assert not stale, f"now consumed; drop from PENDING: {sorted(stale)}"

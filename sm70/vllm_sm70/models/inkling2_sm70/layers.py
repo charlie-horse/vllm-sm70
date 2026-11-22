@@ -38,7 +38,8 @@ from .attention_torch import paged_attention
 from .backend import cache_metadata
 from .cache import STREAM_ATTN, STREAM_MLP
 from .moe import Inkling2Sm70Experts
-from .ops.torch_ref import attn_res_mix, message_gate, rms_norm
+from .norms import Bank, normed_state, sublayer_inputs
+from .ops.torch_ref import message_gate
 from .prologue import attention_prologue, project_qkvr
 from .sconv import short_conv
 from .weights import MESSAGE_STREAMS, ParamSpec, qkvr_sizes
@@ -49,10 +50,9 @@ __all__ = [
     "Inkling2Sm70DecoderLayer",
     "Inkling2Sm70MessageGate",
     "PARTIAL_SITES",
-    "Weights",
     "Bank",
+    "Weights",
     "all_reduce",
-    "mix",
     "normed_state",
     "padding_mask",
 ]
@@ -84,45 +84,6 @@ def all_reduce(x: torch.Tensor, tp_size: int) -> torch.Tensor:
     from vllm.distributed import tensor_model_parallel_all_reduce
 
     return tensor_model_parallel_all_reduce(x)
-
-
-def normed_state(x: torch.Tensor) -> torch.Tensor:
-    """[T, 1, H] fp32: the unweighted RMS norm of x [T, H], one AttnRes key."""
-    return rms_norm(x.float()).unsqueeze(-2)
-
-
-class Bank:
-    """The normed block states of one forward, fp32, in one buffer
-    [T, capacity, H]: `count` states are kept and the slot after them is
-    scratch for the current state of a mix, so no visit copies the bank."""
-
-    def __init__(self, like: torch.Tensor, capacity: int) -> None:
-        num_tokens, hidden_size = like.shape
-        self.buffer = like.new_empty(
-            (num_tokens, capacity + 1, hidden_size), dtype=torch.float32
-        )
-        self.count = 0
-
-    def states(self, start: int = 0) -> torch.Tensor:
-        """[T, count - start, H]: the kept states from `start` on, a view."""
-        return self.buffer[:, start : self.count]
-
-    def with_state(self, x: torch.Tensor) -> torch.Tensor:
-        """[T, count + 1, H]: the kept states and the normed `x` [T, H], a
-        view that is valid until the next call or append."""
-        self.buffer[:, self.count] = rms_norm(x.float())
-        return self.buffer[:, : self.count + 1]
-
-    def append(self, x: torch.Tensor) -> None:
-        """Keep the normed `x` [T, H] as the next block state."""
-        self.with_state(x)
-        self.count += 1
-
-
-def mix(bank: Bank, partial: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
-    """AttnRes mix [T, Q, H] fp32 of the block states of `bank` and the
-    current state `partial` [T, H] by `query` [Q, H]."""
-    return attn_res_mix(bank.with_state(partial), query)
 
 
 @eager_break_during_capture
@@ -301,6 +262,13 @@ class Inkling2Sm70DecoderLayer(nn.Module):
                 }
             )
 
+    def _gates(self, messages: torch.Tensor | None) -> list[nn.Module]:
+        """The message gates in the order of ``MESSAGE_STREAMS``; none in a
+        first pass."""
+        if messages is None:
+            return []
+        return [self.controllers[stream] for stream, _ in MESSAGE_STREAMS]
+
     def _attention_inputs(
         self,
         hidden: torch.Tensor,
@@ -310,22 +278,16 @@ class Inkling2Sm70DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Normed (x_q, x_k, x_v) in the model dtype; x_k and x_v are None
         when the three inputs are one."""
-        if attn_query is None:
-            streams = [hidden]
-        else:
-            streams = list(mix(bank, hidden, attn_query).unbind(-2))
-        norms = self.attn_norm.weight
-        if messages is not None or len(norms) > 1:
-            streams = streams * (3 // len(streams))
-        if messages is not None:
-            streams = [
-                self.controllers[stream](x, messages[:, i])
-                for i, ((stream, _), x) in enumerate(zip(MESSAGE_STREAMS, streams))
-            ]
-        normed = [
-            rms_norm(x, norms[i % len(norms)], self.eps).to(hidden.dtype)
-            for i, x in enumerate(streams)
-        ]
+        normed = sublayer_inputs(
+            bank,
+            hidden,
+            attn_query,
+            self.attn_norm.weight,
+            self.eps,
+            hidden.dtype,
+            gates=self._gates(messages)[:3],
+            messages=messages,
+        )
         if len(normed) == 1:
             return normed[0], None, None
         return normed[0], normed[1], normed[2]
@@ -347,7 +309,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         hidden [T, H]: the residual stream, model dtype. bank: the normed
         block states, the same on every rank; a layer that starts a block
         appends its input. attn_query [1 or 3, H], None in the first layer;
-        mlp_query [1, H]. messages [T, 4, H] fp32 in the order of
+        mlp_query [1, H]. messages: the ``norms.message_mix`` of the four
         ``MESSAGE_STREAMS``, None in a first pass. is_padding [T] bool.
         partial_hook gets this rank's o_proj and expert partials.
         Returns the new residual stream.
@@ -367,10 +329,17 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         else:
             residual = hidden.float() + attn_out.float()
 
-        x = mix(bank, residual, mlp_query)[:, 0]
-        if messages is not None:
-            x = self.controllers[MESSAGE_STREAMS[3][0]](x, messages[:, 3])
-        x = rms_norm(x, self.mlp_norm.weight[0], self.eps).to(dtype)
+        (x,) = sublayer_inputs(
+            bank,
+            residual,
+            mlp_query,
+            self.mlp_norm.weight,
+            self.eps,
+            dtype,
+            gates=self._gates(messages)[3:],
+            messages=messages,
+            first=3,
+        )
         partial = x.new_empty(x.shape)
         self.mlp(x, partial, is_padding)
         if partial_hook is not None:

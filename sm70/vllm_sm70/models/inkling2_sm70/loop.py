@@ -38,11 +38,9 @@ from .layers import (
     Inkling2Sm70AttnRes,
     Inkling2Sm70DecoderLayer,
     Weights,
-    mix,
-    normed_state,
     padding_mask,
 )
-from .ops.torch_ref import attn_res_mix, rms_norm
+from .norms import message_mix, message_sources, rms_norm, sublayer_inputs
 from .weights import build_weight_map
 
 __all__ = ["Inkling2Sm70LoopModel", "PartialAudit", "VisitDump", "layer_visits"]
@@ -100,7 +98,9 @@ class PartialAudit(nn.Module):
         super().__init__()
         self.path = Path(directory) / f"rank{rank}" if directory else None
         self.register_buffer(
-            "maxima", torch.zeros(num_visits, len(PARTIAL_SITES)), persistent=False
+            "maxima",
+            torch.zeros(num_visits, len(PARTIAL_SITES), dtype=torch.float32),
+            persistent=False,
         )
 
     def record(self, visit: int, site: str, partial: torch.Tensor) -> None:
@@ -218,14 +218,11 @@ class Inkling2Sm70LoopModel(nn.Module):
                 else:
                     # The previous pass's own block states after the entry
                     # one, and its output.
-                    message_bank = torch.cat(
-                        [bank.states(entry_count + 1), normed_state(hidden)],
-                        dim=-2,
-                    )
+                    message_bank = message_sources(bank.states(entry_count + 1), hidden)
                     hidden, bank.count = entry_hidden, entry_count
             messages = None
             if pass_idx:
-                messages = attn_res_mix(
+                messages = message_mix(
                     message_bank, self.message_queries[layer_idx - core.start]
                 )
             if visit in self.aux_hidden_state_layers:
@@ -245,8 +242,14 @@ class Inkling2Sm70LoopModel(nn.Module):
                 self.visit_hook(visit, layer_idx, pass_idx, hidden)
         if audit is not None:
             audit.save()
-        final = mix(bank, hidden, self.attn_res.output_query)[:, 0]
-        final = rms_norm(final, self.norm.weight[0], self.eps).to(hidden.dtype)
+        (final,) = sublayer_inputs(
+            bank,
+            hidden,
+            self.attn_res.output_query,
+            self.norm.weight,
+            self.eps,
+            hidden.dtype,
+        )
         if self.aux_hidden_state_layers:
             return final, [*aux, final]
         return final

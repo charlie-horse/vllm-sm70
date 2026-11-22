@@ -1,0 +1,90 @@
+Upstream: https://github.com/vllm-project/vllm
+Path: vllm/models/inkling2/nvidia/ops/loop.py
+Commit: c32251b5d192f0f72f9ca8c5595d1d43f1dd37b8
+sha256: 0c4f5382f65f2776402aa2396d6bf554c42bee85c6a24e6d0259549c1e11c4c8
+
+--- a/vllm/models/inkling2/nvidia/ops/loop.py
++++ b/sm70/vllm_sm70/models/inkling2_sm70/ops/loop.py
+@@ -3,15 +3,14 @@
+ """Loop message controllers, batched over streams.
+ 
+ A controller blends a fp32 message into a fp32 sublayer input `dest`: from
+-`h = down(rms([dest, message]))` (bf16), `out = (1 - tanh(forget(h))) * dest +
++`h = down(rms([dest, message]))` (model dtype), `out = (1 - tanh(forget(h))) * dest +
+ tanh(gain(h)) * message` in fp32, unfused as the reference. The output feeds
+ the sublayer's RMSNorm, applied in the same kernel.
+ """
+ 
+ import torch
+ 
+-from vllm.triton_utils import tl, tldevice, triton
+-
++from ._compat import MODEL_DTYPE, tanh, tl, triton
+ from .norm import rsqrt
+ 
+ 
+@@ -39,14 +38,19 @@
+     tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
+ 
+ 
+-def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+-    """bf16 `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
++def pair_rms_norm(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    eps: float = 1e-6,
++    out_dtype: torch.dtype = MODEL_DTYPE,
++) -> torch.Tensor:
++    """`out_dtype` `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
+     inputs, weightless; `dest` may broadcast over streams (stride 0)."""
+     num_streams, num_tokens, d = message.shape
+     assert dest.shape == message.shape and message.is_contiguous()
+     assert dest.stride(1) == d and dest.stride(2) == 1
+     assert dest.dtype == message.dtype == torch.float32
+-    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=out_dtype)
+     if num_tokens:
+         _pair_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,
+@@ -54,7 +58,7 @@
+             out,
+             dest.stride(0),
+             num_tokens,
+-            1e-6,
++            eps,
+             D=d,
+             BLOCK=triton.next_power_of_2(d),
+             num_warps=8,
+@@ -83,10 +87,8 @@
+     row = s * T + t
+     dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)
+     message = tl.load(Message + row * D + cols, mask, other=0)
+-    gain = tldevice.tanh(tl.load(GainForget + row * (2 * D) + cols, mask, other=0))
+-    forget = tldevice.tanh(
+-        tl.load(GainForget + row * (2 * D) + D + cols, mask, other=0)
+-    )
++    gain = tanh(tl.load(GainForget + row * (2 * D) + cols, mask, other=0))
++    forget = tanh(tl.load(GainForget + row * (2 * D) + D + cols, mask, other=0))
+     x = (1.0 - forget) * dest + gain * message
+     rstd = rsqrt(tl.div_rn(tl.sum(x * x), D) + norm_eps)
+     y = x * rstd
+@@ -100,8 +102,9 @@
+     gain_forget: torch.Tensor,
+     norm_weight: torch.Tensor,
+     norm_eps: float,
++    out_dtype: torch.dtype = MODEL_DTYPE,
+ ) -> torch.Tensor:
+-    """bf16 `(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
++    """`out_dtype` `(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
+     `(1 - tanh(forget)) * dest + tanh(gain) * message`, with fp32 `(S, T, D)`
+     `dest` (may broadcast over streams) and `message`, and fp32 `(S, T, 2D)`
+     `gain_forget` = `[gain, forget]`. `norm_weight` may broadcast too."""
+@@ -111,7 +114,7 @@
+     assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
+     assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
+     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
+-    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, d), dtype=out_dtype)
+     if num_tokens:
+         _blend_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,

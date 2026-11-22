@@ -14,12 +14,15 @@
 * KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), no async
   scheduling (turned off when unset: it doubles the conv and sliding-window
   admission caps), the KV cache in the model dtype, no pipeline parallelism.
-* CUDA graphs: PIECEWISE when ``cudagraph_mode`` is unset; a mode with FULL
-  graphs is refused. A FULL capture runs the model's eager-break ops inline
-  (UP compilation/breakable_cudagraph.py ``eager_break_during_capture``) and
-  would freeze the batch they branch on. UP applies its default,
-  FULL_AND_PIECEWISE, after this hook and only to an unset mode
-  (UP config/vllm.py ``_apply_optimization_level_defaults``).
+* CUDA graphs: an unset ``cudagraph_mode`` becomes PIECEWISE with
+  ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` and NONE without it; a mode with FULL
+  graphs is refused. The model's ops are eager breaks (UP
+  compilation/breakable_cudagraph.py ``eager_break_during_capture``): a FULL
+  capture runs them inline and would freeze the batch they branch on, and
+  without the breakable runner PIECEWISE pads the batches and captures
+  nothing. UP applies its default, FULL_AND_PIECEWISE, after this hook and
+  only to an unset mode (UP config/vllm.py
+  ``_apply_optimization_level_defaults``).
 * Copies ``sm70.inkling2.max_image_encoder_tokens`` onto the model's
   ``hf_config``, where the image processor reads it (processing.py).
 * Logs the routes once per process.
@@ -43,7 +46,7 @@ KV_BLOCK_SIZE = 32
 _logged = False
 
 
-def _log_routes_once(visit_dump_dir: str | None) -> None:
+def _log_routes_once(visit_dump_dir: str | None, cudagraph_mode: str) -> None:
     global _logged
     if _logged:
         return
@@ -51,9 +54,10 @@ def _log_routes_once(visit_dump_dir: str | None) -> None:
     logger.info(
         "Inkling 2 SM70: fp16 on cc 7.0; model-owned attention and KV caches "
         "(neither FLASH_ATTN_V100 nor TRITON_ATTN); KV block size %d, no "
-        "async scheduling; no speculative decoding, no prompt embeddings; "
-        "per-visit state dump %s.",
+        "async scheduling; cudagraph_mode %s; no speculative decoding, no "
+        "prompt embeddings; per-visit state dump %s.",
         KV_BLOCK_SIZE,
+        cudagraph_mode,
         f"to {visit_dump_dir}" if visit_dump_dir else "off",
     )
 
@@ -64,6 +68,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         """Raises ValueError for an engine this model can't serve."""
         import torch
 
+        from vllm import envs
         from vllm.config.compilation import CUDAGraphMode
         from vllm.platforms import current_platform
         from vllm_sm70.config import sm70_config
@@ -135,7 +140,11 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
         if cudagraph_mode is None:
-            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            compilation_config.cudagraph_mode = (
+                CUDAGraphMode.PIECEWISE
+                if envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+                else CUDAGraphMode.NONE
+            )
         elif cudagraph_mode.has_full_cudagraphs():
             raise ValueError(
                 f"{ARCH} runs its attention and conv ops as eager breaks of "
@@ -151,4 +160,6 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 IMAGE_ENCODER_TOKEN_CAP_ATTR,
                 inkling2.max_image_encoder_tokens,
             )
-        _log_routes_once(inkling2.visit_dump_dir)
+        _log_routes_once(
+            inkling2.visit_dump_dir, compilation_config.cudagraph_mode.name
+        )

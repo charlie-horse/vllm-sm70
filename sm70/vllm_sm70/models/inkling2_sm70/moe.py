@@ -11,6 +11,10 @@ sums the partials of all ranks with one all-reduce.
 Rounding follows the reference: routing in fp32, both GEMMs in the model
 dtype, the SwiGLU soft caps in fp32, the routing weight applied after W2 and
 the sum over a token's experts in fp32, rounded once to the model dtype.
+
+With ``VLLM_SM70_INKLING_NVFP4_TM=1`` the NVFP4 layers that
+``moe_tm.rejection`` admits run on the TurboMind dense stage instead
+(moe_tm.py) and hold no fp16 expert weights.
 """
 
 from __future__ import annotations
@@ -22,7 +26,8 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
-from .expert_weights import ExpertLayer, RangeCheck, check_cast_range
+from . import moe_tm
+from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
 from .ops import torch_ref
 
 
@@ -58,7 +63,10 @@ class Inkling2Sm70Experts(nn.Module):
     """Router and experts of one layer on one TP rank.
 
     ``w13`` [E, 2 * I / tp, H] holds the gate rows then the up rows and ``w2``
-    [E, H, I / tp]; both are filled by ``load_expert_layer``.
+    [E, H, I / tp]; both are filled by ``load_expert_layer``. When the shape
+    is admitted to the TurboMind route (``tm_rejection`` is None) they stay
+    empty until a layer that needs them is loaded, and an NVFP4 layer is held
+    in ``tm_route`` instead.
     """
 
     def __init__(
@@ -87,25 +95,81 @@ class Inkling2Sm70Experts(nn.Module):
                 f"got {self.gate_cap} and {self.up_cap}"
             )
         self.gate = Inkling2Sm70Gate(text)
+        self.top_k = int(text.num_experts_per_tok)
+        self.tp_size = tp_size
+        self.dtype = dtype
+        self.contract = (self.hidden_size, intermediate, self.num_experts, self.top_k)
+        self.tm_rejection = moe_tm.rejection(self.contract, tp_size, dtype)
+        self.tm_route: moe_tm.Nvfp4TmExperts | None = None
         e, h, i = self.num_experts, self.hidden_size, self.local_intermediate
-        self.register_buffer(
-            "w13", torch.empty(e, 2 * i, h, dtype=dtype), persistent=False
-        )
-        self.register_buffer("w2", torch.empty(e, h, i, dtype=dtype), persistent=False)
+        self.weight_shapes = {"w13": (e, 2 * i, h), "w2": (e, h, i)}
+        for name, shape in self.weight_shapes.items():
+            if self.tm_rejection is None:
+                shape = (0, *shape[1:])
+            self.register_buffer(
+                name, torch.empty(shape, dtype=dtype), persistent=False
+            )
 
     def load_expert_layer(
         self, layer: ExpertLayer, range_check: RangeCheck | None = check_cast_range
     ) -> None:
-        """Dequantize `layer` (already sliced to this rank) into w13 and w2;
-        `range_check` sees every cast block (expert_weights.py)."""
-        w13, w2 = layer.dequantize(self.w13.dtype, range_check=range_check)
-        for name, got, buffer in (("w13", w13, self.w13), ("w2", w2, self.w2)):
-            if got.shape != buffer.shape:
+        """Load `layer` (already sliced to this rank): TurboMind banks for an
+        admitted NVFP4 layer, else the dequantized w13 and w2. `range_check`
+        sees every cast to fp16: the dequantized blocks (expert_weights.py)
+        or the banks' scales (moe_tm.py)."""
+        device = self.gate.weight.device
+        if layer.format == NVFP4 and self.tm_rejection is None:
+            self.tm_rejection = moe_tm.rejection(
+                self.contract, self.tp_size, self.dtype, device
+            )
+            if self.tm_rejection is None:
+                self._load_tm(layer, device, range_check)
+                return
+        if layer.format == NVFP4 and moe_tm.enabled():
+            moe_tm.logger.warning_once(
+                "Inkling 2 NVFP4 experts stay on the fp16 torch path: %s.",
+                self.tm_rejection,
+            )
+        w13, w2 = layer.dequantize(self.dtype, range_check=range_check)
+        for name, got in (("w13", w13), ("w2", w2)):
+            if got.shape != self.weight_shapes[name]:
                 raise ValueError(
                     f"Inkling 2: layer {layer.layer} {name} has shape "
-                    f"{tuple(got.shape)}, expected {tuple(buffer.shape)}"
+                    f"{tuple(got.shape)}, expected {self.weight_shapes[name]}"
                 )
-            buffer.copy_(got)
+            buffer = getattr(self, name)
+            if buffer.shape == got.shape:
+                buffer.copy_(got)
+            else:
+                setattr(self, name, got.to(device))
+        self.tm_route = None
+
+    def _load_tm(
+        self,
+        layer: ExpertLayer,
+        device: torch.device,
+        range_check: RangeCheck | None,
+    ) -> None:
+        w13, w2 = layer.nvfp4_codes()
+        for name, codes in (("w13", w13), ("w2", w2)):
+            expected = self.weight_shapes[name]
+            if codes.codes.shape != expected:
+                raise ValueError(
+                    f"Inkling 2: layer {layer.layer} {name} has shape "
+                    f"{tuple(codes.codes.shape)}, expected {expected}"
+                )
+        self.tm_route = moe_tm.build(
+            w13, w2,
+            device=device, gate_cap=self.gate_cap, up_cap=self.up_cap,
+            top_k=self.top_k, range_check=range_check,
+        )  # fmt: skip
+        for name, shape in self.weight_shapes.items():
+            setattr(self, name, torch.empty((0, *shape[1:]), dtype=self.dtype))
+        moe_tm.logger.info_once(
+            "Inkling 2 NVFP4 experts %s run on the TurboMind dense stage (%s=1).",
+            self.contract,
+            moe_tm.SWITCH,
+        )
 
     def route(
         self, x: torch.Tensor, is_padding: torch.Tensor | None = None
@@ -134,6 +198,19 @@ class Inkling2Sm70Experts(nn.Module):
         top_k_index, top_k_weights [M, k] as `route` returns them; ids outside
         0..E-1 select no expert.
         """
+        if self.tm_route is not None:
+            self.tm_route.expert_sum(x, top_k_index, top_k_weights, output)
+            return
+        self.torch_expert_sum(x, top_k_index, top_k_weights, output)
+
+    def torch_expert_sum(
+        self,
+        x: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """`expert_sum` on the dequantized w13 and w2."""
         k = top_k_index.shape[-1]
         flat = top_k_index.reshape(-1)
         none = self.num_experts
