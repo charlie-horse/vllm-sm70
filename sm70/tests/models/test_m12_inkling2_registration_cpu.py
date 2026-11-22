@@ -67,6 +67,7 @@ def _raw(mapping) -> dict:
 def registry(monkeypatch):
     """Both registries without the Inkling 2 entries; restored afterwards."""
     from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     saved_model = ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
@@ -74,8 +75,10 @@ def registry(monkeypatch):
         k: dict.pop(_CONFIG_REGISTRY, k) for k in CONFIG_TYPES if k in _CONFIG_REGISTRY
     }
     monkeypatch.setattr(inkling2_sm70, "_registered", False)
+    monkeypatch.delitem(MODELS_CONFIG_MAP, inkling2_sm70.ARCH, raising=False)
     yield ModelRegistry, _CONFIG_REGISTRY
     ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
+    MODELS_CONFIG_MAP.pop(inkling2_sm70.ARCH, None)
     if saved_model is not None:
         ModelRegistry.models[inkling2_sm70.ARCH] = saved_model
     for k in CONFIG_TYPES:
@@ -107,7 +110,9 @@ def test_register_at_cc70(device, registry):
     assert inkling2_sm70.register() is True  # idempotent
     # Nothing else moved: Flint, Qwen and every other entry are the same objects.
     assert {k: v for k, v in reg.models.items() if k != inkling2_sm70.ARCH} == models
-    assert dict(MODELS_CONFIG_MAP) == cfg_map
+    hook = MODELS_CONFIG_MAP[inkling2_sm70.ARCH]
+    assert hook is inkling2_sm70.Inkling2Sm70ModelConfig
+    assert dict(MODELS_CONFIG_MAP) == {**cfg_map, inkling2_sm70.ARCH: hook}
     assert {k: v for k, v in _raw(cfg_reg).items() if k not in CONFIG_TYPES} == cfgs
     assert reg.models["FlintForCausalLM"].module_name == "vllm.models.flint"
 

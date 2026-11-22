@@ -105,6 +105,13 @@ def register() -> bool:
             f"vllm_sm70: {ARCH!r} resolves to {entry!r}, not {LAZY_TARGET}; "
             "upstream registry semantics changed."
         )
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    from .config import Inkling2Sm70ModelConfig
+
+    MODELS_CONFIG_MAP[ARCH] = Inkling2Sm70ModelConfig
+    if MODELS_CONFIG_MAP.get(ARCH) is not Inkling2Sm70ModelConfig:
+        raise RuntimeError(f"vllm_sm70: MODELS_CONFIG_MAP[{ARCH!r}] did not take.")
     _registered = True
     return True
 
@@ -115,4 +122,8 @@ def __getattr__(name: str):
         from .model import Inkling2LoopSm70ForConditionalGeneration
 
         return Inkling2LoopSm70ForConditionalGeneration
+    if name == "Inkling2Sm70ModelConfig":
+        from .config import Inkling2Sm70ModelConfig
+
+        return Inkling2Sm70ModelConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

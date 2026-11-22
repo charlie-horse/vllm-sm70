@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """M1 sm70-config: the typed SM70 policy for the plugin.
 
-What: ``Sm70Config``, a frozen pydantic model with 13 fields (extra keys are
-  rejected), and ``sm70_config(vllm_config)``. The helper reads
+What: ``Sm70Config``, a frozen pydantic model with 13 kernel-policy fields
+  and the ``inkling2`` section (extra keys are rejected), and
+  ``sm70_config(vllm_config)``. The helper reads
   ``additional_config["sm70"]`` (or ``kernel_config.sm70``), applies the
   kill-only env switches from ``vllm_sm70.envs``, and caches the result per
   vllm_config. ``compute_hash()`` covers only the graph-affecting fields.
@@ -37,6 +38,18 @@ from vllm_sm70 import envs
 
 QuantBackend = Literal["auto", "turbomind"]
 VerifierMode = Literal["auto", "on", "off"]
+
+
+class Inkling2Config(BaseModel):
+    """Inkling 2 (inkling2_sm70) settings: ``additional_config["sm70"]["inkling2"]``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    visit_dump_dir: str | None = None
+    """Debug: directory the model writes its per-visit state dump to. None
+    (default) writes nothing. Set only through --additional-config; there is
+    no environment variable, because the environment can't turn a feature
+    on. The dump runs eagerly, so this is not a graph field."""
 
 
 class Sm70Config(BaseModel):
@@ -193,6 +206,9 @@ class Sm70Config(BaseModel):
     sampling runs outside the compiled graph.
     Kill: VLLM_SM70_GREEDY_TOKEN_FASTPATH=0."""
 
+    inkling2: Inkling2Config = Inkling2Config()
+    """The Inkling 2 section (debug only). No kill switch; not a graph field."""
+
 
 GRAPH_FIELDS: tuple[str, ...] = (
     "quant_backend",
@@ -212,7 +228,7 @@ GRAPH_FIELDS: tuple[str, ...] = (
 because the fork always hashes it: all layer aliases pre-Ampere, this one
 alone elsewhere (policy_defaults.py:275-277).
 Keep nvfp4_gemv in until it is tested. greedy_token_fastpath is not one:
-sampling runs eagerly, outside the compiled graph."""
+sampling runs eagerly, outside the compiled graph. Nor is inkling2 (debug)."""
 
 # Kill switch name -> (field, value forced when engaged). VLLM_SM70_FP8_TURBOMIND,
 # VLLM_SM70_QUANT and VLLM_SM70_DFLASH2_EMULATION are env-only kills (no field).
