@@ -18,7 +18,7 @@ safetensors_torch = pytest.importorskip("safetensors.torch")
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from inkling2_ref import Inkling2Oracle
+from inkling2_ref import Inkling2Oracle, Inkling2Weights
 
 TINY = pathlib.Path(__file__).resolve().parent / "fixtures" / "inkling2_tiny"
 ATOL = 1e-4
@@ -155,3 +155,31 @@ def test_half_precision_keeps_the_reference_dtypes():
     assert out.visit_states.isfinite().all() and out.logits.isfinite().all()
     # Visit 0 has no router discontinuity upstream of its own experts' inputs.
     assert max_diff(out.router_logits[0, 0], CASES["text.router_logits"][0]) < 2e-2
+
+
+def test_half_precision_fp32_set_is_the_loaders():
+    """Queries stored in bf16, as in the released checkpoint, stay fp32."""
+    names = (
+        "attn_res.attn_queries.0",
+        "attn_res.mlp_queries.0",
+        "attn_res.output_query",
+        "middle_cycle_cross_pass_queries",
+        "middle_cycle_cross_pass_kv_queries",
+        "layers.0.attn_sconv.weight",
+        "layers.0.mlp.gate.weight",
+    )
+    native = dict(safetensors_torch.load_file(TINY / "model.safetensors"))
+    for name in names:
+        native["model.llm." + name] = native["model.llm." + name].bfloat16()
+    weights = Inkling2Weights(native, torch.float16, text_config=TEXT)
+    assert {weights(name).dtype for name in names} == {torch.float32}
+    for name in ("norm.weight", "embed.weight", "layers.0.attn.wq_du.weight"):
+        assert weights(name).dtype == torch.float16
+    with pytest.raises(ValueError, match="text_config"):
+        Inkling2Weights(native, torch.float16)("norm.weight")
+
+
+def test_full_attention_layers_come_from_the_config(oracle):
+    text = dict(TEXT, local_layer_ids=[0, 1, 2])
+    moved = Inkling2Oracle(text, oracle.weights)
+    assert [i for i in range(24) if not moved.is_full(i)] == [0, 1, 2]

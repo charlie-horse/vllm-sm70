@@ -18,24 +18,19 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
+from vllm_sm70.models.inkling2_sm70 import weights as loader
+from vllm_sm70.models.inkling2_sm70.configs import Inkling2ModelConfig
 from vllm_sm70.models.inkling2_sm70.ops import torch_ref as ref
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-# Tensors the reference keeps in fp32 whatever the model dtype.
-_FP32 = (
-    "mlp.gate.weight",
-    "mlp.gate.bias",
-    "sconv.weight",
-    "forget_weight",
-    "gain_weight",
-)
 
 
 class Inkling2Weights:
     """A checkpoint in the released names, as the reference holds it.
 
-    `weights(name)` is the tensor `model.llm.<name>` in `dtype`, or in fp32
-    where the reference keeps fp32.
+    `weights(name)` is the tensor `model.llm.<name>` in fp32 where the
+    reference keeps fp32 (`weights.HF_FP32_MODULES`, by the loader's route
+    table), else in `dtype`. A dtype other than fp32 needs `text_config`.
     """
 
     def __init__(
@@ -43,22 +38,47 @@ class Inkling2Weights:
         native: dict[str, torch.Tensor],
         dtype: torch.dtype = torch.float32,
         prefix: str = "model.llm.",
+        text_config: dict | None = None,
     ):
         self.native = native
         self.dtype = dtype
         self.prefix = prefix
+        self.text_config = text_config
+        self._fp32: set[str] | None = None
         self._experts: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @classmethod
     def load(
         cls, directory: pathlib.Path | str, dtype: torch.dtype = torch.float32
     ) -> Inkling2Weights:
-        return cls(load_file(pathlib.Path(directory) / "model.safetensors"), dtype)
+        directory = pathlib.Path(directory)
+        config = json.loads((directory / "config.json").read_text())["text_config"]
+        native = load_file(directory / "model.safetensors")
+        return cls(native, dtype, text_config=config)
+
+    def _keeps_fp32(self, key: str) -> bool:
+        if self._fp32 is None:
+            if self.text_config is None:
+                raise ValueError("a dtype other than fp32 needs text_config")
+            routes = loader.build_weight_map(
+                Inkling2ModelConfig(**self.text_config),
+                tp_size=1,
+                tp_rank=0,
+                dtype=self.dtype,
+            ).routes
+            self._fp32 = {
+                source
+                for source, route in routes.items()
+                if any(m in route.hf_name for m in loader.HF_FP32_MODULES)
+            }
+        return key in self._fp32
 
     def __call__(self, name: str) -> torch.Tensor:
-        tensor = self.native[self.prefix + name]
-        fp32 = tensor.dtype == torch.float32 or name.endswith(_FP32)
-        return tensor.float() if fp32 else tensor.to(self.dtype)
+        key = self.prefix + name
+        tensor = self.native[key]
+        if self.dtype == torch.float32 or self._keeps_fp32(key):
+            return tensor.float()
+        return tensor.to(self.dtype)
 
     def _dequantize(self, key: str) -> torch.Tensor:
         """fp32 values of a packed expert tensor [E, out, in]."""
@@ -136,6 +156,7 @@ class Inkling2Oracle:
         self.loop_start, self.loop_end = loop["core_start"], loop["core_end"]
         self.num_passes = loop["num_passes"]
         self.block = text_config["n_layers_per_attn_res_block"]
+        self.local_layers = frozenset(text_config["local_layer_ids"])
         layers = range(text_config["num_hidden_layers"])
         loop_layers = list(layers[self.loop_start : self.loop_end])
         self.visit_layers: list[int] = (
@@ -154,7 +175,7 @@ class Inkling2Oracle:
         return cls(config, Inkling2Weights.load(directory, dtype))
 
     def is_full(self, layer: int) -> bool:
-        return (layer + 1) % 6 == 0
+        return layer not in self.local_layers
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Normed token embeddings [..., H]. Image features replace rows of it."""
