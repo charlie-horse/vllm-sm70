@@ -173,10 +173,11 @@ def test_registered_on_import():
 
 def test_models_register_imports_the_parser(monkeypatch):
     import vllm_sm70.models as models_area
-    from vllm_sm70.models import flint_sm70, qwen
+    from vllm_sm70.models import flint_sm70, inkling2_sm70, qwen
 
     monkeypatch.setattr(models_area, "_registered", False)
     monkeypatch.setattr(flint_sm70, "register", lambda: False)
+    monkeypatch.setattr(inkling2_sm70, "register", lambda: False)
     monkeypatch.setattr(qwen, "register", lambda: None)
     monkeypatch.delitem(sys.modules, "vllm_sm70.reasoning")
     monkeypatch.delattr("vllm_sm70.reasoning", raising=False)
