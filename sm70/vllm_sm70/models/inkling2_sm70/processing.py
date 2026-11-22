@@ -12,7 +12,8 @@ Differences: pixels are fp16, the cell size comes from the checkpoint's
 - any other mode (the checkpoint's Jinja template): the template emits
   ``<|content_image|><|unused_200054|>`` for typed image parts, so only the
   pad is replaced, by ``rows * cols`` pads. Typed parts need
-  ``--chat-template-content-format openai``.
+  ``--chat-template-content-format openai``. A prompt whose pad count
+  differs from its image count is rejected.
 
 Only the pad positions receive vision embeddings.
 """
@@ -280,6 +281,19 @@ class Inkling2MultiModalProcessor(BaseMultiModalProcessor[Inkling2ProcessingInfo
             ),
             "vision_grid_thw": MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         }
+
+    def _apply_prompt_updates(self, token_ids, mm_prompt_updates):
+        if self.info.image_target == TARGET_PAD:
+            # Template mode parses special-token text, so prompt text can
+            # spell the pad; an extra pad would take an image's embeddings.
+            num_pads = token_ids.count(IMAGE_PAD_ID)
+            num_images = len(mm_prompt_updates.get("image", ()))
+            if num_pads != num_images:
+                raise ValueError(
+                    f"The prompt has {num_pads} {IMAGE_PAD} tokens for "
+                    f"{num_images} images; text must not contain {IMAGE_PAD}."
+                )
+        return super()._apply_prompt_updates(token_ids, mm_prompt_updates)
 
     def _get_prompt_updates(
         self,

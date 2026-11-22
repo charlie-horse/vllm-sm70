@@ -99,6 +99,19 @@ runs (they measured 12-27% slower per step): set
 in the host, and the same for `qwen3.6-35b-a3b`. The comment above `builtinModels` in
 `module.nix` has both entries.
 
+## Inkling 2 serve flags and client rules
+
+- Pass `--reasoning-parser inkling2_sm70` only together with
+  `--tool-call-parser inkling2_sm70 --enable-auto-tool-choice`. Any other
+  pairing fails at server start.
+- With `--tokenizer-mode inkling2_sm70`, a client that wants one tool call per
+  response sends `chat_template_kwargs: {"parallel_tool_calls": false}`. The
+  top-level `parallel_tool_calls: false` only trims the response to the first
+  call; the prompt does not carry the instruction.
+- Without `--tokenizer-mode inkling2_sm70` (the checkpoint's Jinja template),
+  request text must not contain `<|unused_200054|>` when the request has
+  images; such a request is rejected.
+
 ## TurboMind small-shape tuning and the GEMM LUT
 
 The fork timed TurboMind NVFP4/FP8 kernels for small shapes (M <= 64) at

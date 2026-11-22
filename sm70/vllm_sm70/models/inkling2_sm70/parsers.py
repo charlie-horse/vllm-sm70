@@ -12,6 +12,8 @@ vllm_sm70.models.inkling2_sm70.parsers --reasoning-parser inkling2_sm70
 --tool-parser-plugin vllm_sm70.models.inkling2_sm70.parsers
 --tool-call-parser inkling2_sm70 --enable-auto-tool-choice``. The plugin
 also registers both names lazily (``inkling2_sm70.register_parsers``).
+The reasoning parser is served only together with the tool parser; any other
+pairing fails at server start.
 """
 
 from __future__ import annotations
@@ -184,10 +186,7 @@ class Inkling2Sm70Parser(InklingParser):
         return latest_block == text_id
 
 
-(
-    Inkling2Sm70ParserReasoningAdapter,
-    Inkling2Sm70ParserToolAdapter,
-) = make_adapters(Inkling2Sm70Parser)
+_ReasoningAdapter, Inkling2Sm70ParserToolAdapter = make_adapters(Inkling2Sm70Parser)
 
 
 class Inkling2Sm70EngineToolParser(Inkling2Sm70ParserToolAdapter):  # type: ignore[valid-type, misc]
@@ -195,6 +194,37 @@ class Inkling2Sm70EngineToolParser(Inkling2Sm70ParserToolAdapter):  # type: igno
     structural_tag_model = None
     supports_required_and_named = False
 
+
+class _NeedsToolParser(type):
+    """Rejects a composed parser that pairs the reasoning parser with no or
+    another tool parser.
+
+    v0.33.0's DelegatingParser stops reasoning parsing at the first text
+    block; only this tool parser parses the later blocks of a stream.
+    ``ParserManager`` composes the parser class at server start, which calls
+    this hook.
+    """
+
+    def __set_name__(cls, owner: type, name: str) -> None:
+        if name != "reasoning_parser_cls":
+            return
+        tool_parser_cls = getattr(owner, "tool_parser_cls", None)
+        if tool_parser_cls is None or not issubclass(
+            tool_parser_cls, Inkling2Sm70EngineToolParser
+        ):
+            raise TypeError(
+                f"--reasoning-parser {PARSER_NAME} requires "
+                f"--tool-call-parser {PARSER_NAME} --enable-auto-tool-choice "
+                f"(got tool parser {getattr(tool_parser_cls, '__name__', None)}): "
+                "without it, streamed content carries the framing tokens."
+            )
+
+
+class Inkling2Sm70ParserReasoningAdapter(_ReasoningAdapter, metaclass=_NeedsToolParser):  # type: ignore[valid-type, misc]
+    pass
+
+
+Inkling2Sm70Parser.reasoning_parser_cls = Inkling2Sm70ParserReasoningAdapter  # type: ignore[attr-defined]
 
 ReasoningParserManager.register_module(
     PARSER_NAME, module=Inkling2Sm70ParserReasoningAdapter
