@@ -134,9 +134,13 @@ def compare_runs(
     gap_max: float = GAP_MAX,
 ) -> dict:
     cand_cases = {c["id"]: c for c in cand["cases"]}
-    missing = [c["id"] for c in ref["cases"] if c["id"] not in cand_cases]
-    if missing:
-        raise ValueError(f"cases missing from the candidate run: {missing}")
+    ref_ids = [c["id"] for c in ref["cases"]]
+    if len(set(ref_ids)) != len(ref_ids) or len(cand_cases) != len(cand["cases"]):
+        raise ValueError("duplicate case ids")
+    if set(ref_ids) != set(cand_cases):
+        raise ValueError(
+            f"case ids differ: {sorted(set(ref_ids) ^ set(cand_cases), key=str)}"
+        )
     cases = [compare_case(c, cand_cases[c["id"]], gap_max) for c in ref["cases"]]
     total = sum(c["positions"] for c in cases)
     agree = sum(c["agree"] for c in cases)
@@ -179,6 +183,10 @@ def compare_states(ref: dict, cand: dict, tol: float = TOL_SHORT) -> dict:
         if not ok and first_failing is None:
             first_failing = name
         visits.append({"visit": name, "relative_l2": rel, "ok": ok})
+    for name in cand:
+        if name not in ref:
+            first_failing = first_failing or name
+            visits.append({"visit": name, "relative_l2": float("inf"), "ok": False})
     return {
         "tol": tol,
         "visits": visits,
@@ -215,8 +223,9 @@ def main(argv: list[str] | None = None) -> int:
     st = sub.add_parser("states")
     st.add_argument("ref")
     st.add_argument("cand")
-    st.add_argument("--tol", type=float, default=TOL_SHORT)
-    st.add_argument(
+    tol = st.add_mutually_exclusive_group()
+    tol.add_argument("--tol", type=float, default=TOL_SHORT)
+    tol.add_argument(
         "--long", action="store_true", help=f"long-context tolerance {TOL_LONG}"
     )
     st.add_argument("--out")
@@ -239,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         for case in report["cases"]:
             print(
                 f"{case['id']}: {case['agree']}/{case['positions']} top-1, "
-                f"max |delta| {case['max_abs_delta']}"
+                f"max |delta| {case['max_abs_delta']}, "
+                f"{case['delta_missing']} without a delta"
             )
             for flip in case["flips"]:
                 kind = "near tie" if flip["near_tie"] else "REAL"

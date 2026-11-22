@@ -236,7 +236,7 @@ def test_mismatched_runs_are_rejected():
     other["output_ids"][0] = 5
     with pytest.raises(ValueError, match="output_ids"):
         tf.compare_runs(_run(_case()), _run(other))
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError, match="case ids differ"):
         tf.compare_runs(_run(_case()), _run(_case(cid="b")))
     assert not tf.compare_runs({"cases": []}, {"cases": []})["pass"]
 
@@ -335,3 +335,20 @@ def test_relative_l2_per_visit(tmp_path):
 def test_default_tolerances():
     assert (tf.MIN_AGREEMENT, tf.GAP_MAX) == (0.99, 0.5)
     assert (tf.TOL_SHORT, tf.TOL_LONG) == (1e-2, 2e-2)
+
+
+def test_extra_candidate_visits_and_cases_fail():
+    np = pytest.importorskip("numpy")
+    ones = np.ones(4)
+    report = tf.compare_states({"a": ones}, {"a": ones, "b": ones})
+    assert not report["pass"] and report["first_failing"] == "b"
+    case = {"id": "x", "prompt_ids": [1], "output_ids": [2], "positions": []}
+    with pytest.raises(ValueError):
+        tf.compare_runs({"cases": [case]}, {"cases": [case, dict(case, id="y")]})
+    with pytest.raises(ValueError):
+        tf.compare_runs({"cases": [case, case]}, {"cases": [case]})
+
+
+def test_tol_and_long_are_exclusive():
+    with pytest.raises(SystemExit):
+        tf.main(["states", "r.npz", "c.npz", "--tol", "0.5", "--long"])
