@@ -333,6 +333,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # (no Sm70Config field), read per call (inkling2_sm70/sconv.py);
         # tensors off the GPU always take the torch ops.
         "VLLM_SM70_INKLING_TRITON_SCONV": kill_switch("VLLM_SM70_INKLING_TRITON_SCONV"),
+        # "0": Inkling 2 decode-only batches take the ops of mixed batches
+        # again, the cache backends declare no full-graph support and an
+        # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/
+        # config.py, backend.py). Env-only (no Sm70Config field).
+        "VLLM_SM70_INKLING_DECODE_GRAPH": kill_switch(
+            "VLLM_SM70_INKLING_DECODE_GRAPH"
+        ),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

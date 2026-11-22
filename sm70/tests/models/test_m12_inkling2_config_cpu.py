@@ -168,35 +168,88 @@ def test_hook_fixes_the_kv_plan(
 
 
 BREAKABLE = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+DECODE_GRAPH = "VLLM_SM70_INKLING_DECODE_GRAPH"
+
+
+def _set_env(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
 
 
 @pytest.mark.parametrize(
-    "breakable, given, want",
+    "switch, breakable, given, want",
     [
-        ("1", None, "PIECEWISE"),
-        (None, None, "NONE"),
-        ("0", None, "NONE"),
-        ("true", None, "NONE"),
-        (None, "PIECEWISE", "PIECEWISE"),
-        ("1", "PIECEWISE", "PIECEWISE"),
-        ("1", "NONE", "NONE"),
-        (None, "NONE", "NONE"),
+        (None, None, None, "FULL_DECODE_ONLY"),
+        (None, "1", None, "FULL_DECODE_ONLY"),
+        ("1", None, None, "FULL_DECODE_ONLY"),
+        ("0", "1", None, "PIECEWISE"),
+        ("0", None, None, "NONE"),
+        ("0", "0", None, "NONE"),
+        ("0", "true", None, "NONE"),
+        (None, None, "FULL_DECODE_ONLY", "FULL_DECODE_ONLY"),
+        (None, "1", "FULL_AND_PIECEWISE", "FULL_AND_PIECEWISE"),
+        (None, None, "PIECEWISE", "PIECEWISE"),
+        ("0", "1", "PIECEWISE", "PIECEWISE"),
+        (None, "1", "NONE", "NONE"),
+        (None, None, "NONE", "NONE"),
+        ("0", None, "NONE", "NONE"),
     ],
 )
-def test_hook_captures_only_with_breakable_cuda_graphs(
-    device, route_log, monkeypatch, breakable, given, want
+def test_hook_picks_the_cuda_graph_mode(
+    device, route_log, monkeypatch, switch, breakable, given, want
 ):
+    """Decode-only FULL graphs by default; the kill switch restores the
+    breakable PIECEWISE or NONE default."""
     from vllm.config.compilation import CUDAGraphMode
 
-    if breakable is None:
-        monkeypatch.delenv(BREAKABLE, raising=False)
-    else:
-        monkeypatch.setenv(BREAKABLE, breakable)
+    _set_env(monkeypatch, DECODE_GRAPH, switch)
+    _set_env(monkeypatch, BREAKABLE, breakable)
     device(7, 0)
     cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
     icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
     assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode[want]
     assert f"cudagraph_mode {want};" in route_log[0]
+
+
+def test_hook_skips_full_graphs_while_dumping_visits(device, route_log, tmp_path):
+    from vllm.config.compilation import CUDAGraphMode
+
+    device(7, 0)
+    sm70 = {"inkling2": {"visit_dump_dir": str(tmp_path)}}
+    cfg = _vllm_config(sm70=sm70)
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.compilation_config.cudagraph_mode is not CUDAGraphMode.FULL_DECODE_ONLY
+    assert not cfg.compilation_config.cudagraph_mode.has_full_cudagraphs()
+
+
+@pytest.mark.parametrize(
+    "sizes, max_size, max_num_seqs, want_max",
+    [
+        (None, None, None, icfg.DECODE_GRAPH_MAX_BATCH),
+        (None, None, 256, icfg.DECODE_GRAPH_MAX_BATCH),
+        (None, None, 1, 1),
+        (None, None, 3, 3),
+        ([1, 2], None, 256, None),
+        (None, 32, 256, 32),
+    ],
+)
+def test_hook_caps_the_default_decode_graph_batch(
+    device, route_log, monkeypatch, sizes, max_size, max_num_seqs, want_max
+):
+    """An unset mode captures decode batches up to DECODE_GRAPH_MAX_BATCH
+    requests (max_num_seqs if fewer) unless the capture sizes are set."""
+    _set_env(monkeypatch, DECODE_GRAPH, None)
+    device(7, 0)
+    cfg = _vllm_config()
+    cfg.scheduler_config.max_num_seqs = max_num_seqs
+    cfg.compilation_config.cudagraph_capture_sizes = sizes
+    cfg.compilation_config.max_cudagraph_capture_size = max_size
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert icfg.DECODE_GRAPH_MAX_BATCH == 8
+    assert cfg.compilation_config.max_cudagraph_capture_size == want_max
+    assert cfg.compilation_config.cudagraph_capture_sizes == sizes
 
 
 @pytest.mark.parametrize(
@@ -205,6 +258,9 @@ def test_hook_captures_only_with_breakable_cuda_graphs(
         (None, "PIECEWISE", True),
         ("0", "PIECEWISE", True),
         ("1", "PIECEWISE", False),
+        (None, "FULL_AND_PIECEWISE", True),
+        ("1", "FULL_AND_PIECEWISE", False),
+        (None, "FULL_DECODE_ONLY", False),
         (None, "NONE", False),
         (None, None, False),
     ],
@@ -232,10 +288,9 @@ def test_hook_warns_on_piecewise_without_breakable_cuda_graphs(
     )
     assert len(warnings) == int(warns)
     if warns:
-        assert "PIECEWISE without VLLM_USE_BREAKABLE_CUDAGRAPH=1 captures no" in (
-            warnings[0].getMessage()
-        )
-        assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+        want = f"cudagraph_mode {given} without VLLM_USE_BREAKABLE_CUDAGRAPH=1 "
+        assert want + "captures no" in warnings[0].getMessage()
+        assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode[given]
 
 
 @pytest.fixture
@@ -264,26 +319,26 @@ def registered(monkeypatch, device):
 
 
 @pytest.mark.parametrize(
-    "breakable, given, want",
+    "switch, breakable, given, want",
     [
-        (None, None, "NONE"),
-        ("1", None, "PIECEWISE"),
-        ("1", "NONE", "NONE"),
-        (None, "FULL_AND_PIECEWISE", None),
+        (None, None, None, "FULL_DECODE_ONLY"),
+        ("0", None, None, "NONE"),
+        ("0", "1", None, "PIECEWISE"),
+        (None, "1", "NONE", "NONE"),
+        (None, None, "FULL", None),
+        ("0", None, "FULL_AND_PIECEWISE", None),
     ],
 )
 def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
-    registered, route_log, monkeypatch, breakable, given, want
+    registered, route_log, monkeypatch, switch, breakable, given, want
 ):
     """VllmConfig.__post_init__ calls the hook before it applies its own
     cudagraph default, so the hook's choice for an unset mode stands."""
     from vllm.config import CompilationConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CUDAGraphMode
 
-    if breakable is None:
-        monkeypatch.delenv(BREAKABLE, raising=False)
-    else:
-        monkeypatch.setenv(BREAKABLE, breakable)
+    _set_env(monkeypatch, DECODE_GRAPH, switch)
+    _set_env(monkeypatch, BREAKABLE, breakable)
     cuda = vllm.platforms.current_platform
     # The class inspection imports the model as a CPU process does.
     monkeypatch.setattr(vllm.platforms, "_current_platform", registered)
@@ -314,12 +369,27 @@ def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
     assert f"cudagraph_mode {want};" in route_log[0]
 
 
-@pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
-def test_hook_refuses_full_cuda_graphs(device, route_log, mode):
+@pytest.mark.parametrize(
+    "switch, dump, mode",
+    [
+        (None, False, "FULL"),
+        ("0", False, "FULL_DECODE_ONLY"),
+        ("0", False, "FULL_AND_PIECEWISE"),
+        (None, True, "FULL_DECODE_ONLY"),
+        (None, True, "FULL_AND_PIECEWISE"),
+    ],
+)
+def test_hook_refuses_full_cuda_graphs(
+    device, route_log, monkeypatch, tmp_path, switch, dump, mode
+):
+    """FULL graphs of mixed batches never; of decode-only batches not with
+    the kill switch or a visit dump."""
     from vllm.config.compilation import CUDAGraphMode
 
+    _set_env(monkeypatch, DECODE_GRAPH, switch)
     device(7, 0)
-    cfg = _vllm_config(cudagraph_mode=CUDAGraphMode[mode])
+    sm70 = {"inkling2": {"visit_dump_dir": str(tmp_path)}} if dump else None
+    cfg = _vllm_config(cudagraph_mode=CUDAGraphMode[mode], sm70=sm70)
     with pytest.raises(ValueError, match=f"cudagraph_mode {mode};"):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
 

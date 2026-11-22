@@ -21,6 +21,13 @@ per `query_chunk` queries (a sliding layer reads the window only); requests
 with one query are batched with a key range each, `OWN_KEY_STEPS *
 key_chunk` gathered keys per step.
 
+A decode-only batch (backend.py) reads no host data: every row of the slot
+mapping is a one-query request whose key range has a static length, the
+window in a sliding layer and the block-table width (times the block size)
+in a global one, with the keys past the query's position masked; a key
+step is up to `OWN_KEY_STEPS` key chunks long when the batch has fewer rows.
+Rows with a negative slot are padding: their output is zero.
+
 Transient memory of one step, beside the op's inputs and output:
 
     scores  at most 4 live tensors of query_chunk * key_chunk * heads fp32
@@ -45,6 +52,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+from .backend import is_decode_only
 
 if TYPE_CHECKING:
     from .backend import Inkling2AttentionMetadata
@@ -217,13 +226,14 @@ def _own_keys(
     md: Inkling2AttentionMetadata,
     out: torch.Tensor,
     *,
-    tokens: torch.Tensor,
+    tokens: torch.Tensor | int,
     max_seq_len: int,
     key_chunk: int,
     hf_rounding: bool = False,
 ) -> None:
-    """Batch tokens `tokens`, one per request: each query reads its own keys,
-    newest first, so key column j is at distance j."""
+    """Batch tokens `tokens` (an int: the first `tokens` rows), one per
+    request: each query reads its own keys, newest first, so key column j is
+    at distance j."""
     heads, head_dim = query.shape[1], query.shape[2]
     groups = heads // kv_cache.shape[1]
     extent = rel_logits.shape[-1]
@@ -233,8 +243,14 @@ def _own_keys(
         num_keys = min(num_keys, md.sliding_window)
     step = min(num_keys, key_chunk)
     rows_per_step = max(1, OWN_KEY_STEPS * key_chunk // max(step, 1))
-    for row in range(0, tokens.shape[0], rows_per_step):
-        chunk = tokens[row : row + rows_per_step]
+    num_rows = tokens if isinstance(tokens, int) else tokens.shape[0]
+    for row in range(0, num_rows, rows_per_step):
+        if isinstance(tokens, int):
+            chunk: torch.Tensor | slice = slice(row, min(row + rows_per_step, tokens))
+            chunk_rows = chunk.stop - row
+        else:
+            chunk = tokens[row : row + rows_per_step]
+            chunk_rows = chunk.shape[0]
         positions = md.positions[chunk].unsqueeze(1)
         requests = md.seq_idx[chunk].long().unsqueeze(1)
         state = _Softmax(
@@ -251,7 +267,7 @@ def _own_keys(
                 requests, torch.div(key_pos, block_size, rounding_mode="floor")
             ]
             states = kv_cache[blocks.long(), :, key_pos % block_size].transpose(1, 2)
-            bias = bias_rows.new_zeros((chunk.shape[0], heads, j1 - j0))
+            bias = bias_rows.new_zeros((chunk_rows, heads, j1 - j0))
             if j0 < extent:
                 covered = min(j1, extent) - j0
                 bias[..., :covered] = bias_rows[..., j0 : j0 + covered]
@@ -262,6 +278,39 @@ def _own_keys(
                 allowed[:, None, None, :],
             )
         out[chunk] = state.result()[:, :, 0].to(out.dtype)
+
+
+def _decode_keys(
+    query: torch.Tensor,
+    rel_logits: torch.Tensor,
+    sinks: torch.Tensor,
+    kv_cache: torch.Tensor,
+    md: Inkling2AttentionMetadata,
+    out: torch.Tensor,
+    *,
+    key_chunk: int,
+    hf_rounding: bool,
+) -> None:
+    """`gather_attention` of a decode-only batch, from device metadata and
+    static shapes only (module docstring)."""
+    rows = min(md.slot_mapping.shape[0], query.shape[0])
+    out[rows:] = 0
+    # Fewer, longer key steps for fewer rows, in the same gather budget.
+    key_chunk = max(key_chunk, OWN_KEY_STEPS * key_chunk // max(rows, 1))
+    _own_keys(
+        query,
+        rel_logits,
+        sinks,
+        kv_cache,
+        md,
+        out,
+        tokens=rows,
+        max_seq_len=md.block_table.shape[1] * md.block_size,
+        key_chunk=key_chunk,
+        hf_rounding=hf_rounding,
+    )
+    padding = md.slot_mapping[:rows] < 0
+    out[:rows].masked_fill_(padding[:, None, None], 0.0)
 
 
 def gather_attention(
@@ -299,6 +348,12 @@ def gather_attention(
         )
     if hf_rounding:
         key_chunk = _ALL_KEYS
+    if is_decode_only(md):
+        _decode_keys(
+            query, rel_logits, sinks, kv_cache, md, out,
+            key_chunk=key_chunk, hf_rounding=hf_rounding,
+        )  # fmt: skip
+        return out
     num_tokens = md.num_actual_tokens
     out[num_tokens:] = 0
     query_lens = np.asarray(md.query_lens_cpu[: md.num_reqs])

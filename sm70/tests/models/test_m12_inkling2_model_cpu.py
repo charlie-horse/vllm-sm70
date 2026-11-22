@@ -58,7 +58,15 @@ def _weights():
 class Engine:
     """The model on one harness. `run` frees every request first."""
 
-    def __init__(self, dtype=torch.float32, *, sm70=None, head_dtype=None, tp_size=1):
+    def __init__(
+        self,
+        dtype=torch.float32,
+        *,
+        sm70=None,
+        head_dtype=None,
+        tp_size=1,
+        device="cpu",
+    ):
         from vllm.config import set_current_vllm_config
 
         from vllm_sm70.models.inkling2_sm70 import model as model_module
@@ -66,7 +74,9 @@ class Engine:
             Inkling2LoopSm70MMConfig,
         )
 
-        self.harness = hx.PagedHarness(tp_size, block_size=BLOCK_SIZE, dtype=dtype)
+        self.harness = hx.PagedHarness(
+            tp_size, block_size=BLOCK_SIZE, dtype=dtype, device=device
+        )
         config = self.harness.vllm_config(0)
         model_config = config.model_config
         model_config.hf_config = Inkling2LoopSm70MMConfig(**_raw_config())
@@ -79,6 +89,7 @@ class Engine:
                 vllm_config=config
             )
         self.loaded = self.model.load_weights(_weights())
+        self.model.to(device)
         self.harness.bind()
         self.states: list[torch.Tensor] = []
         self.sequences: dict[str, torch.Tensor] = {}

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: no host sync in a decode step outside the short convs.
+"""M12 Inkling 2: no host sync in a decode step.
 
 A one-token decode step of the tiny checkpoint (fixtures/inkling2_tiny) runs
 under ``inkling2_sync_guard.no_host_sync``, the CPU stand-in for
 ``torch.cuda.set_sync_debug_mode("error")``: any op that would make the host
-wait for the GPU fails the test. The conv and prologue ops (sconv.py,
-prologue.py) are exempt. Also: the one-token torch expert sum is bit-equal
-to the grouped one, and the guard catches what it should.
+wait for the GPU fails the test, the torch convs included. With
+VLLM_SM70_INKLING_DECODE_GRAPH=0 the convs sync again. Also: the one-token
+torch expert sum is bit-equal to the grouped one, and the guard catches what
+it should.
 """
 
 from __future__ import annotations
@@ -38,12 +39,8 @@ def sequences():
 
 
 def _guard_decode_steps(engine, monkeypatch, guarded):
-    """Run the model body of every one-token step under the guard, with the
-    conv and prologue ops exempt; `guarded` counts those steps."""
-    from vllm_sm70.models.inkling2_sm70 import layers
-
-    for name in ("short_conv", "attention_prologue", "project_qkvr"):
-        monkeypatch.setattr(layers, name, allowed(getattr(layers, name)))
+    """Run the model body of every one-token step under the guard; `guarded`
+    counts those steps."""
     body = engine.model.model
     forward = body.forward
 
@@ -58,7 +55,7 @@ def _guard_decode_steps(engine, monkeypatch, guarded):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_decode_step_has_no_host_sync_outside_the_convs(monkeypatch, sequences, dtype):
+def test_decode_step_has_no_host_sync(monkeypatch, sequences, dtype):
     engine = Engine(dtype)
     want = engine.run(hx.decode_plan("a", LEN_A, PROMPT), sequences)["a"]
     guarded = []
@@ -68,8 +65,10 @@ def test_decode_step_has_no_host_sync_outside_the_convs(monkeypatch, sequences, 
     assert torch.equal(got, want)
 
 
-def test_the_guard_sees_the_convs_sync(monkeypatch, sequences):
-    """Without the exemptions the convs' own syncs fail the step."""
+def test_the_guard_sees_the_convs_sync_without_the_decode_path(monkeypatch, sequences):
+    """With VLLM_SM70_INKLING_DECODE_GRAPH=0 a decode step takes the ops of
+    mixed batches, whose torch convs sync."""
+    monkeypatch.setenv("VLLM_SM70_INKLING_DECODE_GRAPH", "0")
     engine = Engine()
     body = engine.model.model
     forward = body.forward

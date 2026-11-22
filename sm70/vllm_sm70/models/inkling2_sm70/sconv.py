@@ -22,7 +22,12 @@ request stays out of the sum.
 
 Shapes: T batch tokens (padded), C = heads * stream width channels, K taps.
 The metadata covers the first n = ``num_actual_tokens`` tokens (backend.py);
-the ops read those rows of `x` and return zero rows after them.
+the ops read those rows of `x` and return zero rows after them. In a
+decode-only batch n is the length of the slot mapping instead, a static
+shape, and the ops read and write the cache without a host sync: the taps
+are gathered for every row and selected, and a row with a negative slot
+writes the null-block slot 0 back unchanged. ``short_conv`` zeroes the
+output rows of padding there.
 
 Switch: ``short_conv`` and the prologue's K/V convs run one Triton kernel per
 call (ops/paged_conv.py) unless VLLM_SM70_INKLING_TRITON_SCONV=0. Tensors off
@@ -39,7 +44,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from vllm_sm70 import envs
 
-from .backend import cache_metadata
+from .backend import cache_metadata, is_decode_only
 from .ops import _compat
 from .ops import paged_conv as kernels
 
@@ -84,7 +89,9 @@ def _check_channels(channels: int, cache: torch.Tensor, width: int) -> None:
 
 
 def _real_rows(x: torch.Tensor, metadata: Any) -> int:
-    """n: the batch tokens the metadata covers."""
+    """n: the batch tokens the metadata covers (module docstring)."""
+    if is_decode_only(metadata):
+        return min(x.shape[0], metadata.slot_mapping.shape[0])
     num_tokens = metadata.num_actual_tokens
     if not 0 <= num_tokens <= min(x.shape[0], metadata.slot_mapping.shape[0]):
         raise ValueError(
@@ -130,6 +137,19 @@ def conv_taps(
     current = x.to(cache.dtype).float()
     zero = current.new_zeros(())
     taps = [torch.where(valid[:, None], current, zero)]
+    if is_decode_only(metadata):
+        seq_idx = seq_idx.long()
+        for lag in range(1, kernel_size):
+            source = positions - lag
+            inside = valid & (source >= 0)
+            same_batch = inside & (row - lag >= query_start)
+            source = source.clamp(min=0)
+            block = block_table[seq_idx, source // block_tokens].long()
+            values = cache[block, :, source % block_tokens, offset : offset + width]
+            cached = torch.where(inside[:, None], values.flatten(1).float(), zero)
+            previous = current[(row - lag).clamp(min=0)]
+            taps.append(torch.where(same_batch[:, None], previous, cached))
+        return taps
     for lag in range(1, kernel_size):
         source = positions - lag
         inside = valid & (source >= 0)
@@ -155,11 +175,26 @@ def store_taps(
     offset, width = stream
     block_tokens = _block_tokens(cache, metadata)
     slots = metadata.slot_mapping[: x.shape[0]]
+    if is_decode_only(metadata):
+        new = x.to(cache.dtype).unflatten(-1, (cache.shape[1], width))
+        _store_rows(cache[..., offset : offset + width], slots, new)
+        return
     rows = (slots >= 0).nonzero().squeeze(1)
     slots = slots[rows]
     cache[slots // block_tokens, :, slots % block_tokens, offset : offset + width] = (
         x[rows].to(cache.dtype).unflatten(-1, (cache.shape[1], width))
     )
+
+
+def _store_rows(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
+    """cache[slot] = row for every row of `rows` [n, heads, width] with a
+    slot, without a host sync: a row with a negative slot writes slot 0 of
+    the null block back unchanged. `cache` [blocks, heads, tokens, width]."""
+    block_tokens = cache.shape[2]
+    keep = (slots < 0)[:, None, None]
+    slots = slots.clamp(min=0)
+    block, token = slots // block_tokens, slots % block_tokens
+    cache[block, :, token] = torch.where(keep, cache[block, :, token], rows)
 
 
 def static_conv(
@@ -247,10 +282,13 @@ def short_conv(
             _real_rows(x, metadata),
             out,
         )
-        return
-    if dynamic_taps is None:
+    elif dynamic_taps is None:
         static_conv(x, weight, owner.kv_cache, metadata, stream_range, out)
     else:
         dynamic_conv(
             x, weight, dynamic_taps, owner.kv_cache, metadata, stream_range, out
         )
+    if is_decode_only(metadata):
+        # Padding rows of a decode-only batch are zero, as after n.
+        rows = _real_rows(x, metadata)
+        out[:rows].masked_fill_((metadata.slot_mapping[:rows] < 0)[:, None], 0.0)

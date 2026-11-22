@@ -224,7 +224,8 @@ class Bank:
 class Workspace:
     """Stage scratch of one device and shape, shared by its layers (they run
     one after another). Rows grow on demand up to ``CHUNK_ROWS``; ``reserve``
-    sizes them at load."""
+    sizes them at load, for the engine's batch, so a captured decode step
+    never grows them (growth inside a capture raises)."""
 
     _CACHE: ClassVar[dict[tuple[str, int, int, int], Workspace]] = {}
 
@@ -266,6 +267,12 @@ class Workspace:
         rows = min(rows, CHUNK_ROWS)
         if rows <= self.rows:
             return
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            # A graph would keep the replaced buffers' addresses.
+            raise RuntimeError(
+                f"Inkling 2 TurboMind workspace grows to {rows} rows inside a "
+                f"CUDA graph capture; it holds {self.rows}."
+            )
         self.buffers = {}
         for name, width in self.widths.items():
             self.buffers[name] = torch.empty(

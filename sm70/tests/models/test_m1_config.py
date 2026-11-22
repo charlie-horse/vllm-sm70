@@ -165,6 +165,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_SHARED_MOE_OVERLAP",
         "VLLM_SM70_INKLING_TRITON_NORMS",
         "VLLM_SM70_INKLING_TRITON_SCONV",
+        "VLLM_SM70_INKLING_DECODE_GRAPH",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -411,6 +412,23 @@ def _inkling_triton_sconv_off(name):
         assert sconv.on_triton(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_decode_graph_off(name):
+    """Inkling 2 cache builders declare no CUDA-graph support and mark no
+    batch decode-only; the hook's modes are in
+    tests/models/test_m12_inkling2_config_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    from vllm_sm70.models.inkling2_sm70 import backend
+
+    assert backend.SWITCH == name and not backend.decode_graph_enabled()
+    for builder in (
+        backend.Inkling2AttentionMetadataBuilder,
+        backend.Inkling2SconvMetadataBuilder,
+    ):
+        assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
+
+
 OPT_IN_OFF = {
     "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
 }
@@ -461,6 +479,8 @@ def _path_off(name):
         _inkling_nvfp4_tm_off(name)
     elif name == "VLLM_SM70_INKLING_TRITON_SCONV":
         _inkling_triton_sconv_off(name)
+    elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
+        _inkling_decode_graph_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

@@ -21,9 +21,16 @@ padded to the capture size. So an op reads rows [0, n) only and treats the
 model rows after them as padding; inside [0, n) a token with a negative slot
 is padding too. The builders sort decode requests first.
 
-The ops branch in Python on the batch (numpy request lengths, nonzero), so
-they are correct only as eager breaks of a PIECEWISE graph or without graphs;
-the engine-config hook (config.py) refuses a mode with FULL graphs.
+A batch whose requests have at most one query token each is decode-only
+(``decode_only``). Its ops read no host data and their shapes depend on the
+token tensors and the block-table width alone, so the builders declare
+UNIFORM_SINGLE_TOKEN_DECODE graph support and the runner can capture such a
+step as a FULL graph. There an op covers the rows of the slot mapping (P in
+a FULL graph) and a row with a negative slot is padding. The ops of other
+batches branch in Python on the batch (numpy request lengths, nonzero): they
+run eagerly or as eager breaks of a PIECEWISE graph.
+VLLM_SM70_INKLING_DECODE_GRAPH=0 marks no batch decode-only and declares no
+graph support.
 
 Cache views are logical (blocks, heads, tokens, width) in every layout; the
 backends declare LBNHC, the layout Flash-V100 uses.
@@ -32,7 +39,7 @@ backends declare LBNHC, the layout Flash-V100 uses.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -46,6 +53,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+from vllm_sm70 import envs
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -61,10 +70,24 @@ __all__ = [
     "Inkling2SconvMetadata",
     "Inkling2SconvMetadataBuilder",
     "cache_metadata",
+    "decode_graph_enabled",
+    "is_decode_only",
 ]
 
 ATTENTION_BACKEND_NAME = "INKLING2_SM70_ATTN"
 SCONV_BACKEND_NAME = "INKLING2_SM70_SCONV"
+SWITCH = "VLLM_SM70_INKLING_DECODE_GRAPH"
+_enabled = envs.environment_variables()[SWITCH]
+
+
+def decode_graph_enabled() -> bool:
+    """False only when VLLM_SM70_INKLING_DECODE_GRAPH=0."""
+    return _enabled()
+
+
+def is_decode_only(metadata: Any) -> bool:
+    """Whether `metadata` is of a decode-only batch (module docstring)."""
+    return bool(getattr(metadata, "decode_only", False))
 
 
 @dataclass
@@ -78,6 +101,8 @@ class Inkling2SconvMetadata(AttentionMetadata):
     seq_idx: torch.Tensor  # [P] int32 request (batch row) of each token
     query_start: torch.Tensor  # [P] int32 first batch token of that request
     positions: torch.Tensor  # [P] int64 absolute position in the sequence
+    # Every request has at most one query token (module docstring).
+    decode_only: bool = field(default=False, kw_only=True)
 
 
 @dataclass
@@ -149,6 +174,7 @@ class _TokenIndex:
             "seq_idx": seq_idx,
             "query_start": query_start,
             "positions": positions,
+            "decode_only": cm.max_query_len <= 1 and decode_graph_enabled(),
         }
 
 
@@ -156,8 +182,18 @@ class _Builder(AttentionMetadataBuilder):
     """Common part of both builders. The metadata of two groups with equal
     specs differs in the block table and slot mapping only."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
     supports_update_block_table: bool = True
+
+    @classmethod
+    def get_cudagraph_support(
+        cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
+    ) -> AttentionCGSupport:
+        if not decode_graph_enabled():
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
 
     def __init__(
         self,
