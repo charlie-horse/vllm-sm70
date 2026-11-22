@@ -245,9 +245,10 @@ class Inkling2ConvState(_CacheOwner):
 
     @property
     def cache_block_size(self) -> int:
-        """Tokens per block of the bound cache (blocks, heads, tokens, width).
-        The planner may raise it above ``block_size``; index the cache and
-        build its metadata with this value."""
+        """Tokens per block of the bound cache. The runner binds a logical
+        (blocks, heads, tokens, width) view in every KV layout
+        (UP v1/kv_cache_interface.py ``create_kv_cache_views``). The planner
+        may raise it above ``block_size``; index the cache with this value."""
         if self.kv_cache.numel() > 0:
             return self.kv_cache.shape[2]
         return self.block_size

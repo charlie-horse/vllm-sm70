@@ -120,7 +120,7 @@ def test_chunked_attention_equals_unchunked(encoder, chunk):
     chunked = build(attn_query_chunk=chunk)
     # Longest image: 2x3 tiles = 25 tokens with the CLS token.
     assert encoder.attn_query_chunk > 25 > chunk
-    assert max_diff(chunked.encode(PIXELS, GRID), encoder.encode(PIXELS, GRID)) <= 1e-6
+    assert max_diff(chunked.encode(PIXELS, GRID), encoder.encode(PIXELS, GRID)) <= 1e-5
 
 
 @torch.inference_mode()

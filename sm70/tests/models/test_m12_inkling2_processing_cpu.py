@@ -212,6 +212,25 @@ def test_pad_target_needs_the_template_pad():
         _apply(processor, [BOS, IMAGE_MARKER_ID, END], [Image.new("RGB", (40, 40))])
 
 
+def test_pad_target_rejects_a_pad_spelled_in_text():
+    # In template mode "<|unused_200054|>" in user text encodes to the pad id.
+    processor = _make_processor("hf")
+    prompt = [BOS, IMAGE_PAD_ID, END, BOS, IMAGE_MARKER_ID, IMAGE_PAD_ID, END]
+    with pytest.raises(ValueError, match="must not contain"):
+        _apply(processor, prompt, [Image.new("RGB", (80, 40))])
+
+
+def test_marker_target_leaves_a_pad_id_in_the_prompt_alone():
+    processor = _make_processor(TARGET_MODES["marker"])
+    prompt = [BOS, IMAGE_PAD_ID, END, BOS, IMAGE_MARKER_ID, END]
+    out = _apply(processor, prompt, [Image.new("RGB", (80, 40))])
+    assert out["prompt_token_ids"] == (
+        [BOS, IMAGE_PAD_ID, END, BOS, IMAGE_MARKER_ID, IMAGE_PAD_ID, IMAGE_PAD_ID, END]
+    )
+    (placeholder,) = out["mm_placeholders"]["image"]
+    assert placeholder.offset == 4
+
+
 @pytest.mark.parametrize("target", ["marker", "pad"])
 def test_dummy_inputs_expand(target):
     processor = _make_processor(TARGET_MODES[target])

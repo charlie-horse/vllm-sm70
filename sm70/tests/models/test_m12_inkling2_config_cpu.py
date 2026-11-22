@@ -10,6 +10,8 @@ goes through every preparation ``Sm70CudaPlatform.kernel_warmup`` runs and
 through each Flint admission; each returns a reason and none throws.
 """
 
+import json
+import pathlib
 import sys
 import types
 from types import SimpleNamespace
@@ -28,6 +30,7 @@ from vllm_sm70.config import Sm70Config, clear_cache, compute_hash, sm70_config
 from vllm_sm70.models import inkling2_sm70
 from vllm_sm70.models.inkling2_sm70 import config as icfg
 
+DATA = pathlib.Path(__file__).parent / "data" / "inkling2_mini"
 # Inkling 2 Mini (tests/models/data/inkling2_mini/config.json), TP2.
 HIDDEN = 2304
 EXPERTS = 128
@@ -77,7 +80,16 @@ def route_log(monkeypatch):
 
 
 def _vllm_config(
-    dtype=torch.float16, backend=None, spec=None, prompt_embeds=False, sm70=None
+    dtype=torch.float16,
+    backend=None,
+    spec=None,
+    prompt_embeds=False,
+    sm70=None,
+    cache_dtype="auto",
+    block_size=None,
+    pp=1,
+    async_scheduling=None,
+    cudagraph_mode=None,
 ):
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -87,10 +99,16 @@ def _vllm_config(
             get_hidden_size=lambda: HIDDEN,
         ),
         attention_config=SimpleNamespace(backend=backend),
-        cache_config=SimpleNamespace(cache_dtype="auto", block_size=32),
-        parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, disable_custom_all_reduce=False
+        cache_config=SimpleNamespace(
+            cache_dtype=cache_dtype,
+            block_size=block_size or 16,
+            user_specified_block_size=block_size is not None,
         ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp, disable_custom_all_reduce=False
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
         speculative_config=spec,
         additional_config=None if sm70 is None else {"sm70": sm70},
         kernel_config=None,
@@ -109,6 +127,10 @@ def _vllm_config(
         ((7, 0), {"dtype": torch.float32}, "--dtype half"),
         ((7, 0), {"spec": object()}, "speculative decoding"),
         ((7, 0), {"prompt_embeds": True}, "prompt embeddings"),
+        ((7, 0), {"cache_dtype": "fp8"}, "--kv-cache-dtype fp8"),
+        ((7, 0), {"block_size": 16}, "--block-size 32"),
+        ((7, 0), {"pp": 2}, "pipeline parallelism"),
+        ((7, 0), {"async_scheduling": True}, "--no-async-scheduling"),
     ],
 )
 def test_hook_refuses(device, route_log, cc, kw, match):
@@ -124,6 +146,65 @@ def test_hook_refuses_on_cpu_platform(monkeypatch, route_log):
     monkeypatch.setattr(vllm.platforms, "_current_platform", cpu)
     with pytest.raises(ValueError, match="compute capability 7.0 GPU.*got None"):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(_vllm_config())
+
+
+@pytest.mark.parametrize("block_size", [None, 32])
+@pytest.mark.parametrize("async_scheduling", [None, False])
+@pytest.mark.parametrize("cache_dtype", ["auto", "float16"])
+def test_hook_fixes_the_kv_plan(
+    device, route_log, block_size, async_scheduling, cache_dtype
+):
+    device(7, 0)
+    cfg = _vllm_config(
+        block_size=block_size,
+        async_scheduling=async_scheduling,
+        cache_dtype=cache_dtype,
+    )
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.block_size == icfg.KV_BLOCK_SIZE == 32
+    assert cfg.cache_config.user_specified_block_size is True
+    assert cfg.scheduler_config.async_scheduling is False
+    assert cfg.cache_config.cache_dtype == cache_dtype
+
+
+@pytest.mark.parametrize(
+    "given, want", [(None, "PIECEWISE"), ("PIECEWISE", "PIECEWISE"), ("NONE", "NONE")]
+)
+def test_hook_keeps_cuda_graphs_piecewise(device, route_log, given, want):
+    from vllm.config.compilation import CUDAGraphMode
+
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode[want]
+
+
+@pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_hook_refuses_full_cuda_graphs(device, route_log, mode):
+    from vllm.config.compilation import CUDAGraphMode
+
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=CUDAGraphMode[mode])
+    with pytest.raises(ValueError, match=f"cudagraph_mode {mode};"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
+def test_released_index_keeps_the_mtp_file_out_of_the_weights(tmp_path):
+    """The default loader drops safetensors files the index does not name
+    (UP model_loader/default_loader.py ``_prepare_weights``)."""
+    import shutil
+
+    from vllm.model_executor.model_loader.weight_utils import (
+        filter_duplicate_safetensors_files,
+    )
+
+    index = "model.safetensors.index.json"
+    shutil.copy(DATA / index, tmp_path / index)
+    names = sorted(set(json.loads((DATA / index).read_text())["weight_map"].values()))
+    assert names == ["model-00001-of-00001.safetensors"]
+    files = [str(tmp_path / name) for name in [*names, "mtp.safetensors"]]
+    kept = filter_duplicate_safetensors_files(files, str(tmp_path), index)
+    assert kept == files[:1]
 
 
 def test_hook_selects_no_attention_backend(device, route_log):
@@ -156,6 +237,22 @@ def test_hook_logs_the_visit_dump(device, route_log):
     vc = _vllm_config(sm70={"inkling2": {"visit_dump_dir": "/dump"}})
     icfg.Inkling2Sm70ModelConfig.verify_and_update_config(vc)
     assert "state dump to /dump" in route_log[0]
+
+
+def test_hook_hands_the_image_cap_to_the_processor(device, route_log):
+    from vllm_sm70.models.inkling2_sm70.sm70_configs import (
+        IMAGE_ENCODER_TOKEN_CAP_ATTR,
+        Inkling2LoopSm70MMConfig,
+    )
+
+    tiny = pathlib.Path(__file__).parent / "fixtures" / "inkling2_tiny" / "config.json"
+    tiny = json.loads(tiny.read_text())
+    device(7, 0)
+    for sm70, want in ((None, 10817), ({"max_image_encoder_tokens": 1601}, 1601)):
+        vc = _vllm_config(sm70=None if sm70 is None else {"inkling2": sm70})
+        vc.model_config.hf_config = Inkling2LoopSm70MMConfig(**tiny)
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(vc)
+        assert getattr(vc.model_config.hf_config, IMAGE_ENCODER_TOKEN_CAP_ATTR) == want
 
 
 def test_hook_is_reachable_lazily():

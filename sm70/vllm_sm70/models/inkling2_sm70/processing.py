@@ -12,9 +12,13 @@ Differences: pixels are fp16, the cell size comes from the checkpoint's
 - any other mode (the checkpoint's Jinja template): the template emits
   ``<|content_image|><|unused_200054|>`` for typed image parts, so only the
   pad is replaced, by ``rows * cols`` pads. Typed parts need
-  ``--chat-template-content-format openai``.
+  ``--chat-template-content-format openai``. A prompt whose pad count
+  differs from its image count is rejected.
 
 Only the pad positions receive vision embeddings.
+
+An image with more image tokens than ``Inkling2ProcessingInfo.max_image_tokens``
+is rejected with a ValueError; nothing is resized.
 """
 
 from __future__ import annotations
@@ -48,6 +52,10 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 
+from vllm_sm70.config import Inkling2Config
+
+from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
+
 # <|content_image|>: block marker emitted by the renderer, kept verbatim.
 IMAGE_MARKER_ID = 200005
 IMAGE_PLACEHOLDER = "<|content_image|>"
@@ -58,12 +66,11 @@ IMAGE_PAD = "<|unused_200054|>"
 
 # Cell size of Inkling 2 Mini: native_patch_size 20 x adapter_merge_size 2.
 PATCH_SIZE = 40
+MERGE_SIZE = 2
 # Tokenizer mode of the plugin renderer, which emits the marker only.
 NATIVE_RENDERER_MODE = "inkling2_sm70"
 TARGET_MARKER = "marker"
 TARGET_PAD = "pad"
-# Dummy (profiling) images are at most this many pixels per side.
-MAX_DUMMY_IMAGE_SIDE = 2048
 
 ImageInput: TypeAlias = bytes | Image.Image | MediaWithBytes | np.ndarray
 
@@ -110,20 +117,41 @@ class Inkling2ImageProcessor:
 
     Returns `vision_pixels` (fp16 `[sum(rows*cols), P, P, 3]` raw RGB
     values, padding pixels at -1; the encoder normalizes them) and
-    `vision_grid_thw`.
+    `vision_grid_thw`. With `max_tokens`, an image of more cells raises
+    ValueError.
     """
 
-    def __init__(self, patch_size: int = PATCH_SIZE) -> None:
+    def __init__(
+        self, patch_size: int = PATCH_SIZE, max_tokens: int | None = None
+    ) -> None:
         if patch_size < 1:
             raise ValueError(f"patch_size must be positive, got {patch_size}")
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
         self.patch_size = patch_size
+        self.max_tokens = max_tokens
+
+    def check_size(self, width: int, height: int) -> None:
+        rows, cols = self.get_grid(width, height)
+        if self.max_tokens is not None and rows * cols > self.max_tokens:
+            patch = self.patch_size
+            raise ValueError(
+                f"Image of {width}x{height} pixels is too large: it takes "
+                f"{rows * cols} image tokens ({rows} x {cols} cells of {patch} "
+                f"pixels) and this server accepts at most {self.max_tokens} "
+                "per image. Images are not resized; send a smaller one."
+            )
 
     def get_grid(self, width: int, height: int) -> tuple[int, int]:
         return math.ceil(height / self.patch_size), math.ceil(width / self.patch_size)
 
     def preprocess(self, images: Sequence[ImageInput]) -> dict[str, torch.Tensor]:
         patch = self.patch_size
-        decoded = [torch.from_numpy(decode_image(image)) for image in images]
+        decoded = []
+        for image in images:
+            pixels = torch.from_numpy(decode_image(image))
+            self.check_size(pixels.shape[1], pixels.shape[0])
+            decoded.append(pixels)
         grids = [self.get_grid(pixels.shape[1], pixels.shape[0]) for pixels in decoded]
         out = torch.empty(
             (sum(rows * cols for rows, cols in grids), patch, patch, 3),
@@ -179,6 +207,31 @@ class Inkling2ProcessingInfo(BaseProcessingInfo):
         return int(vision["native_patch_size"]) * int(vision["adapter_merge_size"])
 
     @cached_property
+    def max_image_tokens(self) -> int:
+        """Most image tokens one image may take: the encoder sequence cap
+        (`Sm70Config.inkling2.max_image_encoder_tokens`, which the
+        engine-config hook leaves on `hf_config`) less the class token, in
+        cells of merge * merge patches."""
+        hf_config = getattr(self.ctx.model_config, "hf_config", None)
+        cap = getattr(hf_config, IMAGE_ENCODER_TOKEN_CAP_ATTR, None)
+        if cap is None:
+            cap = Inkling2Config().max_image_encoder_tokens
+        vision = getattr(hf_config, "vision_config", None)
+        merge = MERGE_SIZE
+        if vision is not None:
+            if not isinstance(vision, Mapping):
+                vision = vision.to_dict()
+            merge = int(vision["adapter_merge_size"])
+        tokens = (int(cap) - 1) // merge**2
+        if tokens < 1:
+            raise ValueError(
+                f"sm70.inkling2.max_image_encoder_tokens={cap} leaves no room "
+                f"for one image token ({merge * merge} patches and the class "
+                "token)."
+            )
+        return tokens
+
+    @cached_property
     def image_target(self) -> str:
         """Which prompt token the processor expands, by renderer."""
         mode = getattr(self.ctx.model_config, "tokenizer_mode", None)
@@ -193,7 +246,7 @@ class Inkling2ProcessingInfo(BaseProcessingInfo):
 
     @cached_property
     def image_processor(self) -> Inkling2ImageProcessor:
-        return Inkling2ImageProcessor(self.patch_size)
+        return Inkling2ImageProcessor(self.patch_size, self.max_image_tokens)
 
     def get_data_parser(self) -> MultiModalDataParser:
         return Inkling2MultiModalDataParser(
@@ -221,9 +274,9 @@ class Inkling2DummyInputsBuilder(BaseDummyInputsBuilder[Inkling2ProcessingInfo])
         mm_counts: Mapping[str, int],
         mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
-        # Largest square image whose tokens still fit in seq_len.
-        patch = self.info.patch_size
-        side = min(MAX_DUMMY_IMAGE_SIDE, patch * max(1, math.isqrt(seq_len)))
+        # Largest square image whose tokens fit in seq_len and the image cap.
+        cells = math.isqrt(min(seq_len, self.info.max_image_tokens))
+        side = self.info.patch_size * max(1, cells)
         return {
             "image": self._get_dummy_images(
                 width=side,
@@ -280,6 +333,19 @@ class Inkling2MultiModalProcessor(BaseMultiModalProcessor[Inkling2ProcessingInfo
             ),
             "vision_grid_thw": MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         }
+
+    def _apply_prompt_updates(self, token_ids, mm_prompt_updates):
+        if self.info.image_target == TARGET_PAD:
+            # Template mode parses special-token text, so prompt text can
+            # spell the pad; an extra pad would take an image's embeddings.
+            num_pads = token_ids.count(IMAGE_PAD_ID)
+            num_images = len(mm_prompt_updates.get("image", ()))
+            if num_pads != num_images:
+                raise ValueError(
+                    f"The prompt has {num_pads} {IMAGE_PAD} tokens for "
+                    f"{num_images} images; text must not contain {IMAGE_PAD}."
+                )
+        return super()._apply_prompt_updates(token_ids, mm_prompt_updates)
 
     def _get_prompt_updates(
         self,

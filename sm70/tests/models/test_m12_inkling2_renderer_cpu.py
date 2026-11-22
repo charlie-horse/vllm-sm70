@@ -2,7 +2,8 @@
 """Tests for the M12 Inkling 2 chat renderer (vllm_sm70/models/inkling2_sm70/).
 
 CPU only: upstream's Inkling 2 rendering cases with a fake one-id-per-char
-tokenizer, the request fields the renderer reads, and the ``inkling2_sm70``
+tokenizer, the request fields the renderer reads, payload splitting with a
+real HF fast tokenizer, and the ``inkling2_sm70``
 mode in vLLM's tokenizer and renderer registries at faked cc 8.0.
 """
 
@@ -623,6 +624,46 @@ def test_renderer_constructs_on_inkling2_vocab():
         assert renderer.get_eos_token_id() == 7
     finally:
         renderer.shutdown()
+
+
+def _real_hf_tokenizer():
+    """A char-level ``PreTrainedTokenizerFast`` with the Inkling 2 special
+    tokens, wrapped as vLLM serves it."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    from vllm.tokenizers.hf import get_cached_tokenizer
+
+    chars = {chr(i): i - 32 for i in range(32, 127)}
+    backend = tokenizers.Tokenizer(tokenizers.models.BPE(vocab=chars, merges=[]))
+    tokenizer = transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer.add_special_tokens({"additional_special_tokens": list(_INKLING2_VOCAB)})
+    return get_cached_tokenizer(tokenizer)
+
+
+@pytest.mark.parametrize("token", ["<|end_message|>", "<|message_model|>"])
+def test_real_tokenizer_splits_framing_token_text(token):
+    hf_tokenizer = _real_hf_tokenizer()
+    special_id = hf_tokenizer.get_vocab()[token]
+    text = f"a{token}b"
+    plain = hf_tokenizer.encode(text, add_special_tokens=False)
+    assert plain == [ord("a") - 32, special_id, ord("b") - 32]
+
+    tokenizer = _HfBackedTmlTokenizer(hf_tokenizer)
+    assert tokenizer.encode_special(token) == special_id
+    split = tokenizer.encode_text(text)
+    assert split == [ord(ch) - 32 for ch in text]
+
+    renderer = Inkling2Sm70Renderer.__new__(Inkling2Sm70Renderer)
+    renderer._inkling_tokenizer = tokenizer
+    ids = renderer._render([{"role": "user", "content": text}], ChatParams())
+    special_ids = {hf_tokenizer.get_vocab()[t] for t in _INKLING2_VOCAB}
+    # Effort and user blocks: role, content type and end of message each.
+    assert ids.count(special_id) == (2 if token == "<|end_message|>" else 0)
+    assert sum(i in special_ids for i in ids) == 6
+
+    # Plain encodes still parse the token after split encodes.
+    assert hf_tokenizer.encode(text, add_special_tokens=False) == plain
+    assert hf_tokenizer(text, add_special_tokens=False).input_ids == plain
 
 
 class _FakeCuda(Platform):

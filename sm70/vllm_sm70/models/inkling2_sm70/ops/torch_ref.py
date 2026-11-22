@@ -138,7 +138,12 @@ def attn_res(
     Returns [B, T, Q, H] in fp32.
     """
     states = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim=-2)
-    states = rms_norm(states.float())
+    return attn_res_mix(rms_norm(states.float()), query)
+
+
+def attn_res_mix(states: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """The mix of `attn_res` over states [..., N, H] that are already
+    RMS-normed in fp32. query [H] or [Q, H]. Returns [..., Q, H] in fp32."""
     hidden = states.shape[-1]
     query = query.float().view(-1, hidden)
     scores = torch.matmul(query, states.transpose(-1, -2)) * hidden**-0.5

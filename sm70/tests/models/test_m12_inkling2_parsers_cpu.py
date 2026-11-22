@@ -293,6 +293,49 @@ def test_streaming_end_sampling(mock_tokenizer, mock_request, chunk_size):
     assert [json.loads(a) for a in args] == [{"a": 1}]
 
 
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+def test_streaming_thinking_after_text(mock_tokenizer, mock_request, chunk_size):
+    # Blocks after the first text block keep their framing out of the content.
+    output = (
+        f"{MSG_MODEL}{THINK_START}aa{END_MESSAGE}{MSG_MODEL}{TEXT_START}bb{END_MESSAGE}"
+        f"{MSG_MODEL}{THINK_START}cc{END_MESSAGE}{MSG_MODEL}{TEXT_START}dd{END_MESSAGE}"
+        f"{END_SAMPLING}"
+    )
+    content, reasoning, names, _ = _stream_delegating(
+        _delegating(mock_tokenizer), mock_request, output, chunk_size, PROMPT
+    )
+    assert (content, reasoning, names) == ("bbdd", "aacc", [])
+
+
+@pytest.mark.parametrize(
+    "tool_parser",
+    [
+        {},
+        {"tool_parser_name": parsers.PARSER_NAME},
+        {"tool_parser_name": "hermes", "enable_auto_tools": True},
+    ],
+    ids=["none", "auto_tools_off", "other"],
+)
+def test_reasoning_parser_needs_the_tool_parser(mock_tokenizer, tool_parser):
+    # v0.33.0 streams everything after the first text block as raw content
+    # unless this tool parser parses it, so the composition fails at startup.
+    with pytest.raises(TypeError, match="requires --tool-call-parser inkling2_sm70"):
+        ParserManager.get_parser(
+            reasoning_parser_name=parsers.PARSER_NAME,
+            tokenizer=mock_tokenizer,
+            **tool_parser,
+        )
+
+
+def test_reasoning_adapter_alone_still_constructs(mock_tokenizer):
+    # The structured-output manager builds the reasoning parser on its own.
+    assert parsers.Inkling2Sm70Parser.reasoning_parser_cls is (
+        Inkling2Sm70ParserReasoningAdapter
+    )
+    adapter = Inkling2Sm70ParserReasoningAdapter(mock_tokenizer)
+    assert adapter.is_reasoning_end(PROMPT) is False
+
+
 @pytest.mark.parametrize("chunk_size", [1, 64])
 def test_streaming_text_only(mock_tokenizer, mock_request, chunk_size):
     content, reasoning, names, _ = _stream_delegating(

@@ -17,10 +17,14 @@ from typing import Any
 from .configs import Inkling2LoopMMConfig, Inkling2MMConfig, Inkling2ModelConfig
 
 HEAD_DTYPE = "model"
+# Attribute the engine-config hook (config.py) sets on the model's hf_config:
+# Sm70Config.inkling2.max_image_encoder_tokens, for the image processor.
+IMAGE_ENCODER_TOKEN_CAP_ATTR = "sm70_max_image_encoder_tokens"
 
 __all__ = [
     "CONFIG_CLASSES",
     "HEAD_DTYPE",
+    "IMAGE_ENCODER_TOKEN_CAP_ATTR",
     "Inkling2LoopSm70MMConfig",
     "Inkling2Sm70MMConfig",
 ]

@@ -12,7 +12,9 @@ keeps its slice of the head-sharded tensors; everything else is replicated.
 Dtypes: a parameter whose Hugging Face name contains an entry of
 ``HF_FP32_MODULES`` is float32; every other parameter is in the model dtype.
 Checkpoint values are cast (bf16 -> fp16 for the released checkpoint) and are
-otherwise unchanged: queries are not pre-scaled.
+otherwise unchanged: queries are not pre-scaled. Every cast to fp16 goes
+through the map's ``Fp16Audit`` (fp16_audit.py), and the map refuses a config
+that differs from ``HARD_CODED_CONFIG``.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from typing import Any
 
 import torch
 from torch import nn
+
+from .fp16_audit import Fp16Audit, check_hard_coded_config
 
 __all__ = [
     "HF_FP32_MODULES",
@@ -188,12 +192,15 @@ class Inkling2WeightMap:
         tp_rank: int = 0,
         dtype: torch.dtype = torch.float16,
         with_visual: bool = False,
+        audit: Fp16Audit | None = None,
     ) -> None:
         if not 0 <= tp_rank < tp_size:
             raise ValueError(f"Inkling 2: TP rank {tp_rank} outside 0..{tp_size - 1}")
         if not dtype.is_floating_point:
             raise ValueError(f"Inkling 2: model dtype {dtype} is not a float type")
         self.config = _text_config(config)
+        check_hard_coded_config(self.config)
+        self.audit = Fp16Audit() if audit is None else audit
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.dtype = dtype
@@ -466,7 +473,9 @@ class Inkling2WeightMap:
             tensor = tensor.narrow(route.tp_dim, self.tp_rank * size, size)
         if route.pairs:
             tensor = tensor.unflatten(0, (-1, 2))
-        return tensor.to(self.params[route.param].dtype)
+        value = tensor.to(self.params[route.param].dtype)
+        self.audit.check(route.source, tensor, value)
+        return value
 
     def _write(self, route: Route, target: torch.Tensor, tensor: torch.Tensor) -> None:
         value = self.localize(route, tensor)
@@ -571,9 +580,10 @@ def build_weight_map(
     tp_rank: int | None = None,
     dtype: torch.dtype = torch.float16,
     with_visual: bool = False,
+    audit: Fp16Audit | None = None,
 ) -> Inkling2WeightMap:
     """The table for ``config`` (the model config or its text config). TP size
-    and rank default to this process's."""
+    and rank default to this process's; ``audit`` to a new ``Fp16Audit()``."""
     if tp_size is None or tp_rank is None:
         from vllm.distributed import (
             get_tensor_model_parallel_rank,
@@ -583,7 +593,12 @@ def build_weight_map(
         tp_size = get_tensor_model_parallel_world_size() if tp_size is None else tp_size
         tp_rank = get_tensor_model_parallel_rank() if tp_rank is None else tp_rank
     return Inkling2WeightMap(
-        config, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype, with_visual=with_visual
+        config,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        dtype=dtype,
+        with_visual=with_visual,
+        audit=audit,
     )
 
 
@@ -597,6 +612,7 @@ def load_weights(
     dtype: torch.dtype = torch.float16,
     expert_loader: Callable[[str, torch.Tensor], None] | None = None,
     visual_loader: Callable[[str, torch.Tensor], None] | None = None,
+    audit: Fp16Audit | None = None,
 ) -> set[str]:
     """``build_weight_map(...).load_into(model, weights, ...)``; the vision
     tower is expected exactly when ``visual_loader`` is given."""
@@ -606,6 +622,7 @@ def load_weights(
         tp_rank=tp_rank,
         dtype=dtype,
         with_visual=visual_loader is not None,
+        audit=audit,
     )
     return weight_map.load_into(
         model, weights, expert_loader=expert_loader, visual_loader=visual_loader

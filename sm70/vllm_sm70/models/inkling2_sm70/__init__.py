@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """M12 inkling2-sm70-model: Inkling 2 (looped, e.g. Inkling 2 Mini) on SM70.
 
-What: the architecture name ``Inkling2LoopSm70ForConditionalGeneration``
-  (model.py), upstream's Inkling 2 config classes vendored unchanged
+What: the model ``Inkling2LoopSm70ForConditionalGeneration`` (model.py,
+  loop.py, layers.py: the text stack on one TP rank), upstream's Inkling 2 config classes vendored unchanged
   (configs.py, see PROVENANCE.md) and the SM70 subclasses that keep the LM
   head in the model dtype (sm70_configs.py), the chat renderer mode
   ``inkling2_sm70`` (renderer.py, inkling2_encoding.py), and the reasoning

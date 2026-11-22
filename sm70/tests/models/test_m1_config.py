@@ -47,7 +47,7 @@ EFFECTIVE_DEFAULTS = {
     "dflash2_verifier": "auto",
     "shared_moe_overlap": False,
     "greedy_token_fastpath": True,
-    "inkling2": {"visit_dump_dir": None},
+    "inkling2": {"visit_dump_dir": None, "max_image_encoder_tokens": 10817},
 }
 
 # Our sections of K01's registry.
@@ -429,7 +429,7 @@ def test_env_cannot_enable(monkeypatch, value):
         "dflash2_verifier": "off",
         "shared_moe_overlap": False,
         "quant_backend": "turbomind",
-        "inkling2": {"visit_dump_dir": "/dump"},
+        "inkling2": {"visit_dump_dir": "/dump", "max_image_encoder_tokens": 1601},
     }
     assert sm70_config(_vc(off)).model_dump() == off
 
