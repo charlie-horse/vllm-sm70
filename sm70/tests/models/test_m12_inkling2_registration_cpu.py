@@ -255,13 +255,15 @@ def test_metadata_fixtures_are_the_checkpoint_layout():
 
 
 def test_registration_imports_no_model_triton_or_cuda():
-    """In a fresh process without GPUs. vLLM's own config and renderer
-    registry modules (which the registration needs) are imported first: they
-    already pull in torch and, through it, Triton, so the check is on what
+    """In a fresh process without GPUs. vLLM's own config, renderer registry
+    and parser manager modules (which the registration needs) are imported
+    first: they already pull in torch and, through it, Triton, and the
+    parser managers pull in the model registry, so the check is on what
     registration adds."""
     code = (
         "import sys, torch, vllm.transformers_utils.config as c\n"
         "import vllm.renderers.registry, vllm.tokenizers.registry\n"
+        "import vllm.reasoning, vllm.tool_parsers\n"
         "before = set(sys.modules)\n"
         "from vllm_sm70.models import inkling2_sm70\n"
         "assert inkling2_sm70.register() is False\n"
@@ -272,6 +274,8 @@ def test_registration_imports_no_model_triton_or_cuda():
         "assert not bad, bad\n"
         "assert 'vllm_sm70.models.inkling2_sm70.model' not in sys.modules\n"
         "assert 'vllm_sm70.models.inkling2_sm70.renderer' not in sys.modules\n"
+        "assert 'vllm_sm70.models.inkling2_sm70.parsers' not in sys.modules\n"
+        "assert 'xgrammar' not in added and 'vllm.parser.inkling' not in added\n"
         "assert not torch.cuda.is_initialized()\n"
         "assert type(c._CONFIG_REGISTRY['inkling2_loop']).__name__ == 'type'\n"
         "import vllm_sm70\n"

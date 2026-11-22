@@ -4,17 +4,19 @@
 What: the architecture name ``Inkling2LoopSm70ForConditionalGeneration``
   (model.py), upstream's Inkling 2 config classes vendored unchanged
   (configs.py, see PROVENANCE.md) and the SM70 subclasses that keep the LM
-  head in the model dtype (sm70_configs.py), and the chat renderer mode
-  ``inkling2_sm70`` (renderer.py, inkling2_encoding.py).
+  head in the model dtype (sm70_configs.py), the chat renderer mode
+  ``inkling2_sm70`` (renderer.py, inkling2_encoding.py), and the reasoning
+  and tool parsers ``inkling2_sm70`` (parsers.py).
 Why: vLLM v0.33.0 has no ``inkling2`` config type or architecture, and
   upstream's model asserts bf16 and SM90+ kernels. A separate architecture
   name keeps upstream's class untouched; serve args select ours with
   ``--hf-overrides '{"architectures":
   ["Inkling2LoopSm70ForConditionalGeneration"]}'``.
-Registration: the config classes go into vLLM's ``_CONFIG_REGISTRY`` and the
-  renderer mode into its tokenizer and renderer registries in every process
-  (a CPU process parses config.json and renders chat too); the model class
-  only when the visible GPUs are all cc 7.0.
+Registration: the config classes go into vLLM's ``_CONFIG_REGISTRY``, the
+  renderer mode into its tokenizer and renderer registries and the parser
+  names into its reasoning and tool parser managers in every process (a CPU
+  process parses config.json, renders chat and parses output too); the model
+  class only when the visible GPUs are all cc 7.0.
 """
 
 from __future__ import annotations
@@ -33,12 +35,19 @@ RENDERER_MODE = "inkling2_sm70"
 RENDERER_TARGET = ("vllm_sm70.models.inkling2_sm70.renderer", "Inkling2Sm70Renderer")
 # The mode only selects the renderer; token operations use the HF tokenizer.
 TOKENIZER_TARGET = ("vllm.tokenizers.hf", "CachedHfTokenizer")
+PARSER_NAME = "inkling2_sm70"
+PARSER_MODULE = "vllm_sm70.models.inkling2_sm70.parsers"
+REASONING_PARSER_TARGET = (PARSER_MODULE, "Inkling2Sm70ParserReasoningAdapter")
+TOOL_PARSER_TARGET = (PARSER_MODULE, "Inkling2Sm70EngineToolParser")
 __all__ = [
     "ARCH",
+    "PARSER_MODULE",
+    "PARSER_NAME",
     "RENDERER_MODE",
     "Inkling2LoopSm70ForConditionalGeneration",
     "register",
     "register_configs",
+    "register_parsers",
     "register_renderer",
 ]
 
@@ -88,11 +97,25 @@ def register_renderer() -> None:
         RENDERER_REGISTRY.register(RENDERER_MODE, *RENDERER_TARGET)
 
 
-def register() -> bool:
-    """Register configs and renderer mode, then ``ARCH`` on SM70. Idempotent.
+def register_parsers() -> None:
+    """Add ``PARSER_NAME`` to vLLM's reasoning and tool parser managers.
 
-    The config classes and the renderer mode register first, on any device. The model class is
-    skipped (returns False) when the visible GPUs aren't all cc 7.0. Raises
+    Idempotent. The entries are lazy: parsers.py is imported when a name is
+    first resolved, or by ``--reasoning-parser-plugin``/``--tool-parser-plugin``.
+    """
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tool_parsers import ToolParserManager
+
+    ReasoningParserManager.register_lazy_module(PARSER_NAME, *REASONING_PARSER_TARGET)
+    ToolParserManager.register_lazy_module(PARSER_NAME, *TOOL_PARSER_TARGET)
+
+
+def register() -> bool:
+    """Register configs, renderer mode and parsers, then ``ARCH`` on SM70.
+
+    Idempotent. The config classes, the renderer mode and the parser names
+    register first, on any device. The model class is skipped (returns
+    False) when the visible GPUs aren't all cc 7.0. Raises
     when they are but ``_sm70_C`` is missing (K01 fail-fast), and when the
     registry didn't take the entry. It marks itself done only after every
     step succeeded, so a retry runs it again. The lazy "<module>:<class>"
@@ -104,6 +127,7 @@ def register() -> bool:
         return True
     register_configs()
     register_renderer()
+    register_parsers()
 
     from vllm_sm70 import _ext
     from vllm_sm70 import platform as sm70_platform
