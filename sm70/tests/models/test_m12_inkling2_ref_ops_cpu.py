@@ -6,10 +6,10 @@ fixtures/inkling2_tiny/ops.safetensors is recomputed from its recorded inputs
 and the tiny checkpoint's weights and compared with the recorded outputs.
 """
 
-import importlib.util
 import json
 import math
 import pathlib
+import sys
 
 import pytest
 
@@ -20,12 +20,11 @@ import torch.nn.functional as F
 
 from vllm_sm70.models.inkling2_sm70.ops import torch_ref as ref
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from inkling2_ref import Inkling2Weights
+
 TINY = pathlib.Path(__file__).resolve().parent / "fixtures" / "inkling2_tiny"
 ATOL = 1e-5
-
-_spec = importlib.util.spec_from_file_location("gen_fixture", TINY / "gen_fixture.py")
-gen = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gen)
 
 TEXT = json.loads((TINY / "config.json").read_text())["text_config"]
 EPS = TEXT["rms_norm_eps"]
@@ -58,58 +57,11 @@ def close(op: str, *got: torch.Tensor) -> None:
     CHECKED.add(op)
 
 
-def w(name: str) -> torch.Tensor:
-    """A checkpoint tensor as the fp32 reference run holds it."""
-    return NATIVE["model.llm." + name].float()
-
-
-def expert_weights(layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """fp32 (gate_up with the gate rows first, down) of a layer's packed experts."""
-
-    def dequantize(prefix: str) -> torch.Tensor:
-        weight, scale = NATIVE[prefix], NATIVE[prefix + "_scale"].float()
-        if prefix + "_amax" not in NATIVE:
-            blocks = weight.float().unflatten(-1, (-1, 32))
-            return (blocks * torch.exp2(scale - 127)[..., None]).flatten(-2)
-        lut = torch.tensor(gen.E2M1)
-        codes = weight.long()
-        values = torch.stack((lut[codes & 0xF], lut[codes >> 4]), dim=-1).flatten(-2)
-        values = values.unflatten(-1, (-1, 16)) * scale[..., None]
-        factor = NATIVE[prefix + "_amax"] / NATIVE[prefix + "_outer_scale_denominator"]
-        return (values * factor[:, None, None, None]).flatten(-2)
-
-    p = f"model.llm.layers.{layer}.mlp.experts."
-    w13 = dequantize(p + "w13_weight")
-    return torch.cat((w13[:, 0::2], w13[:, 1::2]), dim=1), dequantize(p + "w2_weight")
-
-
-def attention_weights(layer: int) -> ref.AttentionWeights:
-    a = f"layers.{layer}.attn."
-    full = layer % 6 == 5
-    conv = "static_w" if full else "weight"
-    return ref.AttentionWeights(
-        q=w(a + "wq_du.weight"),
-        k=w(a + "wk_dv.weight"),
-        v=w(a + "wv_dv.weight"),
-        rel=w(a + "wr_du.weight"),
-        out=w(a + "wo_ud.weight"),
-        out_gate=w(a + "gate_attn.weight"),
-        sink=w(a + "attn_sink_proj.weight"),
-        q_scale=w(a + "q_l2_clip.scale"),
-        rel_scale=w(a + "rel_l2_clip.scale"),
-        rel_proj=w(a + "rel_logits_proj.proj"),
-        k_conv=w(a + f"k_sconv.{conv}"),
-        v_conv=w(a + f"v_sconv.{conv}"),
-        k_conv_proj=w(a + "k_sconv.weight_proj") if full else None,
-        v_conv_proj=w(a + "v_sconv.weight_proj") if full else None,
-    )
-
-
-def message_queries() -> torch.Tensor:
-    """[loop layers, 4, H] in the order query, key, value, mlp."""
-    q_mlp = w("middle_cycle_cross_pass_queries").unflatten(0, (-1, 2))
-    k_v = w("middle_cycle_cross_pass_kv_queries").unflatten(0, (-1, 2))
-    return torch.cat((q_mlp[:, :1], k_v, q_mlp[:, 1:]), dim=1)
+W = Inkling2Weights(NATIVE)
+w = W
+expert_weights = W.experts
+attention_weights = W.attention
+message_queries = W.message_queries
 
 
 def test_rms_norm():
