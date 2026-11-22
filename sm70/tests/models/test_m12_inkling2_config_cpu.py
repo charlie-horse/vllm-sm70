@@ -10,6 +10,8 @@ goes through every preparation ``Sm70CudaPlatform.kernel_warmup`` runs and
 through each Flint admission; each returns a reason and none throws.
 """
 
+import json
+import pathlib
 import sys
 import types
 from types import SimpleNamespace
@@ -192,6 +194,22 @@ def test_hook_logs_the_visit_dump(device, route_log):
     vc = _vllm_config(sm70={"inkling2": {"visit_dump_dir": "/dump"}})
     icfg.Inkling2Sm70ModelConfig.verify_and_update_config(vc)
     assert "state dump to /dump" in route_log[0]
+
+
+def test_hook_hands_the_image_cap_to_the_processor(device, route_log):
+    from vllm_sm70.models.inkling2_sm70.sm70_configs import (
+        IMAGE_ENCODER_TOKEN_CAP_ATTR,
+        Inkling2LoopSm70MMConfig,
+    )
+
+    tiny = pathlib.Path(__file__).parent / "fixtures" / "inkling2_tiny" / "config.json"
+    tiny = json.loads(tiny.read_text())
+    device(7, 0)
+    for sm70, want in ((None, 10817), ({"max_image_encoder_tokens": 1601}, 1601)):
+        vc = _vllm_config(sm70=None if sm70 is None else {"inkling2": sm70})
+        vc.model_config.hf_config = Inkling2LoopSm70MMConfig(**tiny)
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(vc)
+        assert getattr(vc.model_config.hf_config, IMAGE_ENCODER_TOKEN_CAP_ATTR) == want
 
 
 def test_hook_is_reachable_lazily():

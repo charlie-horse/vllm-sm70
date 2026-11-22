@@ -14,6 +14,8 @@
 * KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), no async
   scheduling (turned off when unset: it doubles the conv and sliding-window
   admission caps), the KV cache in the model dtype, no pipeline parallelism.
+* Copies ``sm70.inkling2.max_image_encoder_tokens`` onto the model's
+  ``hf_config``, where the image processor reads it (processing.py).
 * Logs the routes once per process.
 """
 
@@ -58,6 +60,8 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
 
         from vllm.platforms import current_platform
         from vllm_sm70.config import sm70_config
+
+        from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
 
         capability = (
             current_platform.get_device_capability()
@@ -121,4 +125,12 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 "flight doubles the per-request KV reservation."
             )
         scheduler_config.async_scheduling = False
-        _log_routes_once(sm70_config(vllm_config).inkling2.visit_dump_dir)
+        inkling2 = sm70_config(vllm_config).inkling2
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is not None:
+            setattr(
+                hf_config,
+                IMAGE_ENCODER_TOKEN_CAP_ATTR,
+                inkling2.max_image_encoder_tokens,
+            )
+        _log_routes_once(inkling2.visit_dump_dir)

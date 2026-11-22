@@ -32,7 +32,7 @@ import weakref
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from vllm_sm70 import envs
 
@@ -50,6 +50,14 @@ class Inkling2Config(BaseModel):
     (default) writes nothing. Set only through --additional-config; there is
     no environment variable, because the environment can't turn a feature
     on. The dump runs eagerly, so this is not a graph field."""
+
+    max_image_encoder_tokens: int = Field(default=10817, ge=2)
+    """Largest vision-encoder sequence of one image: merge * merge patches
+    per image token plus the class token (10817 is 2704 image tokens, e.g.
+    2080 x 2080 pixels, for Inkling 2 Mini). A larger image is rejected, and
+    the profiling image has this size. Evidence: on a V100 the encoder's
+    attention takes 0.02 GiB at 10817 on the memory-efficient kernel, the
+    largest sequence measured. The encoder runs eagerly: not a graph field."""
 
 
 class Sm70Config(BaseModel):
@@ -207,7 +215,8 @@ class Sm70Config(BaseModel):
     Kill: VLLM_SM70_GREEDY_TOKEN_FASTPATH=0."""
 
     inkling2: Inkling2Config = Inkling2Config()
-    """The Inkling 2 section (debug only). No kill switch; not a graph field."""
+    """The Inkling 2 section (debug dump, image size cap). No kill switch;
+    not a graph field."""
 
 
 GRAPH_FIELDS: tuple[str, ...] = (
@@ -228,7 +237,7 @@ GRAPH_FIELDS: tuple[str, ...] = (
 because the fork always hashes it: all layer aliases pre-Ampere, this one
 alone elsewhere (policy_defaults.py:275-277).
 Keep nvfp4_gemv in until it is tested. greedy_token_fastpath is not one:
-sampling runs eagerly, outside the compiled graph. Nor is inkling2 (debug)."""
+sampling runs eagerly, outside the compiled graph. Nor is inkling2 (read eagerly)."""
 
 # Kill switch name -> (field, value forced when engaged). VLLM_SM70_FP8_TURBOMIND,
 # VLLM_SM70_QUANT and VLLM_SM70_DFLASH2_EMULATION are env-only kills (no field).
