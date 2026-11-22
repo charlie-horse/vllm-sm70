@@ -129,6 +129,12 @@ The "M8 verifier GEMVs" at the fork (cf9492a) are three routes. All three serve 
 | C3 | Switch `hosts/c4130/vllm` in charlie-horse/flake to this flake's `latest` branch (gated per `docs/release.md`; after the GC of old generations c4130 needs first) | Felix + Charlie | C1, C2 | `nixos-rebuild switch` succeeds; etcd health OK; service serves |
 | C4 | Archive the fork (charlie-horse/vLLM) as reference only | Charlie | C3 | – |
 
+## Phase 6: Inkling 2 Mini
+
+| node | level | what | owner | depends | kill switch | exit test |
+|---|---|---|---|---|---|---|
+| M12 | 0 | `vllm_sm70.models.inkling2_sm70` package: upstream Inkling 2 config classes vendored byte-identical (vLLM c32251b), Sm70 config subclasses with `head_dtype` resolved to the model dtype, config types `inkling2` / `inkling2_loop` / `inkling2_model` registered before the SM70 gate, stub `Inkling2LoopSm70ForConditionalGeneration` registered behind it and selected with `--hf-overrides architectures` | Mara | K01 | none (reachable only through `--hf-overrides`) | CPU `sm70/tests/models/test_m12_inkling2_registration_cpu.py`: arch registered at cc 7.0 and absent at cc 8.0; the real `config.json` parses to 48 layer visits; vendored sha256 matches `PROVENANCE.md`; Flint and Qwen registry entries unchanged |
+
 ## Series order for `patches/`
 
 1. 0001–0099 build: 0001 trims the external projects that build nothing for sm_70 (`VLLM_SM70_TRIM_EXTERNALS=1`, set by nix/package.nix; unset or ≠1 → upstream). The remaining FetchContent sources are fed by Nix.
