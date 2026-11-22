@@ -16,6 +16,9 @@ against this sha256.
 
 The file imports only `transformers.configuration_utils.PreTrainedConfig`.
 
+`processing.py` is an adapted port of `vllm/models/inkling2/processing.py` at
+the same upstream commit; its module docstring lists the differences.
+
 `sm70/tests/models/data/inkling2_mini/` holds `config.json`,
 `hf_quant_config.json` and `model.safetensors.index.json` of
 `thinkingmachines/Inkling-2-Mini` at revision
