@@ -6,9 +6,11 @@ Rules:
   environment can never turn a feature on; defaults are decided in code.
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
-  Two reviewed exceptions select a kernel, off by default:
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32) and
-  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange). See their comments.
+  The exceptions that select a kernel, off by default:
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32),
+  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange) and the Inkling 2
+  routes VLLM_SM70_INKLING_NVFP4_TM and VLLM_SM70_INKLING_TRITON_NORMS. See
+  their comments.
   (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
   now a kill switch.)
 - Each area adds its variables to its own section in `_SECTIONS`.
@@ -57,8 +59,8 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_FP8_QPN8_M32 (K09) and VLLM_SM70_TOP1_CUSTOM_AR (F12),
-    opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09), VLLM_SM70_TOP1_CUSTOM_AR (F12) and
+    the VLLM_SM70_INKLING_* routes, opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -309,6 +311,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # with M*top_k <= 80 slots goes back to per-expert offsets). New name:
         # the fork's compact slot route has no switch.
         "VLLM_SM70_FLINT_MOE_COMPACT": kill_switch("VLLM_SM70_FLINT_MOE_COMPACT"),
+        # "1": Inkling 2 NVFP4 experts run on the TurboMind dense stage instead
+        # of the fp16 torch path (models/inkling2_sm70/moe_tm.py). Env-only, no
+        # field; default off: the route has not run on a GPU.
+        "VLLM_SM70_INKLING_NVFP4_TM": opt_in("VLLM_SM70_INKLING_NVFP4_TM"),
         # "0": Sm70Config.flint_qk_rope_kv=False (fused q/k norm+RoPE+KV write).
         "VLLM_SM70_FLINT_QK_ROPE_KV": kill_switch("VLLM_SM70_FLINT_QK_ROPE_KV"),
         # "0": Sm70Config.dflash2_verifier="off".
