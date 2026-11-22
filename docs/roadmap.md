@@ -133,7 +133,7 @@ The "M8 verifier GEMVs" at the fork (cf9492a) are three routes. All three serve 
 
 | node | level | what | owner | depends | kill switch | exit test |
 |---|---|---|---|---|---|---|
-| M12 | 0 | `vllm_sm70.models.inkling2_sm70` package: upstream Inkling 2 config classes vendored byte-identical (vLLM c32251b), Sm70 config subclasses with `head_dtype` resolved to the model dtype, config types `inkling2` / `inkling2_loop` / `inkling2_model` registered before the SM70 gate, stub `Inkling2LoopSm70ForConditionalGeneration` registered behind it and selected with `--hf-overrides architectures` | Mara | K01 | none (reachable only through `--hf-overrides`) | CPU `sm70/tests/models/test_m12_inkling2_registration_cpu.py`: arch registered at cc 7.0 and absent at cc 8.0; the real `config.json` parses to 48 layer visits; vendored sha256 matches `PROVENANCE.md`; Flint and Qwen registry entries unchanged |
+| M12 | 0 | `vllm_sm70.models.inkling2_sm70` package: upstream Inkling 2 config classes vendored byte-identical (vLLM c32251b), Sm70 config subclasses with `head_dtype` resolved to the model dtype, config types `inkling2` / `inkling2_loop` / `inkling2_model` registered before the SM70 gate, stub `Inkling2LoopSm70ForConditionalGeneration` registered behind it and selected with `--hf-overrides architectures` | – | K01 | none (reachable only through `--hf-overrides`) | CPU `sm70/tests/models/test_m12_inkling2_registration_cpu.py`: arch registered at cc 7.0 and absent at cc 8.0; the real `config.json` parses to 48 layer visits; vendored sha256 matches `PROVENANCE.md`; Flint and Qwen registry entries unchanged |
 
 ## Series order for `patches/`
 
