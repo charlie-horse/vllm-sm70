@@ -224,6 +224,7 @@ def test_hook_skips_full_graphs_while_dumping_visits(device, route_log, tmp_path
     assert not cfg.compilation_config.cudagraph_mode.has_full_cudagraphs()
 
 
+@pytest.mark.parametrize("given", [None, "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
 @pytest.mark.parametrize(
     "sizes, max_size, max_num_seqs, want_max",
     [
@@ -232,17 +233,23 @@ def test_hook_skips_full_graphs_while_dumping_visits(device, route_log, tmp_path
         (None, None, 1, 1),
         (None, None, 3, 3),
         ([1, 2], None, 256, None),
-        (None, 32, 256, 32),
+        ([1, 2, 8], None, 256, None),
+        (None, 8, 256, 8),
+        (None, 4, 256, 4),
     ],
 )
-def test_hook_caps_the_default_decode_graph_batch(
-    device, route_log, monkeypatch, sizes, max_size, max_num_seqs, want_max
+def test_hook_caps_the_decode_graph_batch(
+    device, route_log, monkeypatch, given, sizes, max_size, max_num_seqs, want_max
 ):
-    """An unset mode captures decode batches up to DECODE_GRAPH_MAX_BATCH
-    requests (max_num_seqs if fewer) unless the capture sizes are set."""
+    """A mode with FULL decode graphs captures decode batches up to
+    DECODE_GRAPH_MAX_BATCH requests (max_num_seqs if fewer) unless the
+    capture sizes are set."""
+    from vllm.config.compilation import CUDAGraphMode
+
     _set_env(monkeypatch, DECODE_GRAPH, None)
+    _set_env(monkeypatch, BREAKABLE, "1")
     device(7, 0)
-    cfg = _vllm_config()
+    cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
     cfg.scheduler_config.max_num_seqs = max_num_seqs
     cfg.compilation_config.cudagraph_capture_sizes = sizes
     cfg.compilation_config.max_cudagraph_capture_size = max_size
@@ -250,6 +257,40 @@ def test_hook_caps_the_default_decode_graph_batch(
     assert icfg.DECODE_GRAPH_MAX_BATCH == 8
     assert cfg.compilation_config.max_cudagraph_capture_size == want_max
     assert cfg.compilation_config.cudagraph_capture_sizes == sizes
+
+
+@pytest.mark.parametrize("given", [None, "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+@pytest.mark.parametrize("sizes, max_size", [(None, 9), (None, 512), ([1, 16], None)])
+def test_hook_refuses_decode_graphs_above_the_cap(
+    device, route_log, monkeypatch, given, sizes, max_size
+):
+    from vllm.config.compilation import CUDAGraphMode
+
+    _set_env(monkeypatch, DECODE_GRAPH, None)
+    _set_env(monkeypatch, BREAKABLE, "1")
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
+    cfg.scheduler_config.max_num_seqs = 256
+    cfg.compilation_config.cudagraph_capture_sizes = sizes
+    cfg.compilation_config.max_cudagraph_capture_size = max_size
+    with pytest.raises(ValueError, match="FULL decode graphs of at most 8"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
+@pytest.mark.parametrize("given", ["PIECEWISE", "NONE"])
+def test_hook_leaves_capture_sizes_without_decode_graphs(
+    device, route_log, monkeypatch, given
+):
+    from vllm.config.compilation import CUDAGraphMode
+
+    _set_env(monkeypatch, BREAKABLE, "1")
+    device(7, 0)
+    cfg = _vllm_config(cudagraph_mode=CUDAGraphMode[given])
+    cfg.scheduler_config.max_num_seqs = 256
+    cfg.compilation_config.cudagraph_capture_sizes = None
+    cfg.compilation_config.max_cudagraph_capture_size = 512
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.compilation_config.max_cudagraph_capture_size == 512
 
 
 @pytest.mark.parametrize(
@@ -367,6 +408,10 @@ def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
     assert config.cache_config.block_size == icfg.KV_BLOCK_SIZE
     assert config.scheduler_config.async_scheduling is False
     assert f"cudagraph_mode {want};" in route_log[0]
+    if want == "FULL_DECODE_ONLY":
+        compilation = config.compilation_config
+        assert compilation.max_cudagraph_capture_size == icfg.DECODE_GRAPH_MAX_BATCH
+        assert max(compilation.cudagraph_capture_sizes) <= icfg.DECODE_GRAPH_MAX_BATCH
 
 
 @pytest.mark.parametrize(

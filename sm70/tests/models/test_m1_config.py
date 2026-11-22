@@ -165,6 +165,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_SHARED_MOE_OVERLAP",
         "VLLM_SM70_INKLING_TRITON_NORMS",
         "VLLM_SM70_INKLING_TRITON_SCONV",
+        "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -412,6 +413,20 @@ def _inkling_triton_sconv_off(name):
         assert sconv.on_triton(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_triton_decode_attn_off(name):
+    """A GPU tensor takes the torch attention of one-query rows in
+    inkling2_sm70/attention_torch.py; the kernel's own checks are
+    tests/ops/test_m12_inkling2_triton_decode_attn_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import attention_torch
+
+    assert attention_torch.SWITCH == name
+    with mock.patch.object(attention_torch._compat, "AVAILABLE", True):
+        assert attention_torch.on_triton(SimpleNamespace(is_cuda=True)) is False
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -479,6 +494,8 @@ def _path_off(name):
         _inkling_nvfp4_tm_off(name)
     elif name == "VLLM_SM70_INKLING_TRITON_SCONV":
         _inkling_triton_sconv_off(name)
+    elif name == "VLLM_SM70_INKLING_TRITON_DECODE_ATTN":
+        _inkling_triton_decode_attn_off(name)
     elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
         _inkling_decode_graph_off(name)
     elif name in PENDING:

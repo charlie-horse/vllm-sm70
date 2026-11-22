@@ -56,7 +56,7 @@ def _guard_decode_steps(engine, monkeypatch, guarded):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_decode_step_has_no_host_sync(monkeypatch, sequences, dtype):
-    engine = Engine(dtype)
+    engine = Engine(dtype, cudagraph_mode="FULL_DECODE_ONLY")
     want = engine.run(hx.decode_plan("a", LEN_A, PROMPT), sequences)["a"]
     guarded = []
     _guard_decode_steps(engine, monkeypatch, guarded)
@@ -69,7 +69,7 @@ def test_the_guard_sees_the_convs_sync_without_the_decode_path(monkeypatch, sequ
     """With VLLM_SM70_INKLING_DECODE_GRAPH=0 a decode step takes the ops of
     mixed batches, whose torch convs sync."""
     monkeypatch.setenv("VLLM_SM70_INKLING_DECODE_GRAPH", "0")
-    engine = Engine()
+    engine = Engine(cudagraph_mode="FULL_DECODE_ONLY")
     body = engine.model.model
     forward = body.forward
 

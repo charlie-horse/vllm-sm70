@@ -14,11 +14,12 @@
 * KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), no async
   scheduling (turned off when unset: it doubles the conv and sliding-window
   admission caps), the KV cache in the model dtype, no pipeline parallelism.
-* CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY, with
-  ``max_cudagraph_capture_size`` min(``DECODE_GRAPH_MAX_BATCH``,
-  max_num_seqs) when neither it nor the capture sizes are set: decode-only
-  batches replay a FULL graph
-  and every other batch runs eagerly. The ops of a decode-only batch read
+* CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY:
+  decode-only batches replay a FULL graph and every other batch runs
+  eagerly. A mode with FULL decode graphs sets ``max_cudagraph_capture_size``
+  min(``DECODE_GRAPH_MAX_BATCH``, max_num_seqs) when neither it nor the
+  capture sizes are set, and refuses set sizes above
+  ``DECODE_GRAPH_MAX_BATCH``. The ops of a decode-only batch read
   device metadata only (backend.py); those of other batches branch on the
   batch on the host, so a mode whose mixed batches are FULL (FULL) is
   refused. PIECEWISE (and the mixed part of FULL_AND_PIECEWISE) captures
@@ -49,7 +50,7 @@ ARCH = "Inkling2LoopSm70ForConditionalGeneration"
 
 # Attention page (block x 2 x head_dim) == conv page (kernel x conv head size).
 KV_BLOCK_SIZE = 32
-# Largest decode batch captured by default: a decode step gathers the whole
+# Largest decode batch captured in a FULL graph: a decode step gathers the whole
 # block-table width of keys per global-layer request.
 DECODE_GRAPH_MAX_BATCH = 8
 
@@ -74,10 +75,21 @@ def _log_routes_once(visit_dump_dir: str | None, cudagraph_mode: str) -> None:
 
 def _cap_decode_graph_batch(compilation_config: Any, scheduler_config: Any) -> None:
     """max_cudagraph_capture_size = min(DECODE_GRAPH_MAX_BATCH, max_num_seqs)
-    unless the capture sizes or their maximum are set."""
-    for name in ("cudagraph_capture_sizes", "max_cudagraph_capture_size"):
-        if getattr(compilation_config, name, None) is not None:
-            return
+    unless the capture sizes or their maximum are set; set ones above
+    DECODE_GRAPH_MAX_BATCH raise ValueError."""
+    sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    largest = getattr(compilation_config, "max_cudagraph_capture_size", None)
+    if sizes:
+        largest = max(largest or 0, *sizes)
+    if largest is not None:
+        if largest > DECODE_GRAPH_MAX_BATCH:
+            raise ValueError(
+                f"{ARCH} captures FULL decode graphs of at most "
+                f"{DECODE_GRAPH_MAX_BATCH} requests, got a capture size of "
+                f"{largest}; lower -cc.max_cudagraph_capture_size or "
+                "-cc.cudagraph_capture_sizes."
+            )
+        return
     cap = DECODE_GRAPH_MAX_BATCH
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
     if isinstance(max_num_seqs, int) and max_num_seqs > 0:
@@ -164,11 +176,10 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         inkling2 = sm70_config(vllm_config).inkling2
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
-        decode_graph = decode_graph_enabled() and not inkling2.visit_dump_dir
+        decode_graph = decode_graph_enabled(vllm_config)
         if cudagraph_mode is None:
             if decode_graph:
                 cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-                _cap_decode_graph_batch(compilation_config, scheduler_config)
             elif envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
                 cudagraph_mode = CUDAGraphMode.PIECEWISE
             else:
@@ -199,6 +210,8 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 ARCH,
                 cudagraph_mode.name,
             )
+        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+            _cap_decode_graph_batch(compilation_config, scheduler_config)
         hf_config = getattr(model_config, "hf_config", None)
         if hf_config is not None:
             setattr(

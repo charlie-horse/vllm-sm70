@@ -31,7 +31,9 @@ output rows of padding there.
 
 Switch: ``short_conv`` and the prologue's K/V convs run one Triton kernel per
 call (ops/paged_conv.py) unless VLLM_SM70_INKLING_TRITON_SCONV=0. Tensors off
-the GPU take the torch ops below, except in Triton's interpreter.
+the GPU take the torch ops below, except in Triton's interpreter. The switch
+and ``on_triton`` are read on every eager call; a replayed CUDA graph keeps
+the route it was captured with.
 """
 
 from __future__ import annotations

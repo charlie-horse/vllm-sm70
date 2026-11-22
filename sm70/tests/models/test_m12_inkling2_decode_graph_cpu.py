@@ -2,8 +2,8 @@
 """M12 Inkling 2: decode-only batches are ready for a FULL CUDA graph.
 
 On the tiny checkpoint (fixtures/inkling2_tiny), driven by the paged engine
-harness with the metadata a FULL graph gets (padded slot mapping, padded
-requests):
+harness under FULL_DECODE_ONLY with the metadata a FULL graph gets (padded
+slot mapping, padded requests):
 
 - at one padded size the real rows of a decode step do not depend on the
   padding or on the other requests: bit-identical whether the step pads
@@ -47,6 +47,7 @@ DECODE_STEPS = 5
 PADDED = 4
 TABLE_WIDTH = 16
 SWITCH = "VLLM_SM70_INKLING_DECODE_GRAPH"
+FULL = "FULL_DECODE_ONLY"
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +63,7 @@ def sequences():
 
 @pytest.fixture(scope="module", params=[torch.float32, torch.float16])
 def engine(request):
-    return Engine(request.param)
+    return Engine(request.param, cudagraph_mode=FULL)
 
 
 def _fixed_width(rank, metadata):

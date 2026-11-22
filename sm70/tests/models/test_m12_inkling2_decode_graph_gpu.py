@@ -62,7 +62,7 @@ def engine(monkeypatch):
     from vllm_sm70.models.inkling2_sm70 import sconv
 
     assert sconv.on_triton(torch.zeros(1, device="cuda"))
-    return Engine(torch.float16, device="cuda")
+    return Engine(torch.float16, device="cuda", cudagraph_mode="FULL_DECODE_ONLY")
 
 
 class _StaticMetadata:

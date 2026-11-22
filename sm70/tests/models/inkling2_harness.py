@@ -356,6 +356,8 @@ class PagedHarness:
         batch's slot mapping, or writes only part of an owner's slots.
     vllm_configs: one config per rank to use instead of the stand-ins.
     device: where the caches and the metadata tensors live.
+    cudagraph_mode: the stand-ins' CUDAGraphMode name; FULL_DECODE_ONLY
+        builds the steps a FULL decode graph would replay as decode-only.
     """
 
     def __init__(
@@ -372,8 +374,10 @@ class PagedHarness:
         seed: int = 0,
         device: torch.device | str = "cpu",
         vllm_configs: Sequence[Any] | None = None,
+        cudagraph_mode: str = "NONE",
     ) -> None:
         self.tp_size = tp_size
+        self.cudagraph_mode = cudagraph_mode
         self.block_size = block_size
         self.conv_block_size = conv_block_size
         self.dtype = dtype
@@ -401,13 +405,20 @@ class PagedHarness:
 
     def _stand_in(self, max_num_batched_tokens: int) -> SimpleNamespace:
         """The config fields the owners and the builders read."""
+        from vllm.config.compilation import CUDAGraphMode
+
+        from vllm_sm70.models.inkling2_sm70.config import DECODE_GRAPH_MAX_BATCH
+
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 block_size=self.block_size, cache_dtype="auto"
             ),
             model_config=SimpleNamespace(dtype=self.dtype, max_model_len=1_048_576),
             compilation_config=SimpleNamespace(
-                static_forward_context={}, fast_moe_cold_start=False
+                static_forward_context={},
+                fast_moe_cold_start=False,
+                cudagraph_mode=CUDAGraphMode[self.cudagraph_mode],
+                max_cudagraph_capture_size=DECODE_GRAPH_MAX_BATCH,
             ),
             scheduler_config=SimpleNamespace(
                 disable_hybrid_kv_cache_manager=False,

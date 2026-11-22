@@ -72,8 +72,14 @@ def built():
     return build(BLOCK, TP, torch.float16)
 
 
-def _vllm_config(batched_tokens: int = 64):
+def _vllm_config(
+    batched_tokens: int = 64,
+    cudagraph_mode: str = "FULL_DECODE_ONLY",
+    capture_size: int = 8,
+    enforce_eager: bool = False,
+):
     from vllm.config import CacheConfig
+    from vllm.config.compilation import CUDAGraphMode
 
     cache_config = CacheConfig(block_size=BLOCK, enable_prefix_caching=True)
     cache_config.kv_cache_layout = "LBNHC"
@@ -86,7 +92,13 @@ def _vllm_config(batched_tokens: int = 64):
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1, tensor_parallel_size=TP
         ),
-        model_config=SimpleNamespace(max_model_len=1_048_576),
+        model_config=SimpleNamespace(
+            max_model_len=1_048_576, enforce_eager=enforce_eager
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode[cudagraph_mode],
+            max_cudagraph_capture_size=capture_size,
+        ),
         kv_transfer_config=None,
         speculative_config=None,
         max_in_flight_tokens=batched_tokens,
@@ -229,8 +241,24 @@ def test_sconv_metadata(built):
 
 
 @pytest.mark.parametrize("kind", ["attn", "conv"])
-@pytest.mark.parametrize("switch", [None, "0"])
-def test_all_decode_batch_is_decode_only(built, monkeypatch, kind, switch):
+@pytest.mark.parametrize(
+    "switch, config, replays",
+    [
+        (None, {}, True),
+        (None, {"cudagraph_mode": "FULL_AND_PIECEWISE"}, True),
+        (None, {"capture_size": 4}, True),
+        ("0", {}, False),
+        (None, {"cudagraph_mode": "NONE"}, False),
+        (None, {"cudagraph_mode": "PIECEWISE"}, False),
+        (None, {"enforce_eager": True}, False),
+        (None, {"capture_size": 2}, False),
+    ],
+)
+def test_a_replayed_decode_batch_is_decode_only(
+    built, monkeypatch, kind, switch, config, replays
+):
+    """decode_only exactly when a FULL decode graph of the padded size
+    replays the step; every other decode batch takes the bounded path."""
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     if switch is None:
@@ -260,8 +288,9 @@ def test_all_decode_batch_is_decode_only(built, monkeypatch, kind, switch):
         slot_mapping=torch.tensor(slots[:2] + [-1, -1], dtype=torch.int64),
         seq_lens_cpu_upper_bound=seq_lens.clone(),
     )
-    md = _builder(getattr(owners, kind)[0, 0], owner_config).build(0, cm)
-    assert md.decode_only is (switch != "0")
+    vllm_config = _vllm_config(**config)
+    md = _builder(getattr(owners, kind)[0, 0], owner_config, vllm_config).build(0, cm)
+    assert md.decode_only is replays
     assert md.num_actual_tokens == 2
     # A padded FULL-graph batch: P = 4 rows, the last two padding.
     assert md.slot_mapping.tolist() == slots[:2] + [-1, -1]

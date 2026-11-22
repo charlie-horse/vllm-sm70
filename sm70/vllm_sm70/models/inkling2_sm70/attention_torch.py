@@ -28,6 +28,13 @@ in a global one, with the keys past the query's position masked; a key
 step is up to `OWN_KEY_STEPS` key chunks long when the batch has fewer rows.
 Rows with a negative slot are padding: their output is zero.
 
+Switch: the one-query rows of either kind of batch run one Triton kernel per
+call (ops/paged_attention.py), which reads only each row's own keys, unless
+VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0 or `hf_rounding`. Tensors off the GPU
+take the torch ops below, except in Triton's interpreter. The switch is read
+on every eager call; a replayed CUDA graph keeps the route it was captured
+with.
+
 Transient memory of one step, beside the op's inputs and output:
 
     scores  at most 4 live tensors of query_chunk * key_chunk * heads fp32
@@ -53,7 +60,11 @@ import numpy as np
 import torch
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from vllm_sm70 import envs
+
 from .backend import is_decode_only
+from .ops import _compat
+from .ops.paged_attention import decode_attention
 
 if TYPE_CHECKING:
     from .backend import Inkling2AttentionMetadata
@@ -63,12 +74,17 @@ __all__ = [
     "DEFAULT_KEY_CHUNK",
     "DEFAULT_QUERY_CHUNK",
     "OWN_KEY_STEPS",
+    "SWITCH",
     "attention_with_metadata",
     "gate_and_project",
     "gather_attention",
     "kv_cache_views",
+    "on_triton",
     "paged_attention",
 ]
+
+SWITCH = "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
+_enabled = envs.environment_variables()[SWITCH]
 
 DEFAULT_QUERY_CHUNK = 256
 DEFAULT_KEY_CHUNK = 1024
@@ -76,6 +92,14 @@ DEFAULT_KEY_CHUNK = 1024
 OWN_KEY_STEPS = 8
 # Key chunk of `hf_rounding`: every key in one step.
 _ALL_KEYS = 1 << 62
+
+
+def on_triton(x: torch.Tensor) -> bool:
+    """Whether the one-query rows of attention on `x` run the Triton
+    kernel."""
+    if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
+        return False
+    return _enabled()
 
 
 def kv_cache_views(
@@ -295,6 +319,11 @@ def _decode_keys(
     static shapes only (module docstring)."""
     rows = min(md.slot_mapping.shape[0], query.shape[0])
     out[rows:] = 0
+    if not hf_rounding and on_triton(query):
+        decode_attention(
+            query, rel_logits, sinks, kv_cache, md, out, rows=rows, padding=True
+        )
+        return
     # Fewer, longer key steps for fewer rows, in the same gather budget.
     key_chunk = max(key_chunk, OWN_KEY_STEPS * key_chunk // max(rows, 1))
     _own_keys(
@@ -366,6 +395,11 @@ def gather_attention(
             tokens = md.query_start_loc[: single.size].long()
         else:
             tokens = torch.as_tensor(starts[single], device=query.device)
+    if single.size and not hf_rounding and on_triton(query):
+        decode_attention(
+            query, rel_logits, sinks, kv_cache, md, out, rows=tokens, padding=False
+        )
+    elif single.size:
         _own_keys(
             query,
             rel_logits,

@@ -14,7 +14,8 @@ Triton kernels (ops/norm.py, attn_res.py, loop.py) or on torch
 Switch: the kernels run only with VLLM_SM70_INKLING_TRITON_NORMS=1. Without
 it every op takes the torch path, as tensors off the GPU do. One kernel launch
 replaces the torch ops of a mix with its norm; the two GEMMs of the message
-gates stay on torch.bmm.
+gates stay on torch.bmm. The switch and ``on_triton`` are read on every
+eager call; a replayed CUDA graph keeps the route it was captured with.
 
 The outputs of `message_sources` and `message_mix` are laid out per path and
 are read only by `message_mix` and `sublayer_inputs`.

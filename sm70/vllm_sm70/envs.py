@@ -265,9 +265,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
     "gdn": {
         # "0": GDN chunked prefill stays on upstream Triton/FLA (read when
         # ChunkGatedDeltaRule is built, vllm_sm70/gdn/kernels.py).
-        "VLLM_SM70_GDN_FLASHQLA_PREFILL": kill_switch(
-            "VLLM_SM70_GDN_FLASHQLA_PREFILL"
-        ),
+        "VLLM_SM70_GDN_FLASHQLA_PREFILL": kill_switch("VLLM_SM70_GDN_FLASHQLA_PREFILL"),
         # "0": non-spec GDN decode stays on upstream's packed Triton decode
         # (read on each flashqla_decode() call). Fork name kept.
         "VLLM_SM70_GDN_DECODE_FLASHQLA": kill_switch("VLLM_SM70_GDN_DECODE_FLASHQLA"),
@@ -325,21 +323,29 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
         # "1": the Inkling 2 norms, AttnRes mixes and message blends run the
         # vendored Triton kernels instead of the torch ops. Env-only (no
-        # Sm70Config field), read per call (inkling2_sm70/norms.py); default
-        # off: the kernels have not run on a GPU.
+        # Sm70Config field), read per eager call (inkling2_sm70/norms.py) and
+        # fixed at capture in a replayed CUDA graph; default off: the
+        # kernels have not run on a GPU.
         "VLLM_SM70_INKLING_TRITON_NORMS": opt_in("VLLM_SM70_INKLING_TRITON_NORMS"),
         # "0": the Inkling 2 paged short convs and the prologue's K/V convs
         # take the torch ops instead of one Triton kernel per call. Env-only
-        # (no Sm70Config field), read per call (inkling2_sm70/sconv.py);
-        # tensors off the GPU always take the torch ops.
+        # (no Sm70Config field), read per eager call (inkling2_sm70/sconv.py)
+        # and fixed at capture in a replayed CUDA graph; tensors off the GPU
+        # always take the torch ops.
         "VLLM_SM70_INKLING_TRITON_SCONV": kill_switch("VLLM_SM70_INKLING_TRITON_SCONV"),
+        # "0": the one-query rows of Inkling 2 attention take the torch ops
+        # instead of one Triton kernel per layer visit. Env-only (no
+        # Sm70Config field), read per eager call (inkling2_sm70/
+        # attention_torch.py) and fixed at capture in a replayed CUDA graph;
+        # tensors off the GPU always take the torch ops.
+        "VLLM_SM70_INKLING_TRITON_DECODE_ATTN": kill_switch(
+            "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
+        ),
         # "0": Inkling 2 decode-only batches take the ops of mixed batches
         # again, the cache backends declare no full-graph support and an
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/
         # config.py, backend.py). Env-only (no Sm70Config field).
-        "VLLM_SM70_INKLING_DECODE_GRAPH": kill_switch(
-            "VLLM_SM70_INKLING_DECODE_GRAPH"
-        ),
+        "VLLM_SM70_INKLING_DECODE_GRAPH": kill_switch("VLLM_SM70_INKLING_DECODE_GRAPH"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {
@@ -380,9 +386,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # "0": no pre-capture TurboMind tuning and no TP plan exchange. Then
         # eager's first call of a shape measures per rank, and capture of an
         # untuned shape takes the default spec, as on main before this.
-        "VLLM_SM70_TM_PRECAPTURE_WARMUP": kill_switch(
-            "VLLM_SM70_TM_PRECAPTURE_WARMUP"
-        ),
+        "VLLM_SM70_TM_PRECAPTURE_WARMUP": kill_switch("VLLM_SM70_TM_PRECAPTURE_WARMUP"),
         # Optional TurboMind dispatch-cache file (fork name) to pin specs.
         # Imported on every TP rank; the warmup calls its manifest
         # (<path>.plan.json) covers are not measured, the others are tuned

@@ -21,16 +21,20 @@ padded to the capture size. So an op reads rows [0, n) only and treats the
 model rows after them as padding; inside [0, n) a token with a negative slot
 is padding too. The builders sort decode requests first.
 
-A batch whose requests have at most one query token each is decode-only
-(``decode_only``). Its ops read no host data and their shapes depend on the
-token tensors and the block-table width alone, so the builders declare
-UNIFORM_SINGLE_TOKEN_DECODE graph support and the runner can capture such a
-step as a FULL graph. There an op covers the rows of the slot mapping (P in
-a FULL graph) and a row with a negative slot is padding. The ops of other
-batches branch in Python on the batch (numpy request lengths, nonzero): they
-run eagerly or as eager breaks of a PIECEWISE graph.
-VLLM_SM70_INKLING_DECODE_GRAPH=0 marks no batch decode-only and declares no
-graph support.
+A step that runs as a FULL decode graph is decode-only (``decode_only``):
+every request has at most one query token, the engine's cudagraph_mode has
+FULL decode graphs and the step's (padded) token count is at most
+``max_cudagraph_capture_size``, so the runner captures or replays it (UP
+v1/cudagraph_dispatcher.py). The builders read this from the engine's
+compilation config at build time. The ops of such a step read no host data
+and their shapes depend on the token tensors and the block-table width
+alone; an op covers the rows of the slot mapping (P) and a row with a
+negative slot is padding. Every other step, eager decodes included, takes
+the ops that branch in Python on the batch (numpy request lengths,
+nonzero): they run eagerly or as eager breaks of a PIECEWISE graph. The
+builders declare UNIFORM_SINGLE_TOKEN_DECODE graph support.
+VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit dump, marks no step
+decode-only and declares no graph support.
 
 Cache views are logical (blocks, heads, tokens, width) in every layout; the
 backends declare LBNHC, the layout Flash-V100 uses.
@@ -72,6 +76,7 @@ __all__ = [
     "cache_metadata",
     "decode_graph_enabled",
     "is_decode_only",
+    "replays_decode_graph",
 ]
 
 ATTENTION_BACKEND_NAME = "INKLING2_SM70_ATTN"
@@ -80,9 +85,34 @@ SWITCH = "VLLM_SM70_INKLING_DECODE_GRAPH"
 _enabled = envs.environment_variables()[SWITCH]
 
 
-def decode_graph_enabled() -> bool:
-    """False only when VLLM_SM70_INKLING_DECODE_GRAPH=0."""
-    return _enabled()
+def decode_graph_enabled(vllm_config: Any = None) -> bool:
+    """False when VLLM_SM70_INKLING_DECODE_GRAPH=0 or the engine dumps the
+    per-visit states (``sm70.inkling2.visit_dump_dir``)."""
+    if not _enabled():
+        return False
+    if vllm_config is None:
+        return True
+    from vllm_sm70.config import sm70_config
+
+    return not sm70_config(vllm_config).inkling2.visit_dump_dir
+
+
+def replays_decode_graph(vllm_config: Any, cm: CommonAttentionMetadata) -> bool:
+    """Whether the runner runs the step of `cm` as a FULL decode graph
+    (module docstring)."""
+    from vllm.config.compilation import CUDAGraphMode
+
+    if cm.max_query_len > 1 or not decode_graph_enabled(vllm_config):
+        return False
+    compilation = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation, "cudagraph_mode", None)
+    if not isinstance(mode, CUDAGraphMode) or mode.decode_mode() != CUDAGraphMode.FULL:
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    if getattr(model_config, "enforce_eager", False):
+        return False
+    cap = getattr(compilation, "max_cudagraph_capture_size", None) or 0
+    return cm.num_actual_tokens <= cap
 
 
 def is_decode_only(metadata: Any) -> bool:
@@ -136,7 +166,7 @@ class _TokenIndex:
         self.query_start = torch.zeros(size, dtype=torch.int32, device=device)
         self.positions = torch.zeros(size, dtype=torch.int64, device=device)
 
-    def fill(self, cm: CommonAttentionMetadata) -> dict[str, Any]:
+    def fill(self, cm: CommonAttentionMetadata, decode_only: bool) -> dict[str, Any]:
         num_reqs = cm.num_reqs
         num_actual = int(cm.query_start_loc_cpu[num_reqs])
         num_padded = cm.slot_mapping.shape[0]
@@ -174,7 +204,7 @@ class _TokenIndex:
             "seq_idx": seq_idx,
             "query_start": query_start,
             "positions": positions,
-            "decode_only": cm.max_query_len <= 1 and decode_graph_enabled(),
+            "decode_only": decode_only,
         }
 
 
@@ -191,7 +221,7 @@ class _Builder(AttentionMetadataBuilder):
     def get_cudagraph_support(
         cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
     ) -> AttentionCGSupport:
-        if not decode_graph_enabled():
+        if not decode_graph_enabled(vllm_config):
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support
 
@@ -230,7 +260,7 @@ class Inkling2SconvMetadataBuilder(_Builder):
         return Inkling2SconvMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm),
+            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
         )
 
 
@@ -265,7 +295,7 @@ class Inkling2AttentionMetadataBuilder(_Builder):
         return Inkling2AttentionMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm),
+            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
             num_reqs=num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,

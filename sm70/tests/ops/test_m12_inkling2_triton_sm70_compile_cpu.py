@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
-Every kernel of inkling2_sm70/ops (paged_conv.py, norm.py, attn_res.py,
-loop.py) goes through Triton's compiler and ptxas for
+Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
+norm.py, attn_res.py, loop.py) goes through Triton's compiler and ptxas for
 GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
-128, 4 KV heads per rank at TP2, 4 conv taps), with the constexprs and
+128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps), with the constexprs and
 launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
 This catches what the interpreter tests cannot: Triton's constexpr and
 static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
@@ -42,6 +42,8 @@ pytestmark = [
 HIDDEN = 2304
 HEAD_DIM = 128
 KV_HEADS = 4  # per rank at TP2
+Q_HEADS = 12  # per rank at TP2
+KV_BLOCK = 32
 TAPS = 4
 
 
@@ -169,6 +171,52 @@ def test_key_value_conv_kernel(dynamic, block_t):
         "BLOCK_D": HEAD_DIM,
     }
     _check(_ops("paged_conv")._key_value_conv_kernel, args, enable_fp_fusion=False)
+
+
+# --- paged_attention.py ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("indexed", [False, True], ids=["first_rows", "indexed"])
+@pytest.mark.parametrize("slots", [False, True], ids=["eager", "padded"])
+def test_decode_attention_kernel(indexed, slots):
+    args = {
+        **dict.fromkeys(
+            ("q_ptr", "rel_ptr", "sink_ptr", "cache_ptr", "out_ptr"), "*fp16"
+        ),
+        "rows_ptr": "*i64",
+        "pos_ptr": "*i64",
+        "seq_ptr": "*i32",
+        "slot_ptr": "*i64",
+        "table_ptr": "*i32",
+        **_i32(
+            "stride_q0",
+            "stride_q1",
+            "stride_r0",
+            "stride_r1",
+            "stride_s0",
+            "stride_o0",
+            "stride_o1",
+            "stride_cb",
+            "stride_ch",
+            "stride_cn",
+            "stride_bt",
+            "extent",
+            "window",
+        ),
+        "scale": "fp32",
+        "D": HEAD_DIM,
+        "GROUPS": Q_HEADS // KV_HEADS,
+        "BLOCK_N": KV_BLOCK,
+        "BLOCK_D": HEAD_DIM,
+        "INDEXED": indexed,
+        "SLOTS": slots,
+    }
+    _check(
+        _ops("paged_attention")._decode_attention_kernel,
+        args,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
 
 
 # --- norm.py, attn_res.py, loop.py ------------------------------------------------

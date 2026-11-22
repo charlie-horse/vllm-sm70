@@ -66,6 +66,7 @@ class Engine:
         head_dtype=None,
         tp_size=1,
         device="cpu",
+        cudagraph_mode="NONE",
     ):
         from vllm.config import set_current_vllm_config
 
@@ -75,7 +76,11 @@ class Engine:
         )
 
         self.harness = hx.PagedHarness(
-            tp_size, block_size=BLOCK_SIZE, dtype=dtype, device=device
+            tp_size,
+            block_size=BLOCK_SIZE,
+            dtype=dtype,
+            device=device,
+            cudagraph_mode=cudagraph_mode,
         )
         config = self.harness.vllm_config(0)
         model_config = config.model_config
