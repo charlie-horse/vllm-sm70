@@ -8,14 +8,24 @@ Outputs of the Hugging Face reference classes on a tiny random checkpoint.
 | Reference | https://github.com/huggingface/transformers, `src/transformers/models/inkling2_loop` and `inkling2` |
 | Commit | `2f1bc5e321b9a736200a590d6e7743ccdeb60772` |
 | Run | CPU, fp32 (`dtype=torch.float32`), one thread, eager attention, torch conv fallbacks |
-| Seeds, torch version, sha256 of each file | `manifest.json` |
+| Seeds, torch version, CPU capability, sha256 of each file | `manifest.json` |
 
-Regenerate (the reference tree first on `PYTHONPATH`; `--check` writes to a
-temporary directory and compares sha256 with `manifest.json`):
+Regenerate (a clean checkout of the reference at that commit first on
+`PYTHONPATH`; `--check` writes to a temporary directory and compares):
 
 ```
 PYTHONPATH=<transformers>/src python sm70/tests/models/fixtures/inkling2_tiny/gen_fixture.py [--check]
 ```
+
+The bytes depend on the torch build and the CPU instruction set
+(`torch.backends.cpu.get_cpu_capability()`). `--check` requires equal sha256
+only when `torch_version` and `cpu_capability` equal the manifest's. Otherwise
+it requires `config.json`, `hf_quant_config.json` and `model.safetensors` to
+be identical and the tensors of `ops.safetensors` and `cases.safetensors` to
+be equal: floats within 1e-5, integers and booleans exactly. When
+`model.safetensors` itself differs (`torch.randn` draws other values, as with
+`ATEN_CPU_CAPABILITY=default`), nothing is comparable: it exits 3 and the
+regenerate test skips.
 
 ## Files
 

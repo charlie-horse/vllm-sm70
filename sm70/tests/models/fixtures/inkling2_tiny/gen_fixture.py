@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 HERE = pathlib.Path(__file__).resolve().parent
 TRANSFORMERS_COMMIT = "2f1bc5e321b9a736200a590d6e7743ccdeb60772"
@@ -35,6 +35,10 @@ FILES = (
     "ops.safetensors",
     "cases.safetensors",
 )
+# Exit codes of --check.
+SAME, DIFFERENT, NOT_REFERENCE, NOT_REPRODUCIBLE = 0, 1, 2, 3
+# Bound on float differences between torch builds and CPU instruction sets.
+FLOAT_TOLERANCE = 1e-5
 
 H, EXPERTS, INTER, RANK, KERNEL = 64, 8, 32, 2, 4
 VOCAB, UNPADDED, IMAGE_TOKEN = 80, 72, 71
@@ -519,6 +523,38 @@ class Recorder:
         assert not missing, missing
 
 
+def reference_problem() -> str | None:
+    """Why the importable transformers is not the reference tree, or None."""
+    import transformers
+
+    if not hasattr(transformers, "Inkling2LoopForConditionalGeneration"):
+        return "transformers has no Inkling 2 classes"
+    tree = pathlib.Path(transformers.__file__).resolve().parents[2]
+
+    def git(*args: str) -> str | None:
+        try:
+            run = subprocess.run(
+                ["git", "-C", str(tree), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        return run.stdout.strip() if run.returncode == 0 else None
+
+    # An installed package can sit inside some other repository.
+    top = git("rev-parse", "--show-toplevel")
+    if top is None or pathlib.Path(top).resolve() != tree:
+        return f"transformers at {tree} is not a git checkout"
+    head = git("rev-parse", "HEAD")
+    if head != TRANSFORMERS_COMMIT:
+        return f"transformers at {tree} is at {head}, not {TRANSFORMERS_COMMIT}"
+    if git("status", "--porcelain", "--", "src/transformers") != "":
+        return f"transformers at {tree} has uncommitted changes"
+    return None
+
+
 def load_reference(directory: pathlib.Path):
     from transformers import Inkling2LoopForConditionalGeneration
 
@@ -538,6 +574,7 @@ class Visits:
         self.states: list[torch.Tensor] = []
         self.layers: list[int] = []
         self.router_logits: list[torch.Tensor] = []
+        self.router_indices: list[torch.Tensor] = []
         self.min_router_gap = float("inf")
         for i, layer in enumerate(text_model.layers):
             layer.register_forward_hook(lambda m, a, out, i=i: self._layer(i, out))
@@ -550,6 +587,7 @@ class Visits:
     def _router(self, gate, args, out) -> None:
         logits = out[0]
         self.router_logits.append(logits.detach().clone())
+        self.router_indices.append(out[2].detach().clone())
         # The reference ranks sigmoid(logits) + bias; this is the distance
         # between the last expert chosen and the first one left out.
         ranked = (
@@ -560,14 +598,20 @@ class Visits:
         gap = (ranked[:, gate.top_k - 1] - ranked[:, gate.top_k]).min().item()
         self.min_router_gap = min(self.min_router_gap, gap)
 
-    def take(self) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """What one forward left: states and router logits by visit."""
-        taken = torch.stack(self.states), torch.stack(self.router_logits), self.layers
+    def take(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+        """What one forward left: states, router logits and choices by visit."""
+        taken = (
+            torch.stack(self.states),
+            torch.stack(self.router_logits),
+            torch.stack(self.router_indices),
+            self.layers,
+        )
         self.clear()
         return taken
 
     def clear(self) -> None:
-        self.states, self.router_logits, self.layers = [], [], []
+        self.states, self.layers = [], []
+        self.router_logits, self.router_indices = [], []
 
 
 def run_cases(model) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
@@ -582,7 +626,7 @@ def run_cases(model) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], 
     recorder = Recorder(model)
     out = model(input_ids=ids, use_cache=False)
     recorder.close()
-    states, routers, layers = visits.take()
+    states, routers, chosen, layers = visits.take()
     again = model(input_ids=ids, use_cache=False, output_hidden_states=True)
     visits.clear()
     hidden = torch.stack(again.hidden_states)
@@ -660,12 +704,17 @@ def run_cases(model) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], 
 
     report["min_router_gap"] = visits.min_router_gap
     assert visits.min_router_gap > 1e-4, visits.min_router_gap
-    report["coverage"] = coverage(model, recorder, cases)
+    report["coverage"] = coverage(model, recorder, cases, chosen)
     return recorder.tensors, cases, {**report, "ops": recorder.index}
 
 
-def coverage(model, recorder: Recorder, cases: dict[str, torch.Tensor]) -> dict:
-    """Asserts the tiny run reaches both sides of every branch it is for."""
+def coverage(
+    model, recorder: Recorder, cases: dict[str, torch.Tensor], chosen: torch.Tensor
+) -> dict:
+    """Asserts the tiny run reaches both sides of every branch it is for.
+
+    `chosen` is the routers' top_k_index over the visits of the text case.
+    """
     cfg = model.config.text_config
     layers = model.model.language_model.layers
     stats = {}
@@ -712,9 +761,14 @@ def coverage(model, recorder: Recorder, cases: dict[str, torch.Tensor]) -> dict:
         (arg("attn_full.0", "relative_distance") >= cfg.rel_extent).sum()
     )
     assert stats["keys_past_window"] > 0 and stats["keys_past_rel_extent"] > 0
-    chosen = cases["text.router_logits"].topk(cfg.num_experts_per_tok, dim=-1).indices
-    stats["experts_chosen_by_logits"] = int(chosen.unique().numel())
-    assert stats["experts_chosen_by_logits"] == EXPERTS
+    # The reference's own choices (top-k of sigmoid(logits) + bias): layer 1's
+    # call in ops.safetensors, then every visit of the text case.
+    stats["experts_chosen_in_router_op"] = int(
+        arg("experts_nvfp4.0", "top_k_index").unique().numel()
+    )
+    assert stats["experts_chosen_in_router_op"] > cfg.num_experts_per_tok
+    stats["experts_chosen_in_text_case"] = int(chosen.unique().numel())
+    assert stats["experts_chosen_in_text_case"] == EXPERTS
     stats["max_abs_swiglu_gate"] = arg("swiglu.0", "gate").abs().max().item()
     stats["max_abs_swiglu_up"] = arg("swiglu.0", "up").abs().max().item()
     assert stats["max_abs_swiglu_gate"] > 1 and stats["max_abs_swiglu_up"] > 1
@@ -725,6 +779,8 @@ def coverage(model, recorder: Recorder, cases: dict[str, torch.Tensor]) -> dict:
 
 
 def generate(out: pathlib.Path) -> dict:
+    if problem := reference_problem():
+        raise RuntimeError(problem)
     torch.set_num_threads(1)
     out.mkdir(parents=True, exist_ok=True)
     weights = native_weights(torch.Generator().manual_seed(WEIGHT_SEED))
@@ -741,19 +797,12 @@ def generate(out: pathlib.Path) -> dict:
 
     import transformers
 
-    tree = pathlib.Path(transformers.__file__).resolve().parents[2]
-    commit = subprocess.run(
-        ["git", "-C", str(tree), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert commit == TRANSFORMERS_COMMIT, commit
     manifest = {
         "generator": "sm70/tests/models/fixtures/inkling2_tiny/gen_fixture.py",
-        "transformers_commit": commit,
+        "transformers_commit": TRANSFORMERS_COMMIT,
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
+        "cpu_capability": torch.backends.cpu.get_cpu_capability(),
         "weight_seed": WEIGHT_SEED,
         "data_seed": DATA_SEED,
         "dtype": "float32",
@@ -779,26 +828,92 @@ def _dump(manifest: dict) -> str:
     return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
+def _tensor_differences(want: pathlib.Path, got: pathlib.Path) -> list[str]:
+    """Tensors of two safetensors files that differ: floats by more than
+    FLOAT_TOLERANCE, anything else at all."""
+    a, b = load_file(want), load_file(got)
+    problems = [f"{want.name}: only in one file: {k}" for k in sorted(set(a) ^ set(b))]
+    for key in sorted(set(a) & set(b)):
+        x, y = a[key], b[key]
+        if (x.dtype, x.shape) != (y.dtype, y.shape):
+            problems.append(f"{want.name}: {key}: dtype or shape")
+        elif not x.is_floating_point():
+            if not torch.equal(x, y):
+                problems.append(f"{want.name}: {key}: differs")
+        elif x.numel():
+            diff = (x.double() - y.double()).abs().max().item()
+            if not diff <= FLOAT_TOLERANCE:
+                problems.append(f"{want.name}: {key}: max abs diff {diff:.3g}")
+    return problems
+
+
+def check(out: pathlib.Path) -> tuple[int, list[str]]:
+    """Regenerates elsewhere and compares with `out`: an exit code and a report.
+
+    Byte-identical files are required on the torch version and CPU capability
+    of manifest.json. Elsewhere the files written before the forward must be
+    identical and the recorded tensors equal within FLOAT_TOLERANCE.
+    """
+    want = json.loads((out / "manifest.json").read_text())
+    with tempfile.TemporaryDirectory() as tmp:
+        new = pathlib.Path(tmp)
+        got = generate(new)
+        same = {name: got["files"][name] == want["files"][name] for name in FILES}
+        report = [
+            f"{'same     ' if same[name] else 'DIFFERENT'} {name} {got['files'][name]}"
+            for name in FILES
+        ]
+        if all(same.values()):
+            return SAME, report
+        env = ("torch_version", "cpu_capability")
+        if all(got[key] == want.get(key) for key in env):
+            return DIFFERENT, report
+        report.append(
+            "not the manifest's build: "
+            + ", ".join(f"{key} {got[key]} (manifest: {want.get(key)})" for key in env)
+        )
+        if not (same["config.json"] and same["hf_quant_config.json"]):
+            return DIFFERENT, report
+        if not same["model.safetensors"]:
+            report.append(
+                "not reproducible here: this build draws other random weights "
+                "(model.safetensors), so no output can be compared"
+            )
+            return NOT_REPRODUCIBLE, report
+        problems = [
+            f"manifest.json: {key} differs"
+            for key in ("visit_layers", "ops")
+            if got[key] != want[key]
+        ]
+        for name in ("ops.safetensors", "cases.safetensors"):
+            problems += _tensor_differences(out / name, new / name)
+    if problems:
+        return DIFFERENT, report + problems
+    report.append(
+        f"equal within {FLOAT_TOLERANCE:g}: floats of ops.safetensors and "
+        "cases.safetensors; every other tensor is identical"
+    )
+    return SAME, report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=pathlib.Path, default=HERE)
     parser.add_argument(
         "--check",
         action="store_true",
-        help="regenerate elsewhere and compare sha256 with --out",
+        help="regenerate elsewhere and compare with --out",
     )
     args = parser.parse_args()
+    if problem := reference_problem():
+        print(problem, file=sys.stderr)
+        return NOT_REFERENCE
     if not args.check:
         generate(args.out)
-        return 0
-    want = json.loads((args.out / "manifest.json").read_text())["files"]
-    with tempfile.TemporaryDirectory() as tmp:
-        got = generate(pathlib.Path(tmp))["files"]
-    for name in FILES:
-        print(
-            ("same     " if got[name] == want[name] else "DIFFERENT"), name, got[name]
-        )
-    return 0 if got == want else 1
+        return SAME
+    code, report = check(args.out)
+    print("\n".join(report))
+    return code
 
 
 if __name__ == "__main__":

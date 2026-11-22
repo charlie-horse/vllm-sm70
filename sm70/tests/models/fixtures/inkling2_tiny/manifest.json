@@ -3,6 +3,7 @@
  "transformers_commit": "2f1bc5e321b9a736200a590d6e7743ccdeb60772",
  "transformers_version": "5.24.0.dev0",
  "torch_version": "2.14.0+cpu",
+ "cpu_capability": "AVX512",
  "weight_seed": 7002,
  "data_seed": 7014,
  "dtype": "float32",
@@ -12,7 +13,7 @@
  "max_abs_logit_diff_chunked_prefill_vs_prefill": 2.6226043701171875e-06,
  "greedy_min_top2_logit_margin": 0.05725455284118652,
  "min_router_gap": 0.0005400776863098145,
- "coverage": {"clipped_fraction": {"l2_clip": 0.25, "scaled_l2_clip": 0.574999988079071, "log_scaled_l2_clip": 0.6499999761581421, "rel_l2_clip_sliding": 0.125, "rel_l2_clip_full": 0.19166666269302368}, "positions_past_n_floor": 4, "keys_past_window": 78, "keys_past_rel_extent": 78, "experts_chosen_by_logits": 8, "max_abs_swiglu_gate": 4.326613903045654, "max_abs_swiglu_up": 5.077591896057129, "max_abs_logit": 2.5026469230651855, "max_abs_visit_state": 3.4198338985443115},
+ "coverage": {"clipped_fraction": {"l2_clip": 0.25, "scaled_l2_clip": 0.574999988079071, "log_scaled_l2_clip": 0.6499999761581421, "rel_l2_clip_sliding": 0.125, "rel_l2_clip_full": 0.19166666269302368}, "positions_past_n_floor": 4, "keys_past_window": 78, "keys_past_rel_extent": 78, "experts_chosen_in_router_op": 5, "experts_chosen_in_text_case": 8, "max_abs_swiglu_gate": 4.326613903045654, "max_abs_swiglu_up": 5.077591896057129, "max_abs_logit": 2.5026469230651855, "max_abs_visit_state": 3.4198338985443115},
  "ops": {
   "embed.0": {"module": "model.language_model.embed_tokens", "class": "Inkling2LoopNormedEmbedding", "inputs": {"input_ids": "embed.0.in.input_ids"}, "outputs": ["embed.0.out.0"]},
   "attn_res_one_query.0": {"module": "model.language_model.layers.1.attention_input", "class": "Inkling2LoopBlockAttentionResidual", "inputs": {"block_states": "attn_res_one_query.0.in.block_states", "partial_block_states": "attn_res_one_query.0.in.partial_block_states"}, "outputs": ["attn_res_one_query.0.out.0"]},

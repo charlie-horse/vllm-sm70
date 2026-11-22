@@ -5,8 +5,8 @@ CPU only, and without the Hugging Face Inkling 2 classes: the committed files
 against manifest.json, the tiny checkpoint against the released checkpoint's
 tensor names and quant groups (data/inkling2_mini/), its packed experts
 against the weights the reference loaded, and the reference's own cached
-decode against its prefill. Regenerating needs the reference tree; that test
-skips without it.
+decode against its prefill. Regenerating needs the reference tree at the
+manifest's commit; that test skips without it.
 """
 
 import hashlib
@@ -24,7 +24,6 @@ pytest.importorskip("torch")
 pytest.importorskip("vllm")
 safetensors_torch = pytest.importorskip("safetensors.torch")
 import torch
-import transformers
 
 from vllm_sm70.models.inkling2_sm70 import sm70_configs
 
@@ -35,8 +34,6 @@ MINI = HERE / "data" / "inkling2_mini"
 _spec = importlib.util.spec_from_file_location("gen_fixture", TINY / "gen_fixture.py")
 gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)
-
-HAS_REFERENCE = hasattr(transformers, "Inkling2LoopForConditionalGeneration")
 
 
 @pytest.fixture(scope="module")
@@ -80,6 +77,11 @@ def test_files_match_manifest(manifest):
     assert manifest["transformers_commit"] == gen.TRANSFORMERS_COMMIT
     assert re.fullmatch(r"[0-9a-f]{40}", manifest["transformers_commit"])
     assert manifest["transformers_commit"] in (TINY / "PROVENANCE.md").read_text()
+    assert (manifest["weight_seed"], manifest["data_seed"]) == (
+        gen.WEIGHT_SEED,
+        gen.DATA_SEED,
+    )
+    assert manifest["torch_version"] and manifest["cpu_capability"]
     assert set(manifest["files"]) == set(gen.FILES)
     for name, digest in manifest["files"].items():
         assert hashlib.sha256((TINY / name).read_bytes()).hexdigest() == digest, name
@@ -189,6 +191,12 @@ def test_native_checkpoint_loads_to_the_reference_weights(manifest, native):
         manifest, "lm_head.weight", native[llm + "unembed.weight"][: gen.UNPADDED]
     )
     assert native[llm + "unembed.weight"][gen.UNPADDED :].abs().sum() > 0
+    for layer in range(24):
+        _assert_digest(
+            manifest,
+            f"{hf}layers.{layer}.mlp.gate.e_score_correction_bias",
+            native[f"{llm}layers.{layer}.mlp.gate.bias"],
+        )
     # attn_queries.{i} belongs to layer i + 1; layer 0 has none.
     for i in range(23):
         _assert_digest(
@@ -264,7 +272,7 @@ def test_ops_index_resolves(manifest, ops):
     assert all(torch.isfinite(t).all() for t in ops.values() if t.is_floating_point())
 
 
-def test_ops_cover_the_edges_they_are_for(manifest, ops, cases):
+def test_ops_cover_the_edges_they_are_for(manifest, native, ops, cases):
     index, text = manifest["ops"], gen.CONFIG["text_config"]
 
     def arg(op, name):
@@ -315,6 +323,20 @@ def test_ops_cover_the_edges_they_are_for(manifest, ops, cases):
     assert torch.allclose(capped, 30 * torch.tanh(raw / 30), atol=1e-6)
     assert (raw - capped).abs().max() > 1e-4
     assert manifest["min_router_gap"] > 1e-4
+    # The router ranks sigmoid(logits) + bias, the checkpoint's gate.bias.
+    chosen = out("router.0", 2)
+    assert index["experts_nvfp4.0"]["inputs"]["top_k_index"] == "router.0.out.2"
+    scores = torch.sigmoid(out("router.0")) + native["model.llm.layers.1.mlp.gate.bias"]
+    top_k = text["num_experts_per_tok"]
+    assert torch.equal(
+        chosen.sort(-1).values, scores.topk(top_k).indices.sort(-1).values
+    )
+    assert not torch.equal(
+        chosen.sort(-1).values, out("router.0").topk(top_k).indices.sort(-1).values
+    )
+    coverage = manifest["coverage"]
+    assert coverage["experts_chosen_in_router_op"] == chosen.unique().numel() > top_k
+    assert coverage["experts_chosen_in_text_case"] == gen.EXPERTS
 
 
 def test_reference_cached_decode_equals_prefill(manifest, cases):
@@ -351,10 +373,9 @@ def test_case_shapes(cases):
     assert all(torch.isfinite(t).all() for t in cases.values() if t.is_floating_point())
 
 
-@pytest.mark.skipif(
-    not HAS_REFERENCE, reason="needs transformers with the Inkling 2 classes"
-)
 def test_generator_reproduces_the_committed_files():
+    if problem := gen.reference_problem():
+        pytest.skip(problem)
     env = {**os.environ, "OMP_NUM_THREADS": "1"}
     run = subprocess.run(
         [sys.executable, str(TINY / "gen_fixture.py"), "--check"],
@@ -363,4 +384,6 @@ def test_generator_reproduces_the_committed_files():
         text=True,
         env=env,
     )
-    assert run.returncode == 0, run.stdout + run.stderr
+    if run.returncode == gen.NOT_REPRODUCIBLE:
+        pytest.skip(run.stdout.strip().splitlines()[-1])
+    assert run.returncode == gen.SAME, run.stdout + run.stderr
