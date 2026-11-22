@@ -396,6 +396,7 @@ def test_audit_reports_the_partial_maxima_of_each_rank(tmp_path, sequences):
     for rank, audit in enumerate(audits):
         assert isinstance(audit, PartialAudit)
         assert audit.maxima.shape == (engine.num_visits, 2)
+        assert audit.maxima.dtype == torch.float32
         assert not audit.maxima.any()
         assert "model.partial_audit.maxima" not in engine.models[rank].state_dict()
         record = audit.record

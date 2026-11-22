@@ -167,16 +167,112 @@ def test_hook_fixes_the_kv_plan(
     assert cfg.cache_config.cache_dtype == cache_dtype
 
 
+BREAKABLE = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+
+
 @pytest.mark.parametrize(
-    "given, want", [(None, "PIECEWISE"), ("PIECEWISE", "PIECEWISE"), ("NONE", "NONE")]
+    "breakable, given, want",
+    [
+        ("1", None, "PIECEWISE"),
+        (None, None, "NONE"),
+        ("0", None, "NONE"),
+        ("true", None, "NONE"),
+        (None, "PIECEWISE", "PIECEWISE"),
+        ("1", "PIECEWISE", "PIECEWISE"),
+        ("1", "NONE", "NONE"),
+        (None, "NONE", "NONE"),
+    ],
 )
-def test_hook_keeps_cuda_graphs_piecewise(device, route_log, given, want):
+def test_hook_captures_only_with_breakable_cuda_graphs(
+    device, route_log, monkeypatch, breakable, given, want
+):
     from vllm.config.compilation import CUDAGraphMode
 
+    if breakable is None:
+        monkeypatch.delenv(BREAKABLE, raising=False)
+    else:
+        monkeypatch.setenv(BREAKABLE, breakable)
     device(7, 0)
     cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
     icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
     assert cfg.compilation_config.cudagraph_mode is CUDAGraphMode[want]
+    assert f"cudagraph_mode {want};" in route_log[0]
+
+
+@pytest.fixture
+def registered(monkeypatch, device):
+    """The architecture, its configs and the quant config registered as at
+    cc 7.0; the registries restored afterwards. The modules VllmConfig
+    imports lazily are imported first, on the CPU platform."""
+    import vllm.model_executor.layers.attention
+    import vllm.model_executor.layers.quantization.utils.w8a8_utils
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm_sm70.models.inkling2_sm70 import quant_config
+
+    cpu = vllm.platforms.current_platform
+    had_model = inkling2_sm70.ARCH in ModelRegistry.models
+    had_hook = inkling2_sm70.ARCH in MODELS_CONFIG_MAP
+    monkeypatch.setattr(inkling2_sm70, "_registered", False)
+    quant_config.register()
+    device(7, 0)
+    assert inkling2_sm70.register() is True
+    yield cpu
+    if not had_model:
+        ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
+    if not had_hook:
+        MODELS_CONFIG_MAP.pop(inkling2_sm70.ARCH, None)
+
+
+@pytest.mark.parametrize(
+    "breakable, given, want",
+    [
+        (None, None, "NONE"),
+        ("1", None, "PIECEWISE"),
+        ("1", "NONE", "NONE"),
+        (None, "FULL_AND_PIECEWISE", None),
+    ],
+)
+def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
+    registered, route_log, monkeypatch, breakable, given, want
+):
+    """VllmConfig.__post_init__ calls the hook before it applies its own
+    cudagraph default, so the hook's choice for an unset mode stands."""
+    from vllm.config import CompilationConfig, ModelConfig, VllmConfig
+    from vllm.config.compilation import CUDAGraphMode
+
+    if breakable is None:
+        monkeypatch.delenv(BREAKABLE, raising=False)
+    else:
+        monkeypatch.setenv(BREAKABLE, breakable)
+    cuda = vllm.platforms.current_platform
+    # The class inspection imports the model as a CPU process does.
+    monkeypatch.setattr(vllm.platforms, "_current_platform", registered)
+    model_config = ModelConfig(
+        model=str(DATA),
+        dtype="float16",
+        hf_overrides={"architectures": [inkling2_sm70.ARCH]},
+        tokenizer_mode="inkling2_sm70",
+        skip_tokenizer_init=True,
+    )
+    assert model_config.architecture == inkling2_sm70.ARCH
+    assert model_config.quantization == "inkling2"
+    monkeypatch.setattr(vllm.platforms, "_current_platform", cuda)
+    monkeypatch.setattr(type(cuda), "support_static_graph_mode", lambda self: True)
+    kwargs = {}
+    if given is not None:
+        kwargs["compilation_config"] = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode[given]
+        )
+    if want is None:
+        with pytest.raises(ValueError, match=f"cudagraph_mode {given};"):
+            VllmConfig(model_config=model_config, **kwargs)
+        return
+    config = VllmConfig(model_config=model_config, **kwargs)
+    assert config.compilation_config.cudagraph_mode is CUDAGraphMode[want]
+    assert config.cache_config.block_size == icfg.KV_BLOCK_SIZE
+    assert config.scheduler_config.async_scheduling is False
+    assert f"cudagraph_mode {want};" in route_log[0]
 
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])

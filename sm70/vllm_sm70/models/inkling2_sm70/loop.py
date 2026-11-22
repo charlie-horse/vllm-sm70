@@ -98,7 +98,9 @@ class PartialAudit(nn.Module):
         super().__init__()
         self.path = Path(directory) / f"rank{rank}" if directory else None
         self.register_buffer(
-            "maxima", torch.zeros(num_visits, len(PARTIAL_SITES)), persistent=False
+            "maxima",
+            torch.zeros(num_visits, len(PARTIAL_SITES), dtype=torch.float32),
+            persistent=False,
         )
 
     def record(self, visit: int, site: str, partial: torch.Tensor) -> None:

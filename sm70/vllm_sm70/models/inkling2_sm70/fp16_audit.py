@@ -5,8 +5,11 @@
   a dequantized expert block). A value above the fp16 range raises with the
   tensor name (as flint_sm70/fp16_rescale.py ``check_fp16_range``). So does a
   nonzero value that rounds to zero and is larger than ``FLUSH_RELATIVE``
-  times the tensor's largest |w|: the tensor lies below the fp16 range.
-  Other values that round to zero, and subnormal results, are counted.
+  times the tensor's largest |w|, and a nonzero tensor whose largest |w| is
+  below the smallest normal fp16 value: the tensor lies below the fp16 range
+  and would be held in subnormals. Other values that round to zero, and
+  subnormal results, are counted; a tensor with more than
+  ``SUBNORMAL_WARN_SHARE`` of its values subnormal is logged with its name.
 * ``check_hard_coded_config`` refuses a config whose values differ from the
   ones the model code is written for.
 * ``walk_process_weights_after_loading`` runs the post-load hook of every
@@ -20,12 +23,16 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.sm70.inkling2.fp16_audit")
 
 __all__ = [
     "FLUSH_RELATIVE",
     "FP16_MAX",
     "FP16_MIN_NORMAL",
     "HARD_CODED_CONFIG",
+    "SUBNORMAL_WARN_SHARE",
     "Fp16Audit",
     "check_hard_coded_config",
     "walk_process_weights_after_loading",
@@ -36,6 +43,7 @@ FP16_MIN_NORMAL = 2.0**-14
 # Largest |w| that rounds to zero in fp16 (half the smallest subnormal).
 FP16_FLUSH_MAX = 2.0**-25
 FLUSH_RELATIVE = 2.0**-10
+SUBNORMAL_WARN_SHARE = 0.01
 
 # Text-config values the model code assumes. ``is_varloop`` is a field of
 # ``loop_config``.
@@ -90,9 +98,24 @@ class Fp16Audit:
                     f"{float(lost):g} round to zero in fp16 and the largest "
                     f"|w| is {amax:g}"
                 )
+        if 0.0 < amax < FP16_MIN_NORMAL:
+            raise ValueError(
+                f"{name}: max |w| = {amax:g} is below the smallest normal fp16 "
+                f"value {FP16_MIN_NORMAL:g}; every value is subnormal or zero "
+                "in fp16"
+            )
         self.tensors += 1
         self.flushed += flushed
-        self.subnormal += int((cast.abs() < FP16_MIN_NORMAL).sum()) - zeros
+        subnormal = int((cast.abs() < FP16_MIN_NORMAL).sum()) - zeros
+        self.subnormal += subnormal
+        if subnormal > SUBNORMAL_WARN_SHARE * cast.numel():
+            logger.warning(
+                "fp16 audit: %s has %d of %d values (%.2f%%) subnormal in fp16.",
+                name,
+                subnormal,
+                cast.numel(),
+                100.0 * subnormal / cast.numel(),
+            )
         if amax > self.max_abs:
             self.max_abs, self.max_name = amax, name
 
