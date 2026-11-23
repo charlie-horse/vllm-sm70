@@ -490,13 +490,18 @@ def test_tm_route_rewrites_both_stage_inputs(tm, config, m):
     x = hidden(m, torch.float16)
     _, weights, index = module.route(x)
     module.expert_sum(x, index, weights, torch.empty_like(x))
-    assert len(seen) == 2 and len(inputs) == 2
-    (x_in, x_q), (act_in, act_q) = seen
+    # One input rewrite, then one W13/W2 stage pair and one SwiGLU rewrite
+    # per slot chunk (moe_tm.py runs compact chunks above COMPACT_MAX_SLOTS).
+    chunks = len(seen) - 1
+    assert chunks >= 1 and len(inputs) == 2 * chunks
+    (x_in, x_q), acts = seen[0], seen[1:]
     assert torch.equal(x_in, x) and torch.equal(x_q, quant(x))
     tokens = torch.sort(index.reshape(-1), stable=True).indices // index.shape[1]
-    assert torch.equal(inputs[0], x_q[tokens])
-    assert torch.equal(inputs[1], act_q) and torch.equal(act_q, quant(act_in))
-    assert not torch.equal(act_in, act_q)
+    assert torch.equal(torch.cat(inputs[0::2]), x_q[tokens])
+    for got, (act_in, act_q) in zip(inputs[1::2], acts, strict=True):
+        assert torch.equal(got, act_q) and torch.equal(act_q, quant(act_in))
+    act_in = torch.cat([a for a, _ in acts])
+    assert not torch.equal(act_in, torch.cat([q for _, q in acts]))
 
 
 @pytest.mark.parametrize("m", [1, 8, 41])
