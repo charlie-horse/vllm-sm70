@@ -115,7 +115,8 @@ def test_tp2_ranks_hold_disjoint_head_shards(tiny_config):
     maps, converted = _convert(tiny_config, 2)
     (single,), (whole,) = _convert(tiny_config, 1)
     assert maps[0].params == maps[1].params
-    sharded = {r.param for r in single.routes.values() if r.tp_dim is not None}
+    sharded = {r.param for r in maps[0].routes.values() if r.tp_dim is not None}
+    assert "lm_head.weight" in sharded
     for name, spec in single.params.items():
         halves = [c.params[name] for c in converted]
         if name in sharded:
@@ -138,6 +139,22 @@ def test_tp2_ranks_hold_disjoint_head_shards(tiny_config):
     assert torch.equal(wo, NATIVE[llm + "wo_ud.weight"][:, 12:].float())
     static = converted[1].params["model.layers.5.attn.k_sconv.static_w"]
     assert torch.equal(static, NATIVE[llm + "k_sconv.static_w"][:, 4:].float())
+
+
+def test_lm_head_rows_split_over_the_ranks(tiny_config, monkeypatch):
+    """Rank r holds vocabulary rows [r V/2, (r + 1) V/2); with
+    VLLM_SM70_INKLING_SHARDED_HEAD=0 every rank holds all V rows."""
+    unembed = NATIVE["model.llm.unembed.weight"][:72].float()
+    maps, converted = _convert(tiny_config, 2)
+    for rank, (wmap, result) in enumerate(zip(maps, converted)):
+        assert wmap.head_sharded is True
+        want = unembed[36 * rank : 36 * (rank + 1)]
+        assert torch.equal(result.params["lm_head.weight"], want)
+    monkeypatch.setenv(weights.HEAD_SWITCH, "0")
+    maps, converted = _convert(tiny_config, 2)
+    for wmap, result in zip(maps, converted):
+        assert wmap.head_sharded is False
+        assert torch.equal(result.params["lm_head.weight"], unembed)
 
 
 def test_renames_and_merges(tiny_config):
@@ -246,7 +263,8 @@ def test_released_names_map_to_one_parameter_or_a_skip(mini_config, tp_size):
     assert {r.param for r in wmap.routes.values()} == wmap.params.keys()
 
     shapes = {name: spec.shape for name, spec in wmap.params.items()}
-    assert shapes["lm_head.weight"] == (200058, 2304)
+    assert shapes["lm_head.weight"] == (200058 // tp_size, 2304)
+    assert wmap.head_sharded is (tp_size > 1)
     assert shapes["model.embed_tokens.weight"] == (201024, 2304)
     assert shapes["model.message_queries"] == (12, 4, 2304)
     assert shapes["model.attn_res.attn_queries.22"] == (3, 2304)

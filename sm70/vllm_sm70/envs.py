@@ -403,6 +403,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # setting to upstream, which turns it on when unset
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_ASYNC_SCHED": kill_switch("VLLM_SM70_INKLING_ASYNC_SCHED"),
+        # "0": every TP rank holds the whole Inkling 2 LM head and computes
+        # the logits of the whole vocabulary. Otherwise, at TP > 1 with a
+        # vocabulary that splits evenly, each rank holds and computes its own
+        # vocabulary rows and the ranks all-gather the logits (inkling2_sm70/
+        # weights.py, model.py). Env-only, read when the model is built.
+        "VLLM_SM70_INKLING_SHARDED_HEAD": kill_switch(
+            "VLLM_SM70_INKLING_SHARDED_HEAD"
+        ),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

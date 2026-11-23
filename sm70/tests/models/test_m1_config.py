@@ -182,6 +182,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_DSPARK",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
         "VLLM_SM70_INKLING_ASYNC_SCHED",
+        "VLLM_SM70_INKLING_SHARDED_HEAD",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -565,6 +566,15 @@ def _inkling_async_sched_off(name):
             icfg.Inkling2Sm70ModelConfig.verify_and_update_config(engine(True))
 
 
+def _inkling_sharded_head_off(name):
+    """At TP2 every rank's weight map keeps the whole LM head; the sharded
+    head is in tests/models/test_m12_inkling2_weight_map_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import weights
+
+    assert weights.HEAD_SWITCH == name and not weights.sharded_head_enabled()
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -680,6 +690,8 @@ def _path_off(name):
         _inkling_dspark_kernels_off(name)
     elif name == "VLLM_SM70_INKLING_ASYNC_SCHED":
         _inkling_async_sched_off(name)
+    elif name == "VLLM_SM70_INKLING_SHARDED_HEAD":
+        _inkling_sharded_head_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
