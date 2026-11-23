@@ -193,7 +193,9 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 f"{model_config.dtype}."
             )
         spec_reason = speculative_rejection(
-            vllm_config.speculative_config, getattr(model_config, "hf_config", None)
+            vllm_config.speculative_config,
+            getattr(model_config, "hf_config", None),
+            v2_runner=bool(getattr(vllm_config, "use_v2_model_runner", False)),
         )
         if spec_reason is not None:
             raise ValueError(f"{ARCH} {spec_reason}.")

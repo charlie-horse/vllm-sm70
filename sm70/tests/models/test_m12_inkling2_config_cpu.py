@@ -163,8 +163,12 @@ def test_hook_takes_a_staged_dspark_draft_only(device, route_log, monkeypatch, s
         draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
     )
     cfg = _vllm_config(spec=spec)
+    cfg.use_v2_model_runner = True
     if switch is None:
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        v1 = _vllm_config(spec=spec)
+        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(v1)
         return
     with pytest.raises(ValueError, match="VLLM_SM70_INKLING_DSPARK=0"):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)

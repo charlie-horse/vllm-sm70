@@ -183,3 +183,11 @@ def test_speculator_cls(draft_hf_config, monkeypatch):
     cfg = SimpleNamespace(speculative_config=_spec(draft_hf_config))
     assert draft.speculator_cls(cfg) == "cls"
     assert resolved == [draft.SPECULATOR_TARGET]
+
+
+def test_rejection_refuses_v1_runner(draft_hf_config):
+    """The U6 hook lives only in the V2 runner, so V1 refuses the draft."""
+    reason = draft.speculative_rejection(
+        _spec(draft_hf_config), None, v2_runner=False
+    )
+    assert reason is not None and "VLLM_USE_V2_MODEL_RUNNER=1" in reason

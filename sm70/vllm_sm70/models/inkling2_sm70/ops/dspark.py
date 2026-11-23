@@ -420,9 +420,9 @@ def _block_attention_kernel(
         s = tl.sum(k.to(tl.float32) * q[None, :], 1) * scale
         s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m, tl.max(s, 0))
-        p = tl.exp(s - m_new)
+        p = exp(s - m_new)
         p = tl.where(valid, p, 0.0)
-        corr = tl.exp(m - m_new)
+        corr = exp(m - m_new)
         total = total * corr + tl.sum(p, 0)
         acc = acc * corr + tl.sum(p[:, None] * v.to(tl.float32), 0)
         m = m_new

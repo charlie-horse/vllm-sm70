@@ -290,10 +290,11 @@ class _StepBuilds:
         self._built: dict[Any, tuple[int, Any]] = {}
 
     def _select(self, cm: CommonAttentionMetadata) -> None:
-        step = (cm.query_start_loc_cpu, cm.seq_lens, cm.positions)
+        tensors = (cm.query_start_loc_cpu, cm.seq_lens, cm.positions)
+        step = (*tensors, cm.num_reqs, cm.num_actual_tokens, cm.max_query_len)
         same = len(step) == len(self._step) and all(
-            a is b for a, b in zip(step, self._step, strict=True)
-        )
+            a is b for a, b in zip(tensors, self._step[:3], strict=True)
+        ) and step[3:] == self._step[3:]
         if not same:
             self._step, self._built = step, {}
 

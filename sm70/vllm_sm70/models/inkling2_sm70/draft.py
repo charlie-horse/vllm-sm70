@@ -101,9 +101,12 @@ def _is_inkling_draft(spec: Any) -> bool:
     return getattr(hf_config, "model_type", None) == DRAFT_MODEL_TYPE
 
 
-def speculative_rejection(spec: Any, target_hf_config: Any) -> str | None:
+def speculative_rejection(
+    spec: Any, target_hf_config: Any, v2_runner: bool = True
+) -> str | None:
     """Why the target can't serve ``spec``, or None (no spec, or method
-    dspark with a staged draft whose block and visits fit the target)."""
+    dspark with a staged draft whose block and visits fit the target, on the
+    V2 runner)."""
     if spec is None:
         return None
     if not enabled():
@@ -117,6 +120,11 @@ def speculative_rejection(spec: Any, target_hf_config: Any) -> str | None:
             f"supports speculative decoding only with method {METHOD} and a "
             f"{DRAFT_MODEL_TYPE} draft dir ({STAGE_COMMAND}), got method "
             f"{method}"
+        )
+    if not v2_runner:
+        return (
+            f"runs a {DRAFT_MODEL_TYPE} draft only on the V2 model runner; set "
+            "VLLM_USE_V2_MODEL_RUNNER=1"
         )
     draft = spec.draft_model_config.hf_config
     k = getattr(spec, "num_speculative_tokens", None)
