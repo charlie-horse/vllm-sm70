@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 vendored Triton norm kernels (inkling2_sm70/ops/norm.py,
-attn_res.py, loop.py) and their route (inkling2_sm70/norms.py), on CPU.
+"""M12 Inkling 2 Triton norm kernels (the vendored inkling2_sm70/ops/norm.py,
+attn_res.py, loop.py and the gate and residual kernels of ops/fused.py) and
+their route (inkling2_sm70/norms.py), on CPU.
 
 - provenance: each vendored file, with its stored patch reverse-applied, is
   the upstream file of the recorded sha256;
 - the sources hold nothing sm_70 rejects or runs slowly: PDL only behind
   USE_GDC, no tanh.approx, no tl.dot, no bfloat16, no SM100/SM120 import;
-- the switch VLLM_SM70_INKLING_TRITON_NORMS and the route choice;
+- the switch VLLM_SM70_INKLING_TRITON_NORMS and the route choice: the
+  kernels on decode-only batches by default, none with "0", all with "1";
 - the kernels through Triton's interpreter against the torch reference ops,
   in fp32 within 1e-5 and in fp16 within 2e-3, and the route built on them
   against the torch route.
@@ -166,7 +168,7 @@ def _code(name: str) -> list[str]:
     return [line.split("#")[0].rstrip() for line in text.splitlines()]
 
 
-@pytest.mark.parametrize("name", (*VENDORED, "_compat.py"))
+@pytest.mark.parametrize("name", (*VENDORED, "fused.py", "_compat.py"))
 def test_sources_hold_nothing_sm70_rejects(name):
     lines = _code(name)
     code = "\n".join(lines)
@@ -206,9 +208,10 @@ def test_pdl_follows_the_compute_capability(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("value", "enabled"), [(None, False), ("0", False), ("1", True), ("", False)]
+    ("value", "mode"),
+    [(None, None), ("", None), ("true", None), (" 1", None), ("0", False), ("1", True)],
 )
-def test_switch_only_one_turns_the_kernels_on(monkeypatch, value, enabled):
+def test_switch_sets_the_route(monkeypatch, value, mode):
     from vllm_sm70 import envs
     from vllm_sm70.models.inkling2_sm70 import norms
     from vllm_sm70.models.inkling2_sm70.ops import _compat
@@ -218,15 +221,23 @@ def test_switch_only_one_turns_the_kernels_on(monkeypatch, value, enabled):
         monkeypatch.delenv(SWITCH, raising=False)
     else:
         monkeypatch.setenv(SWITCH, value)
-    assert getattr(envs, SWITCH) is enabled
+    assert getattr(envs, SWITCH) is mode
     x = torch.zeros(2, 8)
-    assert norms.on_triton(x) is (INTERPRETED and enabled)
-    # A GPU tensor follows the switch when Triton is there.
     gpu = type("Gpu", (), {"is_cuda": True})()
-    monkeypatch.setattr(_compat, "AVAILABLE", True)
-    assert norms.on_triton(gpu) is enabled
-    monkeypatch.setattr(_compat, "AVAILABLE", False)
-    assert norms.on_triton(gpu) is (INTERPRETED and enabled)
+    for decode_only in (False, True):
+        want = decode_only if mode is None else mode
+        assert norms.on_triton(x, decode_only) is (INTERPRETED and want)
+        bank = norms.Bank(x, 1, decode_only=decode_only)
+        assert bank.triton is (INTERPRETED and want)
+        # A GPU tensor follows the route when Triton is there.
+        monkeypatch.setattr(_compat, "AVAILABLE", True)
+        assert norms.on_triton(gpu, decode_only) is want
+        monkeypatch.setattr(_compat, "AVAILABLE", False)
+        assert norms.on_triton(gpu, decode_only) is (INTERPRETED and want)
+    assert norms.on_triton(x) is (INTERPRETED and bool(mode))
+
+
+FUSED = ("gate_down", "gate_up", "residual_add")
 
 
 def _forbid_kernels(monkeypatch):
@@ -239,6 +250,8 @@ def _forbid_kernels(monkeypatch):
     monkeypatch.setattr(norms.attn_res_ops, "attn_res", forbidden)
     monkeypatch.setattr(norms.loop_ops, "pair_rms_norm", forbidden)
     monkeypatch.setattr(norms.loop_ops, "blend_rms_norm", forbidden)
+    for name in FUSED:
+        monkeypatch.setattr(norms.fused_ops, name, forbidden)
 
 
 def _counted(calls: dict[str, int], name: str, real):
@@ -258,6 +271,7 @@ def _count_kernels(monkeypatch) -> dict[str, int]:
         (norms.attn_res_ops, "attn_res"),
         (norms.loop_ops, "pair_rms_norm"),
         (norms.loop_ops, "blend_rms_norm"),
+        *((norms.fused_ops, name) for name in FUSED),
     ):
         monkeypatch.setattr(module, name, _counted(calls, name, getattr(module, name)))
     return calls
@@ -285,6 +299,37 @@ def test_torch_route_matches_the_reference_ops_and_calls_no_kernel(monkeypatch):
     (got,) = norms.sublayer_inputs(bank, state, query, weight, cases.EPS, state.dtype)
     mixed = torch_ref.attn_res(bank_state[None, :, None], state[None], query)[0, :, 0]
     assert torch.equal(got, torch_ref.rms_norm(mixed, weight[0], cases.EPS))
+    for start in (False, True):
+        for gated in (False, True):
+            cases.residual_outputs(inputs, 5, 48, 1, start=start, gated=gated)
+
+
+def test_default_route_takes_the_kernels_on_decode_only_batches(monkeypatch):
+    """Switch unset: a forward that is not decode-only calls no kernel; in
+    the interpreter a decode-only one does."""
+    import _inkling2_norms as cases
+
+    from vllm_sm70.models.inkling2_sm70 import norms
+
+    monkeypatch.delenv(SWITCH, raising=False)
+    calls = _count_kernels(monkeypatch)
+    inputs = cases.Inputs("cpu", torch.float32, seed=4)
+    state, query, weight = (
+        inputs.randn(3, 48),
+        inputs.randn(1, 48),
+        inputs.weight(1, 48),
+    )
+    for decode_only in (False, True):
+        calls.clear()
+        bank = norms.Bank(state, 1, decode_only=decode_only)
+        bank.append(inputs.randn(3, 48))
+        residual = norms.Residual(state, inputs.randn(3, 48), bank.triton)
+        norms.sublayer_inputs(bank, residual, query, weight, cases.EPS, state.dtype)
+        residual.add(inputs.randn(3, 48), state.dtype)
+        if decode_only and INTERPRETED:
+            assert calls == {"rms_norm": 1, "attn_res": 1, "residual_add": 1}
+        else:
+            assert calls == {}
 
 
 # --- interpreted kernels --------------------------------------------------------
@@ -341,11 +386,46 @@ def test_attn_res_blocked_kernel_walks_a_wide_row(cases, norm):
 
 
 @pytest.mark.parametrize(("dtype", "tol"), DTYPES)
-@pytest.mark.parametrize(("streams", "tokens"), [(1, 1), (3, 5), (4, 2)])
+@pytest.mark.parametrize(("streams", "tokens"), [(1, 1), (3, 5), (2, 17)])
 def test_loop_kernels(cases, dtype, tol, streams, tokens):
+    """Up to fused.MAX_TOKENS tokens the gate kernels, above it the pair
+    norm and torch.bmm."""
     inputs = cases.Inputs("cpu", dtype, seed=streams)
     assert cases.check_pair_rms_norm(inputs, streams, tokens, 48) <= tol
     assert cases.check_blend(inputs, streams, tokens, 48) <= tol
+
+
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@pytest.mark.parametrize(("streams", "tokens", "hidden"), [(1, 1, 48), (3, 4, 600)])
+def test_gate_kernels(cases, dtype, tol, streams, tokens, hidden):
+    inputs = cases.Inputs("cpu", dtype, seed=tokens)
+    assert cases.check_gate_kernels(inputs, streams, tokens, hidden) <= tol
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
+def test_residual_add_kernel_is_exact(cases, dtype):
+    assert cases.check_residual_add(cases.Inputs("cpu", dtype), 3, 1100) == 0.0
+
+
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@pytest.mark.parametrize("gated", [False, True], ids=["first_pass", "gated"])
+@pytest.mark.parametrize("start", [False, True], ids=["inside", "block_start"])
+def test_residual_route_matches_the_torch_route(
+    cases, monkeypatch, dtype, tol, gated, start
+):
+    calls = _count_kernels(monkeypatch)
+    monkeypatch.setenv(SWITCH, "1")
+    inputs = cases.Inputs("cpu", dtype, seed=7)
+    got = cases.residual_outputs(inputs, 3, 48, 2, start=start, gated=gated)
+    assert calls["residual_add"] == calls["attn_res"] - gated == 1
+    assert calls.get("gate_down", 0) == calls.get("gate_up", 0) == int(gated)
+    used = dict(calls)
+    monkeypatch.setenv(SWITCH, "0")
+    inputs = cases.Inputs("cpu", dtype, seed=7)
+    want = cases.residual_outputs(inputs, 3, 48, 2, start=start, gated=gated)
+    assert calls == used, "the torch route launched a kernel"
+    assert cases.rel_err(got[0], want[0]) <= tol
+    assert torch.equal(got[1], want[1])
 
 
 @pytest.mark.parametrize(("dtype", "tol"), DTYPES)
@@ -364,7 +444,9 @@ def test_triton_route_matches_the_torch_route(
     if case[1]:
         assert calls["attn_res"] == 1 + bool(case[3])
     if case[3]:
-        assert calls["pair_rms_norm"] == calls["blend_rms_norm"] == 1
+        # Five tokens: the gate kernels, not the pair norm and torch.bmm.
+        assert calls["gate_down"] == calls["gate_up"] == calls["blend_rms_norm"] == 1
+        assert "pair_rms_norm" not in calls
     if case[0] in ("local_attention", "global_attention"):
         # One launch for the mix and its norms.
         assert calls["rms_norm"] == 1 + blocks

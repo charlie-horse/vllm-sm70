@@ -38,7 +38,7 @@ from .attention_torch import paged_attention
 from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_ATTN, STREAM_MLP
 from .moe import Inkling2Sm70Experts
-from .norms import Bank, normed_state, sublayer_inputs
+from .norms import Bank, Residual, normed_state, sublayer_inputs
 from .ops.torch_ref import message_gate
 from .prologue import attention_prologue, project_qkvr
 from .sconv import short_conv
@@ -328,9 +328,8 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         # A block boundary restarts the residual from the attention output.
         if self.starts_block:
             bank.append(hidden)
-            residual = attn_out.float()
-        else:
-            residual = hidden.float() + attn_out.float()
+        base = None if self.starts_block else hidden
+        residual = Residual(base, attn_out, bank.triton)
 
         (x,) = sublayer_inputs(
             bank,
@@ -350,7 +349,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         expert_sum = all_reduce(partial, self.tp_size)
         mlp_out = expert_sum.new_empty(expert_sum.shape)
         short_conv(expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out)
-        return (residual + mlp_out).to(dtype)
+        return residual.add(mlp_out, dtype)
 
 
 class Inkling2Sm70AttnRes(nn.Module):

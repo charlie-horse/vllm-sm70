@@ -7,11 +7,13 @@ Rules:
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
   The exceptions that select a kernel, off by default:
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32),
-  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange) and the Inkling 2
-  route VLLM_SM70_INKLING_TRITON_NORMS. See their comments.
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32) and
+  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange). See their comments.
   (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
   now a kill switch.)
+- Route switches (`route_switch`): "0" and "1" both act, forcing a route
+  off or on everywhere; any other value keeps the code's default route.
+  VLLM_SM70_INKLING_TRITON_NORMS is the only one.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -58,14 +60,25 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_FP8_QPN8_M32 (K09), VLLM_SM70_TOP1_CUSTOM_AR (F12) and
-    VLLM_SM70_INKLING_TRITON_NORMS, opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09) and VLLM_SM70_TOP1_CUSTOM_AR (F12),
+    opt-in by review decision.
     """
 
     def getter() -> bool:
         return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
+    return getter
+
+
+def route_switch(name: str) -> Callable[[], bool | None]:
+    """Getter that is False when `name` == "0", True when it is "1" and None
+    (the code's default route) otherwise."""
+
+    def getter() -> bool | None:
+        return {"0": False, "1": True}.get(os.environ.get(name, ""))
+
+    getter.__name__ = f"route_{name}"
     return getter
 
 
@@ -321,12 +334,15 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_DFLASH2_EMULATION": kill_switch("VLLM_SM70_DFLASH2_EMULATION"),
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
-        # "1": the Inkling 2 norms, AttnRes mixes and message blends run the
-        # vendored Triton kernels instead of the torch ops. Env-only (no
-        # Sm70Config field), read per eager call (inkling2_sm70/norms.py) and
-        # fixed at capture in a replayed CUDA graph; default off: the
-        # kernels have not run on a GPU.
-        "VLLM_SM70_INKLING_TRITON_NORMS": opt_in("VLLM_SM70_INKLING_TRITON_NORMS"),
+        # Route of the Inkling 2 norms, AttnRes mixes, message gates and
+        # residual adds (inkling2_sm70/norms.py): by default Triton kernels
+        # on decode-only batches and the torch ops on every other batch;
+        # "0": the torch ops on every batch; "1": the kernels on every
+        # batch. Env-only (no Sm70Config field), read once per forward and
+        # fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_TRITON_NORMS": route_switch(
+            "VLLM_SM70_INKLING_TRITON_NORMS"
+        ),
         # "0": the Inkling 2 paged short convs and the prologue's K/V convs
         # take the torch ops instead of one Triton kernel per call. Env-only
         # (no Sm70Config field), read per eager call (inkling2_sm70/sconv.py)

@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from .backend import cache_metadata, is_decode_only
 from .cache import build_cache_owners
 from .layers import (
     PARTIAL_SITES,
@@ -204,7 +205,11 @@ class Inkling2Sm70LoopModel(nn.Module):
         core = self.config.loop_core_layers
         hidden = inputs_embeds
         num_tokens = hidden.shape[0]
-        bank = Bank(hidden, sum(layer.starts_block for layer in self.layers))
+        bank = Bank(
+            hidden,
+            sum(layer.starts_block for layer in self.layers),
+            decode_only=is_decode_only(cache_metadata(self.caches.conv[0, 0])),
+        )
         is_padding = torch.empty(num_tokens, dtype=torch.bool, device=hidden.device)
         padding_mask(self.caches.conv[0, 0], is_padding)
         aux: list[torch.Tensor] = []
@@ -218,7 +223,9 @@ class Inkling2Sm70LoopModel(nn.Module):
                 else:
                     # The previous pass's own block states after the entry
                     # one, and its output.
-                    message_bank = message_sources(bank.states(entry_count + 1), hidden)
+                    message_bank = message_sources(
+                        bank.states(entry_count + 1), hidden, bank.triton
+                    )
                     hidden, bank.count = entry_hidden, entry_count
             messages = None
             if pass_idx:

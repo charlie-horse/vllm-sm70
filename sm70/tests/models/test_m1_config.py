@@ -56,10 +56,11 @@ EFFECTIVE_DEFAULTS = {
 
 # Our sections of K01's registry.
 REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
-# Routes that run only when their variable is "1" (envs.opt_in).
-OPT_IN = {"VLLM_SM70_INKLING_TRITON_NORMS"}
+# Route switches (envs.route_switch): "0" and "1" force a route, any other
+# value keeps the default one.
+ROUTE = {"VLLM_SM70_INKLING_TRITON_NORMS"}
 # The kill switches: only "0" acts.
-OURS = {name: get for name, get in REGISTERED.items() if name not in OPT_IN}
+OURS = {name: get for name, get in REGISTERED.items() if name not in ROUTE}
 
 # Sm70Config fields whose kill switch is registered in Kai's "sampler"
 # section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
@@ -394,15 +395,22 @@ def _inkling_nvfp4_tm_off(name):
             assert moe_tm.rejection(contract, tp, torch.float16) == moe_tm.SWITCHED_OFF
 
 
-def _inkling_triton_norms_off(name):
-    """A GPU tensor takes the torch ops of inkling2_sm70/norms.py; the
-    kernels' own checks are tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+def _inkling_triton_norms_route(name, mode):
+    """A GPU tensor of inkling2_sm70/norms.py takes the kernels on a
+    decode-only batch by default, on none with "0" and on every batch with
+    "1"; the kernels' own checks are
+    tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+    from unittest import mock
+
     pytest.importorskip("vllm")
     from vllm_sm70.models.inkling2_sm70 import norms
 
     assert norms.SWITCH == name
     gpu = SimpleNamespace(is_cuda=True)
-    assert norms.on_triton(gpu) is False
+    with mock.patch.object(norms._compat, "AVAILABLE", True):
+        for decode_only in (False, True):
+            want = decode_only if mode is None else mode
+            assert norms.on_triton(gpu, decode_only) is want
 
 
 def _inkling_triton_sconv_off(name):
@@ -462,29 +470,29 @@ def _inkling_decode_graph_off(name):
         assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
 
 
-OPT_IN_OFF = {
-    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
+ROUTE_CHECKS = {
+    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_route,
 }
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "true", "on", "yes", " 1"])
-@pytest.mark.parametrize("name", sorted(OPT_IN))
-def test_opt_in_route_is_off_unless_one(monkeypatch, name, value):
+@pytest.mark.parametrize(
+    "value", [None, "", "0", "1", "true", "on", "yes", "off", " 1", " 0"]
+)
+@pytest.mark.parametrize("name", sorted(ROUTE))
+def test_route_switch_acts_only_on_zero_and_one(monkeypatch, name, value):
     if value is None:
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, value)
-    assert getattr(envs, name) is False
-    OPT_IN_OFF[name](name)
-    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
+    mode = {"0": False, "1": True}.get(value)
+    assert getattr(envs, name) is mode
+    ROUTE_CHECKS[name](name, mode)
     assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
 
 
-def test_opt_in_names_are_registered():
-    assert set(OPT_IN) == set(OPT_IN_OFF)
-    assert set(OPT_IN) <= set(envs._SECTIONS["models"])
+def test_route_names_are_registered():
+    assert set(ROUTE) == set(ROUTE_CHECKS)
+    assert set(ROUTE) <= set(envs._SECTIONS["models"])
 
 
 def _path_off(name):

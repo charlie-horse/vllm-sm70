@@ -2,12 +2,12 @@
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
-norm.py, attn_res.py, loop.py, activation.py, grouped_gemm.py, routing.py)
-goes through
-Triton's compiler and ptxas for GPUTarget("cuda", 70, 32) at Inkling 2 Mini
-sizes (hidden 2304, head dim 128, 12 query and 4 KV heads per rank at TP2,
-KV block 32, 4 conv taps, expert intermediate 576 per rank, 128 experts,
-top-8, decode batches of 1 to 8 tokens), with the
+norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
+routing.py) goes through Triton's compiler and ptxas for
+GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim 128,
+12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
+intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
+tokens, message-gate rank 64), with the
 constexprs and launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
 This catches what the interpreter tests cannot: Triton's constexpr and
 static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
@@ -310,6 +310,62 @@ def test_loop_kernels():
         },
         num_warps=8,
         enable_fp_fusion=False,
+    )
+
+
+# --- fused.py ------------------------------------------------------------------------
+
+GATE_RANK = 64
+
+
+@pytest.mark.parametrize("weight", ["*fp16", "*fp32"])
+def test_gate_kernels(weight):
+    fused = _ops("fused")
+    _check(
+        fused._gate_down_kernel,
+        {
+            "Dest": "*fp32",
+            "Message": "*fp32",
+            **dict.fromkeys(("Down0", "Down1", "Down2"), weight),
+            "Low": "*fp32",
+            **_i32("stride_dest_s", "T"),
+            "eps": "fp32",
+            "D": HIDDEN,
+            "R": GATE_RANK,
+            "BLOCK_R": fused.BLOCK_R,
+            "BLOCK_K": fused.BLOCK_K,
+        },
+        num_warps=4,
+    )
+    _check(
+        fused._gate_up_kernel,
+        {
+            "Low": "*fp32",
+            **dict.fromkeys(
+                ("Gain0", "Gain1", "Gain2", "Forget0", "Forget1", "Forget2"), weight
+            ),
+            "Out": "*fp32",
+            "T": "i32",
+            "D": HIDDEN,
+            "R": GATE_RANK,
+            "BLOCK_D": fused.BLOCK_D,
+        },
+        num_warps=4,
+    )
+
+
+@pytest.mark.parametrize("base", [False, True], ids=["update", "base_update"])
+def test_residual_add_kernel(base):
+    fused = _ops("fused")
+    _check(
+        fused._residual_add_kernel,
+        {
+            **dict.fromkeys(("Base", "Update", "Addend", "Out"), "*fp16"),
+            "N": "i32",
+            "HAS_BASE": base,
+            "BLOCK": fused.BLOCK_ADD,
+        },
+        num_warps=4,
     )
 
 
