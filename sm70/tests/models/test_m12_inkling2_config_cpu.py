@@ -568,7 +568,10 @@ def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
     assert config.cache_config.block_size == icfg.KV_BLOCK_SIZE
     # Upstream turns the unset async scheduling on after the hook.
     assert config.scheduler_config.async_scheduling is True
-    assert f"cudagraph_mode {want};" in route_log[0]
+    # The route line, whichever info lines the hook logs before it (the
+    # TurboMind tuning line comes first when a real _sm70_C is importable).
+    routes = [line for line in route_log if "cudagraph_mode" in line]
+    assert routes and f"cudagraph_mode {want};" in routes[0]
     if want == "FULL_DECODE_ONLY":
         compilation = config.compilation_config
         assert compilation.max_cudagraph_capture_size == icfg.DECODE_GRAPH_MAX_BATCH
