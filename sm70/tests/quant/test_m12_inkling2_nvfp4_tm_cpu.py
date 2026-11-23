@@ -176,6 +176,13 @@ def hidden(m):
     return x[torch.arange(m) % x.shape[0]].half()
 
 
+def stage_calls(m, top_k=2):
+    """Stage calls of one expert sum of m tokens: two per slot chunk, with
+    compact chunks of 80 slots for 80 < slots <= 640."""
+    slots = m * top_k
+    return 2 * (-(-slots // 80) if 80 < slots <= 640 else 1)
+
+
 def run(module, x, is_padding=None):
     out = torch.full_like(x, float("nan"))
     module(x, out, is_padding)
@@ -409,7 +416,7 @@ def test_route_matches_torch_path_tp1(tm, config, monkeypatch, m):
     out, ref = run(module, x), run(oracle, x)
     assert out.dtype == torch.float16 and bool(torch.isfinite(out).all())
     assert max_abs_rel(out, ref) < TOL
-    assert len(tm.stages) == 2
+    assert len(tm.stages) == stage_calls(m)
 
 
 @pytest.mark.parametrize("m", SIZES + [20])
@@ -459,8 +466,9 @@ def test_compact_form_up_to_80_slots(tm, config, m):
         assert torch.equal(ids.long(), sorted_ids)
 
 
-@pytest.mark.parametrize("m", [41, 64])
-def test_dense_form_above_80_slots(tm, config, m):
+@pytest.mark.parametrize("m", [321, 400])
+def test_dense_form_above_the_compact_batch_bound(tm, config, m):
+    assert 2 * m > moe_tm.COMPACT_BATCH_MAX_SLOTS == 640
     module = build(config)
     x = hidden(m)
     _, _, indices = module.route(x)
@@ -471,6 +479,30 @@ def test_dense_form_above_80_slots(tm, config, m):
         assert torch.equal(ids, torch.arange(8, dtype=torch.int32))
         assert offsets[0] == 0
         assert torch.equal(offsets[1:].long(), torch.cumsum(counts, 0))
+
+
+@pytest.mark.parametrize("m", [41, 64, 160, 320])
+def test_compact_chunks_up_to_the_compact_batch_bound(tm, config, monkeypatch, m):
+    """A verify-sized batch (80 < slots <= 640) runs as compact chunks of
+    80 slots, each slot its own group, in expert order."""
+    module = build(config)
+    x = hidden(m)
+    _, _, indices = module.route(x)
+    out = run(module, x)
+    slots = 2 * m
+    sorted_ids = torch.sort(indices.reshape(-1), stable=True).values
+    sizes = [min(80, slots - start) for start in range(0, slots, 80)]
+    assert [stage[0] for stage in tm.stages[::2]] == sizes
+    start = 0
+    for (rows13, ne13, *_, off13, ids13), (rows2, ne2, *_, off2, ids2) in zip(
+        tm.stages[::2], tm.stages[1::2]
+    ):
+        assert rows13 == ne13 == rows2 == ne2
+        for offsets, ids in ((off13, ids13), (off2, ids2)):
+            assert torch.equal(offsets, torch.arange(rows13 + 1, dtype=torch.int32))
+            assert torch.equal(ids.long(), sorted_ids[start : start + rows13])
+        start += rows13
+    assert max_abs_rel(out, run(build_torch(config, monkeypatch), x).float()) < TOL
 
 
 def test_compact_bound_is_the_turbomind_limit():
@@ -491,8 +523,9 @@ def test_padding_rows_are_zero(tm, config, monkeypatch, m, pad):
     assert max_abs_rel(out, ref) < TOL
     # Padding slots run on expert E - 1 and add zero: no host count.
     for rows, _, _, _, offsets, ids in tm.stages:
-        assert rows == int(offsets[-1]) == 2 * m
+        assert rows == int(offsets[-1])
         assert int(ids.max()) < 8 and int(ids.min()) >= 0
+    assert sum(stage[0] for stage in tm.stages[::2]) == 2 * m
 
 
 @pytest.mark.parametrize("m", [1, 64])
@@ -501,7 +534,7 @@ def test_all_padding_is_zero(tm, config, m):
     x = hidden(m)
     x[0] = float("nan")
     out = run(module, x, torch.ones(m, dtype=torch.bool))
-    assert len(tm.stages) == 2 and bool((out == 0).all())
+    assert len(tm.stages) == stage_calls(m) and bool((out == 0).all())
 
 
 @pytest.mark.parametrize("m", [1, 8, 41])
@@ -702,7 +735,9 @@ def test_chunked_output_equals_unchunked(tm, monkeypatch, compact, m, chunk):
     random_route(tm, max_slots=2 * m, compact=compact).expert_sum(
         x, indices, weights, whole
     )
-    assert [stage[0] for stage in tm.stages] == [2 * m, 2 * m]
+    step = 80 if compact and 80 < 2 * m <= 640 else 2 * m
+    whole_sizes = [min(step, 2 * m - start) for start in range(0, 2 * m, step)]
+    assert [stage[0] for stage in tm.stages[::2]] == whole_sizes
     tm.stages.clear()
     moe_tm.Workspace.clear()
     monkeypatch.setattr(moe_tm, "CHUNK_ROWS", chunk)
