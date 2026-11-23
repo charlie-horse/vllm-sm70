@@ -173,6 +173,8 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
         "VLLM_SM70_INKLING_GROUPED_MOE",
+        "VLLM_SM70_INKLING_FUSED_ROUTING",
+        "VLLM_SM70_INKLING_TM_TUNE",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -453,6 +455,29 @@ def _inkling_grouped_moe_off(name):
         assert moe.on_grouped(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_fused_routing_off(name):
+    """A one-token GPU batch keeps the torch router of inkling2_sm70/moe.py;
+    the kernels' own checks are tests/ops/test_m12_inkling2_routing_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import moe
+
+    assert moe.FUSED_SWITCH == name
+    x = SimpleNamespace(is_cuda=True, shape=(1, 64))
+    with mock.patch.object(moe._compat, "AVAILABLE", True):
+        assert moe.on_fused_routing(x, 8) is False
+
+
+def _inkling_tm_tune_off(name):
+    """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
+    checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+
+    assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -526,6 +551,10 @@ def _path_off(name):
         _inkling_decode_graph_off(name)
     elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
         _inkling_grouped_moe_off(name)
+    elif name == "VLLM_SM70_INKLING_FUSED_ROUTING":
+        _inkling_fused_routing_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_TUNE":
+        _inkling_tm_tune_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
