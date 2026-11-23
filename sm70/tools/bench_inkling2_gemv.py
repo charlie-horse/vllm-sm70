@@ -36,7 +36,7 @@ DENSE = {  # name: (rows, K, inputs)
     "qkvr_local": (sum(QKVR), HIDDEN, 1),
     "qkvr_gated": (sum(QKVR), HIDDEN, 3),
     "wo": (HIDDEN, 1536, 1),
-    "lm_head": (50256, HIDDEN, 1),
+    "lm_head": (100512, HIDDEN, 1),  # vocab 201024 over TP2
 }
 DENSE_CANDIDATES = [
     (n, k, w)
