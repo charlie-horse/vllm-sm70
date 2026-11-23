@@ -23,6 +23,8 @@ clip, the norm and the K/V store run as one kernel launch
 (ops/paged_conv.py ``key_value_conv``). In a decode-only batch on the route
 of fused_small.py the q and r clips, tau and the projection of r run as one
 launch (ops/small_ops.py ``query_rel``); otherwise q and r run on torch.
+When both run kernels on a decode-only batch, the two are one launch on the
+route of visit_fusion.py (ops/visit.py ``prologue``).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_K, STREAM_V
 from .fused_small import on_fused
 from .ops import paged_conv, small_ops
+from .ops import visit as visit_ops
 from .ops.torch_ref import l2_clip, log_scale_tau, rms_norm
 from .sconv import (
     _block_tokens,
@@ -46,6 +49,7 @@ from .sconv import (
     on_triton,
     static_conv,
 )
+from .visit_fusion import on_decode
 from .weights import rows_view
 
 __all__ = [
@@ -220,6 +224,14 @@ def _query_rel_torch(
         rel_out[:n].masked_fill_(padding, 0.0)
 
 
+def _check_conv_rows(k: torch.Tensor, conv_metadata: Any, n: int) -> None:
+    if _real_rows(k, conv_metadata) != n:
+        raise ValueError(
+            f"vllm_sm70: attention metadata of {n} tokens, conv-state metadata "
+            f"of {_real_rows(k, conv_metadata)}."
+        )
+
+
 @eager_break_during_capture
 def attention_prologue(
     q: torch.Tensor,
@@ -277,7 +289,26 @@ def attention_prologue(
             f"vllm_sm70: K/V cache blocks hold {attn_owner.kv_cache.shape[2]} "
             f"tokens, the metadata has block size {attn_metadata.block_size}."
         )
-    if on_fused(q, is_decode_only(attn_metadata)):
+    decode_only = is_decode_only(attn_metadata)
+    fused = on_fused(q, decode_only)
+    if (
+        fused
+        and conv_metadata is not None
+        and on_triton(k)
+        and on_decode(q, decode_only)
+        and conv_owner.kv_cache.shape[1] * q_scale.shape[1] == k.shape[1]
+    ):
+        _check_conv_rows(k, conv_metadata, n)
+        _block_tokens(conv_owner.kv_cache, conv_metadata)
+        visit_ops.prologue(
+            q, r, q_scale, rel_scale, rel_proj, attn_metadata, q_out, rel_out,
+            k, v, k_conv, v_conv, k_taps, v_taps, conv_owner.kv_cache,
+            conv_metadata, conv_owner.stream_ranges[STREAM_K],
+            conv_owner.stream_ranges[STREAM_V], attn_owner.kv_cache, n,
+            qk_clip=qk_clip, rel_clip=rel_clip, eps=eps, log_scaling=log_scaling,
+        )  # fmt: skip
+        return
+    if fused:
         small_ops.query_rel(
             q, r, q_scale, rel_scale, rel_proj, attn_metadata.slot_mapping,
             attn_metadata.positions, q_out, rel_out, n,
@@ -290,11 +321,7 @@ def attention_prologue(
         )  # fmt: skip
     if conv_metadata is None:
         return
-    if _real_rows(k, conv_metadata) != n:
-        raise ValueError(
-            f"vllm_sm70: attention metadata of {n} tokens, conv-state metadata "
-            f"of {_real_rows(k, conv_metadata)}."
-        )
+    _check_conv_rows(k, conv_metadata, n)
     k_stream = conv_owner.stream_ranges[STREAM_K]
     v_stream = conv_owner.stream_ranges[STREAM_V]
     if on_triton(k):

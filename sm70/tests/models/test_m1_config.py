@@ -190,6 +190,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_SHARDED_EMBED",
         "VLLM_SM70_INKLING_MXFP8_EXPERTS",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
+        "VLLM_SM70_INKLING_VISIT_FUSION",
         "VLLM_SM70_INKLING_MERGED_PROJ",
         "VLLM_SM70_INKLING_GREEDY_TOP1",
     }
@@ -519,6 +520,22 @@ def _inkling_greedy_top1_off(name):
     assert greedy.SWITCH == name and not greedy.enabled()
 
 
+def _inkling_visit_fusion_off(name):
+    """A decode-only GPU batch keeps the kernels of each op of a layer
+    visit (inkling2_sm70/visit_fusion.py); the fused kernels' own checks are
+    tests/ops/test_m12_inkling2_visit_fusion_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import visit_fusion
+
+    assert visit_fusion.SWITCH == name
+    x = SimpleNamespace(is_cuda=True)
+    with mock.patch.object(visit_fusion._compat, "AVAILABLE", True):
+        assert visit_fusion.on_decode(x, True) is False
+        assert visit_fusion.on_visit(x, True, True) is False
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -778,6 +795,8 @@ def _path_off(name):
         _inkling_fused_small_ops_off(name)
     elif name == "VLLM_SM70_INKLING_GREEDY_TOP1":
         _inkling_greedy_top1_off(name)
+    elif name == "VLLM_SM70_INKLING_VISIT_FUSION":
+        _inkling_visit_fusion_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

@@ -36,8 +36,16 @@ from typing import Final, NamedTuple
 import torch
 
 from ._compat import exp, tl, triton
+from .tickets import ROUTE_TICKET, ticket_counter
 
-__all__ = ["MAX_SLOTS", "Routed", "combine", "route", "router_logits"]
+__all__ = [
+    "MAX_SLOTS",
+    "Routed",
+    "RouterInput",
+    "combine",
+    "route",
+    "router_logits",
+]
 
 # Routed slots (M * top_k) up to which the launchers are meant to run.
 MAX_SLOTS: Final = 64
@@ -86,34 +94,23 @@ def _router_logits_kernel(
 
 
 @triton.jit
-def _route_kernel(
+def _route_plan(
     logits_ptr,
     bias_ptr,
     pad_ptr,
-    ids_ptr,
-    weights_ptr,
-    pos_ptr,
-    sorted_ptr,
-    offsets_ptr,
-    src_ptr,
-    rows_ptr,
     tokens,
     experts,
-    hidden,
     stride_l,
-    stride_src,
-    stride_rows,
-    pad_id,
     route_scale,
     TOP_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_TOP: tl.constexpr,
-    BLOCK_H: tl.constexpr,
     HAS_PAD: tl.constexpr,
-    DISPATCH: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    """(ids, weights, pos) [BLOCK_M, BLOCK_TOP] and the running slot count
+    of each expert, `upto` [BLOCK_E]. The logits are read from L2, so a
+    program reads the rows the other programs of its launch wrote."""
     t = tl.arange(0, BLOCK_M)
     e = tl.arange(0, BLOCK_E)
     r = tl.arange(0, BLOCK_TOP)
@@ -127,6 +124,7 @@ def _route_kernel(
         logits_ptr + t[:, None] * stride_l + e[None, :],
         mask=t_ok[:, None] & e_ok[None, :],
         other=0.0,
+        cache_modifier=".cg",
     )
     score = tl.div_rn(1.0, 1.0 + exp(-logit))
     bias = tl.load(bias_ptr + e, mask=e_ok, other=0.0)
@@ -158,16 +156,7 @@ def _route_kernel(
     invalid = tl.where(t_ok, TOP_K - n_valid, 0)
     invalid_before = tl.cumsum(invalid, axis=0) - invalid
 
-    if DISPATCH:
-        h = pid * BLOCK_H + tl.arange(0, BLOCK_H)
-        h_mask = t_ok[:, None] & (h < hidden)[None, :]
-        x = tl.load(
-            src_ptr + t[:, None].to(tl.int64) * stride_src + h[None, :],
-            mask=h_mask,
-            other=0.0,
-        )
-
-    ids = tl.zeros([BLOCK_M, BLOCK_TOP], dtype=tl.int32) + pad_id
+    ids = tl.zeros([BLOCK_M, BLOCK_TOP], dtype=tl.int32) - 1
     weights = tl.zeros([BLOCK_M, BLOCK_TOP], dtype=tl.float32)
     pos = tl.zeros([BLOCK_M, BLOCK_TOP], dtype=tl.int32)
     rest = chosen
@@ -186,27 +175,204 @@ def _route_kernel(
         ids = tl.where(col & ok[:, None], cur[:, None], ids)
         weights = tl.where(col & ok[:, None], w_j[:, None], weights)
         pos = tl.where(col, p_j[:, None], pos)
-        if DISPATCH:
-            tl.store(
-                rows_ptr + p_j[:, None].to(tl.int64) * stride_rows + h[None, :],
-                x,
-                mask=h_mask,
-            )
+    return ids, weights, pos, upto
 
+
+@triton.jit
+def _route_rows(
+    pos,
+    h,
+    src_ptr,
+    rows_ptr,
+    tokens,
+    hidden,
+    stride_src,
+    stride_rows,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_TOP: tl.constexpr,
+):
+    """Copy the columns `h` of each token's row x[t] to its sorted rows."""
+    t = tl.arange(0, BLOCK_M)
+    r = tl.arange(0, BLOCK_TOP)
+    h_mask = (t < tokens)[:, None] & (h < hidden)[None, :]
+    x = tl.load(
+        src_ptr + t[:, None].to(tl.int64) * stride_src + h[None, :],
+        mask=h_mask,
+        other=0.0,
+    )
+    for j in tl.static_range(TOP_K):
+        p_j = tl.sum(tl.where(r[None, :] == j, pos, 0), axis=1)
+        tl.store(
+            rows_ptr + p_j[:, None].to(tl.int64) * stride_rows + h[None, :],
+            x,
+            mask=h_mask,
+        )
+
+
+@triton.jit
+def _route_store(
+    ids,
+    weights,
+    pos,
+    upto,
+    ids_ptr,
+    weights_ptr,
+    pos_ptr,
+    sorted_ptr,
+    offsets_ptr,
+    tokens,
+    experts,
+    pad_id,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_TOP: tl.constexpr,
+    DISPATCH: tl.constexpr,
+):
+    t = tl.arange(0, BLOCK_M)
+    e = tl.arange(0, BLOCK_E)
+    r = tl.arange(0, BLOCK_TOP)
+    out = t[:, None] * TOP_K + r[None, :]
+    out_mask = (t < tokens)[:, None] & (r < TOP_K)[None, :]
+    tl.store(ids_ptr + out, tl.where(ids >= 0, ids, pad_id), mask=out_mask)
+    tl.store(weights_ptr + out, weights, mask=out_mask)
+    if DISPATCH:
+        tl.store(pos_ptr + out, pos, mask=out_mask)
+        clamped = tl.where(ids >= 0, ids, experts - 1)
+        tl.store(sorted_ptr + pos, clamped, mask=out_mask)
+        # offsets[0] = 0, offsets[e + 1] = slots of experts <= e; the
+        # padding slots count as expert E - 1.
+        e_ok = e < experts
+        bound = tl.where(e == experts - 1, tokens * TOP_K, upto)
+        tl.store(offsets_ptr + 1 + e, bound, mask=e_ok)
+        tl.store(offsets_ptr + e, tl.zeros_like(e), mask=e == 0)
+
+
+@triton.jit
+def _route_kernel(
+    logits_ptr,
+    bias_ptr,
+    pad_ptr,
+    ids_ptr,
+    weights_ptr,
+    pos_ptr,
+    sorted_ptr,
+    offsets_ptr,
+    src_ptr,
+    rows_ptr,
+    tokens,
+    experts,
+    hidden,
+    stride_l,
+    stride_src,
+    stride_rows,
+    pad_id,
+    route_scale,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_TOP: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HAS_PAD: tl.constexpr,
+    DISPATCH: tl.constexpr,
+):
+    # Every program routes all tokens; program p copies columns block p.
+    pid = tl.program_id(0)
+    ids, weights, pos, upto = _route_plan(
+        logits_ptr, bias_ptr, pad_ptr, tokens, experts, stride_l, route_scale,
+        TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+        HAS_PAD=HAS_PAD,
+    )  # fmt: skip
+    if DISPATCH:
+        _route_rows(
+            pos, pid * BLOCK_H + tl.arange(0, BLOCK_H), src_ptr, rows_ptr, tokens,
+            hidden, stride_src, stride_rows,
+            TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_TOP=BLOCK_TOP,
+        )  # fmt: skip
     if pid == 0:
-        out = t[:, None] * TOP_K + r[None, :]
-        out_mask = t_ok[:, None] & (r < TOP_K)[None, :]
-        tl.store(ids_ptr + out, ids, mask=out_mask)
-        tl.store(weights_ptr + out, weights, mask=out_mask)
+        _route_store(
+            ids, weights, pos, upto, ids_ptr, weights_ptr, pos_ptr, sorted_ptr,
+            offsets_ptr, tokens, experts, pad_id,
+            TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+            DISPATCH=DISPATCH,
+        )  # fmt: skip
+
+
+@triton.jit
+def _router_route_kernel(
+    x_ptr,
+    w_ptr,
+    logits_ptr,
+    counter_ptr,
+    bias_ptr,
+    pad_ptr,
+    ids_ptr,
+    weights_ptr,
+    pos_ptr,
+    sorted_ptr,
+    offsets_ptr,
+    src_ptr,
+    rows_ptr,
+    tokens,
+    experts,
+    hidden,
+    stride_x,
+    stride_w,
+    stride_src,
+    stride_rows,
+    pad_id,
+    route_scale,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_TOP: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_PAD: tl.constexpr,
+    DISPATCH: tl.constexpr,
+):
+    # Program p: the logits of expert p for every token, as
+    # _router_logits_kernel sums them. The last program to finish (a ticket
+    # on `counter`) routes, copies the rows and puts the ticket back to 0.
+    expert = tl.program_id(0)
+    t = tl.arange(0, BLOCK_M)
+    t_ok = t < tokens
+    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for k0 in range(0, hidden, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = k < hidden
+        w = tl.load(w_ptr + expert.to(tl.int64) * stride_w + k, mask=k_mask, other=0.0)
+        v = tl.load(
+            x_ptr + t[:, None].to(tl.int64) * stride_x + k[None, :],
+            mask=t_ok[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(v * w[None, :], axis=1)
+    tl.store(logits_ptr + t * experts + expert, acc, mask=t_ok)
+    tl.debug_barrier()
+    ticket = tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="gpu")
+    if ticket == tl.num_programs(0) - 1:
+        tl.debug_barrier()
+        ids, weights, pos, upto = _route_plan(
+            logits_ptr, bias_ptr, pad_ptr, tokens, experts, experts, route_scale,
+            TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+            HAS_PAD=HAS_PAD,
+        )  # fmt: skip
         if DISPATCH:
-            tl.store(pos_ptr + out, pos, mask=out_mask)
-            clamped = tl.where((ids >= 0) & (ids < experts), ids, experts - 1)
-            tl.store(sorted_ptr + pos, clamped, mask=out_mask)
-            # offsets[0] = 0, offsets[e + 1] = slots of experts <= e; the
-            # padding slots count as expert E - 1.
-            bound = tl.where(e == experts - 1, tokens * TOP_K, upto)
-            tl.store(offsets_ptr + 1 + e, bound, mask=e_ok)
-            tl.store(offsets_ptr + e, tl.zeros_like(e), mask=e == 0)
+            for h0 in range(0, hidden, BLOCK_H):
+                _route_rows(
+                    pos, h0 + tl.arange(0, BLOCK_H), src_ptr, rows_ptr, tokens,
+                    hidden, stride_src, stride_rows,
+                    TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_TOP=BLOCK_TOP,
+                )  # fmt: skip
+        _route_store(
+            ids, weights, pos, upto, ids_ptr, weights_ptr, pos_ptr, sorted_ptr,
+            offsets_ptr, tokens, experts, pad_id,
+            TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+            DISPATCH=DISPATCH,
+        )  # fmt: skip
+        tl.atomic_xchg(counter_ptr, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -262,8 +428,17 @@ def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
+class RouterInput(NamedTuple):
+    """The router GEMV's input x [M, H] (any float dtype) and fp32 weight
+    [E, H], passed to ``route`` in place of the logits: one launch then runs
+    the GEMV and the routing (``_router_route_kernel``)."""
+
+    x: torch.Tensor
+    weight: torch.Tensor
+
+
 def route(
-    logits: torch.Tensor,
+    logits: torch.Tensor | RouterInput,
     bias: torch.Tensor,
     top_k: int,
     route_scale: float,
@@ -273,16 +448,25 @@ def route(
     dispatch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | None = None,
 ) -> Routed:
-    """Route the rows of fp32 `logits` [M, E] (see the module doc).
+    """Route the rows of fp32 `logits` [M, E] (see the module doc), or of
+    the logits of a ``RouterInput``, computed in the same launch.
 
     `dispatch` = (x [M, H], rows [>= S, H], sorted_ids int32 [>= S],
     offsets int32 [E + 1]): the buffers the sorted slots go to.
     """
-    tokens, experts = logits.shape
-    assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+    router = logits if isinstance(logits, RouterInput) else None
+    if router is not None:
+        tokens, experts = router.x.shape[0], router.weight.shape[0]
+        assert router.weight.dtype == torch.float32
+        assert router.weight.shape[1] == router.x.shape[1]
+        assert router.x.stride(-1) == 1 and router.weight.stride(-1) == 1
+        device = router.x.device
+    else:
+        tokens, experts = logits.shape
+        assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+        device = logits.device
     assert bias.dtype == torch.float32 and bias.shape == (experts,)
     assert 0 < top_k <= experts and not 0 <= pad_id < experts
-    device = logits.device
     ids = torch.empty(tokens, top_k, dtype=torch.int32, device=device)
     weights = torch.empty(tokens, top_k, dtype=torch.float32, device=device)
     pos = None
@@ -294,6 +478,7 @@ def route(
         assert x.stride(-1) == 1 and rows.stride(-1) == 1
         assert sorted_ids.dtype == offsets.dtype == torch.int32
         assert sorted_ids.numel() >= slots and offsets.numel() >= experts + 1
+        assert router is None or router.x.shape[1] == x.shape[1]
         pos = torch.empty(tokens, top_k, dtype=torch.int32, device=device)
         hidden = x.shape[1]
         grid = (triton.cdiv(hidden, BLOCK_H),)
@@ -304,22 +489,44 @@ def route(
         grid = (1,)
     if tokens == 0:
         return Routed(ids, weights, pos)
+    meta = {
+        "TOP_K": top_k,
+        "BLOCK_M": max(2, triton.next_power_of_2(tokens)),
+        "BLOCK_E": max(2, triton.next_power_of_2(experts)),
+        "BLOCK_TOP": max(2, triton.next_power_of_2(top_k)),
+        "BLOCK_H": BLOCK_H,
+        "HAS_PAD": is_padding is not None,
+        "DISPATCH": dispatch is not None,
+        "num_warps": 4,
+        "enable_fp_fusion": False,
+    }
+    pad = is_padding if is_padding is not None else ids
+    if router is not None:
+        x_r, weight = router
+        scratch = torch.empty(tokens, experts, dtype=torch.float32, device=device)
+        _router_route_kernel[(experts,)](
+            x_r, weight, scratch, ticket_counter(device, ROUTE_TICKET), bias, pad,
+            ids, weights, pos if pos is not None else ids, sorted_ids, offsets,
+            src, rows,
+            tokens, experts, x_r.shape[1], x_r.stride(0), weight.stride(0),
+            src_stride, rows_stride, pad_id, float(route_scale),
+            BLOCK_K=_fused_block_k(meta["BLOCK_M"]), **meta,
+        )  # fmt: skip
+        return Routed(ids, weights, pos)
     _route_kernel[grid](
-        logits, bias, is_padding if is_padding is not None else ids,
+        logits, bias, pad,
         ids, weights, pos if pos is not None else ids, sorted_ids, offsets,
         src, rows,
         tokens, experts, hidden, logits.stride(0), src_stride, rows_stride,
-        pad_id, float(route_scale),
-        TOP_K=top_k,
-        BLOCK_M=max(2, triton.next_power_of_2(tokens)),
-        BLOCK_E=max(2, triton.next_power_of_2(experts)),
-        BLOCK_TOP=max(2, triton.next_power_of_2(top_k)),
-        BLOCK_H=BLOCK_H,
-        HAS_PAD=is_padding is not None,
-        DISPATCH=dispatch is not None,
-        num_warps=4, enable_fp_fusion=False,
+        pad_id, float(route_scale), **meta,
     )  # fmt: skip
     return Routed(ids, weights, pos)
+
+
+def _fused_block_k(block_m: int) -> int:
+    """Router columns per step of the fused GEMV: those of
+    _router_logits_kernel up to 8 tokens, fewer for more."""
+    return max(64, min(GEMV_BLOCK_K, 4096 // block_m))
 
 
 def combine(

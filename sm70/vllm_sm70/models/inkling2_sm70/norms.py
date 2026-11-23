@@ -26,6 +26,9 @@ message gates of a batch of at most ``fused.MAX_TOKENS`` tokens are three
 launches (``fused.gate_down``, ``fused.gate_up``, ``loop.blend_rms_norm``);
 larger batches run the two GEMMs on torch.bmm between ``loop.pair_rms_norm``
 and the blend.
+On the route of visit_fusion.py a mix over a ``Pending`` state runs the
+short conv that produces it in the same launch (ops/visit.py ``conv_mix``)
+and the three gate launches are one (``gate_blend``).
 
 The outputs of `message_sources` and `message_mix` are laid out per path and
 are read only by `message_mix` and `sublayer_inputs`.
@@ -45,6 +48,8 @@ from .ops import attn_res as attn_res_ops
 from .ops import fused as fused_ops
 from .ops import loop as loop_ops
 from .ops import norm as norm_ops
+from .ops import visit as visit_ops
+from .visit_fusion import Pending, on_decode
 
 __all__ = [
     "SWITCH",
@@ -111,6 +116,8 @@ class Bank:
         )
         self.count = 0
         self.triton = on_triton(like, decode_only)
+        # The message gates run as one launch (visit_fusion.py).
+        self.fused_gates = self.triton and on_decode(like, decode_only)
 
     def states(self, start: int = 0) -> torch.Tensor:
         """[T, count - start, H]: the kept states from `start` on, a view."""
@@ -211,9 +218,20 @@ def _blend(
     norm_weight: torch.Tensor,
     eps: float,
     dtype: torch.dtype,
+    fused: bool = False,
 ) -> torch.Tensor:
     """[S, T, H] `dtype`: the message gates `gates` on fp32 [S, T, H] `dests`
-    and `messages`, each output normed with its row of `norm_weight`."""
+    and `messages`, each output normed with its row of `norm_weight`; one
+    launch when `fused` (visit_fusion.py) and the batch is small."""
+    rows = dests.shape[0] * dests.shape[1]
+    small = dests.shape[1] <= fused_ops.MAX_TOKENS
+    if fused and small and rows <= visit_ops.GATE_MAX_ROWS:
+        return visit_ops.gate_blend(
+            dests, messages, [gate.down_weight for gate in gates],
+            [gate.gain_weight for gate in gates],
+            [gate.forget_weight for gate in gates],
+            gates[0].eps, norm_weight, eps, dtype,
+        )  # fmt: skip
     if dests.shape[1] <= fused_ops.MAX_TOKENS:
         low = fused_ops.gate_down(
             dests, messages, [gate.down_weight for gate in gates], gates[0].eps
@@ -239,7 +257,7 @@ def _blend(
 
 def _triton_inputs(
     bank: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     addend: torch.Tensor | None,
     query: torch.Tensor | None,
     norm_weight: torch.Tensor,
@@ -248,10 +266,22 @@ def _triton_inputs(
     gates: Sequence[Any],
     messages: torch.Tensor | None,
     first: int,
+    pending: Pending | None = None,
+    fused_gates: bool = False,
 ) -> list[torch.Tensor]:
     rows = norm_weight.shape[0]
-    state = state.contiguous()
     assert query is not None or addend is None
+    assert (pending is None) != (state is None)
+    if pending is None:
+        state = state.contiguous()
+
+    def mix(
+        weight: torch.Tensor | None, mix_eps: float, out_dtype: torch.dtype | None
+    ) -> torch.Tensor:
+        if pending is not None:
+            return pending.mix(bank, query, weight, mix_eps, out_dtype)
+        return _mix(bank, state, addend, query, weight, mix_eps, out_dtype)
+
     if not gates:
         if query is None:
             return [
@@ -259,12 +289,11 @@ def _triton_inputs(
                 for i in range(rows)
             ]
         if query.shape == norm_weight.shape:
-            mixes = _mix(bank, state, addend, query, norm_weight, eps, dtype)
-            return list(mixes.unbind(0))
+            return list(mix(norm_weight, eps, dtype).unbind(0))
     if query is None:
         dests = state.float().unsqueeze(0)
     else:
-        dests = _mix(bank, state, addend, query, None, 0.0, None)
+        dests = mix(None, 0.0, None)
     if not gates:
         return [
             norm_ops.rms_norm(dests[i % len(dests)], norm_weight[i % rows], eps, dtype)
@@ -279,13 +308,14 @@ def _triton_inputs(
         norm_weight.expand(num, -1),
         eps,
         dtype,
+        fused_gates,
     )
     return list(blended.unbind(0))
 
 
 def sublayer_inputs(
     bank: Bank,
-    state: torch.Tensor | Residual,
+    state: torch.Tensor | Residual | Pending,
     query: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
@@ -298,8 +328,9 @@ def sublayer_inputs(
     """The normed input streams [T, H] of a sublayer, in `dtype`, on the
     route of `bank`.
 
-    bank: the normed block states. state [T, H] or a `Residual` of the
-    route: the current residual state. query [Q, H] fp32: the AttnRes mix
+    bank: the normed block states. state [T, H], a `Residual` of the route
+    or a visit_fusion ``Pending`` of the kernel route: the current residual
+    state; a mix of a pending state runs its conv. query [Q, H] fp32: the AttnRes mix
     of each stream; None: the state itself. norm_weight [W, H]: the norm of
     each stream. gates: the message gates of the streams, which read the
     rows `first`... of `messages` (`message_mix`); empty in a first pass.
@@ -307,7 +338,13 @@ def sublayer_inputs(
     gates max(Q, W).
     """
     addend = None
-    if isinstance(state, Residual):
+    pending = state if isinstance(state, Pending) else None
+    if pending is not None:
+        if bank.triton and query is not None and pending.fits(query.shape[0]):
+            state = None
+        else:
+            (state, addend), pending = pending.resolve(), None
+    elif isinstance(state, Residual):
         if state.value is None:
             state, addend = state.parts()
         else:
@@ -324,6 +361,8 @@ def sublayer_inputs(
             gates,
             messages,
             first,
+            pending,
+            bank.fused_gates,
         )
     assert addend is None, "a Residual of the kernel route"
     if query is None:

@@ -221,6 +221,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_INKLING_DSPARK_KERNELS` | new (Inkling 2; kill switch: `0` runs the DSpark draft's norm, RoPE, block attention, SwiGLU, Markov gate and soft-cap ops on torch, default on runs the Triton kernels of `ops/dspark.py`) |
 | `VLLM_SM70_INKLING_FUSED_SMALL_OPS` | new (Inkling 2; kill switch: `0` sends the small chains of decode-only batches (q/r clips and relative projection, attention output gate, TurboMind SwiGLU, short-conv padding masks) back to the torch ops, default on runs one Triton kernel each on GPU tensors) |
 | `VLLM_SM70_INKLING_GREEDY_TOP1` | new (Inkling 2; kill switch: `0` keeps every batch on compute_logits, the fp16 logit all-gather and the upstream Sampler, default on gives an all-greedy batch the F12 fast path admits a per-shard soft-capped top-1 and a pair all-gather) |
+| `VLLM_SM70_INKLING_VISIT_FUSION` | new (Inkling 2; kill switch: `0` puts decode-only batches back on one kernel per op of a layer visit; default on merges the short convs with the residual add and the AttnRes mix after them, the three message-gate kernels, the prologue's q/r and K/V kernels, and the router GEMV with the route, on GPU tensors) |
 | `VLLM_SM70_INKLING_MERGED_PROJ` | new (Inkling 2; opt-in: default off keeps each projection in its own buffer and GEMM, `1` packs the projections that share an input and runs a small visit's projections as one GEMM) |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |

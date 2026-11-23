@@ -35,6 +35,8 @@ TurboMind or the grouped route is routed by ops/routing.py (router GEMV,
 then top-k, weights, slot sort and row gather in one launch, the weighted
 sum in another) unless VLLM_SM70_INKLING_FUSED_ROUTING=0, which keeps the
 torch router and the torch sort of those routes. Read and fixed as above.
+On a decode-only batch the router GEMV runs inside the route launch
+(visit_fusion.py).
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from . import act_quant, moe_tm
 from .expert_weights import MXFP8, NVFP4, ExpertLayer, RangeCheck, check_cast_range
 from .fused_small import on_fused
 from .ops import _compat, grouped_gemm, routing, torch_ref
+from .visit_fusion import on_decode
 
 SWITCH = "VLLM_SM70_INKLING_GROUPED_MOE"
 _enabled = envs.environment_variables()[SWITCH]
@@ -451,7 +454,11 @@ class Inkling2Sm70Experts(nn.Module):
         route; the caller checks ``on_fused_routing`` and the route.
         `decode_only` as `expert_sum`'s `rowwise`."""
         gate = self.gate
-        logits = routing.router_logits(x, gate.weight)
+        if on_decode(x, decode_only):
+            # The router GEMV runs inside the route launch (visit_fusion.py).
+            logits = routing.RouterInput(x, gate.weight)
+        else:
+            logits = routing.router_logits(x, gate.weight)
         if is_padding is not None:
             is_padding = is_padding.reshape(-1)
         x = act_quant.apply(self.act_quant, x)

@@ -440,6 +440,9 @@ def test_interpreted_suite():
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
     ):
         env.pop(name, None)
+    # The small-op kernels on their own; test_m12_inkling2_visit_fusion_cpu.py
+    # checks the prologue that merges query_rel into one launch.
+    env["VLLM_SM70_INKLING_VISIT_FUSION"] = "0"
     proc = subprocess.run(
         [
             sys.executable, "-m", "pytest", __file__, "-q", "-p",

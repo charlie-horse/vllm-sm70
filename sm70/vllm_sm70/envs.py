@@ -457,6 +457,15 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
             "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
         ),
+        # "0": Inkling 2 decode-only batches run one kernel per op of a layer
+        # visit again instead of the merged kernels of inkling2_sm70/
+        # visit_fusion.py (short conv with residual and AttnRes mix, message
+        # gates, prologue, router with route). Env-only (no Sm70Config
+        # field), read per eager call and fixed at capture in a replayed CUDA
+        # graph; other batches and tensors off the GPU never merge.
+        "VLLM_SM70_INKLING_VISIT_FUSION": kill_switch(
+            "VLLM_SM70_INKLING_VISIT_FUSION"
+        ),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

@@ -43,6 +43,7 @@ from .layers import (
     padding_mask,
 )
 from .norms import message_mix, message_sources, rms_norm, sublayer_inputs
+from .visit_fusion import value
 from .weights import build_weight_map, merged_enabled
 
 __all__ = ["Inkling2Sm70LoopModel", "PartialAudit", "VisitDump", "layer_visits"]
@@ -232,6 +233,10 @@ class Inkling2Sm70LoopModel(nn.Module):
         entry_hidden = message_bank = None
         entry_count = 0
         for visit, (layer_idx, pass_idx) in enumerate(self.visits):
+            # A visit may leave its output pending for the next mix
+            # (visit_fusion.py); everything else reads its value.
+            if layer_idx == core.start or visit in self.aux_hidden_state_layers:
+                hidden = value(hidden)
             if layer_idx == core.start:
                 if pass_idx == 0:
                     entry_hidden, entry_count = hidden, bank.count
@@ -259,8 +264,10 @@ class Inkling2Sm70LoopModel(nn.Module):
                 self.caches.conv[layer_idx, pass_idx],
                 is_padding,
                 None if audit is None else functools.partial(audit.record, visit),
+                defer=True,
             )
             if self.visit_hook is not None:
+                hidden = value(hidden)
                 self.visit_hook(visit, layer_idx, pass_idx, hidden)
         if audit is not None:
             audit.save()

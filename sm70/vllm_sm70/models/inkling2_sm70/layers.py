@@ -23,6 +23,10 @@ inputs of a visit with up to ``prologue.STACKED_MAX_TOKENS`` tokens over the
 whole qkvr (and tap) rows, and the gain and forget gates of a message gate.
 The q and r clip scales are then read in fp32 copies made after loading.
 
+On the route of visit_fusion.py the attention output conv runs inside the
+MLP input mix, and a visit's MLP output conv and residual add run inside
+the next visit's attention input mix (``defer``) or as one launch.
+
 Rounding as the reference (transformers modeling_inkling2_loop.py): the
 residual stream and the block states are in the model dtype between visits;
 AttnRes mixes, message gates, norms and residual adds run in fp32; each norm
@@ -54,6 +58,7 @@ from .prologue import (
     project_qkvr,
 )
 from .sconv import short_conv
+from .visit_fusion import Conv, Pending, on_visit, value
 from .weights import MESSAGE_STREAMS, ParamSpec, qkvr_sizes, rows_view
 
 __all__ = [
@@ -341,7 +346,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
 
     def _attention_inputs(
         self,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor | Pending,
         bank: Bank,
         attn_query: torch.Tensor | None,
         messages: torch.Tensor | None,
@@ -364,7 +369,7 @@ class Inkling2Sm70DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor | Pending,
         bank: Bank,
         attn_query: torch.Tensor | None,
         mlp_query: torch.Tensor,
@@ -373,40 +378,50 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         conv_owner: Any,
         is_padding: torch.Tensor,
         partial_hook: PartialHook | None = None,
-    ) -> torch.Tensor:
+        defer: bool = False,
+    ) -> torch.Tensor | Pending:
         """One visit of the layer over the caches of the visit's owners.
 
-        hidden [T, H]: the residual stream, model dtype. bank: the normed
+        hidden [T, H]: the residual stream, model dtype, or the ``Pending``
+        output of the previous visit. bank: the normed
         block states, the same on every rank; a layer that starts a block
         appends its input. attn_query [1 or 3, H], None in the first layer;
         mlp_query [1, H]. messages: the ``norms.message_mix`` of the four
         ``MESSAGE_STREAMS``, None in a first pass. is_padding [T] bool.
-        partial_hook gets this rank's o_proj and expert partials.
-        Returns the new residual stream.
+        partial_hook gets this rank's o_proj and expert partials. Returns
+        the new residual stream; a ``Pending`` one with `defer` on the route
+        of visit_fusion.py.
         """
         dtype = hidden.dtype
         decode_only = is_decode_only(cache_metadata(conv_owner))
         x_q, x_k, x_v = self._attention_inputs(hidden, bank, attn_query, messages)
+        hidden = value(hidden)
         partial = self.attn(x_q, x_k, x_v, attn_owner, conv_owner)
         if partial_hook is not None:
             partial_hook(PARTIAL_SITES[0], partial)
         attn = all_reduce(partial, self.tp_size)
         attn_out = attn.new_empty(attn.shape)
+        fusion = on_visit(attn, decode_only, bank.triton)
         # Padding rows of `attn` and `expert_sum` are zero on the fused route.
         zero_padding = not on_fused(attn, decode_only)
-        short_conv(
-            attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out,
-            zero_padding=zero_padding,
-        )  # fmt: skip
+        if not fusion:
+            short_conv(
+                attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out,
+                zero_padding=zero_padding,
+            )  # fmt: skip
         # A block boundary restarts the residual from the attention output.
         if self.starts_block:
             bank.append(hidden)
         base = None if self.starts_block else hidden
         residual = Residual(base, attn_out, bank.triton)
+        state: Residual | Pending = residual
+        if fusion:
+            conv = Conv(attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN)
+            state = Pending(conv, base, conv_out=attn_out)
 
         (x,) = sublayer_inputs(
             bank,
-            residual,
+            state,
             mlp_query,
             self.mlp_norm.weight,
             self.eps,
@@ -420,6 +435,18 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         if partial_hook is not None:
             partial_hook(PARTIAL_SITES[1], partial)
         expert_sum = all_reduce(partial, self.tp_size)
+        if fusion:
+            if isinstance(state, Pending):
+                state.resolve()
+            last, addend = residual.parts()
+            base, update = (None, last) if addend is None else (last, addend)
+            output = Pending(
+                Conv(expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP),
+                base,
+                update=update,
+                state_out=expert_sum.new_empty(expert_sum.shape, dtype=dtype),
+            )
+            return output if defer else value(output)
         mlp_out = expert_sum.new_empty(expert_sum.shape)
         short_conv(
             expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out,
