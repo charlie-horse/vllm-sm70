@@ -693,7 +693,10 @@ def test_inkling2_section_is_config_only():
     does not enter the graph hash."""
     names = [n for n in envs.environment_variables() if "INKLING" in n]
     assert not [n for n in names if "INKLING2" in n or "DUMP" in n]
-    assert all(n in envs._SECTIONS["models"] for n in names)  # route switches
+    # route switches; the TurboMind grouped-prefill knob is read by the C++
+    knobs = {"VLLM_SM70_INKLING_TM_GROUPED_PREFILL"}
+    assert all(n in envs._SECTIONS["models"] for n in names if n not in knobs)
+    assert all(n in envs._SECTIONS["ops"] for n in knobs)
     on = Sm70Config.model_validate({"inkling2": {"visit_dump_dir": "/dump"}})
     assert compute_hash(on) == compute_hash(Sm70Config())
 
