@@ -59,8 +59,12 @@ REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # Route switches (envs.route_switch): "0" and "1" force a route, any other
 # value keeps the default one.
 ROUTE = {"VLLM_SM70_INKLING_TRITON_NORMS"}
+# Opt-in switches (envs.opt_in): only "1" acts, and it turns a feature on.
+OPT_IN = {"VLLM_SM70_INKLING_MERGED_PROJ"}
 # The kill switches: only "0" acts.
-OURS = {name: get for name, get in REGISTERED.items() if name not in ROUTE}
+OURS = {
+    name: get for name, get in REGISTERED.items() if name not in ROUTE | OPT_IN
+}
 
 # Sm70Config fields whose kill switch is registered in Kai's "sampler"
 # section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
@@ -496,18 +500,41 @@ def _inkling_decode_graph_off(name):
         assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
 
 
-def _inkling_merged_proj_off(name):
-    """Models built now pack no projections; the packed and unpacked models
-    are compared in tests/models/test_m12_inkling2_merged_proj_cpu.py."""
+def _inkling_merged_proj(name, on):
+    """Models built now pack their projections only when on; the packed and
+    unpacked models are compared in test_m12_inkling2_merged_proj_cpu.py."""
     pytest.importorskip("vllm")
     from vllm_sm70.models.inkling2_sm70 import weights
 
-    assert weights.MERGED_SWITCH == name and not weights.merged_enabled()
+    assert weights.MERGED_SWITCH == name and weights.merged_enabled() is on
 
 
 ROUTE_CHECKS = {
     "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_route,
 }
+OPT_IN_CHECKS = {
+    "VLLM_SM70_INKLING_MERGED_PROJ": _inkling_merged_proj,
+}
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "0", "1", "true", "on", "yes", " 1", "1 "]
+)
+@pytest.mark.parametrize("name", sorted(OPT_IN))
+def test_opt_in_switch_acts_only_on_one(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    on = value == "1"
+    assert getattr(envs, name) is on
+    OPT_IN_CHECKS[name](name, on)
+    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
+
+
+def test_opt_in_names_are_registered():
+    assert set(OPT_IN) == set(OPT_IN_CHECKS)
+    assert set(OPT_IN) <= set(envs._SECTIONS["models"])
 
 
 @pytest.mark.parametrize(
@@ -565,8 +592,6 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
-    elif name == "VLLM_SM70_INKLING_MERGED_PROJ":
-        _inkling_merged_proj_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

@@ -7,8 +7,9 @@ Rules:
 - Opt-in safety switches (`opt_in`, only "1" acts) are the exception, kept
   for fork compatibility: they add a check or a memset, never a kernel.
   The exceptions that select a kernel, off by default:
-  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32) and
-  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange). See their comments.
+  VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32),
+  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange) and
+  VLLM_SM70_INKLING_MERGED_PROJ (M12 packed projections). See their comments.
   (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
   now a kill switch.)
 - Route switches (`route_switch`): "0" and "1" both act, forcing a route
@@ -60,8 +61,8 @@ def opt_in(name: str) -> Callable[[], bool]:
     For the few fork switches that default off and keep their fork meaning
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
-    except VLLM_SM70_FP8_QPN8_M32 (K09) and VLLM_SM70_TOP1_CUSTOM_AR (F12),
-    opt-in by review decision.
+    except VLLM_SM70_FP8_QPN8_M32 (K09), VLLM_SM70_TOP1_CUSTOM_AR (F12) and
+    VLLM_SM70_INKLING_MERGED_PROJ (M12), opt-in by review decision.
     """
 
     def getter() -> bool:
@@ -385,13 +386,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are measured in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
-        # "0": the Inkling 2 projections that share an input are not packed
-        # into one buffer and run one GEMM each again: a global layer's
-        # q/k/v/r/gate/sink rows and conv taps, the controllers' gain and
-        # forget gates; no fp32 copies of the q/r clip scales. Env-only (no
-        # Sm70Config field), read when the model is built
-        # (inkling2_sm70/weights.py, layers.py).
-        "VLLM_SM70_INKLING_MERGED_PROJ": kill_switch("VLLM_SM70_INKLING_MERGED_PROJ"),
+        # "1": the Inkling 2 projections that share an input are packed into
+        # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
+        # rows and conv taps, the controllers' gain and forget gates; the q/r
+        # clip scales get fp32 copies. Default off: each projection keeps its
+        # own buffer and GEMM. Env-only (no Sm70Config field), read when the
+        # model is built (inkling2_sm70/weights.py, layers.py).
+        "VLLM_SM70_INKLING_MERGED_PROJ": opt_in("VLLM_SM70_INKLING_MERGED_PROJ"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

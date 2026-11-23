@@ -4,11 +4,12 @@
 The weight map's packs, ``rows_view`` and ``pack_parameters``; the packed
 projections and message gates against the per-projection ops; the loaded
 model's packs and fp32 clip scales; and the registered model class on the
-tiny checkpoint (fixtures/inkling2_tiny) with the packs against the same
-class built with ``VLLM_SM70_INKLING_MERGED_PROJ=0``, at TP1 and TP2, in the
+tiny checkpoint (fixtures/inkling2_tiny) built with
+``VLLM_SM70_INKLING_MERGED_PROJ=1`` (the packs) against the same class built
+with the switch unset (no packs), at TP1 and TP2, in the
 paged engine scenarios. In fp32 the packed ops agree with the separate ones
 to 1e-6, and every visit, the final state and the logits of the model to
-5e-6 of their scale. Also: fewer GEMMs per decode step, and the kill switch.
+5e-6 of their scale. Also: fewer GEMMs per decode step, and the default.
 """
 
 from __future__ import annotations
@@ -71,9 +72,9 @@ def _engines(tp_size: int, merged: bool):
     """TP1: the model-test engine; TP2: the TP2-test engine."""
     with pytest.MonkeyPatch.context() as patch:
         if merged:
-            patch.delenv(SWITCH, raising=False)
+            patch.setenv(SWITCH, "1")
         else:
-            patch.setenv(SWITCH, "0")
+            patch.delenv(SWITCH, raising=False)
         if tp_size == 1:
             from test_m12_inkling2_model_cpu import Engine
 
@@ -413,7 +414,7 @@ def test_a_decode_step_runs_fewer_gemms(pairs, sequences):
     assert counts[1] - counts[0] == saved, counts
 
 
-def test_kill_switch_keeps_every_projection_apart(pairs):
+def test_default_keeps_every_projection_apart(pairs):
     weights = _weights_module()
     plain = pairs[1][1].model
     assert not plain.model.merged

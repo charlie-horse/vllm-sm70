@@ -22,7 +22,8 @@ input per row block) and are stored back to back in one buffer by
 layer's ``attn.qkvr.weight`` with its two conv tap projections, and per core
 layer the four controller ``down_weight`` and the ``gain_weight``,
 ``forget_weight`` pairs. Names, shapes and dtypes of the parameters do not
-change. Switch: ``VLLM_SM70_INKLING_MERGED_PROJ=0`` packs nothing.
+change. Packing is opt-in: ``VLLM_SM70_INKLING_MERGED_PROJ=1`` packs; unset
+or any other value packs nothing.
 """
 
 from __future__ import annotations

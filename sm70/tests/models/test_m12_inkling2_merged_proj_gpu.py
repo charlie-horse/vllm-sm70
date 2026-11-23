@@ -2,8 +2,8 @@
 """M12 Inkling 2 merged projections on an SM70 GPU.
 
 The tiny checkpoint (fixtures/inkling2_tiny) in fp16 at TP1 on the GPU,
-built with the packs (``VLLM_SM70_INKLING_MERGED_PROJ`` unset) and without
-(``=0``). The move to the GPU splits the packs; the post-load hook packs
+built with the packs (``VLLM_SM70_INKLING_MERGED_PROJ=1``) and without
+(unset). The move to the GPU splits the packs; the post-load hook packs
 them again. In each engine scenario, with steps padded as for a FULL decode
 graph, every visit, the final state and the logits of the two agree within
 the fp16 kernel tolerance: the stacked GEMMs and the merged gate GEMM sum in
@@ -41,9 +41,9 @@ def _engine(monkeypatch, merged: bool):
     from test_m12_inkling2_model_cpu import Engine
 
     if merged:
-        monkeypatch.delenv(SWITCH, raising=False)
+        monkeypatch.setenv(SWITCH, "1")
     else:
-        monkeypatch.setenv(SWITCH, "0")
+        monkeypatch.delenv(SWITCH, raising=False)
     engine = Engine(torch.float16, device="cuda")
     engine.model.process_weights_after_loading()
     return engine

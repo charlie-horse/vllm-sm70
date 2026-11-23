@@ -2,8 +2,8 @@
 """M12 Inkling 2 decode route of inkling2_sm70/norms.py on an SM70 GPU.
 
 - the gate kernels of ops/fused.py at the checkpoint's sizes (hidden 2304,
-  gate rank 64) against the torch GEMMs within 2e-3, and the residual add
-  bit-identical to the torch adds;
+  gate rank 64) against the torch GEMMs within 2e-3, the fp16 blend within
+  5e-3, and the residual add bit-identical to the torch adds;
 - a layer's MLP input and output (``Residual``, with and without a message
   gate) on the kernels against the torch route;
 - the route: unset switch, kernels on a decode-only forward only;
@@ -28,6 +28,8 @@ pytestmark = pytest.mark.gpu
 HIDDEN = 2304
 GATE_RANK = 64
 TOL = 2e-3
+# The fp16 blend against a reference rounded once: about 5 fp16 ulps of the max.
+BLEND_TOL = 5e-3
 SWITCH = "VLLM_SM70_INKLING_TRITON_NORMS"
 
 
@@ -50,7 +52,7 @@ def _inputs(cases, seed: int = 0):
 def test_gate_kernels(cases, tokens, streams):
     inputs = _inputs(cases, seed=tokens)
     assert cases.check_gate_kernels(inputs, streams, tokens, HIDDEN) <= TOL
-    assert cases.check_blend(inputs, streams, tokens, HIDDEN) <= TOL
+    assert cases.check_blend(inputs, streams, tokens, HIDDEN) <= BLEND_TOL
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 512])

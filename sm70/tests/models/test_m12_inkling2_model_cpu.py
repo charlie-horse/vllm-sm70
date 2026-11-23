@@ -114,9 +114,13 @@ class Engine:
                 hook(visit, layer, pass_idx, state)
 
         body.visit_hook = record
+        # The batch is built on the CPU; the model runs on the harness device.
+        device = self.harness.device
+        input_ids = batch.take(self.sequences).to(device)
+        positions = batch.positions.to(device)
         try:
             with torch.no_grad():
-                final = self.model(batch.take(self.sequences), batch.positions)
+                final = self.model(input_ids, positions)
                 logits = self.model.compute_logits(final)
         finally:
             body.visit_hook = hook
