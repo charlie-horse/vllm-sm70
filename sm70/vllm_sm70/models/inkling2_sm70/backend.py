@@ -36,6 +36,14 @@ builders declare UNIFORM_SINGLE_TOKEN_DECODE graph support.
 VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit dump, marks no step
 decode-only and declares no graph support.
 
+On the V2 runner a step builds once per (builder class, spec) and fills the
+token index once: the other groups of that step reuse the first build
+through ``update_block_table``, as the V1 runner does itself (UP
+v1/worker/gpu_model_runner.py ``_build_attention_metadata``); V2 reuses only
+Mamba builds (UP v1/worker/gpu/attn_utils.py ``build_attn_metadata``). A step is the set of
+builds that share the runner's ``query_start_loc_cpu``, ``seq_lens`` and
+``positions`` tensors.
+
 Cache views are logical (blocks, heads, tokens, width) in every layout; the
 backends declare LBNHC, the layout Flash-V100 uses.
 """
@@ -208,6 +216,39 @@ class _TokenIndex:
         }
 
 
+class _StepBuilds:
+    """What the builders made in the current V2 step, by key: the metadata
+    per (builder class, spec) and the token index (``_TokenIndex``)."""
+
+    def __init__(self) -> None:
+        self._step: tuple[Any, ...] = ()
+        self._built: dict[Any, tuple[int, Any]] = {}
+
+    def _select(self, cm: CommonAttentionMetadata) -> None:
+        step = (cm.query_start_loc_cpu, cm.seq_lens, cm.positions)
+        same = len(step) == len(self._step) and all(
+            a is b for a, b in zip(step, self._step, strict=True)
+        )
+        if not same:
+            self._step, self._built = step, {}
+
+    def get(self, cm: CommonAttentionMetadata, key: Any) -> Any:
+        self._select(cm)
+        rows, value = self._built.get(key, (-1, None))
+        return value if rows == cm.slot_mapping.shape[0] else None
+
+    def put(self, cm: CommonAttentionMetadata, key: Any, value: Any) -> None:
+        self._select(cm)
+        self._built[key] = (cm.slot_mapping.shape[0], value)
+
+
+_step_builds = _StepBuilds()
+
+
+def _uses_v2_runner(vllm_config: Any) -> bool:
+    return bool(getattr(vllm_config, "use_v2_model_runner", False))
+
+
 class _Builder(AttentionMetadataBuilder):
     """Common part of both builders. The metadata of two groups with equal
     specs differs in the block table and slot mapping only."""
@@ -239,6 +280,39 @@ class _Builder(AttentionMetadataBuilder):
             int(vllm_config.scheduler_config.max_num_batched_tokens),
         )
         self._init_reorder_batch_threshold(1)
+        self._reuse_step_builds = _uses_v2_runner(vllm_config)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> Any:
+        cm = common_attn_metadata
+        if not self._reuse_step_builds:
+            return self._build(cm)
+        key = (type(self), self.kv_cache_spec)
+        hit = _step_builds.get(cm, key)
+        if hit is not None:
+            return self.update_block_table(hit, cm.block_table_tensor, cm.slot_mapping)
+        metadata = self._build(cm)
+        _step_builds.put(cm, key, metadata)
+        return metadata
+
+    def _build(self, cm: CommonAttentionMetadata) -> Any:
+        raise NotImplementedError
+
+    def _token_fields(self, cm: CommonAttentionMetadata) -> dict[str, Any]:
+        """``_TokenIndex.fill`` of `cm`; on V2 once per step for all builders."""
+        if not self._reuse_step_builds:
+            return self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm))
+        fields = _step_builds.get(cm, _TokenIndex)
+        if fields is None:
+            fields = self.token_index.fill(
+                cm, replays_decode_graph(self.vllm_config, cm)
+            )
+            _step_builds.put(cm, _TokenIndex, fields)
+        return {**fields, "slot_mapping": cm.slot_mapping}
 
     def update_block_table(
         self, metadata: Any, blk_table: torch.Tensor, slot_mapping: torch.Tensor
@@ -250,17 +324,11 @@ class _Builder(AttentionMetadataBuilder):
 
 
 class Inkling2SconvMetadataBuilder(_Builder):
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> Inkling2SconvMetadata:
-        cm = common_attn_metadata
+    def _build(self, cm: CommonAttentionMetadata) -> Inkling2SconvMetadata:
         return Inkling2SconvMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
+            **self._token_fields(cm),
         )
 
 
@@ -276,13 +344,7 @@ class Inkling2AttentionMetadataBuilder(_Builder):
         window = getattr(kv_cache_spec, "sliding_window", None)
         self.sliding_window = None if window is None else int(window)
 
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> Inkling2AttentionMetadata:
-        cm = common_attn_metadata
+    def _build(self, cm: CommonAttentionMetadata) -> Inkling2AttentionMetadata:
         num_reqs = cm.num_reqs
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -295,7 +357,7 @@ class Inkling2AttentionMetadataBuilder(_Builder):
         return Inkling2AttentionMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
+            **self._token_fields(cm),
             num_reqs=num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
