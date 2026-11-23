@@ -170,6 +170,10 @@ def test_split_replays_in_a_cuda_graph(cases, monkeypatch, window):
     attention = cases.attention_module()
     monkeypatch.delenv(SPLIT_SWITCH, raising=False)
     case = _cuda(cases.Case(torch.float16, window, 1024, [33000]))
+    # The case writes only the last window of keys; earlier replays read more.
+    case.cache = torch.where(
+        case.cache.isnan(), torch.randn_like(case.cache), case.cache
+    )
     out = torch.zeros_like(case.query)
 
     def run():

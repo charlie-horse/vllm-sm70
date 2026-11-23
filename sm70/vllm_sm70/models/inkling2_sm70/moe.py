@@ -165,6 +165,21 @@ class Inkling2Sm70Experts(nn.Module):
         self.mx13: grouped_gemm.Mxfp8Weight | None = None
         self.mx2: grouped_gemm.Mxfp8Weight | None = None
 
+    def _apply(self, fn, recurse=True):
+        # The held MXFP8 codes and scales move with the module (.to, .cuda).
+        super()._apply(fn, recurse)
+        for name in ("mx13", "mx2"):
+            held = getattr(self, name)
+            if held is not None:
+                setattr(
+                    self,
+                    name,
+                    grouped_gemm.Mxfp8Weight(
+                        fn(held.codes), fn(held.scale), held.offset
+                    ),
+                )
+        return self
+
     def expert_weights(self) -> tuple[Any, Any]:
         """(w13, w2) as the routes read them: tensors in the model dtype, or
         the ``grouped_gemm.Mxfp8Weight`` pair of a held MXFP8 layer."""
