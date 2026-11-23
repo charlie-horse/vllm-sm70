@@ -498,6 +498,7 @@ def test_mx_dequant_kernel():
             "BLOCK": grouped_gemm.DEQUANT_BLOCK,
             "MX_BLOCK": grouped_gemm.MX_BLOCK,
         },
+    )
 
 
 # --- small_m_gemv.py, nvfp4_gemv.py -----------------------------------------------
