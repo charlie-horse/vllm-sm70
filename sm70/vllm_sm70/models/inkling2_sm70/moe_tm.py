@@ -10,8 +10,10 @@ n = H), and sums a token's experts in fp32, as the torch path of moe.py does.
 The slots run in chunks of at most ``CHUNK_ROWS`` rows, so the stage scratch
 and the fp32 temporaries do not grow with the batch. Stage call forms per
 chunk: up to ``COMPACT_MAX_SLOTS`` slots each slot is its own one-row group
-(one launch per stage; ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off);
-above that the groups are the per-expert offsets over all experts.
+(one launch per stage; ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off); a
+batch of up to ``COMPACT_BATCH_MAX_SLOTS`` slots runs in compact chunks of
+``COMPACT_MAX_SLOTS``; above that the groups are the per-expert offsets over
+all experts.
 
 Every routed slot runs, so ``expert_sum`` reads nothing back to the host: a
 slot with no expert (padding) is computed on expert E - 1 and zeroed.
@@ -59,6 +61,11 @@ FP16_MAX: Final = 65504.0
 # Routed slots per stage call: bounds the workspace (TP2: 4096 x 6336 fp16,
 # 52 MB per device) and the fp32 temporaries of one call.
 CHUNK_ROWS: Final = 4096
+# Batches of up to this many slots run as chunks of COMPACT_MAX_SLOTS compact
+# slot groups, because the per-expert groups over all 128 experts cost about
+# 128 launches per stage call at any batch size. The bound covers the largest
+# captured verify step: 8 requests of 8 tokens at top-k 8 is 512 slots.
+COMPACT_BATCH_MAX_SLOTS: Final = 8 * COMPACT_MAX_SLOTS
 
 Contract = tuple[int, int, int, int]
 
@@ -380,8 +387,11 @@ class Nvfp4TmExperts:
         weights = top_k_weights.reshape(-1)[order].float()
         total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         self.workspace.reserve(slots)
-        for start in range(0, slots, CHUNK_ROWS):
-            part = slice(start, min(start + CHUNK_ROWS, slots))
+        step = CHUNK_ROWS
+        if self.compact and COMPACT_MAX_SLOTS < slots <= COMPACT_BATCH_MAX_SLOTS:
+            step = min(step, COMPACT_MAX_SLOTS)
+        for start in range(0, slots, step):
+            part = slice(start, min(start + step, slots))
             self._chunk(
                 x, tokens[part], sorted_ids[part], weights[part], skip[part], total,
                 act_quant, fused_act,
