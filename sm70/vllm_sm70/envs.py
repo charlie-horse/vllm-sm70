@@ -193,6 +193,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE",
             "VLLM_SM70_FP8_SAFE_FAST_SELECTOR",
             "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+            # "0": the Inkling 2 NVFP4 expert stages above 64 routed slots
+            # take the per-expert loop (128 launches per stage) instead of
+            # one grouped launch (tm_moe_sm70.cu nvfp4_moe_dense_stage_sm70_out,
+            # mirrored by ops/tm.py nvfp4_moe_dense_stage_route).
+            "VLLM_SM70_INKLING_TM_GROUPED_PREFILL",
             "VLLM_SM70_MXFP4_MOE_GROUPED_M8",
             "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR",
             "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",

@@ -100,6 +100,13 @@ bool sm70_fp8_moe_prepare_vec_enabled() {
                                  0) != 0;
 }
 
+// Kill switch: only "0" turns the Inkling 2 grouped prefill off.
+static bool sm70_inkling_tm_grouped_prefill_enabled() {
+  const char* raw = vllm::sm70::policy_value(
+      vllm::sm70::PolicyField::inkling_tm_grouped_prefill);
+  return raw == nullptr || std::string(raw) != "0";
+}
+
 namespace {
 
 __global__ void awq_moe_fill_strided_ptrs_kernel(
@@ -2451,6 +2458,22 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
   const bool exact_qwen4_exp_prefill_shape =
       input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 512 &&
       ((k == 2560 && n == 320) || (k == 160 && n == 2560));
+  // Inkling 2 Mini TP2 banks (moe_tm.py): W13 k=H, n=2*I/tp; W2 k=I/tp, n=H.
+  const bool exact_inkling2_prefill_shape =
+      input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 128 &&
+      ((k == 2304 && n == 1152) || (k == 576 && n == 2304));
+  if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
+      exact_inkling2_prefill_shape &&
+      sm70_inkling_tm_grouped_prefill_enabled()) {
+    maybe_log_sm70_moe_route_once(
+        "logged_nvfp4_inkling2_grouped_prefill",
+        "SM70 NVFP4 MoE Inkling 2 grouped TurboMind prefill path reached",
+        input, input.size(0), num_experts);
+    nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                                 num_experts, k, n, group_size,
+                                 dense_expert_ids);
+    return;
+  }
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
       (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
     maybe_log_sm70_moe_route_once(

@@ -94,7 +94,9 @@ namespace vllm::sm70 {
   X(awq_moe_batched_active_exact_w2,                                         \
     "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2")                             \
   X(awq_qwen38_moe_compact_grouped_decode,                                   \
-    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE")
+    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE")                       \
+  /* M12 (Inkling 2 NVFP4 expert prefill, tm_moe_sm70.cu) */                 \
+  X(inkling_tm_grouped_prefill, "VLLM_SM70_INKLING_TM_GROUPED_PREFILL")
 
 // c4130 production defaults.
 //

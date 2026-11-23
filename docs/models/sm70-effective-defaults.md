@@ -73,6 +73,7 @@ When an env var is unset, the native ABI tuple passes `UNSET` and the **C++ defa
 | NVFP4 native: QPN2_M16_NATIVE, QWEN38_TP4_M1_FAST_SELECTOR (TP4 only → inert) | 1 | 1 | no |
 | FP8 MoE: BATCHED_GEMM 1, W13/W2_PER_EXPERT 0, PERMUTE_WITH_SCRATCH 1, LEGACY_SINGLE_TOKEN_COMPACT 1 (compact exact layout 1, native-unpermute 0, decomposed 0), single-token W13 dense / W2 indexed / reduce **weighted**, PERMUTE_FASTPATH 0, MOE_SINGLE_TOKEN_FASTPATH 0 | as listed | same | no |
 | NVFP4 MoE routes (GROUPED_PREFILL, FAST_PREFILL, FUSED_SWIGLU_PREFILL, INDEXED_PREFILL, FUSED_BATCH_W13/W2, W2_DIRECT_REDUCE, QPN_M1/BATCH/MTP5, GROUPED_MTP5 = 1; GROUPED_DECODE, QPN_DYNAMIC, RAW_SCALE, GROUPED_EXPERT_ROWS = 0) | as listed | same | no. Most are exact Qwen3.8-NVFP4-TP4 contracts and stay inert for Flint TP2 (rule: the selector checks experts, top_k and TP shape) |
+| VLLM_SM70_INKLING_TM_GROUPED_PREFILL (M12, ops knob read by tm_moe_sm70.cu) | – | 1 | no. Inkling 2 NVFP4 expert stages above 64 routed slots run as one grouped TurboMind launch; `"0"` (only that value) sends them back to the per-expert loop of 128 launches per stage. GROUPED_PREFILL=0 also turns it off |
 | FLINT_MOE_PERSISTENT | 0 | 0 | no |
 | DFlash2 lookup (sm70_dflash2.py:144): adaptive 1, agree 0, cheap_context 0, entry_streak 2, long_min 6, nmin_tail 4, nstrong 6, search 2^30, sticky 3 | as listed | same | no |
 | sm70_turbomind_workspace_bytes | 32 MiB (kernel.py:934) | 32 MiB | no |

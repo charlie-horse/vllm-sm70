@@ -935,6 +935,46 @@ if has_op("nvfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+# Python mirror of the launch form nvfp4_moe_dense_stage_sm70_out picks
+# (sm70/csrc/turbomind/ops/tm_moe_sm70.cu); tests/quant/
+# test_m12_inkling2_grouped_prefill_cpu.py keeps it in step with the C++.
+NVFP4_MOE_COMPACT_MAX_GROUPS = 80
+NVFP4_MOE_GROUPED_MIN_ROWS = 65
+# num_experts -> (k, n) stage shapes of the grouped prefill.
+NVFP4_MOE_GROUPED_PREFILL_SHAPES = {
+    128: frozenset({(2304, 1152), (576, 2304)}),  # Inkling 2 Mini, TP2
+    256: frozenset(
+        {(2048, 1024), (2048, 512), (2048, 256), (512, 2048), (256, 2048)}
+        | {(128, 2048)}
+    ),  # Qwen3.6 and Flint
+    512: frozenset({(2560, 320), (160, 2560)}),  # Qwen4 experts
+}
+INKLING_GROUPED_PREFILL_SWITCH = "VLLM_SM70_INKLING_TM_GROUPED_PREFILL"
+
+
+def nvfp4_moe_dense_stage_route(rows: int, num_experts: int, k: int, n: int) -> str:
+    """Launch form of one nvfp4_moe_dense_stage_sm70_out call on `rows`
+    input rows: "compact" or "grouped" (one launch each) or "per_expert"
+    (num_experts launches). The knobs are read as the C++ reads them:
+    VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL by atoi (default 1),
+    VLLM_SM70_INKLING_TM_GROUPED_PREFILL off only at "0"."""
+    import os
+
+    from vllm_sm70.warmup.plan import knob
+
+    if rows == num_experts and num_experts <= NVFP4_MOE_COMPACT_MAX_GROUPS:
+        return "compact"
+    inkling_on = os.environ.get(INKLING_GROUPED_PREFILL_SWITCH) != "0"
+    if (
+        rows >= NVFP4_MOE_GROUPED_MIN_ROWS
+        and (k, n) in NVFP4_MOE_GROUPED_PREFILL_SHAPES.get(num_experts, ())
+        and knob("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", 1) != 0
+        and (num_experts != 128 or inkling_on)
+    ):
+        return "grouped"
+    return "per_expert"
+
+
 # fork vllm/_sm70/moe.py:1083-1099
 def awq_moe_build_strided_ptrs(
     tm_weights: torch.Tensor,
