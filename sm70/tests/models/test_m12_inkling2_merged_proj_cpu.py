@@ -29,6 +29,9 @@ import inkling2_harness as hx
 
 LEN_A, LEN_B, PREFIX = 23, 19, 8
 TOL = 1e-6
+# One stacked GEMM vs separate ones: the summation order differs with the CPU's
+# vector width (AVX2 vs AVX-512), about 1e-6 of the output's scale.
+GEMM_TOL = 1e-5
 # Over 48 visits: the stacked GEMMs' other summation order (about 1e-7 per op)
 # grows to about 1.1e-6 of the stream's scale on the tiny checkpoint.
 MODEL_TOL = 5e-6
@@ -212,7 +215,7 @@ def test_project_packed_matches_project_qkvr(tokens, taps, inputs):
         if w is None:
             continue
         assert g.shape == w.shape, i
-        torch.testing.assert_close(g, w, atol=TOL, rtol=TOL)
+        torch.testing.assert_close(g, w, atol=GEMM_TOL, rtol=GEMM_TOL)
 
 
 def test_project_packed_reads_adjacent_inputs_in_place():
