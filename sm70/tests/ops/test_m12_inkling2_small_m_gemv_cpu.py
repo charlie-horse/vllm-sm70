@@ -3,7 +3,7 @@
 and its route (inkling2_sm70/gemv.py), on CPU.
 
 - the kill switch VLLM_SM70_INKLING_SMALL_M_GEMV and the route choice: 1 to
-  8 fp16 rows with unit K stride, from 2 rows for the LM head, tensors off
+  8 fp16 rows with unit K stride, 1 to 4 rows for the LM head, tensors off
   the GPU on cuBLAS's torch ops, only "0" turns it off;
 - through Triton's interpreter, each against the torch op it replaces:
   - ``segment_gemv`` with one input and with three inputs over 3 and 5 row
@@ -132,8 +132,10 @@ def test_route_takes_one_to_eight_fp16_rows(monkeypatch):
     assert [route.on_small_m(_gpu_like(m), weight) for m in range(10)] == [
         False, *[True] * 8, False,
     ]  # fmt: skip
-    assert not route.on_small_m(_gpu_like(1), weight, route.HEAD_MIN_ROWS)
-    assert route.on_small_m(_gpu_like(2), weight, route.HEAD_MIN_ROWS)
+    head = (route.HEAD_MIN_ROWS, route.HEAD_MAX_ROWS)
+    assert [route.on_small_m(_gpu_like(m), weight, *head) for m in range(10)] == [
+        False, *[True] * 4, *[False] * 5,
+    ]  # fmt: skip
     assert not route.on_small_m(_gpu_like(4, dtype=torch.float32), weight)
     assert not route.on_small_m(_gpu_like(4, stride=2), weight)
     assert not route.on_small_m(_gpu_like(4, k=48), weight)
@@ -256,8 +258,8 @@ def test_interpreted_packed_projections(taps, rows):
 
 
 @interpreted
-@pytest.mark.parametrize("rows", [1, 2, 8])
-def test_interpreted_lm_head_from_two_rows(rows, monkeypatch):
+@pytest.mark.parametrize("rows", [1, 4, 5, 8])
+def test_interpreted_lm_head_up_to_four_rows(rows, monkeypatch):
     from vllm_sm70.models.inkling2_sm70 import model
 
     calls = []
@@ -274,7 +276,7 @@ def test_interpreted_lm_head_from_two_rows(rows, monkeypatch):
     got = model._head_logits(head, hidden, None)
     want = torch.nn.functional.linear(hidden.half(), head.weight)
     assert got.dtype == torch.float16 and max_abs_rel(got, want) <= TOL
-    assert calls == ([] if rows < 2 else [rows])
+    assert calls == ([rows] if rows <= 4 else [])
 
 
 # --- interpreted child run ------------------------------------------------------------

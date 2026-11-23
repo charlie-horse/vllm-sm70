@@ -33,10 +33,10 @@ MAX_SEGMENTS: Final = 5
 # BLOCK_M -> (BLOCK_N, BLOCK_K, num_warps); the fp32 partials of a program
 # are BLOCK_M * BLOCK_N * BLOCK_K values.
 CONFIGS: Final = {
-    1: (16, 128, 4),
-    2: (16, 128, 4),
-    4: (16, 64, 4),
-    8: (16, 64, 4),
+    1: (8, 256, 2),
+    2: (16, 256, 2),
+    4: (8, 128, 2),
+    8: (8, 128, 2),
 }
 # Segment input order (module doc).
 SEGMENT_INPUTS: Final = (0, 1, 2, 1, 2)

@@ -129,11 +129,12 @@ class Inkling2Sm70LMHead(nn.Module):
 def _head_logits(
     lm_head: Any, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None
 ) -> torch.Tensor:
-    """This rank's logits in the model dtype (gemv.py from 2 rows)."""
+    """This rank's logits in the model dtype (gemv.py up to 4 rows)."""
     logits = gemv.linear(
         hidden_states.to(lm_head.weight.dtype),
         lm_head.weight,
         min_rows=gemv.HEAD_MIN_ROWS,
+        max_rows=gemv.HEAD_MAX_ROWS,
     )
     if embedding_bias is not None:
         logits = logits + embedding_bias

@@ -470,7 +470,7 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
 
         # "0": the Inkling 2 dense projections of 1 to 8 tokens (qkvr with
         # its k/v inputs and packed taps, the attention output projection,
-        # the LM head from 2 tokens) run on cuBLAS instead of one Triton
+        # the LM head of 1 to 4 tokens) run on cuBLAS instead of one Triton
         # GEMV launch each (inkling2_sm70/gemv.py). Env-only (no Sm70Config
         # field), read per eager call and fixed at capture in a replayed CUDA
         # graph; tensors off the GPU always take cuBLAS.

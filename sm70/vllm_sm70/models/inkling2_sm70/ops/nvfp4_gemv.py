@@ -38,8 +38,8 @@ NIBBLE_K: Final = (0, 2, 4, 6, 1, 3, 5, 7)
 TILE_N: Final = 32
 # (BLOCK_K8, num_warps) per stage; BLOCK_K8 counts K rows of 8.
 CONFIGS: Final = {
-    "w13": (16, 4),
-    "w2": (8, 4),
+    "w13": (32, 8),
+    "w2": (16, 2),
 }
 
 
