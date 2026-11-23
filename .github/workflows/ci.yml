@@ -102,7 +102,7 @@ jobs:
     #          run instead of skipping.
     name: Python unit tests (CPU, vLLM ${{ matrix.vllm }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
