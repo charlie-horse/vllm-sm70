@@ -255,6 +255,15 @@ class Sm70CudaPlatform(CudaPlatform):
             greedy=bool(envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH),
         )
 
+    # U6 hook (patches/0006), asked once by the V2 runner's init_speculator:
+    # the Inkling 2 DSpark draft's speculator, None for every other config
+    # or with VLLM_SM70_INKLING_DSPARK=0 (models/inkling2_sm70/draft.py).
+    @classmethod
+    def get_speculator_cls(cls, vllm_config: VllmConfig) -> Any:
+        from vllm_sm70.models.inkling2_sm70 import draft
+
+        return draft.speculator_cls(vllm_config)
+
     # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
     # the gate; the provider caches its route per layer (vllm_sm70/router.py).
     @classmethod

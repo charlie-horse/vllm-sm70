@@ -27,7 +27,7 @@ decode-only batch n is the length of the slot mapping instead, a static
 shape, and the ops read and write the cache without a host sync: the taps
 are gathered for every row and selected, and a row with a negative slot
 writes the null-block slot 0 back unchanged. ``short_conv`` zeroes the
-output rows of padding there.
+output rows of padding there, unless its caller's input is zero in them.
 
 Switch: ``short_conv`` and the prologue's K/V convs run one Triton kernel per
 call (ops/paged_conv.py) unless VLLM_SM70_INKLING_TRITON_SCONV=0. Tensors off
@@ -261,11 +261,14 @@ def short_conv(
     stream: int,
     out: torch.Tensor,
     dynamic_taps: torch.Tensor | None = None,
+    zero_padding: bool = True,
 ) -> None:
     """Conv of `x` [T, C] over stream `stream` of the conv state `owner`
     (``Inkling2ConvState``) with the current forward's metadata, into `out`.
     Dynamic when `dynamic_taps` is given. A forward without conv-state
-    metadata copies `x`."""
+    metadata copies `x`. `zero_padding` False: the caller's `x` is zero in
+    the padding rows of a decode-only batch, so their output is zero
+    without the mask."""
     metadata = cache_metadata(owner)
     if metadata is None:
         out.copy_(x)
@@ -290,7 +293,7 @@ def short_conv(
         dynamic_conv(
             x, weight, dynamic_taps, owner.kv_cache, metadata, stream_range, out
         )
-    if is_decode_only(metadata):
+    if zero_padding and is_decode_only(metadata):
         # Padding rows of a decode-only batch are zero, as after n.
         rows = _real_rows(x, metadata)
         out[:rows].masked_fill_((metadata.slot_mapping[:rows] < 0)[:, None], 0.0)

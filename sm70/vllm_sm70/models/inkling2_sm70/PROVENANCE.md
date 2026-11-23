@@ -39,6 +39,16 @@ takes the patch back out and checks the hash. Kernels whose work is a GEMM
 (`tl.dot`) are not vendored. `ops/fused.py` is not vendored: the message-gate
 projections and the residual add of the decode route, written for SM70.
 
+`dspark.py`, `speculator.py` and `ops/dspark.py` are ported from the same
+upstream commit; they are not byte-identical copies. Each module docstring
+lists the differences.
+
+| File | Upstream path | Ported |
+|---|---|---|
+| `dspark.py` | `vllm/models/inkling2/nvidia/dspark.py` | The whole file, in fp16 on SM70 caches (`cache.py`) and without flashinfer, FlashAttention or the MNNVL all-reduce. |
+| `speculator.py` | `vllm/models/inkling2/speculator.py` | The whole file, on the v0.33.0 DSpark speculator; draft logits are fp32. |
+| `ops/dspark.py` | `vllm/models/inkling2/nvidia/ops/dspark.py`, `vllm/models/inkling2/nvidia/ops/attention.py` | The mix-norm, RoPE, SwiGLU, soft-cap and Markov-gate ops of `ops/dspark.py`, rounding to fp16 for bfloat16; `block_attention` in place of `block_decode_attention` (FlashAttention), without `tl.dot` or splits. Each op has a torch form. |
+
 | File | Upstream path | Ported |
 |---|---|---|
 | `ops/norm.py` | `vllm/models/inkling2/nvidia/ops/norm.py` | `rsqrt`, `_rms_norm_kernel` and `rms_norm` (lines 1-71), with a `tl.rsqrt` form of `rsqrt` for Triton's interpreter. `_l2_clip` and `qr_clip_rel_tokens` (lines 74-185, a `tl.dot` kernel and its helper) are left out. |

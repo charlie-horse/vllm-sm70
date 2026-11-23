@@ -179,6 +179,11 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_DSPARK",
+        "VLLM_SM70_INKLING_DSPARK_KERNELS",
+        "VLLM_SM70_INKLING_ASYNC_SCHED",
+        "VLLM_SM70_INKLING_SHARDED_HEAD",
+        "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -474,6 +479,20 @@ def _inkling_fused_routing_off(name):
         assert moe.on_fused_routing(x, 8) is False
 
 
+def _inkling_fused_small_ops_off(name):
+    """A decode-only GPU batch keeps the torch ops of the small chains
+    (inkling2_sm70/fused_small.py); the kernels' own checks are
+    tests/ops/test_m12_inkling2_fused_small_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import fused_small
+
+    assert fused_small.SWITCH == name
+    with mock.patch.object(fused_small._compat, "AVAILABLE", True):
+        assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -481,6 +500,94 @@ def _inkling_tm_tune_off(name):
     from vllm_sm70.models.inkling2_sm70 import config as icfg
 
     assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
+
+
+def _inkling_dspark_off(name):
+    """The Inkling 2 hook refuses a staged DSpark draft and the U6 hook has
+    no speculator; the accepted case is in
+    tests/models/test_m12_inkling2_draft_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    hf_config = SimpleNamespace(model_type=draft.DRAFT_MODEL_TYPE)
+    spec = SimpleNamespace(
+        method="dspark", draft_model_config=SimpleNamespace(hf_config=hf_config)
+    )
+    assert name in draft.speculative_rejection(spec, None)
+    assert draft.speculator_cls(SimpleNamespace(speculative_config=spec)) is None
+
+
+def _inkling_dspark_kernels_off(name):
+    """The Inkling 2 draft ops take their torch forms, even on tensors the
+    kernels could run; the forms are compared in
+    tests/ops/test_m12_inkling2_dspark_ops_cpu.py."""
+    pytest.importorskip("vllm")
+    import torch
+
+    from vllm_sm70.models.inkling2_sm70 import dspark
+    from vllm_sm70.models.inkling2_sm70.ops import _compat
+
+    assert dspark.SWITCH == name
+    interpret, _compat.INTERPRET = _compat.INTERPRET, True
+    try:
+        assert not dspark.kernels_on(torch.zeros(1))
+    finally:
+        _compat.INTERPRET = interpret
+
+
+def _inkling_async_sched_off(name):
+    """The Inkling 2 hook turns an unset async scheduling off and refuses
+    --async-scheduling; the default is in
+    tests/models/test_m12_inkling2_config_cpu.py."""
+    from unittest import mock
+
+    pytest.importorskip("vllm")
+    import torch
+    import vllm.platforms
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+
+    def engine(async_scheduling):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(dtype=torch.float16, hf_config=None),
+            attention_config=SimpleNamespace(backend=None),
+            cache_config=SimpleNamespace(
+                cache_dtype="auto", block_size=16, user_specified_block_size=False
+            ),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=async_scheduling, max_num_seqs=4
+            ),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.NONE,
+                cudagraph_capture_sizes=None,
+                max_cudagraph_capture_size=None,
+            ),
+            speculative_config=None,
+            additional_config=None,
+            kernel_config=None,
+        )
+
+    v100 = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+    )
+    with mock.patch.object(vllm.platforms, "_current_platform", v100):
+        cfg = engine(None)
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        assert cfg.scheduler_config.async_scheduling is False
+        with pytest.raises(ValueError, match=name):
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(engine(True))
+
+
+def _inkling_sharded_head_off(name):
+    """At TP2 every rank's weight map keeps the whole LM head; the sharded
+    head is in tests/models/test_m12_inkling2_weight_map_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import weights
+
+    assert weights.HEAD_SWITCH == name and not weights.sharded_head_enabled()
 
 
 def _inkling_decode_graph_off(name):
@@ -592,6 +699,16 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK":
+        _inkling_dspark_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK_KERNELS":
+        _inkling_dspark_kernels_off(name)
+    elif name == "VLLM_SM70_INKLING_ASYNC_SCHED":
+        _inkling_async_sched_off(name)
+    elif name == "VLLM_SM70_INKLING_SHARDED_HEAD":
+        _inkling_sharded_head_off(name)
+    elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
+        _inkling_fused_small_ops_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

@@ -4,17 +4,24 @@
     Inkling2LoopSm70ForConditionalGeneration
       model            Inkling2Sm70LoopModel (loop.py): embedding, layer
                        visits, final norm; owns the caches of every visit
-      lm_head          Inkling2Sm70LMHead: the unpadded vocabulary rows
+      lm_head          Inkling2Sm70LMHead: the unpadded vocabulary rows, or
+                       this rank's part of them (weights.py ``head_sharded``)
       logits_processor Inkling2Sm70LogitsProcessor: head GEMM in the model
-                       dtype, cast to fp32, then the soft cap
+                       dtype, all-gather of a sharded head, cast to fp32,
+                       then the soft cap
       visual           Inkling2VisionEncoder (vision.py), or None when the
                        image limit per prompt is 0
 
 Weights load through weights.py (parameters), expert_weights.py (experts,
 into each layer's ``mlp``) and the encoder's own loader. Each TP rank builds
 this class and loads its own shards: a slice of the attention heads and of
-the expert intermediate units; embedding, norms, convs, routers, the LM head
-and the vision encoder are whole on every rank.
+the expert intermediate units and, when sharded, of the LM head rows;
+embedding, norms, convs, routers and the vision encoder are whole on every
+rank.
+
+DSpark draft features (``SupportsEagle3``): with aux layers set, ``forward``
+returns ``(final, [input of each listed visit..., final])``. A visit input
+is the AttnRes partial block, upstream's ``stack[num_blocks]``.
 
 Images: ``embed_multimodal`` returns one ``[rows * cols, H]`` tensor per
 image; ``embed_input_ids`` writes them over the image-token rows of the
@@ -37,6 +44,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
 )
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -81,28 +89,56 @@ def vision_query_chunk(max_encoder_tokens: int, num_heads: int) -> int:
 
 
 class Inkling2Sm70LMHead(nn.Module):
-    """``weight`` [unpadded vocab, H] in the model dtype, whole on every
-    rank. The vocabulary attributes are those of an unsharded
-    ``VocabParallelEmbedding``, which the greedy sampler reads."""
+    """``weight`` [rows, H] in the model dtype: the unpadded vocabulary, or
+    at ``tp_size`` > 1 rank ``tp_rank``'s equal share of it. The vocabulary
+    attributes are those of a ``VocabParallelEmbedding`` without padding or
+    added vocabulary, which the logits processor and the greedy sampler
+    read."""
 
-    def __init__(self, vocab_size: int, hidden_size: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        *,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ) -> None:
         super().__init__()
+        if vocab_size % tp_size:
+            raise ValueError(
+                f"vllm_sm70: an LM head of {vocab_size} rows does not split "
+                f"over {tp_size} ranks."
+            )
+        rows = vocab_size // tp_size
         self.weight = nn.Parameter(
-            torch.empty(vocab_size, hidden_size, dtype=dtype), requires_grad=False
+            torch.empty(rows, hidden_size, dtype=dtype), requires_grad=False
         )
-        self.tp_size = 1
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.org_vocab_size = vocab_size
         self.org_vocab_size_padded = vocab_size
-        self.num_embeddings_per_partition = vocab_size
+        self.num_embeddings_per_partition = rows
         self.num_added_embeddings = 0
         self.shard_indices = SimpleNamespace(
-            num_org_vocab_padding=0, org_vocab_start_index=0
+            num_org_vocab_padding=0, org_vocab_start_index=tp_rank * rows
         )
+
+
+def _head_logits(
+    lm_head: Any, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None
+) -> torch.Tensor:
+    """This rank's logits in the model dtype."""
+    logits = F.linear(hidden_states.to(lm_head.weight.dtype), lm_head.weight)
+    if embedding_bias is not None:
+        logits = logits + embedding_bias
+    return logits
 
 
 class Inkling2Sm70LogitsProcessor(LogitsProcessor):
     """The head GEMM runs in the model dtype and its result is cast to fp32,
-    so the soft cap of the base class applies to fp32 logits."""
+    so the soft cap of the base class applies to fp32 logits. A sharded
+    head's logits are all-gathered in the model dtype, before the cast."""
 
     def _apply_head(
         self,
@@ -110,9 +146,20 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        logits = F.linear(hidden_states.to(lm_head.weight.dtype), lm_head.weight)
-        if embedding_bias is not None:
-            logits = logits + embedding_bias
+        return _head_logits(lm_head, hidden_states, embedding_bias).float()
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: Any,
+        embedding_bias: torch.Tensor | None,
+        skip_gather: bool = False,
+    ) -> torch.Tensor | None:
+        logits = _head_logits(lm_head, hidden_states, embedding_bias)
+        if lm_head.tp_size > 1 and not skip_gather:
+            logits = self._gather_logits(logits)
+            if logits is None:
+                return None
         return logits.float()
 
 
@@ -121,7 +168,9 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
     info=Inkling2ProcessingInfo,
     dummy_inputs=Inkling2DummyInputsBuilder,
 )
-class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
+class Inkling2LoopSm70ForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsEagle3
+):
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         from vllm.distributed import (
@@ -162,7 +211,14 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
             dtype=dtype,
         )
         vocab_size = int(text_config.unpadded_vocab_size)
-        self.lm_head = Inkling2Sm70LMHead(vocab_size, text_config.hidden_size, dtype)
+        head_tp = tp_size if self.model.weight_map.head_sharded else 1
+        self.lm_head = Inkling2Sm70LMHead(
+            vocab_size,
+            text_config.hidden_size,
+            dtype,
+            tp_size=head_tp,
+            tp_rank=tp_rank if head_tp > 1 else 0,
+        )
         self.logits_processor = Inkling2Sm70LogitsProcessor(
             vocab_size,
             org_vocab_size=vocab_size,
@@ -233,7 +289,20 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
         return self.visual(pixels, grid_thw).split(sizes)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Layer visits (loop passes counted) whose input is returned; an id
+        past the last visit adds nothing, the final state is always last."""
         self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """The checkpoint's ``mtp_config.target_layer_ids``."""
+        mtp_config = getattr(self.config, "mtp_config", None) or {}
+        layers = tuple(mtp_config.get("target_layer_ids", ()))
+        if not layers:
+            raise ValueError(
+                "vllm_sm70: this Inkling 2 checkpoint has no "
+                "mtp_config.target_layer_ids to capture."
+            )
+        return layers
 
     def embed_input_ids(
         self,

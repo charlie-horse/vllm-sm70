@@ -483,3 +483,128 @@ def test_per_pass_metadata_keys_resolve_to_distinct_caches(built):
         assert cache_metadata(owners.attn[6, 2]) is not None
     with override_forward_context(SimpleNamespace(attn_metadata=None)):
         assert cache_metadata(owners.attn[6, 2]) is None
+
+
+def _decode_common(table, slots, num_real, num_padded):
+    """A decode step as the runner gives it: `num_real` one-token requests,
+    padded to `num_padded` rows and requests, runner positions."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    qsl = torch.tensor(
+        list(range(num_real + 1)) + [num_real] * (num_padded - num_real),
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor(
+        SEQ_LENS[:num_real] + [0] * (num_padded - num_real), dtype=torch.int32
+    )
+    width = len(table[0])
+    return CommonAttentionMetadata(
+        query_start_loc=qsl.clone(),
+        query_start_loc_cpu=qsl,
+        seq_lens=seq_lens,
+        num_reqs=num_padded,
+        num_actual_tokens=num_padded,
+        max_query_len=1,
+        max_seq_len=max(SEQ_LENS),
+        block_table_tensor=torch.tensor(
+            table[:num_real] + [[0] * width] * (num_padded - num_real),
+            dtype=torch.int32,
+        ),
+        slot_mapping=torch.tensor(
+            slots[:num_real] + [-1] * (num_padded - num_real), dtype=torch.int64
+        ),
+        seq_lens_cpu_upper_bound=seq_lens.clone(),
+        positions=torch.tensor(
+            POSITIONS[:num_real] + [0] * (num_padded - num_real), dtype=torch.int64
+        ),
+    )
+
+
+class _OpLog:
+    """The aten ops a block runs on `tensors` (the device tensors of a
+    step), other than views and host reads."""
+
+    VIEWS = frozenset(
+        ("slice", "select", "alias", "view", "detach", "_local_scalar_dense")
+    )
+
+    def __init__(self, *tensors):
+        self.storages = {t.untyped_storage().data_ptr() for t in tensors}
+
+    def _touches(self, args, kwargs) -> bool:
+        flat = torch.utils._pytree.tree_leaves((args, kwargs or {}))
+        return any(
+            isinstance(a, torch.Tensor)
+            and a.untyped_storage().data_ptr() in self.storages
+            for a in flat
+        )
+
+    def __enter__(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        log = self.ops = []
+        outer = self
+
+        class Mode(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                name = func.overloadpacket.__name__
+                if name not in outer.VIEWS and outer._touches(args, kwargs):
+                    log.append(name)
+                return func(*args, **(kwargs or {}))
+
+        self._mode = Mode()
+        self._mode.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._mode.__exit__(*exc)
+
+
+@pytest.mark.parametrize("kind", ["attn", "conv"])
+def test_decode_steps_reuse_the_token_buffers(built, kind):
+    """A decode step with runner positions writes the token buffers only
+    when its real or padded count changes; the values are those the general
+    path writes, also after a mixed batch left other values behind."""
+    owners, owner_config = built
+    table, slots = (
+        (ATTN_TABLE, ATTN_SLOTS) if kind == "attn" else (CONV_TABLE, CONV_SLOTS)
+    )
+    builder = _builder(getattr(owners, kind)[0, 0], owner_config)
+    positions = torch.tensor(POSITIONS, dtype=torch.int64)
+    steps = [(2, 4), (2, 4), (1, 4), (2, 2), (2, 2)]
+    for index, (real, padded) in enumerate(steps):
+        if index == 3:
+            # A mixed batch in between leaves its rows in the buffers.
+            builder.build(0, _common(table, slots, positions=positions))
+        cm = _decode_common(table, slots, real, padded)
+        index_ = builder.token_index
+        device = (cm.query_start_loc, cm.seq_lens, index_.seq_idx)
+        device += (index_.query_start, index_.positions, index_.arange)
+        with _OpLog(*device) as log:
+            md = builder.build(0, cm)
+        repeat = index and steps[index - 1] == (real, padded) and index != 3
+        assert (log.ops == []) is bool(repeat), (index, log.ops)
+        assert md.decode_only is (padded <= 8)
+        assert md.num_actual_tokens == real
+        want = list(range(real)) + [0] * (padded - real)
+        assert md.seq_idx.tolist() == want
+        assert md.query_start.tolist() == want
+        assert md.positions.data_ptr() == cm.positions.data_ptr()
+        # The general path agrees.
+        general = _decode_common(table, slots, real, padded)
+        general.positions = None
+        other = _builder(getattr(owners, kind)[0, 0], owner_config).build(0, general)
+        assert other.seq_idx.tolist() == want
+        assert other.query_start.tolist() == want
+        assert other.positions.tolist() == POSITIONS[:real] + [0] * (padded - real)
+
+
+def test_a_mixed_batch_after_decode_steps_takes_the_general_path(built):
+    owners, owner_config = built
+    builder = _builder(owners.conv[0, 0], owner_config)
+    builder.build(0, _decode_common(CONV_TABLE, CONV_SLOTS, 2, 4))
+    positions = torch.tensor(POSITIONS, dtype=torch.int64)
+    md = builder.build(0, _common(CONV_TABLE, CONV_SLOTS, positions=positions))
+    _check_tokens(md, CONV_TABLE, CONV_SLOTS, CONV_BLOCK)
+    md = builder.build(0, _decode_common(CONV_TABLE, CONV_SLOTS, 2, 4))
+    assert md.seq_idx.tolist() == md.query_start.tolist() == [0, 1, 0, 0]

@@ -219,9 +219,8 @@ def test_expert_shards_are_the_intermediate_slices_of_tp1(tp1, tp2):
 def test_other_parameters_are_whole_on_every_rank(tp1, tp2):
     whole = dict(tp1.models[0].named_parameters())
     sharded = (".attn.qkvr.", ".attn.wo_ud.", ".attn.q_scale", ".attn.r_scale")
-    sharded += (".k_sconv.", ".v_sconv.")
+    sharded += (".k_sconv.", ".v_sconv.", "lm_head.")
     replicated = [name for name in whole if not any(s in name for s in sharded)]
-    assert "lm_head.weight" in replicated
     assert "model.layers.0.attn_sconv.weight" in replicated
     assert "model.layers.0.mlp_sconv.weight" in replicated
     for model in tp2.models:
@@ -229,6 +228,22 @@ def test_other_parameters_are_whole_on_every_rank(tp1, tp2):
         assert set(params) == set(whole)
         for name in replicated:
             assert torch.equal(params[name], whole[name]), name
+
+
+def test_lm_head_rows_are_split_over_the_ranks(tp1, tp2):
+    """Each rank holds half of the vocabulary rows; the vocabulary attributes
+    are those of a VocabParallelEmbedding without padding."""
+    whole = tp1.models[0].lm_head
+    heads = [model.lm_head for model in tp2.models]
+    assert whole.tp_size == 1
+    assert torch.equal(torch.cat([h.weight for h in heads]), whole.weight)
+    rows = whole.weight.shape[0] // 2
+    for rank, head in enumerate(heads):
+        assert (head.tp_size, head.tp_rank) == (2, rank)
+        assert head.org_vocab_size == head.org_vocab_size_padded == 2 * rows
+        assert head.num_embeddings_per_partition == rows
+        assert head.shard_indices.org_vocab_start_index == rank * rows
+        assert head.shard_indices.num_org_vocab_padding == 0
 
 
 # --- the engine scenarios against TP1 ------------------------------------------
@@ -296,8 +311,9 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
     tp2, sequences, monkeypatch
 ):
     """Per visit a rank all-reduces its o_proj partial, then its expert
-    partial, and nothing else; the short convs store the reduced tensors, so
-    the ranks' conv streams hold the same values."""
+    partial, and nothing else (the logits all-gather once); the short convs
+    store the reduced tensors, so the ranks' conv streams hold the same
+    values."""
     from vllm_sm70.models.inkling2_sm70 import layers
     from vllm_sm70.models.inkling2_sm70.cache import STREAM_ATTN, STREAM_MLP
 
@@ -313,17 +329,20 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
         calls.append((rank, tensor, out))
         return out
 
-    def no_gather(*args, **kwargs):
-        raise AssertionError("the model body all-gathers nothing")
+    gathers: list[tuple[int, torch.Tensor]] = []
+
+    def logits_gather(tensor, dim=-1):
+        gathers.append((group.rank_in_group, tensor))
+        return gather(tensor, dim)
 
     short_conv = layers.short_conv
 
-    def conv(x, weight, owner, stream, out):
+    def conv(x, weight, owner, stream, out, **kwargs):
         conv_inputs[group.rank_in_group].append(x)
-        short_conv(x, weight, owner, stream, out)
+        short_conv(x, weight, owner, stream, out, **kwargs)
 
     monkeypatch.setattr(group, "all_reduce", counted)
-    monkeypatch.setattr(group, "all_gather", no_gather)
+    monkeypatch.setattr(group, "all_gather", logits_gather)
     monkeypatch.setattr(layers, "short_conv", conv)
     tp2.reset()
     tp2.sequences = sequences
@@ -338,6 +357,13 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
             model.model.partial_audit = None
     visits = tp2.num_visits
     assert len(calls) == 2 * 2 * visits
+    # The body all-gathers nothing; the sharded head's logits once per rank,
+    # in the model dtype.
+    rows = tp2.models[0].lm_head.weight.shape[0]
+    assert sorted(rank for rank, _ in gathers) == [0, 1]
+    for _, sent in gathers:
+        assert sent.shape == (9, rows)
+        assert sent.dtype == tp2.models[0].lm_head.weight.dtype
     for rank in (0, 1):
         own = [(sent, out) for r, sent, out in calls if r == rank]
         assert len(own) == len(partials[rank]) == len(conv_inputs[rank]) == 2 * visits

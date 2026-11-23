@@ -386,6 +386,41 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are measured in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "0": the Inkling 2 config hook refuses every --speculative-config
+        # again and Sm70CudaPlatform.get_speculator_cls (U6) returns None
+        # (inkling2_sm70/draft.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_DSPARK": kill_switch("VLLM_SM70_INKLING_DSPARK"),
+        # "0": the Inkling 2 draft (inkling2_sm70/dspark.py) runs the torch
+        # forms of its norm, RoPE, block attention, SwiGLU, Markov gate and
+        # soft-cap ops instead of the Triton kernels (inkling2_sm70/ops/
+        # dspark.py). Env-only, read per eager call and fixed at capture in a
+        # replayed CUDA graph.
+        "VLLM_SM70_INKLING_DSPARK_KERNELS": kill_switch(
+            "VLLM_SM70_INKLING_DSPARK_KERNELS"
+        ),
+        # "0": the Inkling 2 config hook turns async scheduling off when it
+        # is unset and refuses --async-scheduling. Otherwise it leaves the
+        # setting to upstream, which turns it on when unset
+        # (inkling2_sm70/config.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_ASYNC_SCHED": kill_switch("VLLM_SM70_INKLING_ASYNC_SCHED"),
+        # "0": every TP rank holds the whole Inkling 2 LM head and computes
+        # the logits of the whole vocabulary. Otherwise, at TP > 1 with a
+        # vocabulary that splits evenly, each rank holds and computes its own
+        # vocabulary rows and the ranks all-gather the logits (inkling2_sm70/
+        # weights.py, model.py). Env-only, read when the model is built.
+        "VLLM_SM70_INKLING_SHARDED_HEAD": kill_switch(
+            "VLLM_SM70_INKLING_SHARDED_HEAD"
+        ),
+        # "0": the small torch chains of Inkling 2 decode-only batches (the
+        # prologue's q/r clips and relative projection, the attention output
+        # gate, the TurboMind SwiGLU, the short convs' padding masks) run on
+        # torch instead of one Triton kernel each (inkling2_sm70/
+        # fused_small.py). Env-only (no Sm70Config field), read per eager
+        # call and fixed at capture in a replayed CUDA graph; other batches
+        # and tensors off the GPU always take the torch ops.
+        "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
+            "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
+        ),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

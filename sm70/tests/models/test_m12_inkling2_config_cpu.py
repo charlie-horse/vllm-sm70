@@ -130,7 +130,6 @@ def _vllm_config(
         ((7, 0), {"cache_dtype": "fp8"}, "--kv-cache-dtype fp8"),
         ((7, 0), {"block_size": 16}, "--block-size 32"),
         ((7, 0), {"pp": 2}, "pipeline parallelism"),
-        ((7, 0), {"async_scheduling": True}, "--no-async-scheduling"),
     ],
 )
 def test_hook_refuses(device, route_log, cc, kw, match):
@@ -148,8 +147,35 @@ def test_hook_refuses_on_cpu_platform(monkeypatch, route_log):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(_vllm_config())
 
 
+@pytest.mark.parametrize("switch", [None, "0"])
+def test_hook_takes_a_staged_dspark_draft_only(device, route_log, monkeypatch, switch):
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    device(7, 0)
+    monkeypatch.setattr(icfg, "tm_tuning_env", lambda *args: {})
+    if switch is None:
+        monkeypatch.delenv("VLLM_SM70_INKLING_DSPARK", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_INKLING_DSPARK", switch)
+    spec = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
+    )
+    cfg = _vllm_config(spec=spec)
+    cfg.use_v2_model_runner = True
+    if switch is None:
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        v1 = _vllm_config(spec=spec)
+        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(v1)
+        return
+    with pytest.raises(ValueError, match="VLLM_SM70_INKLING_DSPARK=0"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
 @pytest.mark.parametrize("block_size", [None, 32])
-@pytest.mark.parametrize("async_scheduling", [None, False])
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
 @pytest.mark.parametrize("cache_dtype", ["auto", "float16"])
 def test_hook_fixes_the_kv_plan(
     device, route_log, block_size, async_scheduling, cache_dtype
@@ -163,8 +189,30 @@ def test_hook_fixes_the_kv_plan(
     icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
     assert cfg.cache_config.block_size == icfg.KV_BLOCK_SIZE == 32
     assert cfg.cache_config.user_specified_block_size is True
-    assert cfg.scheduler_config.async_scheduling is False
     assert cfg.cache_config.cache_dtype == cache_dtype
+    # Async scheduling stays upstream's choice.
+    assert cfg.scheduler_config.async_scheduling is async_scheduling
+    word = {None: "upstream's default", False: "off", True: "on"}[async_scheduling]
+    assert f"async scheduling {word};" in route_log[0]
+
+
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
+def test_async_sched_switch_off(device, route_log, monkeypatch, async_scheduling):
+    """VLLM_SM70_INKLING_ASYNC_SCHED=0: an unset value becomes off and an
+    explicit --async-scheduling is refused."""
+    monkeypatch.setenv("VLLM_SM70_INKLING_ASYNC_SCHED", "0")
+    monkeypatch.setattr(icfg, "tm_tuning_env", lambda *args: {})
+    device(7, 0)
+    cfg = _vllm_config(async_scheduling=async_scheduling)
+    if async_scheduling:
+        with pytest.raises(ValueError, match="--no-async-scheduling") as e:
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        assert inkling2_sm70.ARCH in str(e.value)
+        assert route_log == []
+        return
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.scheduler_config.async_scheduling is False
+    assert "async scheduling off;" in route_log[0]
 
 
 def test_hook_sets_the_turbomind_tuning_knobs(device, route_log, monkeypatch):
@@ -430,7 +478,8 @@ def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
     config = VllmConfig(model_config=model_config, **kwargs)
     assert config.compilation_config.cudagraph_mode is CUDAGraphMode[want]
     assert config.cache_config.block_size == icfg.KV_BLOCK_SIZE
-    assert config.scheduler_config.async_scheduling is False
+    # Upstream turns the unset async scheduling on after the hook.
+    assert config.scheduler_config.async_scheduling is True
     assert f"cudagraph_mode {want};" in route_log[0]
     if want == "FULL_DECODE_ONLY":
         compilation = config.compilation_config

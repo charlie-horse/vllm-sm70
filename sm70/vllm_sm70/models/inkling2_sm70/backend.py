@@ -22,19 +22,31 @@ model rows after them as padding; inside [0, n) a token with a negative slot
 is padding too. The builders sort decode requests first.
 
 A step that runs as a FULL decode graph is decode-only (``decode_only``):
-every request has at most one query token, the engine's cudagraph_mode has
-FULL decode graphs and the step's (padded) token count is at most
-``max_cudagraph_capture_size``, so the runner captures or replays it (UP
-v1/cudagraph_dispatcher.py). The builders read this from the engine's
-compilation config at build time. The ops of such a step read no host data
-and their shapes depend on the token tensors and the block-table width
-alone; an op covers the rows of the slot mapping (P) and a row with a
-negative slot is padding. Every other step, eager decodes included, takes
-the ops that branch in Python on the batch (numpy request lengths,
-nonzero): they run eagerly or as eager breaks of a PIECEWISE graph. The
-builders declare UNIFORM_SINGLE_TOKEN_DECODE graph support.
-VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit dump, marks no step
-decode-only and declares no graph support.
+it is a uniform decode of q = ``decode_query_len`` tokens per request (q = 1
+without a speculative config; a verify step of 1 + num_speculative_tokens
+with one), its zero-token requests (graph padding) are last, the engine's
+cudagraph_mode has FULL decode graphs and the step's (padded) token count
+is at most ``max_cudagraph_capture_size``, so the runner captures or
+replays it (UP v1/cudagraph_dispatcher.py, v1/worker/gpu/cudagraph_utils.py).
+The builders read this from the engine's config at build time. The ops of
+such a step read no host data and their shapes depend on the token tensors
+and the block-table width alone; an op covers the rows of the slot mapping
+(P), a row with a negative slot is padding, and each row is a query at its
+own position that sees the rows of its request before it. Every other step,
+eager decodes included, takes the ops that branch in Python on the batch
+(numpy request lengths, nonzero): they run eagerly or as eager breaks of a
+PIECEWISE graph. The builders declare UNIFORM_SINGLE_TOKEN_DECODE graph
+support, UNIFORM_BATCH with a speculative config, and order requests of up
+to q tokens first. VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit dump,
+marks no step decode-only and declares no graph support.
+
+On the V2 runner a step builds once per (builder class, spec) and fills the
+token index once: the other groups of that step reuse the first build
+through ``update_block_table``, as the V1 runner does itself (UP
+v1/worker/gpu_model_runner.py ``_build_attention_metadata``); V2 reuses only
+Mamba builds (UP v1/worker/gpu/attn_utils.py ``build_attn_metadata``). A step is the set of
+builds that share the runner's ``query_start_loc_cpu``, ``seq_lens`` and
+``positions`` tensors.
 
 Cache views are logical (blocks, heads, tokens, width) in every layout; the
 backends declare LBNHC, the layout Flash-V100 uses.
@@ -75,6 +87,7 @@ __all__ = [
     "Inkling2SconvMetadataBuilder",
     "cache_metadata",
     "decode_graph_enabled",
+    "decode_query_len",
     "is_decode_only",
     "replays_decode_graph",
 ]
@@ -97,12 +110,41 @@ def decode_graph_enabled(vllm_config: Any = None) -> bool:
     return not sm70_config(vllm_config).inkling2.visit_dump_dir
 
 
+def decode_query_len(vllm_config: Any) -> int:
+    """q: query tokens per request of a decode step, 1 + num_speculative_tokens
+    with a speculative config (UP v1/attention/backend.py
+    ``max_decode_query_len``), else 1."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    k = int(getattr(spec, "num_speculative_tokens", None) or 0)
+    # The V1 runner's parallel drafter appends k mask slots per request.
+    v1_parallel = getattr(spec, "parallel_drafting", False) and not getattr(
+        vllm_config, "use_v2_model_runner", False
+    )
+    return 1 + (2 * k if v1_parallel else k)
+
+
+def _uniform_decode(cm: CommonAttentionMetadata, query_len: int) -> bool:
+    """Whether every request of `cm` has `query_len` tokens, but for
+    zero-token requests after them (host data only)."""
+    if query_len == 1:
+        return cm.max_query_len <= 1
+    if cm.max_query_len != query_len or not cm.num_reqs:
+        return False
+    lens = cm.query_start_loc_cpu[: cm.num_reqs + 1].diff()
+    real, rest = divmod(int(lens.sum()), query_len)
+    if rest or not real:
+        return False
+    return bool((lens[:real] == query_len).all()) and not bool(lens[real:].any())
+
+
 def replays_decode_graph(vllm_config: Any, cm: CommonAttentionMetadata) -> bool:
     """Whether the runner runs the step of `cm` as a FULL decode graph
     (module docstring)."""
     from vllm.config.compilation import CUDAGraphMode
 
-    if cm.max_query_len > 1 or not decode_graph_enabled(vllm_config):
+    if not decode_graph_enabled(vllm_config):
+        return False
+    if not _uniform_decode(cm, decode_query_len(vllm_config)):
         return False
     compilation = getattr(vllm_config, "compilation_config", None)
     mode = getattr(compilation, "cudagraph_mode", None)
@@ -157,7 +199,12 @@ class Inkling2AttentionMetadata(Inkling2SconvMetadata):
 
 class _TokenIndex:
     """Per-token request index, query start and position of a batch, in
-    buffers one builder owns for its lifetime (CUDA graphs capture them)."""
+    buffers one builder owns for its lifetime (CUDA graphs capture them).
+
+    A batch whose first n requests hold one token each and the rest none
+    (every decode batch, padded or not) has seq_idx = query_start = row on
+    rows [0, n) and 0 after them. The buffers keep that pattern between such
+    batches and are written only when n or P changes."""
 
     def __init__(self, device: torch.device, size: int) -> None:
         self.size = size
@@ -165,6 +212,25 @@ class _TokenIndex:
         self.seq_idx = torch.zeros(size, dtype=torch.int32, device=device)
         self.query_start = torch.zeros(size, dtype=torch.int32, device=device)
         self.positions = torch.zeros(size, dtype=torch.int64, device=device)
+        # (n, P) of the decode pattern rows [0, P) hold, or None.
+        self._pattern: tuple[int, int] | None = None
+
+    @staticmethod
+    def _decode_rows(cm: CommonAttentionMetadata, num_actual: int) -> bool:
+        """Whether request i < num_actual has token i alone and the rest no
+        token: with at most one token per request, the first num_actual
+        requests hold num_actual tokens (host data only)."""
+        if cm.max_query_len > 1 or num_actual > cm.num_reqs:
+            return False
+        return int(cm.query_start_loc_cpu[num_actual]) == num_actual
+
+    def _fill_decode(self, num_actual: int, num_padded: int) -> None:
+        if self._pattern == (num_actual, num_padded):
+            return
+        for buffer in (self.seq_idx, self.query_start):
+            buffer[:num_actual].copy_(self.arange[:num_actual])
+            buffer[num_actual:num_padded].zero_()
+        self._pattern = (num_actual, num_padded)
 
     def fill(self, cm: CommonAttentionMetadata, decode_only: bool) -> dict[str, Any]:
         num_reqs = cm.num_reqs
@@ -183,7 +249,13 @@ class _TokenIndex:
         seq_idx = self.seq_idx[:num_padded]
         query_start = self.query_start[:num_padded]
         positions = self.positions[:num_padded]
-        if num_reqs and num_padded:
+        own_positions = cm.positions is None
+        if not num_reqs or not num_padded:
+            pass
+        elif not own_positions and self._decode_rows(cm, num_actual):
+            self._fill_decode(num_actual, num_padded)
+        else:
+            self._pattern = None
             starts = cm.query_start_loc[: num_reqs + 1]
             ends = starts[1:].contiguous()
             token = self.arange[:num_padded]
@@ -192,11 +264,12 @@ class _TokenIndex:
             req = torch.searchsorted(ends, token, right=True).clamp_(max=num_reqs - 1)
             real = token < num_actual
             start = starts[req]
-            context = cm.seq_lens[:num_reqs] - (ends - starts[:-1])
             seq_idx.copy_(torch.where(real, req, 0))
             query_start.copy_(torch.where(real, start, 0))
-            positions.copy_(torch.where(real, context[req] + token - start, 0))
-        if cm.positions is not None:
+            if own_positions:
+                context = cm.seq_lens[:num_reqs] - (ends - starts[:-1])
+                positions.copy_(torch.where(real, context[req] + token - start, 0))
+        if not own_positions:
             positions = cm.positions[:num_padded]
         return {
             "num_actual_tokens": num_actual,
@@ -206,6 +279,40 @@ class _TokenIndex:
             "positions": positions,
             "decode_only": decode_only,
         }
+
+
+class _StepBuilds:
+    """What the builders made in the current V2 step, by key: the metadata
+    per (builder class, spec) and the token index (``_TokenIndex``)."""
+
+    def __init__(self) -> None:
+        self._step: tuple[Any, ...] = ()
+        self._built: dict[Any, tuple[int, Any]] = {}
+
+    def _select(self, cm: CommonAttentionMetadata) -> None:
+        tensors = (cm.query_start_loc_cpu, cm.seq_lens, cm.positions)
+        step = (*tensors, cm.num_reqs, cm.num_actual_tokens, cm.max_query_len)
+        same = len(step) == len(self._step) and all(
+            a is b for a, b in zip(tensors, self._step[:3], strict=True)
+        ) and step[3:] == self._step[3:]
+        if not same:
+            self._step, self._built = step, {}
+
+    def get(self, cm: CommonAttentionMetadata, key: Any) -> Any:
+        self._select(cm)
+        rows, value = self._built.get(key, (-1, None))
+        return value if rows == cm.slot_mapping.shape[0] else None
+
+    def put(self, cm: CommonAttentionMetadata, key: Any, value: Any) -> None:
+        self._select(cm)
+        self._built[key] = (cm.slot_mapping.shape[0], value)
+
+
+_step_builds = _StepBuilds()
+
+
+def _uses_v2_runner(vllm_config: Any) -> bool:
+    return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
 class _Builder(AttentionMetadataBuilder):
@@ -223,6 +330,8 @@ class _Builder(AttentionMetadataBuilder):
     ) -> AttentionCGSupport:
         if not decode_graph_enabled(vllm_config):
             return AttentionCGSupport.NEVER
+        if decode_query_len(vllm_config) > 1:
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def __init__(
@@ -238,7 +347,41 @@ class _Builder(AttentionMetadataBuilder):
             torch.device(device),
             int(vllm_config.scheduler_config.max_num_batched_tokens),
         )
-        self._init_reorder_batch_threshold(1)
+        # Verify requests (q tokens) are ordered as decodes.
+        self._init_reorder_batch_threshold(decode_query_len(vllm_config))
+        self._reuse_step_builds = _uses_v2_runner(vllm_config)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> Any:
+        cm = common_attn_metadata
+        if not self._reuse_step_builds:
+            return self._build(cm)
+        key = (type(self), self.kv_cache_spec)
+        hit = _step_builds.get(cm, key)
+        if hit is not None:
+            return self.update_block_table(hit, cm.block_table_tensor, cm.slot_mapping)
+        metadata = self._build(cm)
+        _step_builds.put(cm, key, metadata)
+        return metadata
+
+    def _build(self, cm: CommonAttentionMetadata) -> Any:
+        raise NotImplementedError
+
+    def _token_fields(self, cm: CommonAttentionMetadata) -> dict[str, Any]:
+        """``_TokenIndex.fill`` of `cm`; on V2 once per step for all builders."""
+        if not self._reuse_step_builds:
+            return self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm))
+        fields = _step_builds.get(cm, _TokenIndex)
+        if fields is None:
+            fields = self.token_index.fill(
+                cm, replays_decode_graph(self.vllm_config, cm)
+            )
+            _step_builds.put(cm, _TokenIndex, fields)
+        return {**fields, "slot_mapping": cm.slot_mapping}
 
     def update_block_table(
         self, metadata: Any, blk_table: torch.Tensor, slot_mapping: torch.Tensor
@@ -250,17 +393,11 @@ class _Builder(AttentionMetadataBuilder):
 
 
 class Inkling2SconvMetadataBuilder(_Builder):
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> Inkling2SconvMetadata:
-        cm = common_attn_metadata
+    def _build(self, cm: CommonAttentionMetadata) -> Inkling2SconvMetadata:
         return Inkling2SconvMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
+            **self._token_fields(cm),
         )
 
 
@@ -276,13 +413,7 @@ class Inkling2AttentionMetadataBuilder(_Builder):
         window = getattr(kv_cache_spec, "sliding_window", None)
         self.sliding_window = None if window is None else int(window)
 
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> Inkling2AttentionMetadata:
-        cm = common_attn_metadata
+    def _build(self, cm: CommonAttentionMetadata) -> Inkling2AttentionMetadata:
         num_reqs = cm.num_reqs
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -295,7 +426,7 @@ class Inkling2AttentionMetadataBuilder(_Builder):
         return Inkling2AttentionMetadata(
             block_size=self.block_size,
             block_table=cm.block_table_tensor,
-            **self.token_index.fill(cm, replays_decode_graph(self.vllm_config, cm)),
+            **self._token_fields(cm),
             num_reqs=num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,

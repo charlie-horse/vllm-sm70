@@ -44,6 +44,7 @@ from vllm_sm70 import envs
 
 from . import act_quant, moe_tm
 from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
+from .fused_small import on_fused
 from .ops import _compat, grouped_gemm, routing, torch_ref
 
 SWITCH = "VLLM_SM70_INKLING_GROUPED_MOE"
@@ -245,13 +246,16 @@ class Inkling2Sm70Experts(nn.Module):
 
         top_k_index, top_k_weights [M, k] as `route` returns them; ids outside
         0..E-1 select no expert. `rowwise`: the torch path sums each token
-        on its own, without a host sync; the other routes never sync.
+        on its own, without a host sync; the other routes never sync. A
+        `rowwise` (decode-only) batch on the TurboMind route runs its SwiGLU
+        as one kernel on the route of fused_small.py.
         """
         x = act_quant.apply(self.act_quant, x)
         if self.tm_route is not None:
             self.tm_route.expert_sum(
-                x, top_k_index, top_k_weights, output, self.act_quant
-            )
+                x, top_k_index, top_k_weights, output, self.act_quant,
+                on_fused(x, rowwise),
+            )  # fmt: skip
             return
         if on_grouped(x):
             grouped_gemm.grouped_expert_sum(
@@ -362,7 +366,7 @@ class Inkling2Sm70Experts(nn.Module):
         `rowwise` as `expert_sum` (a decode-only batch).
         """
         if self._fused_routing(x):
-            self.fused_forward(x, output, is_padding)
+            self.fused_forward(x, output, is_padding, rowwise)
             return
         _, weights, indices = self.route(x, is_padding)
         self.expert_sum(x, indices, weights, output, rowwise)
@@ -377,9 +381,11 @@ class Inkling2Sm70Experts(nn.Module):
         x: torch.Tensor,
         output: torch.Tensor,
         is_padding: torch.Tensor | None = None,
+        decode_only: bool = False,
     ) -> None:
         """`forward` through ops/routing.py, on the TurboMind or the grouped
-        route; the caller checks ``on_fused_routing`` and the route."""
+        route; the caller checks ``on_fused_routing`` and the route.
+        `decode_only` as `expert_sum`'s `rowwise`."""
         gate = self.gate
         logits = routing.router_logits(x, gate.weight)
         if is_padding is not None:
@@ -388,7 +394,7 @@ class Inkling2Sm70Experts(nn.Module):
         if self.tm_route is not None:
             self.tm_route.routed_expert_sum(
                 x, logits, gate.bias, self.top_k, gate.route_scale, is_padding,
-                output, self.act_quant,
+                output, self.act_quant, on_fused(x, decode_only),
             )  # fmt: skip
             return
         routed = routing.route(

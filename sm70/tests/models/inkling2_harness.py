@@ -462,6 +462,16 @@ class PagedHarness:
                 stack.enter_context(set_current_vllm_config(config))
             yield
 
+    def lockstep(self, fn: Callable[[int], Any]) -> list:
+        """`fn(rank)` for every rank outside a step, with collectives (a
+        load-time all-gather); returns each rank's result."""
+
+        def activate(rank: int) -> None:
+            self._group.rank_in_group = rank
+
+        with self._installed():
+            return self._group.run(fn, activate)
+
     # Caches.
 
     def bind(self) -> None:

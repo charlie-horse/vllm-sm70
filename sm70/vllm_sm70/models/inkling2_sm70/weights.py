@@ -7,7 +7,12 @@ language model to one parameter (``Route``) or to an owner outside this module
 names after ``RENAMES``, with the per-layer projections fused as in
 ``QKVR_SHARDS`` and ``NORM_SHARDS`` (upstream vLLM's layout,
 vllm/models/inkling2/nvidia/model.py ``_renames`` / ``_shards``). Each rank
-keeps its slice of the head-sharded tensors; everything else is replicated.
+keeps its slice of the head-sharded tensors and, when ``head_sharded``, its
+rows of the LM head; everything else is replicated.
+
+LM head: at TP > 1 with an unpadded vocabulary that splits evenly, rank r
+holds vocabulary rows [r V/tp, (r + 1) V/tp) (``head_sharded``).
+``VLLM_SM70_INKLING_SHARDED_HEAD=0`` keeps the whole head on every rank.
 
 Dtypes: a parameter whose Hugging Face name contains an entry of
 ``HF_FP32_MODULES`` is float32; every other parameter is in the model dtype.
@@ -41,6 +46,7 @@ from vllm_sm70 import envs
 from .fp16_audit import Fp16Audit, check_hard_coded_config
 
 __all__ = [
+    "HEAD_SWITCH",
     "HF_FP32_MODULES",
     "MERGED_SWITCH",
     "MESSAGE_STREAMS",
@@ -59,10 +65,13 @@ __all__ = [
     "pack_parameters",
     "qkvr_sizes",
     "rows_view",
+    "sharded_head_enabled",
 ]
 
 MERGED_SWITCH = "VLLM_SM70_INKLING_MERGED_PROJ"
 merged_enabled = envs.environment_variables()[MERGED_SWITCH]
+HEAD_SWITCH = "VLLM_SM70_INKLING_SHARDED_HEAD"
+sharded_head_enabled = envs.environment_variables()[HEAD_SWITCH]
 
 # transformers modeling_inkling2_loop.py ``_keep_in_fp32_modules_strict``,
 # verbatim; matched as substrings of the Hugging Face parameter name.
@@ -232,6 +241,11 @@ class Inkling2WeightMap:
         self.tp_rank = tp_rank
         self.dtype = dtype
         self.with_visual = with_visual
+        self.head_sharded = (
+            sharded_head_enabled()
+            and tp_size > 1
+            and self.config.unpadded_vocab_size % tp_size == 0
+        )
         self.params: dict[str, ParamSpec] = {}
         self.routes: dict[str, Route] = {}
         self.packs: list[Pack] = []
@@ -297,6 +311,7 @@ class Inkling2WeightMap:
             "lm_head.weight",
             (text.padded_vocab_size, hidden),
             rows=text.unpadded_vocab_size,
+            tp_dim=0 if self.head_sharded else None,
         )
         self._add(
             "embed_norm.weight",

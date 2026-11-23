@@ -29,7 +29,8 @@ from vllm_sm70.models import flint_sm70, inkling2_sm70
 
 PKG = pathlib.Path(inkling2_sm70.__file__).resolve().parent
 DATA = pathlib.Path(__file__).resolve().parent / "data" / "inkling2_mini"
-CONFIG_TYPES = ("inkling2", "inkling2_loop", "inkling2_model")
+CONFIG_TYPES = ("inkling2", "inkling2_loop", "inkling2_model", "inkling2_dspark")
+ARCHS = (inkling2_sm70.ARCH, "Inkling2DSparkSm70Model")
 
 
 class _FakeCuda(Platform):
@@ -70,17 +71,18 @@ def registry(monkeypatch):
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
-    saved_model = ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
+    saved_models = {a: ModelRegistry.models.pop(a, None) for a in ARCHS}
     saved_cfg = {
         k: dict.pop(_CONFIG_REGISTRY, k) for k in CONFIG_TYPES if k in _CONFIG_REGISTRY
     }
     monkeypatch.setattr(inkling2_sm70, "_registered", False)
     monkeypatch.delitem(MODELS_CONFIG_MAP, inkling2_sm70.ARCH, raising=False)
     yield ModelRegistry, _CONFIG_REGISTRY
-    ModelRegistry.models.pop(inkling2_sm70.ARCH, None)
+    for arch, saved in saved_models.items():
+        ModelRegistry.models.pop(arch, None)
+        if saved is not None:
+            ModelRegistry.models[arch] = saved
     MODELS_CONFIG_MAP.pop(inkling2_sm70.ARCH, None)
-    if saved_model is not None:
-        ModelRegistry.models[inkling2_sm70.ARCH] = saved_model
     for k in CONFIG_TYPES:
         dict.pop(_CONFIG_REGISTRY, k, None)
     _CONFIG_REGISTRY.update(saved_cfg)
@@ -92,6 +94,7 @@ def _assert_configs_registered(cfg_reg):
     assert cfg_reg["inkling2"] is sm70_configs.Inkling2Sm70MMConfig
     assert cfg_reg["inkling2_loop"] is sm70_configs.Inkling2LoopSm70MMConfig
     assert cfg_reg["inkling2_model"] is configs.Inkling2ModelConfig
+    assert cfg_reg["inkling2_dspark"] is configs.Inkling2DSparkConfig
 
 
 def test_register_at_cc70(device, registry):
@@ -106,10 +109,15 @@ def test_register_at_cc70(device, registry):
         "vllm_sm70.models.inkling2_sm70",
         "Inkling2LoopSm70ForConditionalGeneration",
     )
+    draft = reg.models["Inkling2DSparkSm70Model"]
+    assert (draft.module_name, draft.class_name) == (
+        "vllm_sm70.models.inkling2_sm70.dspark",
+        "Inkling2DSparkSm70Model",
+    )
     _assert_configs_registered(cfg_reg)
     assert inkling2_sm70.register() is True  # idempotent
     # Nothing else moved: Flint, Qwen and every other entry are the same objects.
-    assert {k: v for k, v in reg.models.items() if k != inkling2_sm70.ARCH} == models
+    assert {k: v for k, v in reg.models.items() if k not in ARCHS} == models
     hook = MODELS_CONFIG_MAP[inkling2_sm70.ARCH]
     assert hook is inkling2_sm70.Inkling2Sm70ModelConfig
     assert dict(MODELS_CONFIG_MAP) == {**cfg_map, inkling2_sm70.ARCH: hook}
@@ -122,7 +130,7 @@ def test_not_registered_at_cc80_but_configs_are(device, registry):
     device(8, 0)
     models, cfgs = dict(reg.models), _raw(cfg_reg)
     assert inkling2_sm70.register() is False
-    assert inkling2_sm70.ARCH not in reg.models
+    assert not set(ARCHS) & set(reg.models)
     assert inkling2_sm70._registered is False
     assert dict(reg.models) == models
     _assert_configs_registered(cfg_reg)

@@ -37,6 +37,7 @@ from vllm_sm70.fused_moe.method import COMPACT_MAX_SLOTS
 
 from .expert_weights import NVFP4_BLOCK, Nvfp4Codes, RangeCheck
 from .ops import routing, torch_ref
+from .ops.activation import softcapped_swiglu_out
 
 logger = init_logger("vllm.sm70.models.inkling2.moe_tm")
 
@@ -351,11 +352,13 @@ class Nvfp4TmExperts:
         top_k_weights: torch.Tensor,
         output: torch.Tensor,
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        fused_act: bool = False,
     ) -> None:
         """Write this rank's weighted expert sum of x [M, H] fp16 into `output`.
 
         top_k_index, top_k_weights [M, k]; ids outside 0..E-1 select no expert.
         `act_quant` (act_quant.py) rewrites the SwiGLU output before W2.
+        `fused_act`: the SwiGLU runs as one kernel (fused_small.py).
         """
         if x.dtype != torch.float16 or x.ndim != 2 or x.shape[1] != self.hidden_size:
             raise TypeError(
@@ -381,7 +384,7 @@ class Nvfp4TmExperts:
             part = slice(start, min(start + CHUNK_ROWS, slots))
             self._chunk(
                 x, tokens[part], sorted_ids[part], weights[part], skip[part], total,
-                act_quant,
+                act_quant, fused_act,
             )  # fmt: skip
         output.copy_(total)
 
@@ -394,6 +397,7 @@ class Nvfp4TmExperts:
         skip: torch.Tensor,
         total: torch.Tensor,
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        fused_act: bool = False,
     ) -> None:
         """Add the weighted expert outputs of up to CHUNK_ROWS slots, sorted
         by expert, into the fp32 `total` [M, H]; slots where the bool `skip`
@@ -406,7 +410,7 @@ class Nvfp4TmExperts:
         torch.index_select(x, 0, tokens, out=rows)
         offsets, expert_ids, groups = self.stage_groups(sorted_ids)
         self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
-                     act_quant)  # fmt: skip
+                     act_quant, fused_act)  # fmt: skip
         weighted = sorted_out.float() * weights[:, None]
         total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
 
@@ -420,21 +424,26 @@ class Nvfp4TmExperts:
         expert_ids: torch.Tensor,
         groups: int,
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None,
+        fused_act: bool = False,
     ) -> None:
-        """W13, the soft-capped SwiGLU in fp32 and W2 of the expert-sorted
-        `rows` into `sorted_out`, through the scratch `gate_up` and `act`."""
+        """W13, the soft-capped SwiGLU in fp32 (one kernel with `fused_act`)
+        and W2 of the expert-sorted `rows` into `sorted_out`, through the
+        scratch `gate_up` and `act`."""
         stage = self.tm.nvfp4_moe_dense_stage_sm70_out
         stage(
             gate_up, rows, offsets, expert_ids,
             self.w13.ptrs_w, self.w13.ptrs_s,
             groups, self.hidden_size, 2 * self.local_intermediate, NVFP4_BLOCK,
         )  # fmt: skip
-        gate, up = gate_up.float().chunk(2, dim=-1)
-        act.copy_(
-            torch_ref.softcap(gate, self.gate_cap)
-            * torch.sigmoid(gate)
-            * torch_ref.softcap(up, self.up_cap)
-        )
+        if fused_act:
+            softcapped_swiglu_out(gate_up, act, self.gate_cap, self.up_cap)
+        else:
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            act.copy_(
+                torch_ref.softcap(gate, self.gate_cap)
+                * torch.sigmoid(gate)
+                * torch_ref.softcap(up, self.up_cap)
+            )
         if act_quant is not None:
             act.copy_(act_quant(act))
         stage(
@@ -453,6 +462,7 @@ class Nvfp4TmExperts:
         is_padding: torch.Tensor | None,
         output: torch.Tensor,
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        fused_act: bool = False,
     ) -> None:
         """`expert_sum` of x [M, H] fp16 routed from the fp32 router `logits`
         [M, E] by ops/routing.py, for M * top_k <= routing.MAX_SLOTS; rows
@@ -488,7 +498,7 @@ class Nvfp4TmExperts:
                 ws.expert_offsets, ws.dense_expert_ids, self.num_experts,
             )  # fmt: skip
         self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
-                     act_quant)  # fmt: skip
+                     act_quant, fused_act)  # fmt: skip
         routing.combine(sorted_out, routed, self.num_experts, output)
 
 
