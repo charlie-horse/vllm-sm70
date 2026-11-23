@@ -437,6 +437,7 @@ def test_interpreted_suite():
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
+        "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
     ):
         env.pop(name, None)
     proc = subprocess.run(

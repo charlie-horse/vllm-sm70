@@ -33,15 +33,20 @@ of fused_small.py the output gate of a decode-only batch is one launch
 Switch: the one-query rows of either kind of batch run one Triton kernel per
 call (ops/paged_attention.py), which reads only each row's own keys, unless
 VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0 or `hf_rounding`. Tensors off the GPU
-take the torch ops below, except in Triton's interpreter. The switch is read
-on every eager call; a replayed CUDA graph keeps the route it was captured
-with.
+take the torch ops below, except in Triton's interpreter. Its key range is
+split over several programs per row and head with a merge launch after
+(split-KV), the chunk count bounded by the shapes and the largest context
+(the block-table width in a decode-only batch), unless
+VLLM_SM70_INKLING_SPLIT_KV_ATTN=0. The switches are read on every eager
+call; a replayed CUDA graph keeps the route it was captured with.
 
 Transient memory of one step, beside the op's inputs and output:
 
     scores  at most 4 live tensors of query_chunk * key_chunk * heads fp32
             values: 4 * 4 B * 256 * 1024 * 24 = 101 MB at the defaults with
             the 24 heads of an Inkling 2 Mini global layer
+    split   the split-KV partials, (D + 2) * 4 B per program of at most
+            8 per SM: 333 KB with D 128 on a V100
     K | V   the gathered keys in the cache dtype and the values in fp32,
             kv_heads * D * 8 B per key: 8 MB for key_chunk keys of a request
             with several queries, 67 MB for the single-query requests
@@ -77,17 +82,21 @@ __all__ = [
     "DEFAULT_KEY_CHUNK",
     "DEFAULT_QUERY_CHUNK",
     "OWN_KEY_STEPS",
+    "SPLIT_SWITCH",
     "SWITCH",
     "attention_with_metadata",
     "gate_and_project",
     "gather_attention",
     "kv_cache_views",
+    "on_split_kv",
     "on_triton",
     "paged_attention",
 ]
 
 SWITCH = "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
 _enabled = envs.environment_variables()[SWITCH]
+SPLIT_SWITCH = "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
+_split_enabled = envs.environment_variables()[SPLIT_SWITCH]
 
 DEFAULT_QUERY_CHUNK = 256
 DEFAULT_KEY_CHUNK = 1024
@@ -103,6 +112,11 @@ def on_triton(x: torch.Tensor) -> bool:
     if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
         return False
     return _enabled()
+
+
+def on_split_kv() -> bool:
+    """Whether the Triton kernel of one-query rows may split their keys."""
+    return _split_enabled()
 
 
 def kv_cache_views(
@@ -324,8 +338,9 @@ def _decode_keys(
     out[rows:] = 0
     if not hf_rounding and on_triton(query):
         decode_attention(
-            query, rel_logits, sinks, kv_cache, md, out, rows=rows, padding=True
-        )
+            query, rel_logits, sinks, kv_cache, md, out, rows=rows, padding=True,
+            split_kv=on_split_kv(),
+        )  # fmt: skip
         return
     # Fewer, longer key steps for fewer rows, in the same gather budget.
     key_chunk = max(key_chunk, OWN_KEY_STEPS * key_chunk // max(rows, 1))
@@ -400,8 +415,9 @@ def gather_attention(
             tokens = torch.as_tensor(starts[single], device=query.device)
     if single.size and not hf_rounding and on_triton(query):
         decode_attention(
-            query, rel_logits, sinks, kv_cache, md, out, rows=tokens, padding=False
-        )
+            query, rel_logits, sinks, kv_cache, md, out, rows=tokens, padding=False,
+            split_kv=on_split_kv(), max_keys=int(seq_lens[single].max()),
+        )  # fmt: skip
     elif single.size:
         _own_keys(
             query,

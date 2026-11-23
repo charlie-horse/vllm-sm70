@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
-Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
+Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py with
+its split-KV pair,
 norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
 routing.py, dspark.py, small_ops.py, top1.py) goes through Triton's compiler and ptxas
 for GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
@@ -221,6 +222,51 @@ def test_decode_attention_kernel(indexed, slots):
         num_warps=4,
         enable_fp_fusion=False,
     )
+
+
+def _split_args(indexed: bool, slots: bool) -> dict:
+    return {
+        "rows_ptr": "*i64",
+        "pos_ptr": "*i64",
+        "slot_ptr": "*i64",
+        "part_ptr": "*fp32",
+        "stat_ptr": "*fp32",
+        **_i32("window", "splits", "min_keys"),
+        "D": HEAD_DIM,
+        "BLOCK_N": KV_BLOCK,
+        "BLOCK_D": HEAD_DIM,
+        "INDEXED": indexed,
+        "SLOTS": slots,
+    }
+
+
+@pytest.mark.parametrize("indexed", [False, True], ids=["first_rows", "indexed"])
+@pytest.mark.parametrize("slots", [False, True], ids=["eager", "padded"])
+def test_split_kv_kernels(indexed, slots):
+    ops = _ops("paged_attention")
+    split = {
+        **_split_args(indexed, slots),
+        **dict.fromkeys(
+            ("q_ptr", "rel_ptr", "sink_ptr", "cache_ptr", "out_ptr"), "*fp16"
+        ),
+        "seq_ptr": "*i32",
+        "table_ptr": "*i32",
+        **_i32(
+            "stride_q0", "stride_q1", "stride_r0", "stride_r1", "stride_s0",
+            "stride_o0", "stride_o1", "stride_cb", "stride_ch", "stride_cn",
+            "stride_bt", "extent",
+        ),
+        "scale": "fp32",
+        "GROUPS": Q_HEADS // KV_HEADS,
+    }  # fmt: skip
+    _check(ops._split_kv_kernel, split, num_warps=4, enable_fp_fusion=False)
+    merge = {
+        **_split_args(indexed, slots),
+        **dict.fromkeys(("sink_ptr", "out_ptr"), "*fp16"),
+        **_i32("stride_s0", "stride_o0", "stride_o1"),
+        "BLOCK_S": ops.MAX_SPLITS,
+    }
+    _check(ops._split_kv_merge_kernel, merge, num_warps=4, enable_fp_fusion=False)
 
 
 # --- norm.py, attn_res.py, loop.py ------------------------------------------------

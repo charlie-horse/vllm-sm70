@@ -363,6 +363,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN": kill_switch(
             "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
         ),
+        # "0": the Inkling 2 decode-attention kernel walks each row's keys in
+        # one program per row and head instead of splitting them over several
+        # programs and merging the partials (split-KV). Env-only (no
+        # Sm70Config field), read per eager call (inkling2_sm70/
+        # attention_torch.py) and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_SPLIT_KV_ATTN": kill_switch(
+            "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
+        ),
         # "0": Inkling 2 decode-only batches take the ops of mixed batches
         # again, the cache backends declare no full-graph support and an
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/

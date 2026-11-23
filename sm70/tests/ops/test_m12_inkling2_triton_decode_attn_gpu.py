@@ -7,7 +7,9 @@ The cases of test_m12_inkling2_triton_decode_attn_cpu.py
 (attention_torch.py ``gather_attention``) on the same GPU: fp16 within 2e-3
 and fp32 within 1e-5 of the largest reference value. Plus Inkling 2 Mini
 shapes per TP2 rank: 12 heads, 4 KV heads, head dim 128, 32-token blocks,
-contexts up to 33K tokens.
+contexts up to 33K tokens. Split-KV (the default) against the unsplit
+kernel (VLLM_SM70_INKLING_SPLIT_KV_ATTN=0), and inside a captured CUDA
+graph replayed at other positions.
 
     pytest -m gpu sm70/tests/ops/test_m12_inkling2_triton_decode_attn_gpu.py
 """
@@ -128,3 +130,64 @@ def test_mini_shapes_match_the_torch_route(
     case = _cuda(cases.Case(torch.float16, window, extent, seq_lens))
     got, want = cases.both_routes(case, monkeypatch)
     assert cases.rel_err(got, want) <= 2e-3
+
+
+SPLIT_SWITCH = "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
+
+
+def _mini(cases, monkeypatch, seq_lens):
+    monkeypatch.setattr(cases, "HEADS", 12)
+    monkeypatch.setattr(cases, "KV_HEADS", 4)
+    monkeypatch.setattr(cases, "HEAD_DIM", 128)
+    blocks = sum(-(-n // cases.BLOCK) for n in seq_lens) + 8
+    monkeypatch.setattr(cases, "NUM_BLOCKS", blocks)
+
+
+@pytest.mark.parametrize(
+    "window, seq_lens",
+    [(None, [60]), (None, [4000]), (None, [33000]), (1024, [4000]),
+     (1024, [3000, 17, 1500, 900]), (None, [33000, 5, 900, 4000])],
+    ids=["short", "global-4k", "global-33k", "window-4k", "window-4req",
+         "global-4req"],
+)  # fmt: skip
+def test_split_matches_the_unsplit_kernel(cases, monkeypatch, window, seq_lens):
+    _mini(cases, monkeypatch, seq_lens)
+    attention = cases.attention_module()
+    case = _cuda(cases.Case(torch.float16, window, 1024, seq_lens, pad=3))
+    monkeypatch.delenv(SPLIT_SWITCH, raising=False)
+    got = case.run(attention)
+    monkeypatch.setenv(SPLIT_SWITCH, "0")
+    want = case.run(attention)
+    assert cases.rel_err(got, want) <= 2e-3
+    assert bool((got[len(seq_lens) :] == 0).all())
+
+
+@pytest.mark.parametrize("window", [None, 1024], ids=["global", "sliding"])
+def test_split_replays_in_a_cuda_graph(cases, monkeypatch, window):
+    """Captured once at the longest context, replayed at shorter positions:
+    each replay matches the eager torch route at those positions."""
+    _mini(cases, monkeypatch, [33000])
+    attention = cases.attention_module()
+    monkeypatch.delenv(SPLIT_SWITCH, raising=False)
+    case = _cuda(cases.Case(torch.float16, window, 1024, [33000]))
+    out = torch.zeros_like(case.query)
+
+    def run():
+        attention.gather_attention(
+            case.query, case.rel, case.sinks, case.cache, case.md, out
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for position in (0, 31, 100, 1500, 4000, 32999):
+        case.md.positions.fill_(position)
+        graph.replay()
+        torch.cuda.synchronize()
+        got = out.clone()
+        monkeypatch.setenv(cases.SWITCH, "0")
+        want = case.run(attention)
+        monkeypatch.delenv(cases.SWITCH)
+        assert cases.rel_err(got, want) <= 2e-3, position
