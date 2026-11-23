@@ -353,6 +353,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # fixed at capture in a replayed CUDA graph; tensors off the GPU
         # always take the torch expert sum.
         "VLLM_SM70_INKLING_GROUPED_MOE": kill_switch("VLLM_SM70_INKLING_GROUPED_MOE"),
+        # "0": Inkling 2 batches of at most 64 routed slots on the TurboMind
+        # or grouped expert route take the torch router and the torch slot
+        # sort instead of the routing kernels (inkling2_sm70/ops/routing.py).
+        # Env-only (no Sm70Config field), read per eager call (inkling2_sm70/
+        # moe.py) and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_FUSED_ROUTING": kill_switch(
+            "VLLM_SM70_INKLING_FUSED_ROUTING"
+        ),
+        # "0": the Inkling 2 config hook leaves the TurboMind NVFP4 tuning
+        # knobs alone. Otherwise, when none of VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES,
+        # VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS and VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M
+        # is set, it sets them (1, decode graph cap x top-k, 0) for the
+        # workers it spawns: the expert stages of decode batches up to the
+        # capture cap are measured in eager warmup and reused by capture
+        # (inkling2_sm70/config.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

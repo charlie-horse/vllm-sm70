@@ -2,10 +2,12 @@
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
-norm.py, attn_res.py, loop.py, activation.py, grouped_gemm.py) goes through
+norm.py, attn_res.py, loop.py, activation.py, grouped_gemm.py, routing.py)
+goes through
 Triton's compiler and ptxas for GPUTarget("cuda", 70, 32) at Inkling 2 Mini
 sizes (hidden 2304, head dim 128, 12 query and 4 KV heads per rank at TP2,
-KV block 32, 4 conv taps, expert intermediate 576 per rank), with the
+KV block 32, 4 conv taps, expert intermediate 576 per rank, 128 experts,
+top-8, decode batches of 1 to 8 tokens), with the
 constexprs and launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
 This catches what the interpreter tests cannot: Triton's constexpr and
 static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
@@ -349,6 +351,89 @@ def test_slot_gemv_kernel(row_div, k_in):
             "ROW_DIV": row_div,
             "BLOCK_N": grouped_gemm.BLOCK_N,
             "BLOCK_K": grouped_gemm.BLOCK_K,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+# --- routing.py ---------------------------------------------------------------------
+
+EXPERTS = 128
+TOP_K = 8
+
+
+@pytest.mark.parametrize("x", ["*fp16", "*fp32"])
+def test_router_logits_kernel(x):
+    routing = _ops("routing")
+    _check(
+        routing._router_logits_kernel,
+        {
+            "x_ptr": x,
+            "w_ptr": "*fp32",
+            "out_ptr": "*fp32",
+            **_i32("stride_x", "stride_w", "stride_out", "hidden", "experts"),
+            "BLOCK_E": routing.GEMV_BLOCK_E,
+            "BLOCK_K": routing.GEMV_BLOCK_K,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 8])
+@pytest.mark.parametrize("has_pad", [False, True], ids=["no_pad", "pad"])
+@pytest.mark.parametrize("dispatch", [False, True], ids=["route", "dispatch"])
+def test_route_kernel(tokens, has_pad, dispatch):
+    routing = _ops("routing")
+    _check(
+        routing._route_kernel,
+        {
+            "logits_ptr": "*fp32",
+            "bias_ptr": "*fp32",
+            "pad_ptr": "*i1" if has_pad else "*i32",
+            "ids_ptr": "*i32",
+            "weights_ptr": "*fp32",
+            "pos_ptr": "*i32",
+            "sorted_ptr": "*i32",
+            "offsets_ptr": "*i32",
+            "src_ptr": "*fp16" if dispatch else "*i32",
+            "rows_ptr": "*fp16" if dispatch else "*i32",
+            **_i32(
+                "tokens",
+                "experts",
+                "hidden",
+                "stride_l",
+                "stride_src",
+                "stride_rows",
+                "pad_id",
+            ),
+            "route_scale": "fp32",
+            "TOP_K": TOP_K,
+            "BLOCK_M": max(2, tokens),
+            "BLOCK_E": EXPERTS,
+            "BLOCK_TOP": TOP_K,
+            "BLOCK_H": routing.BLOCK_H,
+            "HAS_PAD": has_pad,
+            "DISPATCH": dispatch,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize("has_pos", [False, True], ids=["by_token", "sorted"])
+def test_combine_kernel(has_pos):
+    routing = _ops("routing")
+    _check(
+        routing._combine_kernel,
+        {
+            "y_ptr": "*fp16",
+            "ids_ptr": "*i32",
+            "weights_ptr": "*fp32",
+            "pos_ptr": "*i32",
+            "out_ptr": "*fp16",
+            **_i32("stride_y", "stride_out", "hidden", "experts"),
+            "TOP_K": TOP_K,
+            "BLOCK_H": routing.BLOCK_H,
+            "HAS_POS": has_pos,
         },
         enable_fp_fusion=False,
     )

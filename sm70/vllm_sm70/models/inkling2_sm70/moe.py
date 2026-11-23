@@ -23,6 +23,12 @@ VLLM_SM70_INKLING_GROUPED_MOE=0, which sends them back to the torch expert
 sum below. Tensors off the GPU take the torch expert sum, except in
 Triton's interpreter. The switch is read on every eager call; a replayed
 CUDA graph keeps the route it was captured with.
+
+Switch: a batch of at most ``routing.MAX_SLOTS`` routed slots on the
+TurboMind or the grouped route is routed by ops/routing.py (router GEMV,
+then top-k, weights, slot sort and row gather in one launch, the weighted
+sum in another) unless VLLM_SM70_INKLING_FUSED_ROUTING=0, which keeps the
+torch router and the torch sort of those routes. Read and fixed as above.
 """
 
 from __future__ import annotations
@@ -38,10 +44,12 @@ from vllm_sm70 import envs
 
 from . import act_quant, moe_tm
 from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
-from .ops import _compat, grouped_gemm, torch_ref
+from .ops import _compat, grouped_gemm, routing, torch_ref
 
 SWITCH = "VLLM_SM70_INKLING_GROUPED_MOE"
 _enabled = envs.environment_variables()[SWITCH]
+FUSED_SWITCH = "VLLM_SM70_INKLING_FUSED_ROUTING"
+_fused_enabled = envs.environment_variables()[FUSED_SWITCH]
 
 
 def on_grouped(x: torch.Tensor) -> bool:
@@ -50,6 +58,15 @@ def on_grouped(x: torch.Tensor) -> bool:
     if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
         return False
     return _enabled()
+
+
+def on_fused_routing(x: torch.Tensor, top_k: int) -> bool:
+    """Whether x [M, H] is routed by ops/routing.py's kernels."""
+    if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
+        return False
+    if not 0 < x.shape[0] * top_k <= routing.MAX_SLOTS:
+        return False
+    return _fused_enabled()
 
 
 def _text_config(config: Any) -> Any:
@@ -344,5 +361,40 @@ class Inkling2Sm70Experts(nn.Module):
         `output` must not alias `x`. Padding rows are written as zeros.
         `rowwise` as `expert_sum` (a decode-only batch).
         """
+        if self._fused_routing(x):
+            self.fused_forward(x, output, is_padding)
+            return
         _, weights, indices = self.route(x, is_padding)
         self.expert_sum(x, indices, weights, output, rowwise)
+
+    def _fused_routing(self, x: torch.Tensor) -> bool:
+        if not on_fused_routing(x, self.top_k):
+            return False
+        return self.tm_route is not None or on_grouped(x)
+
+    def fused_forward(
+        self,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        is_padding: torch.Tensor | None = None,
+    ) -> None:
+        """`forward` through ops/routing.py, on the TurboMind or the grouped
+        route; the caller checks ``on_fused_routing`` and the route."""
+        gate = self.gate
+        logits = routing.router_logits(x, gate.weight)
+        if is_padding is not None:
+            is_padding = is_padding.reshape(-1)
+        x = act_quant.apply(self.act_quant, x)
+        if self.tm_route is not None:
+            self.tm_route.routed_expert_sum(
+                x, logits, gate.bias, self.top_k, gate.route_scale, is_padding,
+                output, self.act_quant,
+            )  # fmt: skip
+            return
+        routed = routing.route(
+            logits, gate.bias, self.top_k, gate.route_scale, is_padding, pad_id=-1
+        )
+        grouped_gemm.routed_expert_sum(
+            x, routed, self.w13, self.w2, self.gate_cap, self.up_cap, output,
+            act_hook=self.act_quant,
+        )  # fmt: skip

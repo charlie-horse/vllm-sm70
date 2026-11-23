@@ -167,6 +167,30 @@ def test_hook_fixes_the_kv_plan(
     assert cfg.cache_config.cache_dtype == cache_dtype
 
 
+def test_hook_sets_the_turbomind_tuning_knobs(device, route_log, monkeypatch):
+    """With FULL decode graphs and no knob set: tuning on for the expert
+    stages up to the decode graph cap x top-k slots (tm_tune test)."""
+    import os
+
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    device(7, 0)
+    for name in (*icfg.TM_TUNE_KNOBS, "VLLM_SM70_INKLING_TM_TUNE", DECODE_GRAPH):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(moe_tm, "turbomind", lambda: object())
+    cfg = _vllm_config()
+    cfg.model_config.hf_config = SimpleNamespace(num_experts_per_tok=TOP_K)
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert cfg.compilation_config.max_cudagraph_capture_size == 8
+    assert {name: os.environ[name] for name in icfg.TM_TUNE_KNOBS} == {
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
+        "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": str(8 * TOP_K),
+        "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "0",
+    }
+    assert any("expert stages tuned up to 64 routed slots" in x for x in route_log)
+
+
 BREAKABLE = "VLLM_USE_BREAKABLE_CUDAGRAPH"
 DECODE_GRAPH = "VLLM_SM70_INKLING_DECODE_GRAPH"
 

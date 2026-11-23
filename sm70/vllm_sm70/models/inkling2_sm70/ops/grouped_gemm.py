@@ -28,6 +28,10 @@ such is zero.
 
 ``kernels=False`` runs the slot GEMVs and the SwiGLU as torch ops
 (per-slot weight gathers and ``bmm``) for tensors off the GPU.
+
+    routed_expert_sum    the same sum for a batch that routing.py routed
+                         (S <= SLOT_MAX): the slot way only, without the
+                         sort and masks, the sum in ``routing.combine``
 """
 
 from __future__ import annotations
@@ -37,10 +41,17 @@ from typing import Final
 
 import torch
 
+from . import routing
 from ._compat import tl, triton
 from .activation import softcapped_swiglu_out
 
-__all__ = ["CHUNK_TOKENS", "SLOT_MAX", "capacity", "grouped_expert_sum"]
+__all__ = [
+    "CHUNK_TOKENS",
+    "SLOT_MAX",
+    "capacity",
+    "grouped_expert_sum",
+    "routed_expert_sum",
+]
 
 # Routed slots up to which every slot takes the GEMV kernel.
 SLOT_MAX: Final = 64
@@ -170,6 +181,31 @@ def grouped_expert_sum(
             x[start:stop], top_k_index[start:stop], top_k_weights[start:stop],
             w13, w2, gate_cap, up_cap, output[start:stop], kernels, act_hook,
         )  # fmt: skip
+
+
+def routed_expert_sum(
+    x: torch.Tensor,
+    routed: routing.Routed,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    gate_cap: float,
+    up_cap: float,
+    output: torch.Tensor,
+    *,
+    act_hook: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> None:
+    """`grouped_expert_sum` with the kernels, for `routed` from
+    ``routing.route(..., pad_id=-1)`` of x [M, H] with M * k <= SLOT_MAX."""
+    tokens, top_k = routed.ids.shape
+    assert tokens * top_k <= SLOT_MAX and x.shape[0] == tokens
+    x = x.contiguous()
+    slot_experts = routed.ids.reshape(-1)
+    gate_up = _slot_gemv(x, w13, slot_experts, top_k, kernels=True)
+    act = _swiglu(gate_up, gate_cap, up_cap, True)
+    if act_hook is not None:
+        act = act_hook(act)
+    y = _slot_gemv(act, w2, slot_experts, 1, kernels=True)
+    routing.combine(y, routed, w13.shape[0], output)
 
 
 def _chunk(

@@ -33,9 +33,21 @@
   config/vllm.py ``_apply_optimization_level_defaults``).
 * Copies ``sm70.inkling2.max_image_encoder_tokens`` onto the model's
   ``hf_config``, where the image processor reads it (processing.py).
+* TurboMind tuning (``tm_tuning_env``): with FULL decode graphs, the
+  TurboMind expert route on and its ops loaded, and none of
+  ``TM_TUNE_KNOBS`` set, writes them into the environment of the workers
+  spawned after this: small-shape tuning on, the NVFP4 MoE limit at the
+  decode graph cap times top-k routed slots, the NVFP4 dense limit 0. The
+  knobs are process-wide and read once (csrc/turbomind/ops/tm_config.h);
+  an Inkling 2 engine holds no other NVFP4 TurboMind layer. Each capture
+  size runs once eagerly before its capture (UP gpu_model_runner.py
+  ``_warmup_and_capture``), which measures its stage shapes; capture never
+  measures (gemm_runtime.cpp ``select_moe_dispatch_policy_impl``) and reuses
+  them. VLLM_SM70_INKLING_TM_TUNE=0 leaves the knobs alone.
 * Logs the routes once per process.
 """
 
+import os
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -53,6 +65,12 @@ KV_BLOCK_SIZE = 32
 # Largest decode batch captured in a FULL graph: a decode step gathers the whole
 # block-table width of keys per global-layer request.
 DECODE_GRAPH_MAX_BATCH = 8
+
+TM_TUNE_KNOBS = (
+    "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
+    "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS",
+    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+)
 
 _logged = False
 
@@ -95,6 +113,32 @@ def _cap_decode_graph_batch(compilation_config: Any, scheduler_config: Any) -> N
     if isinstance(max_num_seqs, int) and max_num_seqs > 0:
         cap = min(cap, max_num_seqs)
     compilation_config.max_cudagraph_capture_size = cap
+
+
+def tm_tuning_env(compilation_config: Any, hf_config: Any) -> dict[str, str]:
+    """The ``TM_TUNE_KNOBS`` values to set for this engine ({} for none)."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_sm70 import envs as sm70_envs
+
+    from . import moe_tm
+
+    if not sm70_envs.VLLM_SM70_INKLING_TM_TUNE or not moe_tm.enabled():
+        return {}
+    if any(name in os.environ for name in TM_TUNE_KNOBS):
+        return {}
+    get_text = getattr(hf_config, "get_text_config", None)
+    text = get_text() if callable(get_text) else hf_config
+    top_k = int(getattr(text, "num_experts_per_tok", 0) or 0)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if top_k <= 0 or mode is None or mode.decode_mode() != CUDAGraphMode.FULL:
+        return {}
+    sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or ()
+    largest = getattr(compilation_config, "max_cudagraph_capture_size", None)
+    cap = max(largest or 0, *sizes, 0)
+    if cap <= 0 or moe_tm.turbomind() is None:
+        return {}
+    slots = min(cap, DECODE_GRAPH_MAX_BATCH) * top_k
+    return dict(zip(TM_TUNE_KNOBS, ("1", str(slots), "0"), strict=True))
 
 
 class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
@@ -213,6 +257,15 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
             _cap_decode_graph_batch(compilation_config, scheduler_config)
         hf_config = getattr(model_config, "hf_config", None)
+        tuning = tm_tuning_env(compilation_config, hf_config)
+        if tuning:
+            os.environ.update(tuning)
+            logger.info(
+                "Inkling 2 SM70: TurboMind NVFP4 expert stages tuned up to %s "
+                "routed slots (%s); VLLM_SM70_INKLING_TM_TUNE=0 turns it off.",
+                tuning[TM_TUNE_KNOBS[1]],
+                ", ".join(f"{k}={v}" for k, v in tuning.items()),
+            )
         if hf_config is not None:
             setattr(
                 hf_config,

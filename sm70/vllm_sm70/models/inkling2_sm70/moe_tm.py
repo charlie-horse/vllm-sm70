@@ -15,6 +15,9 @@ above that the groups are the per-expert offsets over all experts.
 
 Every routed slot runs, so ``expert_sum`` reads nothing back to the host: a
 slot with no expert (padding) is computed on expert E - 1 and zeroed.
+``routed_expert_sum`` takes the router logits of a small batch instead and
+routes, sorts and gathers the slots in one launch and sums them in another
+(ops/routing.py); the stages and the SwiGLU are those of ``expert_sum``.
 
 Switch: the route is on where ``rejection`` admits a layer;
 ``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer on the torch path of
@@ -33,7 +36,7 @@ from vllm_sm70 import envs
 from vllm_sm70.fused_moe.method import COMPACT_MAX_SLOTS
 
 from .expert_weights import NVFP4_BLOCK, Nvfp4Codes, RangeCheck
-from .ops import torch_ref
+from .ops import routing, torch_ref
 
 logger = init_logger("vllm.sm70.models.inkling2.moe_tm")
 
@@ -402,6 +405,24 @@ class Nvfp4TmExperts:
         )
         torch.index_select(x, 0, tokens, out=rows)
         offsets, expert_ids, groups = self.stage_groups(sorted_ids)
+        self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
+                     act_quant)  # fmt: skip
+        weighted = sorted_out.float() * weights[:, None]
+        total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
+
+    def _stages(
+        self,
+        rows: torch.Tensor,
+        gate_up: torch.Tensor,
+        act: torch.Tensor,
+        sorted_out: torch.Tensor,
+        offsets: torch.Tensor,
+        expert_ids: torch.Tensor,
+        groups: int,
+        act_quant: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> None:
+        """W13, the soft-capped SwiGLU in fp32 and W2 of the expert-sorted
+        `rows` into `sorted_out`, through the scratch `gate_up` and `act`."""
         stage = self.tm.nvfp4_moe_dense_stage_sm70_out
         stage(
             gate_up, rows, offsets, expert_ids,
@@ -421,8 +442,54 @@ class Nvfp4TmExperts:
             self.w2.ptrs_w, self.w2.ptrs_s,
             groups, self.local_intermediate, self.hidden_size, NVFP4_BLOCK,
         )  # fmt: skip
-        weighted = sorted_out.float() * weights[:, None]
-        total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
+
+    def routed_expert_sum(
+        self,
+        x: torch.Tensor,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        top_k: int,
+        route_scale: float,
+        is_padding: torch.Tensor | None,
+        output: torch.Tensor,
+        act_quant: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        """`expert_sum` of x [M, H] fp16 routed from the fp32 router `logits`
+        [M, E] by ops/routing.py, for M * top_k <= routing.MAX_SLOTS; rows
+        where the bool `is_padding` is set are zero."""
+        tokens = x.shape[0]
+        slots = tokens * top_k
+        if x.dtype != torch.float16 or x.shape[1] != self.hidden_size:
+            raise TypeError(
+                f"Inkling 2 NVFP4 experts need fp16 [M, {self.hidden_size}] "
+                f"input, got {x.dtype} {tuple(x.shape)}"
+            )
+        assert 0 < slots <= routing.MAX_SLOTS, slots
+        ws = self.workspace
+        ws.reserve(slots)
+        rows, gate_up, act, sorted_out = (
+            ws.buffers[name][:slots] for name in ws.widths
+        )
+        compact = self.compact and slots <= COMPACT_MAX_SLOTS
+        if compact:
+            sorted_ids = ws.compact_expert_ids[:slots]
+        else:
+            sorted_ids = torch.empty(slots, dtype=torch.int32, device=x.device)
+        routed = routing.route(
+            logits, bias, top_k, route_scale, is_padding,
+            pad_id=self.num_experts,
+            dispatch=(x.contiguous(), rows, sorted_ids, ws.expert_offsets),
+        )  # fmt: skip
+        if compact:
+            offsets, expert_ids = ws.compact_offsets[: slots + 1], sorted_ids
+            groups = slots
+        else:
+            offsets, expert_ids, groups = (
+                ws.expert_offsets, ws.dense_expert_ids, self.num_experts,
+            )  # fmt: skip
+        self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
+                     act_quant)  # fmt: skip
+        routing.combine(sorted_out, routed, self.num_experts, output)
 
 
 def build(
