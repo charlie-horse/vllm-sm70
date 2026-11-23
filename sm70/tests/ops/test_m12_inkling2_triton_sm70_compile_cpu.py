@@ -3,11 +3,12 @@
 
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
 norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
-routing.py) goes through Triton's compiler and ptxas for
+routing.py, dspark.py) goes through Triton's compiler and ptxas for
 GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim 128,
 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
 intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
-tokens, message-gate rank 64), with the
+tokens, message-gate rank 64; draft: 8-query blocks, 4 feature taps,
+Markov rank 256), with the
 constexprs and launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
 This catches what the interpreter tests cannot: Triton's constexpr and
 static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
@@ -491,5 +492,113 @@ def test_combine_kernel(has_pos):
             "BLOCK_H": routing.BLOCK_H,
             "HAS_POS": has_pos,
         },
+        enable_fp_fusion=False,
+    )
+
+
+# --- dspark.py -----------------------------------------------------------------
+
+DRAFT_BLOCK = 8
+DRAFT_TAPS = 4
+MARKOV_RANK = 256
+
+
+def test_mix_rmsnorm_kernel():
+    _check(
+        _ops("dspark")._mix_rmsnorm_kernel,
+        {
+            **dict.fromkeys(("x_ptr", "out_ptr", "weight_ptr"), "*fp16"),
+            "alpha_ptr": "*fp32",
+            **_i32("stride_row", "stride_tap", "stride_h"),
+            "eps": "fp32",
+            "TAPS": DRAFT_TAPS,
+            "HIDDEN": HIDDEN,
+            "BLOCK": 4096,
+        },
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize("norm", [False, True], ids=["rope", "norm_rope"])
+def test_qk_norm_rope_kernel(norm):
+    _check(
+        _ops("dspark")._qk_norm_rope_kernel,
+        {
+            **dict.fromkeys(("x_ptr", "q_weight_ptr", "k_weight_ptr"), "*fp16"),
+            "cos_sin_ptr": "*fp32",
+            "pos_ptr": "*i64",
+            **_i32("stride_row", "q_size"),
+            "eps": "fp32",
+            "NHQ": Q_HEADS if norm else 0,
+            "D": HEAD_DIM,
+            "NORM": norm,
+        },
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+
+
+def test_silu_and_mul_kernel():
+    _check(
+        _ops("dspark")._silu_and_mul_kernel,
+        {"x_ptr": "*fp16", "out_ptr": "*fp16", **_i32("stride_x", "n"), "BLOCK": 1024},
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+
+def test_add_softcap_kernel():
+    _check(
+        _ops("dspark")._add_softcap_kernel,
+        {
+            **dict.fromkeys(("a_ptr", "b_ptr"), "*fp16"),
+            "out_ptr": "*fp32",
+            **_i32("stride_a", "stride_b", "stride_o", "n"),
+            "cap": "fp32",
+            "BLOCK": 1024,
+        },
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+
+def test_markov_gate_kernel():
+    _check(
+        _ops("dspark")._markov_gate_kernel,
+        {
+            "raw_ptr": "*fp32",
+            **dict.fromkeys(("state_ptr", "out_ptr", "latent_ptr"), "*fp16"),
+            "RANK": MARKOV_RANK,
+        },
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+
+
+def test_block_attention_kernel():
+    _check(
+        _ops("dspark")._block_attention_kernel,
+        {
+            **dict.fromkeys(("q_ptr", "key_ptr", "value_ptr", "out_ptr"), "*fp16"),
+            "table_ptr": "*i32",
+            "seq_ptr": "*i32",
+            **_i32(
+                "stride_qt",
+                "stride_qh",
+                "stride_kb",
+                "stride_kn",
+                "stride_kh",
+                "stride_ot",
+                "stride_bt",
+                "window",
+            ),
+            "scale": "fp32",
+            "BLOCK_Q": DRAFT_BLOCK,
+            "GROUPS": Q_HEADS // KV_HEADS,
+            "D": HEAD_DIM,
+            "BLOCK_N": KV_BLOCK,
+        },
+        num_warps=4,
         enable_fp_fusion=False,
     )

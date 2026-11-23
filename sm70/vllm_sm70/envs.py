@@ -390,6 +390,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # again and Sm70CudaPlatform.get_speculator_cls (U6) returns None
         # (inkling2_sm70/draft.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_DSPARK": kill_switch("VLLM_SM70_INKLING_DSPARK"),
+        # "0": the Inkling 2 draft (inkling2_sm70/dspark.py) runs the torch
+        # forms of its norm, RoPE, block attention, SwiGLU, Markov gate and
+        # soft-cap ops instead of the Triton kernels (inkling2_sm70/ops/
+        # dspark.py). Env-only, read per eager call and fixed at capture in a
+        # replayed CUDA graph.
+        "VLLM_SM70_INKLING_DSPARK_KERNELS": kill_switch(
+            "VLLM_SM70_INKLING_DSPARK_KERNELS"
+        ),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

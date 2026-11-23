@@ -180,6 +180,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
         "VLLM_SM70_INKLING_DSPARK",
+        "VLLM_SM70_INKLING_DSPARK_KERNELS",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -499,6 +500,24 @@ def _inkling_dspark_off(name):
     assert draft.speculator_cls(SimpleNamespace(speculative_config=spec)) is None
 
 
+def _inkling_dspark_kernels_off(name):
+    """The Inkling 2 draft ops take their torch forms, even on tensors the
+    kernels could run; the forms are compared in
+    tests/ops/test_m12_inkling2_dspark_ops_cpu.py."""
+    pytest.importorskip("vllm")
+    import torch
+
+    from vllm_sm70.models.inkling2_sm70 import dspark
+    from vllm_sm70.models.inkling2_sm70.ops import _compat
+
+    assert dspark.SWITCH == name
+    interpret, _compat.INTERPRET = _compat.INTERPRET, True
+    try:
+        assert not dspark.kernels_on(torch.zeros(1))
+    finally:
+        _compat.INTERPRET = interpret
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -610,6 +629,8 @@ def _path_off(name):
         _inkling_tm_tune_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK":
         _inkling_dspark_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK_KERNELS":
+        _inkling_dspark_kernels_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
