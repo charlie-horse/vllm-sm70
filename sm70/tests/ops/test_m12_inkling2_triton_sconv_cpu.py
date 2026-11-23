@@ -10,8 +10,9 @@ and their route (sconv.py ``short_conv``, prologue.py
   and in fp16 within 2e-3: pure prefill, pure decode, mixed batches,
   positions across the 32-token block boundary, requests shorter than the
   conv width, padded and unpadded metadata, a scheduled row without a slot,
-  the LBNHC cache view, static and dynamic convs; the conv-state and K/V
-  caches after every scenario;
+  the LBNHC cache view, static and dynamic convs, decode-only verify steps
+  of 8 tokens per request against the eager torch ops; the conv-state and
+  K/V caches after every scenario;
 - one kernel launch per short conv and per prologue K/V pair, and no host
   sync or data-dependent op on the route;
 - the tiny model through the interpreted kernels against the torch route.
@@ -361,6 +362,42 @@ def test_padding_rows_match_the_torch_route(
     if pad:
         for out in got[2:-2:4] + got[3:-2:4]:
             assert not out[-pad:].any()
+
+
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@CONVS
+@pytest.mark.parametrize("pad", [0, 8], ids=["unpadded", "padded"])
+def test_decode_only_verify_matches_the_eager_torch_route(
+    cases, monkeypatch, dtype, tol, dynamic, pad
+):
+    """Verify steps (8 tokens per request) marked decode-only, whose taps
+    reach into the same request's rows, on the kernels against the eager
+    torch ops."""
+    steps = cases.SCENARIOS["verify"]
+    monkeypatch.delenv(SWITCH, raising=False)
+    weights = cases.Weights("cpu", dtype, dynamic)
+    got = cases.run(weights, steps, pad=pad, decode_only=True)
+    monkeypatch.setenv(SWITCH, "0")
+    want = cases.run(cases.Weights("cpu", dtype, dynamic), steps, pad=pad)
+    _check(cases, got, want, tol)
+
+
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@CONVS
+@pytest.mark.parametrize("pad", [0, 8], ids=["unpadded", "padded"])
+def test_decode_only_torch_verify_matches_the_eager_torch_route(
+    monkeypatch, dtype, tol, dynamic, pad
+):
+    """The same on the torch route: the decode-only taps (selected, no host
+    sync) against the eager ones."""
+    import _inkling2_sconv as cases
+
+    steps = cases.SCENARIOS["verify"]
+    monkeypatch.setenv(SWITCH, "0")
+    weights = cases.Weights("cpu", dtype, dynamic)
+    got = cases.run(weights, steps, pad=pad, decode_only=True)
+    want = cases.run(cases.Weights("cpu", dtype, dynamic), steps, pad=pad)
+    _check(cases, got, want, tol)
 
 
 @CONVS

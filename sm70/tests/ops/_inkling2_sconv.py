@@ -45,6 +45,8 @@ SCENARIOS = {
         [(2, 1), (0, 1), (3, 1), (1, 30)],
         [(1, 1), (0, 1), (2, 1), (3, 1)],
     ],
+    # Verify steps of 8 tokens per request after the prompts.
+    "verify": [[(0, 30), (1, 5), (2, 2)]] + [[(0, 8), (1, 8), (2, 8)]] * 3,
 }
 
 
@@ -110,10 +112,18 @@ class Paged:
             table.append(self.free[kind].pop())
         return table[position // BLOCK] * BLOCK + position % BLOCK
 
-    def batch(self, parts, pad: int = 0, pad_metadata: bool = True, hole=None):
+    def batch(
+        self,
+        parts,
+        pad: int = 0,
+        pad_metadata: bool = True,
+        hole=None,
+        decode_only: bool = False,
+    ):
         """Metadata of one batch per owner name. `pad` rows follow the
         scheduled ones; the token tensors cover them (slot -1) with
-        `pad_metadata`. `hole` is a scheduled row whose slots are -1."""
+        `pad_metadata`. `hole` is a scheduled row whose slots are -1.
+        `decode_only` marks the batch decode-only (backend.py)."""
         rows = []
         for seq, count in parts:
             start = self.lengths.get(seq, 0)
@@ -152,6 +162,7 @@ class Paged:
                 seq_idx=tensor(seq_idx + [0] * extra, torch.int32),
                 query_start=tensor(query_start + [0] * extra, torch.int32),
                 positions=tensor(positions + [0] * extra, torch.int64),
+                decode_only=decode_only,
             )
         return metadata, num_tokens
 
@@ -195,10 +206,12 @@ def run(
     hole: bool = False,
     lbnhc: bool = False,
     paged: Paged | None = None,
+    decode_only: bool = False,
 ):
     """Every output of `steps` on the route the switch selects, then the
     final conv-state and K/V caches. A batch runs the prologue, the static
-    output conv of stream 2 and the dynamic one of stream 3."""
+    output conv of stream 2 and the dynamic one of stream 3. With
+    `decode_only`, batches of one token count per request are decode-only."""
     from vllm_sm70.models.inkling2_sm70 import prologue, sconv
 
     paged = paged or Paged(weights.device, weights.dtype, lbnhc=lbnhc)
@@ -206,7 +219,11 @@ def run(
     log_scaling = (0.1, 16.0) if weights.dynamic else None
     for step in steps:
         metadata, n = paged.batch(
-            step, pad, pad_metadata, hole=(n_hole(step) if hole else None)
+            step,
+            pad,
+            pad_metadata,
+            hole=(n_hole(step) if hole else None),
+            decode_only=decode_only and len({count for _, count in step}) == 1,
         )
         total = n + pad
         q = weights.randn(total, Q_HEADS * HEAD_DIM)

@@ -9,8 +9,9 @@
 - the kernel source holds nothing sm_70 rejects;
 - through Triton's interpreter against the torch route, in fp32 within 1e-5
   and in fp16 within 2e-3: decode-only batches with padding rows, eager
-  batches with one-query rows before and after a prefill, global and
-  sliding layers, contexts across many 32-token blocks, a bias extent
+  batches with one-query rows before and after a prefill, decode-only
+  verify batches of 8 queries per request against the eager route, global
+  and sliding layers, contexts across many 32-token blocks, a bias extent
   longer than a block, GQA, a head dim that is not a power of 2. Every slot
   a row may not read (null block, unwritten slots, keys out of the window)
   holds NaN.
@@ -195,6 +196,31 @@ def test_eager_one_query_rows_match_the_torch_route(
     got, want = cases.both_routes(case, monkeypatch)
     assert cases.rel_err(got, want) <= tol
     assert bool((got[sum(query_lens) :] == 0).all())
+
+
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@LAYERS
+@pytest.mark.parametrize(
+    "seq_lens, pad",
+    [([8], 0), ([40, 70, 8], 16), ([300, 2 * cases.BLOCK + 8], 8)],
+    ids=["first-block", "three-padded", "long-padded"],
+)
+def test_verify_rows_match_the_eager_route(
+    monkeypatch, dtype, tol, window, extent, seq_lens, pad
+):
+    """A decode-only verify batch (8 queries per request, each row at its
+    own position) against the eager route's shared key ranges; on the
+    kernel in the interpreted run, on torch otherwise."""
+    attention = cases.attention_module()
+    query_lens = [8] * len(seq_lens)
+    args = (dtype, window, extent, seq_lens)
+    monkeypatch.delenv(SWITCH, raising=False)
+    decode = cases.Case(*args, pad=pad, query_lens=query_lens, seed=2)
+    eager = cases.Case(*args, pad=pad, decode_only=False, query_lens=query_lens, seed=2)
+    got, want = decode.run(attention), eager.run(attention)
+    rows = sum(query_lens)
+    assert cases.rel_err(got[:rows], want[:rows]) <= tol
+    assert bool((got[rows:] == 0).all()) and bool((want[rows:] == 0).all())
 
 
 @interpreted

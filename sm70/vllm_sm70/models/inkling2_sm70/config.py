@@ -22,11 +22,13 @@
   VLLM_SM70_INKLING_ASYNC_SCHED=0 an unset value becomes off and
   ``--async-scheduling`` is refused.
 * CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY:
-  decode-only batches replay a FULL graph and every other batch runs
-  eagerly. A mode with FULL decode graphs sets ``max_cudagraph_capture_size``
-  min(``DECODE_GRAPH_MAX_BATCH``, max_num_seqs) when neither it nor the
-  capture sizes are set, and refuses set sizes above
-  ``DECODE_GRAPH_MAX_BATCH``. The ops of a decode-only batch read
+  decode-only batches (one token per request, or 1 + num_speculative_tokens
+  in a verify step: q = backend.py ``decode_query_len``) replay a FULL
+  graph and every other batch runs eagerly. A mode with FULL decode graphs
+  sets ``max_cudagraph_capture_size`` q x min(``DECODE_GRAPH_MAX_BATCH``,
+  max_num_seqs) tokens when neither it nor the capture sizes are set, and
+  refuses set sizes above q x ``DECODE_GRAPH_MAX_BATCH``. The ops of a
+  decode-only batch read
   device metadata only (backend.py); those of other batches branch on the
   batch on the host, so a mode whose mixed batches are FULL (FULL) is
   refused. PIECEWISE (and the mixed part of FULL_AND_PIECEWISE) captures
@@ -69,8 +71,8 @@ ARCH = "Inkling2LoopSm70ForConditionalGeneration"
 
 # Attention page (block x 2 x head_dim) == conv page (kernel x conv head size).
 KV_BLOCK_SIZE = 32
-# Largest decode batch captured in a FULL graph: a decode step gathers the whole
-# block-table width of keys per global-layer request.
+# Most requests of a decode batch captured in a FULL graph: a decode step
+# gathers the whole block-table width of keys per global-layer row.
 DECODE_GRAPH_MAX_BATCH = 8
 
 TM_TUNE_KNOBS = (
@@ -101,32 +103,38 @@ def _log_routes_once(
     )
 
 
-def _cap_decode_graph_batch(compilation_config: Any, scheduler_config: Any) -> None:
-    """max_cudagraph_capture_size = min(DECODE_GRAPH_MAX_BATCH, max_num_seqs)
-    unless the capture sizes or their maximum are set; set ones above
+def _cap_decode_graph_batch(
+    compilation_config: Any, scheduler_config: Any, query_len: int = 1
+) -> None:
+    """max_cudagraph_capture_size = `query_len` tokens per request times
+    min(DECODE_GRAPH_MAX_BATCH, max_num_seqs) requests unless the capture
+    sizes or their maximum are set; set ones above `query_len` x
     DECODE_GRAPH_MAX_BATCH raise ValueError."""
     sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
     largest = getattr(compilation_config, "max_cudagraph_capture_size", None)
     if sizes:
         largest = max(largest or 0, *sizes)
     if largest is not None:
-        if largest > DECODE_GRAPH_MAX_BATCH:
+        if largest > DECODE_GRAPH_MAX_BATCH * query_len:
             raise ValueError(
                 f"{ARCH} captures FULL decode graphs of at most "
-                f"{DECODE_GRAPH_MAX_BATCH} requests, got a capture size of "
-                f"{largest}; lower -cc.max_cudagraph_capture_size or "
-                "-cc.cudagraph_capture_sizes."
+                f"{DECODE_GRAPH_MAX_BATCH} requests of {query_len} tokens, got "
+                f"a capture size of {largest}; lower "
+                "-cc.max_cudagraph_capture_size or -cc.cudagraph_capture_sizes."
             )
         return
     cap = DECODE_GRAPH_MAX_BATCH
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
     if isinstance(max_num_seqs, int) and max_num_seqs > 0:
         cap = min(cap, max_num_seqs)
-    compilation_config.max_cudagraph_capture_size = cap
+    compilation_config.max_cudagraph_capture_size = cap * query_len
 
 
-def tm_tuning_env(compilation_config: Any, hf_config: Any) -> dict[str, str]:
-    """The ``TM_TUNE_KNOBS`` values to set for this engine ({} for none)."""
+def tm_tuning_env(
+    compilation_config: Any, hf_config: Any, query_len: int = 1
+) -> dict[str, str]:
+    """The ``TM_TUNE_KNOBS`` values to set for this engine ({} for none);
+    `query_len` tokens per request of a decode step."""
     from vllm.config.compilation import CUDAGraphMode
     from vllm_sm70 import envs as sm70_envs
 
@@ -147,7 +155,7 @@ def tm_tuning_env(compilation_config: Any, hf_config: Any) -> dict[str, str]:
     cap = max(largest or 0, *sizes, 0)
     if cap <= 0 or moe_tm.turbomind() is None:
         return {}
-    slots = min(cap, DECODE_GRAPH_MAX_BATCH) * top_k
+    slots = min(cap, DECODE_GRAPH_MAX_BATCH * query_len) * top_k
     return dict(zip(TM_TUNE_KNOBS, ("1", str(slots), "0"), strict=True))
 
 
@@ -163,7 +171,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         from vllm_sm70 import envs as sm70_envs
         from vllm_sm70.config import sm70_config
 
-        from .backend import decode_graph_enabled
+        from .backend import decode_graph_enabled, decode_query_len
         from .draft import speculative_rejection
         from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
 
@@ -267,10 +275,11 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 ARCH,
                 cudagraph_mode.name,
             )
+        query_len = decode_query_len(vllm_config)
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
-            _cap_decode_graph_batch(compilation_config, scheduler_config)
+            _cap_decode_graph_batch(compilation_config, scheduler_config, query_len)
         hf_config = getattr(model_config, "hf_config", None)
-        tuning = tm_tuning_env(compilation_config, hf_config)
+        tuning = tm_tuning_env(compilation_config, hf_config, query_len)
         if tuning:
             os.environ.update(tuning)
             logger.info(
