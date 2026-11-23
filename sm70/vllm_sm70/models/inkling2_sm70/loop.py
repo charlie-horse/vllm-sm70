@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from .backend import cache_metadata, is_decode_only
 from .cache import build_cache_owners
 from .layers import (
     PARTIAL_SITES,
@@ -41,7 +42,7 @@ from .layers import (
     padding_mask,
 )
 from .norms import message_mix, message_sources, rms_norm, sublayer_inputs
-from .weights import build_weight_map
+from .weights import build_weight_map, merged_enabled
 
 __all__ = ["Inkling2Sm70LoopModel", "PartialAudit", "VisitDump", "layer_visits"]
 
@@ -154,6 +155,7 @@ class Inkling2Sm70LoopModel(nn.Module):
         self.weight_map = build_weight_map(
             config, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype
         )
+        self.merged = merged_enabled()
         specs = self.weight_map.params
         self.embed_tokens = Weights(specs, "model.embed_tokens", ("weight",))
         self.embed_norm = Weights(specs, "model.embed_norm", ("weight",))
@@ -165,6 +167,7 @@ class Inkling2Sm70LoopModel(nn.Module):
                 layer,
                 tp_size=tp_size,
                 dtype=dtype,
+                merged=self.merged,
             )
             for layer in range(config.num_hidden_layers)
         )
@@ -204,7 +207,11 @@ class Inkling2Sm70LoopModel(nn.Module):
         core = self.config.loop_core_layers
         hidden = inputs_embeds
         num_tokens = hidden.shape[0]
-        bank = Bank(hidden, sum(layer.starts_block for layer in self.layers))
+        bank = Bank(
+            hidden,
+            sum(layer.starts_block for layer in self.layers),
+            decode_only=is_decode_only(cache_metadata(self.caches.conv[0, 0])),
+        )
         is_padding = torch.empty(num_tokens, dtype=torch.bool, device=hidden.device)
         padding_mask(self.caches.conv[0, 0], is_padding)
         aux: list[torch.Tensor] = []
@@ -218,7 +225,9 @@ class Inkling2Sm70LoopModel(nn.Module):
                 else:
                     # The previous pass's own block states after the entry
                     # one, and its output.
-                    message_bank = message_sources(bank.states(entry_count + 1), hidden)
+                    message_bank = message_sources(
+                        bank.states(entry_count + 1), hidden, bank.triton
+                    )
                     hidden, bank.count = entry_hidden, entry_count
             messages = None
             if pass_idx:

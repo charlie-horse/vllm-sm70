@@ -36,13 +36,14 @@ files of the same upstream commit. Each is its upstream file plus the patch
 commit and the hash of the unpatched file. Change a vendored file only
 together with its patch: `sm70/tests/ops/test_m12_inkling2_triton_norms_cpu.py`
 takes the patch back out and checks the hash. Kernels whose work is a GEMM
-(`tl.dot`) are not vendored.
+(`tl.dot`) are not vendored. `ops/fused.py` is not vendored: the message-gate
+projections and the residual add of the decode route, written for SM70.
 
 | File | Upstream path | Ported |
 |---|---|---|
 | `ops/norm.py` | `vllm/models/inkling2/nvidia/ops/norm.py` | `rsqrt`, `_rms_norm_kernel` and `rms_norm` (lines 1-71), with a `tl.rsqrt` form of `rsqrt` for Triton's interpreter. `_l2_clip` and `qr_clip_rel_tokens` (lines 74-185, a `tl.dot` kernel and its helper) are left out. |
-| `ops/attn_res.py` | `vllm/models/inkling2/nvidia/ops/attn_res.py` | The whole file. Changed: `gdc_wait` behind the `USE_GDC` constexpr and `launch_pdl` from `_compat.use_gdc()`; the `stride_t` argument (stored blocks with any token stride); the `STACK_NORMED` constexpr (stored blocks already RMS-normalized); the `q_scale` argument (queries not pre-scaled); `out_dtype`; `exp` from `_compat`. |
-| `ops/loop.py` | `vllm/models/inkling2/nvidia/ops/loop.py` | The whole file. Changed: `out_dtype` in place of the bfloat16 outputs, `eps` of `pair_rms_norm` as an argument, `tanh` from `_compat`. |
+| `ops/attn_res.py` | `vllm/models/inkling2/nvidia/ops/attn_res.py` | The whole file. Changed: `gdc_wait` behind the `USE_GDC` constexpr and `launch_pdl` from `_compat.use_gdc()`; the `stride_t` argument (stored blocks with any token stride); the `STACK_NORMED` constexpr (stored blocks already RMS-normalized); the `q_scale` argument (queries not pre-scaled); `out_dtype`; `exp` from `_compat`; no JIT specialization on `T`. |
+| `ops/loop.py` | `vllm/models/inkling2/nvidia/ops/loop.py` | The whole file. Changed: `out_dtype` in place of the bfloat16 outputs, `eps` of `pair_rms_norm` as an argument, `tanh` from `_compat`, no JIT specialization on `T`. |
 
 `sm70/tests/models/data/inkling2_mini/` holds `config.json`,
 `hf_quant_config.json` and `model.safetensors.index.json` of

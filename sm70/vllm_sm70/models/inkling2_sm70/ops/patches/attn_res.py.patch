@@ -55,7 +55,7 @@ sha256: 39f8392a06c76980ebf7b1981894451ecf74501fa5b43791c1e46cf185589981
      row_off,
      offs,
      mask,
-@@ -48,7 +60,17 @@
+@@ -48,13 +60,23 @@
      acc = tl.zeros((BLOCK_D,), tl.float32)
      for n in tl.static_range(N_STACK + 1):
          x = _load_source(
@@ -74,6 +74,13 @@ sha256: 39f8392a06c76980ebf7b1981894451ecf74501fa5b43791c1e46cf185589981
          )
          acc = tl.fma(tl.sum(tl.where(n_idx == n, probs, 0.0)), x, acc)
      return acc
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["T"])
+ def _attn_res_kernel(
+     Stack,
+     Last,
 @@ -63,22 +85,28 @@
      NormW,
      Out,
@@ -146,6 +153,15 @@ sha256: 39f8392a06c76980ebf7b1981894451ecf74501fa5b43791c1e46cf185589981
                  row_off,
                  offs,
                  mask,
+@@ -167,7 +201,7 @@
+         tl.store(out + offs, acc.to(Out.dtype.element_ty), mask)
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["T"])
+ def _attn_res_row_kernel(
+     Stack,
+     Last,
 @@ -176,25 +210,31 @@
      NormW,
      Out,

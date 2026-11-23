@@ -43,10 +43,13 @@ from .sconv import (
     on_triton,
     static_conv,
 )
+from .weights import rows_view
 
 __all__ = [
+    "STACKED_MAX_TOKENS",
     "attention_prologue",
     "key_value_states",
+    "project_packed",
     "project_qkvr",
     "query_states",
     "store_key_value",
@@ -71,18 +74,63 @@ def project_qkvr(
     return q, r, gate, sink, F.linear(x_k, w_k), F.linear(x_v, w_v)
 
 
+# Three inputs run as one GEMM up to this many tokens (``project_packed``).
+STACKED_MAX_TOKENS = 8
+
+
+def _stacked(*xs: torch.Tensor) -> torch.Tensor:
+    """`xs` [T, H] stacked along dim 0: a view when they lie back to back."""
+    view = rows_view(*xs)
+    return torch.cat(xs) if view is None else view
+
+
+def project_packed(
+    x_q: torch.Tensor,
+    x_k: torch.Tensor | None,
+    x_v: torch.Tensor | None,
+    weight: torch.Tensor,
+    sizes: tuple[int, ...],
+    tap_rows: int = 0,
+) -> tuple[torch.Tensor | None, ...]:
+    """(q, r, gate, sink, k, v, k_taps, v_taps) of a packed `weight`: the
+    rows of ``attn.qkvr.weight`` (`sizes`), then `tap_rows` rows each of the
+    key and value tap projections of a global layer (taps None when 0).
+
+    One GEMM: with three inputs over [x_q; x_k; x_v], keeping each input's
+    own columns (q, r, gate and sink of x_q; k and its taps of x_k; v and its
+    taps of x_v). Each output is the GEMM of its own input and rows."""
+    splits = (*sizes, tap_rows, tap_rows)
+    if x_k is None and x_v is None:
+        parts = F.linear(x_q, weight).split(splits, dim=-1)
+    else:
+        assert x_k is not None and x_v is not None
+        y = F.linear(_stacked(x_q, x_k, x_v), weight)
+        by_q, by_k, by_v = (
+            rows.split(splits, dim=-1) for rows in y.split(x_q.shape[0])
+        )
+        parts = (*by_q[:4], by_k[4], by_v[5], by_k[6], by_v[7])
+    if not tap_rows:
+        return (*parts[:6], None, None)
+    return tuple(parts)
+
+
 def query_states(
     x: torch.Tensor,
     scale: torch.Tensor,
     threshold: float,
     tau: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Scaled, clipped per-head states [T, heads, D] of `x` [T, heads * D];
-    `tau` [T] fp32 multiplies the rounded clip. Serves q and r."""
+    """Scaled, clipped per-head states [T, heads, D] of `x` [T, heads * D],
+    in the dtype of `x`; `tau` [T] fp32 multiplies the rounded clip. Written
+    to `out` when given. Serves q and r."""
+    if tau is None:
+        return l2_clip(x.unflatten(-1, scale.shape), threshold, scale, out=out)
     states = l2_clip(x.unflatten(-1, scale.shape), threshold, scale)
-    if tau is not None:
-        states = (states.float() * tau[:, None, None]).to(states.dtype)
-    return states
+    scaled = states * tau[:, None, None]
+    if out is not None:
+        return out.copy_(scaled)
+    return scaled.to(states.dtype)
 
 
 def key_value_states(
@@ -182,7 +230,7 @@ def attention_prologue(
     attn_metadata = cache_metadata(attn_owner)
     conv_metadata = cache_metadata(conv_owner)
     if attn_metadata is None:
-        q_out.copy_(query_states(q, q_scale, qk_clip))
+        query_states(q, q_scale, qk_clip, out=q_out)
         torch.matmul(query_states(r, rel_scale, rel_clip), rel_proj, out=rel_out)
         return
     n = _real_rows(q, attn_metadata)
@@ -199,9 +247,11 @@ def attention_prologue(
     tau = None
     if log_scaling is not None:
         tau = log_scale_tau(attn_metadata.positions[:n], *log_scaling)
-    q_out[:n] = query_states(q[:n], q_scale, qk_clip, tau)
+    query_states(q[:n], q_scale, qk_clip, tau, out=q_out[:n])
     q_out[n:] = 0
-    rel_out[:n] = torch.matmul(query_states(r[:n], rel_scale, rel_clip, tau), rel_proj)
+    torch.matmul(
+        query_states(r[:n], rel_scale, rel_clip, tau), rel_proj, out=rel_out[:n]
+    )
     rel_out[n:] = 0
     if is_decode_only(attn_metadata):
         padding = (attn_metadata.slot_mapping[:n] < 0)[:, None, None]

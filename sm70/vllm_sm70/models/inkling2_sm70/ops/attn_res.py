@@ -76,7 +76,7 @@ def _mix(
     return acc
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _attn_res_kernel(
     Stack,
     Last,
@@ -201,7 +201,7 @@ def _attn_res_kernel(
         tl.store(out + offs, acc.to(Out.dtype.element_ty), mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _attn_res_row_kernel(
     Stack,
     Last,

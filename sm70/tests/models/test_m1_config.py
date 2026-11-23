@@ -56,10 +56,15 @@ EFFECTIVE_DEFAULTS = {
 
 # Our sections of K01's registry.
 REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
-# Routes that run only when their variable is "1" (envs.opt_in).
-OPT_IN = {"VLLM_SM70_INKLING_TRITON_NORMS"}
+# Route switches (envs.route_switch): "0" and "1" force a route, any other
+# value keeps the default one.
+ROUTE = {"VLLM_SM70_INKLING_TRITON_NORMS"}
+# Opt-in switches (envs.opt_in): only "1" acts, and it turns a feature on.
+OPT_IN = {"VLLM_SM70_INKLING_MERGED_PROJ"}
 # The kill switches: only "0" acts.
-OURS = {name: get for name, get in REGISTERED.items() if name not in OPT_IN}
+OURS = {
+    name: get for name, get in REGISTERED.items() if name not in ROUTE | OPT_IN
+}
 
 # Sm70Config fields whose kill switch is registered in Kai's "sampler"
 # section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
@@ -172,6 +177,9 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
         "VLLM_SM70_INKLING_GROUPED_MOE",
+        "VLLM_SM70_INKLING_FUSED_ROUTING",
+        "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -394,15 +402,22 @@ def _inkling_nvfp4_tm_off(name):
             assert moe_tm.rejection(contract, tp, torch.float16) == moe_tm.SWITCHED_OFF
 
 
-def _inkling_triton_norms_off(name):
-    """A GPU tensor takes the torch ops of inkling2_sm70/norms.py; the
-    kernels' own checks are tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+def _inkling_triton_norms_route(name, mode):
+    """A GPU tensor of inkling2_sm70/norms.py takes the kernels on a
+    decode-only batch by default, on none with "0" and on every batch with
+    "1"; the kernels' own checks are
+    tests/ops/test_m12_inkling2_triton_norms_cpu.py."""
+    from unittest import mock
+
     pytest.importorskip("vllm")
     from vllm_sm70.models.inkling2_sm70 import norms
 
     assert norms.SWITCH == name
     gpu = SimpleNamespace(is_cuda=True)
-    assert norms.on_triton(gpu) is False
+    with mock.patch.object(norms._compat, "AVAILABLE", True):
+        for decode_only in (False, True):
+            want = decode_only if mode is None else mode
+            assert norms.on_triton(gpu, decode_only) is want
 
 
 def _inkling_triton_sconv_off(name):
@@ -445,6 +460,29 @@ def _inkling_grouped_moe_off(name):
         assert moe.on_grouped(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_fused_routing_off(name):
+    """A one-token GPU batch keeps the torch router of inkling2_sm70/moe.py;
+    the kernels' own checks are tests/ops/test_m12_inkling2_routing_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import moe
+
+    assert moe.FUSED_SWITCH == name
+    x = SimpleNamespace(is_cuda=True, shape=(1, 64))
+    with mock.patch.object(moe._compat, "AVAILABLE", True):
+        assert moe.on_fused_routing(x, 8) is False
+
+
+def _inkling_tm_tune_off(name):
+    """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
+    checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+
+    assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -462,29 +500,61 @@ def _inkling_decode_graph_off(name):
         assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
 
 
-OPT_IN_OFF = {
-    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_off,
+def _inkling_merged_proj(name, on):
+    """Models built now pack their projections only when on; the packed and
+    unpacked models are compared in test_m12_inkling2_merged_proj_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import weights
+
+    assert weights.MERGED_SWITCH == name and weights.merged_enabled() is on
+
+
+ROUTE_CHECKS = {
+    "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_route,
+}
+OPT_IN_CHECKS = {
+    "VLLM_SM70_INKLING_MERGED_PROJ": _inkling_merged_proj,
 }
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "true", "on", "yes", " 1"])
+@pytest.mark.parametrize(
+    "value", [None, "", "0", "1", "true", "on", "yes", " 1", "1 "]
+)
 @pytest.mark.parametrize("name", sorted(OPT_IN))
-def test_opt_in_route_is_off_unless_one(monkeypatch, name, value):
+def test_opt_in_switch_acts_only_on_one(monkeypatch, name, value):
     if value is None:
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, value)
-    assert getattr(envs, name) is False
-    OPT_IN_OFF[name](name)
-    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
+    on = value == "1"
+    assert getattr(envs, name) is on
+    OPT_IN_CHECKS[name](name, on)
     assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
 
 
 def test_opt_in_names_are_registered():
-    assert set(OPT_IN) == set(OPT_IN_OFF)
+    assert set(OPT_IN) == set(OPT_IN_CHECKS)
     assert set(OPT_IN) <= set(envs._SECTIONS["models"])
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "0", "1", "true", "on", "yes", "off", " 1", " 0"]
+)
+@pytest.mark.parametrize("name", sorted(ROUTE))
+def test_route_switch_acts_only_on_zero_and_one(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    mode = {"0": False, "1": True}.get(value)
+    assert getattr(envs, name) is mode
+    ROUTE_CHECKS[name](name, mode)
+    assert sm70_config(_vc({})).model_dump() == EFFECTIVE_DEFAULTS
+
+
+def test_route_names_are_registered():
+    assert set(ROUTE) == set(ROUTE_CHECKS)
+    assert set(ROUTE) <= set(envs._SECTIONS["models"])
 
 
 def _path_off(name):
@@ -518,6 +588,10 @@ def _path_off(name):
         _inkling_decode_graph_off(name)
     elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
         _inkling_grouped_moe_off(name)
+    elif name == "VLLM_SM70_INKLING_FUSED_ROUTING":
+        _inkling_fused_routing_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_TUNE":
+        _inkling_tm_tune_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

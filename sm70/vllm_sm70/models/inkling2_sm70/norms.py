@@ -1,21 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the row-wise ops between the sublayers, on the vendored
-Triton kernels (ops/norm.py, attn_res.py, loop.py) or on torch
-(ops/torch_ref.py).
+Triton kernels (ops/norm.py, attn_res.py, loop.py) and the gate and residual
+kernels of ops/fused.py, or on torch (ops/torch_ref.py).
 
     rms_norm          weighted RMS norm of one stream
     normed_state      one key of the AttnRes mixes
-    Bank              the keys of one forward, in one buffer
+    Bank              the keys of one forward, in one buffer, and the route
+                      of the forward's ops
+    Residual          the fp32 residual stream inside a layer
     message_sources   what the message mixes of a loop pass read
     message_mix       the messages of one core layer
     sublayer_inputs   AttnRes mix, message gates and RMS norm of the input
                       streams of a sublayer
 
-Switch: the kernels run only with VLLM_SM70_INKLING_TRITON_NORMS=1. Without
-it every op takes the torch path, as tensors off the GPU do. One kernel launch
-replaces the torch ops of a mix with its norm; the two GEMMs of the message
-gates stay on torch.bmm. The switch and ``on_triton`` are read on every
-eager call; a replayed CUDA graph keeps the route it was captured with.
+Route (``on_triton``): the kernels run on a decode-only batch
+(backend.is_decode_only), the torch ops on every other batch.
+VLLM_SM70_INKLING_TRITON_NORMS=0 puts every batch on the torch ops, =1 every
+batch on the kernels. Tensors off the GPU take the torch ops, except in
+Triton's interpreter. A forward's route is fixed when its ``Bank`` is made;
+a replayed CUDA graph keeps the route it was captured with.
+
+On the kernels one launch replaces the torch ops of a mix with its norm, and
+a layer's residual add is summed inside the kernels that read it. The
+message gates of a batch of at most ``fused.MAX_TOKENS`` tokens are three
+launches (``fused.gate_down``, ``fused.gate_up``, ``loop.blend_rms_norm``);
+larger batches run the two GEMMs on torch.bmm between ``loop.pair_rms_norm``
+and the blend.
 
 The outputs of `message_sources` and `message_mix` are laid out per path and
 are read only by `message_mix` and `sublayer_inputs`.
@@ -32,12 +42,14 @@ from vllm_sm70 import envs
 
 from .ops import _compat, torch_ref
 from .ops import attn_res as attn_res_ops
+from .ops import fused as fused_ops
 from .ops import loop as loop_ops
 from .ops import norm as norm_ops
 
 __all__ = [
     "SWITCH",
     "Bank",
+    "Residual",
     "message_mix",
     "message_sources",
     "normed_state",
@@ -47,17 +59,19 @@ __all__ = [
 ]
 
 SWITCH = "VLLM_SM70_INKLING_TRITON_NORMS"
-_enabled = envs.environment_variables()[SWITCH]
+_mode = envs.environment_variables()[SWITCH]
 
 # Unit norm weights [H] fp32 per (device, H), for the weightless norm.
 _ONES: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def on_triton(x: torch.Tensor) -> bool:
-    """Whether the ops on `x` run the Triton kernels."""
+def on_triton(x: torch.Tensor, decode_only: bool = False) -> bool:
+    """Whether the ops on `x`, of a decode-only batch or not, run the
+    kernels (module docstring)."""
     if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
         return False
-    return _enabled()
+    mode = _mode()
+    return decode_only if mode is None else mode
 
 
 def _ones(x: torch.Tensor) -> torch.Tensor:
@@ -74,9 +88,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch_ref.rms_norm(x, weight, eps)
 
 
-def normed_state(x: torch.Tensor) -> torch.Tensor:
-    """[T, 1, H] fp32: the unweighted RMS norm of x [T, H], one AttnRes key."""
-    if on_triton(x):
+def normed_state(x: torch.Tensor, triton: bool | None = None) -> torch.Tensor:
+    """[T, 1, H] fp32: the unweighted RMS norm of x [T, H], one AttnRes key;
+    on the kernels when `triton` (None: ``on_triton(x)``)."""
+    if on_triton(x) if triton is None else triton:
         return norm_ops.rms_norm(x, _ones(x), 1e-6, torch.float32).unsqueeze(-2)
     return torch_ref.rms_norm(x.float()).unsqueeze(-2)
 
@@ -84,14 +99,18 @@ def normed_state(x: torch.Tensor) -> torch.Tensor:
 class Bank:
     """The normed block states of one forward, fp32, in one buffer
     [T, capacity, H]: `count` states are kept and the slot after them is
-    scratch for the current state of a mix, so no visit copies the bank."""
+    scratch for the current state of a mix, so no visit copies the bank.
+    `triton`, the route of the forward: ``on_triton(like, decode_only)``."""
 
-    def __init__(self, like: torch.Tensor, capacity: int) -> None:
+    def __init__(
+        self, like: torch.Tensor, capacity: int, *, decode_only: bool = False
+    ) -> None:
         num_tokens, hidden_size = like.shape
         self.buffer = like.new_empty(
             (num_tokens, capacity + 1, hidden_size), dtype=torch.float32
         )
         self.count = 0
+        self.triton = on_triton(like, decode_only)
 
     def states(self, start: int = 0) -> torch.Tensor:
         """[T, count - start, H]: the kept states from `start` on, a view."""
@@ -100,7 +119,7 @@ class Bank:
     def with_state(self, x: torch.Tensor) -> torch.Tensor:
         """[T, count + 1, H]: the kept states and the normed `x` [T, H], a
         view that is valid until the next call or append."""
-        self.buffer[:, self.count] = normed_state(x)[:, 0]
+        self.buffer[:, self.count] = normed_state(x, self.triton)[:, 0]
         return self.buffer[:, : self.count + 1]
 
     def append(self, x: torch.Tensor) -> None:
@@ -109,37 +128,72 @@ class Bank:
         self.count += 1
 
 
-def message_sources(bank: torch.Tensor, state: torch.Tensor) -> Any:
+class Residual:
+    """The fp32 residual stream inside a layer: `base` [T, H] (the layer
+    input; None at a block start) plus `update` [T, H] (the attention
+    output), on the route `triton`. The torch route sums it here (`value`);
+    on the kernels `sublayer_inputs` and `add` read the two parts."""
+
+    def __init__(
+        self, base: torch.Tensor | None, update: torch.Tensor, triton: bool
+    ) -> None:
+        self.base, self.update = base, update
+        self.value: torch.Tensor | None = None
+        if not triton:
+            self.value = update.float()
+            if base is not None:
+                self.value = base.float() + self.value
+
+    def parts(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """(last, addend): the residual is last + addend, or last alone."""
+        if self.base is None:
+            return self.update.contiguous(), None
+        return self.base.contiguous(), self.update.contiguous()
+
+    def add(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """The layer output: residual + x [T, H], rounded to `dtype`."""
+        if self.value is not None:
+            return (self.value + x).to(dtype)
+        last, addend = self.parts()
+        base, update = (None, last) if addend is None else (last, addend)
+        return fused_ops.residual_add(base, update, x.contiguous(), dtype)
+
+
+def message_sources(
+    bank: torch.Tensor, state: torch.Tensor, triton: bool | None = None
+) -> Any:
     """The sources of a pass's message mixes: the normed block states `bank`
-    [T, N, H] fp32 of the previous pass and its output `state` [T, H].
-    `bank` is copied: the next pass overwrites a `Bank` view."""
-    if on_triton(state):
+    [T, N, H] fp32 of the previous pass and its output `state` [T, H]; on
+    the kernels when `triton` (None: ``on_triton(state)``). `bank` is
+    copied: the next pass overwrites a `Bank` view."""
+    if on_triton(state) if triton is None else triton:
         return bank.clone(), state.contiguous()
-    return torch.cat([bank, normed_state(state)], dim=-2)
+    return torch.cat([bank, normed_state(state, False)], dim=-2)
 
 
 def message_mix(sources: Any, query: torch.Tensor) -> torch.Tensor:
     """The fp32 messages of the streams `query` [S, H] fp32 has a row for."""
     if isinstance(sources, tuple):
         bank, state = sources
-        return _mix(bank, state, query, None, 0.0, None)
+        return _mix(bank, state, None, query, None, 0.0, None)
     return torch_ref.attn_res_mix(sources, query)
 
 
 def _mix(
     bank: torch.Tensor,
     state: torch.Tensor,
+    addend: torch.Tensor | None,
     query: torch.Tensor,
     norm_weight: torch.Tensor | None,
     eps: float,
     dtype: torch.dtype | None,
 ) -> torch.Tensor:
-    """[Q, T, H]: the AttnRes mixes in fp32, or normed with `norm_weight`
-    [Q, H] in `dtype`."""
+    """[Q, T, H]: the AttnRes mixes over the current state `state` (plus
+    `addend`) in fp32, or normed with `norm_weight` [Q, H] in `dtype`."""
     return attn_res_ops.attn_res(
         bank.transpose(0, 1),
         state,
-        None,
+        addend,
         query,
         norm_weight,
         eps,
@@ -160,6 +214,16 @@ def _blend(
 ) -> torch.Tensor:
     """[S, T, H] `dtype`: the message gates `gates` on fp32 [S, T, H] `dests`
     and `messages`, each output normed with its row of `norm_weight`."""
+    if dests.shape[1] <= fused_ops.MAX_TOKENS:
+        low = fused_ops.gate_down(
+            dests, messages, [gate.down_weight for gate in gates], gates[0].eps
+        )
+        gains = fused_ops.gate_up(
+            low,
+            [gate.gain_weight for gate in gates],
+            [gate.forget_weight for gate in gates],
+        )
+        return loop_ops.blend_rms_norm(dests, messages, gains, norm_weight, eps, dtype)
     if len(gates) == 1:
         down = gates[0].down_weight.unsqueeze(0)
     else:
@@ -176,6 +240,7 @@ def _blend(
 def _triton_inputs(
     bank: torch.Tensor,
     state: torch.Tensor,
+    addend: torch.Tensor | None,
     query: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
@@ -186,6 +251,7 @@ def _triton_inputs(
 ) -> list[torch.Tensor]:
     rows = norm_weight.shape[0]
     state = state.contiguous()
+    assert query is not None or addend is None
     if not gates:
         if query is None:
             return [
@@ -193,11 +259,12 @@ def _triton_inputs(
                 for i in range(rows)
             ]
         if query.shape == norm_weight.shape:
-            return list(_mix(bank, state, query, norm_weight, eps, dtype).unbind(0))
+            mixes = _mix(bank, state, addend, query, norm_weight, eps, dtype)
+            return list(mixes.unbind(0))
     if query is None:
         dests = state.float().unsqueeze(0)
     else:
-        dests = _mix(bank, state, query, None, 0.0, None)
+        dests = _mix(bank, state, addend, query, None, 0.0, None)
     if not gates:
         return [
             norm_ops.rms_norm(dests[i % len(dests)], norm_weight[i % rows], eps, dtype)
@@ -218,7 +285,7 @@ def _triton_inputs(
 
 def sublayer_inputs(
     bank: Bank,
-    state: torch.Tensor,
+    state: torch.Tensor | Residual,
     query: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
@@ -228,19 +295,37 @@ def sublayer_inputs(
     messages: torch.Tensor | None = None,
     first: int = 0,
 ) -> list[torch.Tensor]:
-    """The normed input streams [T, H] of a sublayer, in `dtype`.
+    """The normed input streams [T, H] of a sublayer, in `dtype`, on the
+    route of `bank`.
 
-    bank: the normed block states. state [T, H]: the current residual
-    state. query [Q, H] fp32: the AttnRes mix of each stream; None:
-    the state itself. norm_weight [W, H]: the norm of each stream. gates: the
-    message gates of the streams, which read the rows `first`... of
-    `messages` (`message_mix`); empty in a first pass. One mix or norm row
-    serves every stream: len(gates) streams, without gates max(Q, W).
+    bank: the normed block states. state [T, H] or a `Residual` of the
+    route: the current residual state. query [Q, H] fp32: the AttnRes mix
+    of each stream; None: the state itself. norm_weight [W, H]: the norm of
+    each stream. gates: the message gates of the streams, which read the
+    rows `first`... of `messages` (`message_mix`); empty in a first pass.
+    One mix or norm row serves every stream: len(gates) streams, without
+    gates max(Q, W).
     """
-    if on_triton(state):
+    addend = None
+    if isinstance(state, Residual):
+        if state.value is None:
+            state, addend = state.parts()
+        else:
+            state = state.value
+    if bank.triton:
         return _triton_inputs(
-            bank.states(), state, query, norm_weight, eps, dtype, gates, messages, first
+            bank.states(),
+            state,
+            addend,
+            query,
+            norm_weight,
+            eps,
+            dtype,
+            gates,
+            messages,
+            first,
         )
+    assert addend is None, "a Residual of the kernel route"
     if query is None:
         streams = [state]
     else:

@@ -5,7 +5,7 @@ sha256: 0c4f5382f65f2776402aa2396d6bf554c42bee85c6a24e6d0259549c1e11c4c8
 
 --- a/vllm/models/inkling2/nvidia/ops/loop.py
 +++ b/sm70/vllm_sm70/models/inkling2_sm70/ops/loop.py
-@@ -3,15 +3,14 @@
+@@ -3,19 +3,18 @@
  """Loop message controllers, batched over streams.
  
  A controller blends a fp32 message into a fp32 sublayer input `dest`: from
@@ -23,6 +23,11 @@ sha256: 0c4f5382f65f2776402aa2396d6bf554c42bee85c6a24e6d0259549c1e11c4c8
  from .norm import rsqrt
  
  
+-@triton.jit
++@triton.jit(do_not_specialize=["T"])
+ def _pair_rms_norm_kernel(
+     Dest,
+     Message,
 @@ -39,14 +38,19 @@
      tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
  
@@ -55,6 +60,15 @@ sha256: 0c4f5382f65f2776402aa2396d6bf554c42bee85c6a24e6d0259549c1e11c4c8
              D=d,
              BLOCK=triton.next_power_of_2(d),
              num_warps=8,
+@@ -62,7 +66,7 @@
+     return out
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["T"])
+ def _blend_rms_norm_kernel(
+     Dest,
+     Message,
 @@ -83,10 +87,8 @@
      row = s * T + t
      dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)

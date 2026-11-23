@@ -8,10 +8,13 @@ Rules:
   for fork compatibility: they add a check or a memset, never a kernel.
   The exceptions that select a kernel, off by default:
   VLLM_SM70_FP8_QPN8_M32 (K09; block-scaled M=9..32),
-  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange) and the Inkling 2
-  route VLLM_SM70_INKLING_TRITON_NORMS. See their comments.
+  VLLM_SM70_TOP1_CUSTOM_AR (F12 custom-AR pair exchange) and
+  VLLM_SM70_INKLING_MERGED_PROJ (M12 packed projections). See their comments.
   (K18's VLLM_SM70_DFLASH2_FP16 was the other until E3 measured it; it is
   now a kill switch.)
+- Route switches (`route_switch`): "0" and "1" both act, forcing a route
+  off or on everywhere; any other value keeps the code's default route.
+  VLLM_SM70_INKLING_TRITON_NORMS is the only one.
 - Each area adds its variables to its own section in `_SECTIONS`.
 - `merge_into_vllm()` adds every getter to `vllm.envs.environment_variables`
   (setdefault, never overriding upstream). This has two effects:
@@ -59,13 +62,24 @@ def opt_in(name: str) -> Callable[[], bool]:
     (e.g. VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS, an extra safety
     memset). They add work or checks; they never select a different kernel,
     except VLLM_SM70_FP8_QPN8_M32 (K09), VLLM_SM70_TOP1_CUSTOM_AR (F12) and
-    VLLM_SM70_INKLING_TRITON_NORMS, opt-in by review decision.
+    VLLM_SM70_INKLING_MERGED_PROJ (M12), opt-in by review decision.
     """
 
     def getter() -> bool:
         return os.environ.get(name) == "1"
 
     getter.__name__ = f"env_{name}"
+    return getter
+
+
+def route_switch(name: str) -> Callable[[], bool | None]:
+    """Getter that is False when `name` == "0", True when it is "1" and None
+    (the code's default route) otherwise."""
+
+    def getter() -> bool | None:
+        return {"0": False, "1": True}.get(os.environ.get(name, ""))
+
+    getter.__name__ = f"route_{name}"
     return getter
 
 
@@ -321,12 +335,15 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_DFLASH2_EMULATION": kill_switch("VLLM_SM70_DFLASH2_EMULATION"),
         # "0": Sm70Config.shared_moe_overlap=False.
         "VLLM_SM70_SHARED_MOE_OVERLAP": kill_switch("VLLM_SM70_SHARED_MOE_OVERLAP"),
-        # "1": the Inkling 2 norms, AttnRes mixes and message blends run the
-        # vendored Triton kernels instead of the torch ops. Env-only (no
-        # Sm70Config field), read per eager call (inkling2_sm70/norms.py) and
-        # fixed at capture in a replayed CUDA graph; default off: the
-        # kernels have not run on a GPU.
-        "VLLM_SM70_INKLING_TRITON_NORMS": opt_in("VLLM_SM70_INKLING_TRITON_NORMS"),
+        # Route of the Inkling 2 norms, AttnRes mixes, message gates and
+        # residual adds (inkling2_sm70/norms.py): by default Triton kernels
+        # on decode-only batches and the torch ops on every other batch;
+        # "0": the torch ops on every batch; "1": the kernels on every
+        # batch. Env-only (no Sm70Config field), read once per forward and
+        # fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_TRITON_NORMS": route_switch(
+            "VLLM_SM70_INKLING_TRITON_NORMS"
+        ),
         # "0": the Inkling 2 paged short convs and the prologue's K/V convs
         # take the torch ops instead of one Triton kernel per call. Env-only
         # (no Sm70Config field), read per eager call (inkling2_sm70/sconv.py)
@@ -353,6 +370,29 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # fixed at capture in a replayed CUDA graph; tensors off the GPU
         # always take the torch expert sum.
         "VLLM_SM70_INKLING_GROUPED_MOE": kill_switch("VLLM_SM70_INKLING_GROUPED_MOE"),
+        # "0": Inkling 2 batches of at most 64 routed slots on the TurboMind
+        # or grouped expert route take the torch router and the torch slot
+        # sort instead of the routing kernels (inkling2_sm70/ops/routing.py).
+        # Env-only (no Sm70Config field), read per eager call (inkling2_sm70/
+        # moe.py) and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_FUSED_ROUTING": kill_switch(
+            "VLLM_SM70_INKLING_FUSED_ROUTING"
+        ),
+        # "0": the Inkling 2 config hook leaves the TurboMind NVFP4 tuning
+        # knobs alone. Otherwise, when none of VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES,
+        # VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS and VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M
+        # is set, it sets them (1, decode graph cap x top-k, 0) for the
+        # workers it spawns: the expert stages of decode batches up to the
+        # capture cap are measured in eager warmup and reused by capture
+        # (inkling2_sm70/config.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "1": the Inkling 2 projections that share an input are packed into
+        # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
+        # rows and conv taps, the controllers' gain and forget gates; the q/r
+        # clip scales get fp32 copies. Default off: each projection keeps its
+        # own buffer and GEMM. Env-only (no Sm70Config field), read when the
+        # model is built (inkling2_sm70/weights.py, layers.py).
+        "VLLM_SM70_INKLING_MERGED_PROJ": opt_in("VLLM_SM70_INKLING_MERGED_PROJ"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

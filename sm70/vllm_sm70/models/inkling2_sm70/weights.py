@@ -15,6 +15,15 @@ Checkpoint values are cast (bf16 -> fp16 for the released checkpoint) and are
 otherwise unchanged: queries are not pre-scaled. Every cast to fp16 goes
 through the map's ``Fp16Audit`` (fp16_audit.py), and the map refuses a config
 that differs from ``HARD_CODED_CONFIG``.
+
+Packs: ``packs`` lists parameters of one layer that read one input (or one
+input per row block) and are stored back to back in one buffer by
+``pack_parameters``, so a single GEMM covers them (``rows_view``): a global
+layer's ``attn.qkvr.weight`` with its two conv tap projections, and per core
+layer the four controller ``down_weight`` and the ``gain_weight``,
+``forget_weight`` pairs. Names, shapes and dtypes of the parameters do not
+change. Packing is opt-in: ``VLLM_SM70_INKLING_MERGED_PROJ=1`` packs; unset
+or any other value packs nothing.
 """
 
 from __future__ import annotations
@@ -27,23 +36,33 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_sm70 import envs
+
 from .fp16_audit import Fp16Audit, check_hard_coded_config
 
 __all__ = [
     "HF_FP32_MODULES",
+    "MERGED_SWITCH",
     "MESSAGE_STREAMS",
     "NORM_SHARDS",
     "QKVR_SHARDS",
     "RENAMES",
     "Inkling2WeightMap",
     "Inkling2Weights",
+    "Pack",
     "ParamSpec",
     "Route",
     "Skip",
     "build_weight_map",
     "load_weights",
+    "merged_enabled",
+    "pack_parameters",
     "qkvr_sizes",
+    "rows_view",
 ]
+
+MERGED_SWITCH = "VLLM_SM70_INKLING_MERGED_PROJ"
+merged_enabled = envs.environment_variables()[MERGED_SWITCH]
 
 # transformers modeling_inkling2_loop.py ``_keep_in_fp32_modules_strict``,
 # verbatim; matched as substrings of the Hugging Face parameter name.
@@ -142,6 +161,14 @@ class Skip:
     owner: str
 
 
+@dataclass(frozen=True)
+class Pack:
+    """Parameters of one dtype and row shape, kept back to back in this
+    order along their first dim."""
+
+    params: tuple[str, ...]
+
+
 @dataclass
 class Inkling2Weights:
     params: dict[str, torch.Tensor]
@@ -207,6 +234,7 @@ class Inkling2WeightMap:
         self.with_visual = with_visual
         self.params: dict[str, ParamSpec] = {}
         self.routes: dict[str, Route] = {}
+        self.packs: list[Pack] = []
         self._build()
 
     # Table construction.
@@ -437,6 +465,34 @@ class Inkling2WeightMap:
                         f"{hf}{hf_stream}_message_gate.{hf_weight}.weight",
                         shape,
                     )
+        self._add_packs(param, is_local, in_core)
+
+    def _add_packs(self, param: str, is_local: bool, in_core: bool) -> None:
+        packs = []
+        if not is_local:
+            packs.append(
+                (
+                    param + "attn.qkvr.weight",
+                    param + "attn.k_sconv.weight_proj",
+                    param + "attn.v_sconv.weight_proj",
+                )
+            )
+        if in_core:
+            gates = [f"{param}controllers.{stream}." for stream, _ in MESSAGE_STREAMS]
+            packs.append(tuple(gate + "down_weight" for gate in gates))
+            packs.append(
+                tuple(
+                    gate + w for gate in gates for w in ("gain_weight", "forget_weight")
+                )
+            )
+        for names in packs:
+            specs = [self.params[name] for name in names]
+            if any(
+                (s.dtype, s.shape[1:]) != (specs[0].dtype, specs[0].shape[1:])
+                for s in specs
+            ):
+                raise AssertionError(f"{names}: members of a pack differ")
+            self.packs.append(Pack(names))
 
     # Lookup and conversion.
 
@@ -572,6 +628,61 @@ class Inkling2WeightMap:
             visual_loader or (lambda name, tensor: None),
         )
         return set(self.params)
+
+
+def rows_view(*tensors: torch.Tensor) -> torch.Tensor | None:
+    """One view over `tensors` concatenated along dim 0 when they are
+    contiguous and lie back to back in one storage with one dtype and row
+    shape; None otherwise."""
+    first = tensors[0]
+    end = first.data_ptr()
+    rows = 0
+    for t in tensors:
+        if (
+            t.dtype != first.dtype
+            or t.device != first.device
+            or t.shape[1:] != first.shape[1:]
+            or not t.is_contiguous()
+            or t.data_ptr() != end
+            or t.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+        ):
+            return None
+        end += t.numel() * t.element_size()
+        rows += t.shape[0]
+    if len(tensors) == 1:
+        return first
+    return first.as_strided(
+        (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+    )
+
+
+def pack_parameters(
+    model: nn.Module, packs: Iterable[Pack], *, copy: bool = True
+) -> list[Pack]:
+    """Move the members of every pack of `model` that are not back to back
+    into one new buffer, each parameter a view of its rows (values copied
+    when `copy`); returns the packs moved. Peak memory: one pack."""
+    moved = []
+    with torch.no_grad():
+        for pack in packs:
+            params = [model.get_parameter(name) for name in pack.params]
+            if rows_view(*params) is not None:
+                continue
+            first = params[0]
+            buffer = torch.empty(
+                (sum(p.shape[0] for p in params), *first.shape[1:]),
+                dtype=first.dtype,
+                device=first.device,
+            )
+            start = 0
+            for p in params:
+                view = buffer[start : start + p.shape[0]]
+                if copy:
+                    view.copy_(p.data)
+                p.data = view
+                start += p.shape[0]
+            moved.append(pack)
+    return moved
 
 
 def build_weight_map(

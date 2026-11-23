@@ -14,7 +14,7 @@ from ._compat import MODEL_DTYPE, tanh, tl, triton
 from .norm import rsqrt
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _pair_rms_norm_kernel(
     Dest,
     Message,
@@ -66,7 +66,7 @@ def pair_rms_norm(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _blend_rms_norm_kernel(
     Dest,
     Message,
