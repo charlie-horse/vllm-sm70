@@ -59,6 +59,14 @@ class Inkling2Config(BaseModel):
     attention takes 0.02 GiB at 10817 on the memory-efficient kernel, the
     largest sequence measured. The encoder runs eagerly: not a graph field."""
 
+    expert_act_fake_quant: bool = False
+    """Numerics emulation: fake-quantize (fp32) each expert GEMM's input and
+    post-activation value as upstream's NVFP4 (layers 0-19) and MXFP8
+    (layers 20-23) activation GEMMs quantize them, on every expert path
+    (models/inkling2_sm70/act_quant.py). Off (default): outputs are
+    unchanged. Set only through --additional-config. Not a graph field: the
+    model is not compiled, and its decode graphs are captured with it."""
+
 
 class Sm70Config(BaseModel):
     """SM70 (Volta) kernel policy. Defaults are the effective cf9492a values."""
@@ -215,7 +223,8 @@ class Sm70Config(BaseModel):
     Kill: VLLM_SM70_GREEDY_TOKEN_FASTPATH=0."""
 
     inkling2: Inkling2Config = Inkling2Config()
-    """The Inkling 2 section (debug dump, image size cap). No kill switch;
+    """The Inkling 2 section (debug dump, image size cap, activation
+    fake-quant). No kill switch;
     not a graph field."""
 
 

@@ -91,6 +91,15 @@ def _pil_to_rgb(image: Image.Image) -> np.ndarray:
     return _composite_on_checkerboard(np.array(image.convert("RGBA")))
 
 
+class Inkling2DecodedImage(MediaWithBytes[Image.Image]):
+    """RGB media decoded from ``original_bytes`` by ``decode_image``.
+
+    vLLM's ``ImageMediaIO`` flattens transparency on a solid color before the
+    processor runs, and its processor cache re-parses the unwrapped media, so
+    the parser swaps that media for the reference decoding of the same bytes.
+    """
+
+
 def decode_image(image: ImageInput) -> np.ndarray:
     """Decode an image to HWC uint8 RGB, compositing alpha on a checkerboard.
 
@@ -98,6 +107,8 @@ def decode_image(image: ImageInput) -> np.ndarray:
     over decoded media, so no vLLM-side mode conversion or EXIF handling
     leaks into the pixels.
     """
+    if isinstance(image, Inkling2DecodedImage):
+        return np.array(image.media, dtype=np.uint8)
     if isinstance(image, MediaWithBytes):
         image = image.original_bytes
     if isinstance(image, (bytes, bytearray, memoryview)):
@@ -110,6 +121,18 @@ def decode_image(image: ImageInput) -> np.ndarray:
     if isinstance(image, np.ndarray):
         image = Image.fromarray(image)
     return _pil_to_rgb(image)
+
+
+def _reference_item(item: Any) -> Any:
+    if (
+        not isinstance(item, MediaWithBytes)
+        or isinstance(item, Inkling2DecodedImage)
+        or not isinstance(item.media, Image.Image)
+    ):
+        return item
+    rgb = Image.fromarray(decode_image(item.original_bytes), "RGB")
+    # Pixels depend on the bytes alone, so they alone key the caches.
+    return Inkling2DecodedImage(rgb, item.original_bytes)
 
 
 class Inkling2ImageProcessor:
@@ -180,18 +203,22 @@ class Inkling2ImageProcessor:
 
 
 class Inkling2MultiModalDataParser(MultiModalDataParser):
-    """Keeps PIL image modes so transparency reaches the checkerboard step."""
+    """Gives the processor the reference decoding of every image.
+
+    PIL images keep their mode, so transparency reaches the checkerboard
+    step; fetched images (``MediaWithBytes``) become ``Inkling2DecodedImage``.
+    """
 
     def _parse_image_data(self, data: Any) -> Any:
-        if isinstance(data, Image.Image):
-            return ImageProcessorItems([data])
-        if (
-            isinstance(data, Sequence)
-            and data
-            and all(isinstance(item, Image.Image) for item in data)
-        ):
-            return ImageProcessorItems(list(data))
-        return super()._parse_image_data(data)
+        if data is None or self.is_embeddings(data):
+            return super()._parse_image_data(data)
+        if isinstance(data, (Image.Image, MediaWithBytes)):
+            items = [data]
+        elif isinstance(data, (np.ndarray, torch.Tensor)):
+            return super()._parse_image_data(data)
+        else:
+            items = list(data)
+        return ImageProcessorItems([_reference_item(item) for item in items])
 
 
 class Inkling2ProcessingInfo(BaseProcessingInfo):
