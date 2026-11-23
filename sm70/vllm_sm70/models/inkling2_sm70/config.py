@@ -13,9 +13,14 @@
   goes through the platform's backend selection (Flash-V100 or TRITON_ATTN).
   ``attention_config.backend`` stays unset and an explicit
   ``--attention-backend`` is refused.
-* KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), no async
-  scheduling (turned off when unset: it doubles the conv and sliding-window
-  admission caps), the KV cache in the model dtype, no pipeline parallelism.
+* KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), the KV cache in
+  the model dtype, no pipeline parallelism.
+* Async scheduling stays upstream's choice (on when unset and the executor
+  supports it). With it on, two batches are in flight, so the conv and
+  sliding-window admission caps count 2 x ``max_num_batched_tokens``
+  in-flight tokens (UP config/vllm.py ``max_in_flight_tokens``). With
+  VLLM_SM70_INKLING_ASYNC_SCHED=0 an unset value becomes off and
+  ``--async-scheduling`` is refused.
 * CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY:
   decode-only batches replay a FULL graph and every other batch runs
   eagerly. A mode with FULL decode graphs sets ``max_cudagraph_capture_size``
@@ -77,17 +82,20 @@ TM_TUNE_KNOBS = (
 _logged = False
 
 
-def _log_routes_once(visit_dump_dir: str | None, cudagraph_mode: str) -> None:
+def _log_routes_once(
+    visit_dump_dir: str | None, cudagraph_mode: str, async_scheduling: str
+) -> None:
     global _logged
     if _logged:
         return
     _logged = True
     logger.info(
         "Inkling 2 SM70: fp16 on cc 7.0; model-owned attention and KV caches "
-        "(neither FLASH_ATTN_V100 nor TRITON_ATTN); KV block size %d, no "
-        "async scheduling; cudagraph_mode %s; no prompt embeddings; "
-        "per-visit state dump %s.",
+        "(neither FLASH_ATTN_V100 nor TRITON_ATTN); KV block size %d; "
+        "async scheduling %s; cudagraph_mode %s; no "
+        "prompt embeddings; per-visit state dump %s.",
         KV_BLOCK_SIZE,
+        async_scheduling,
         cudagraph_mode,
         f"to {visit_dump_dir}" if visit_dump_dir else "off",
     )
@@ -152,6 +160,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         from vllm import envs
         from vllm.config.compilation import CUDAGraphMode
         from vllm.platforms import current_platform
+        from vllm_sm70 import envs as sm70_envs
         from vllm_sm70.config import sm70_config
 
         from .backend import decode_graph_enabled
@@ -214,12 +223,13 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 f"--pipeline-parallel-size {pp_size}."
             )
         scheduler_config = vllm_config.scheduler_config
-        if scheduler_config.async_scheduling:
-            raise ValueError(
-                f"{ARCH} needs --no-async-scheduling: a second batch in "
-                "flight doubles the per-request KV reservation."
-            )
-        scheduler_config.async_scheduling = False
+        if not sm70_envs.VLLM_SM70_INKLING_ASYNC_SCHED:
+            if scheduler_config.async_scheduling:
+                raise ValueError(
+                    f"{ARCH} with VLLM_SM70_INKLING_ASYNC_SCHED=0 needs "
+                    "--no-async-scheduling."
+                )
+            scheduler_config.async_scheduling = False
         inkling2 = sm70_config(vllm_config).inkling2
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
@@ -276,5 +286,9 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 inkling2.max_image_encoder_tokens,
             )
         _log_routes_once(
-            inkling2.visit_dump_dir, compilation_config.cudagraph_mode.name
+            inkling2.visit_dump_dir,
+            compilation_config.cudagraph_mode.name,
+            {False: "off", True: "on"}.get(
+                scheduler_config.async_scheduling, "upstream's default"
+            ),
         )

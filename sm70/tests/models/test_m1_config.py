@@ -181,6 +181,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TM_TUNE",
         "VLLM_SM70_INKLING_DSPARK",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
+        "VLLM_SM70_INKLING_ASYNC_SCHED",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -518,6 +519,52 @@ def _inkling_dspark_kernels_off(name):
         _compat.INTERPRET = interpret
 
 
+def _inkling_async_sched_off(name):
+    """The Inkling 2 hook turns an unset async scheduling off and refuses
+    --async-scheduling; the default is in
+    tests/models/test_m12_inkling2_config_cpu.py."""
+    from unittest import mock
+
+    pytest.importorskip("vllm")
+    import torch
+    import vllm.platforms
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+
+    def engine(async_scheduling):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(dtype=torch.float16, hf_config=None),
+            attention_config=SimpleNamespace(backend=None),
+            cache_config=SimpleNamespace(
+                cache_dtype="auto", block_size=16, user_specified_block_size=False
+            ),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=async_scheduling, max_num_seqs=4
+            ),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.NONE,
+                cudagraph_capture_sizes=None,
+                max_cudagraph_capture_size=None,
+            ),
+            speculative_config=None,
+            additional_config=None,
+            kernel_config=None,
+        )
+
+    v100 = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+    )
+    with mock.patch.object(vllm.platforms, "_current_platform", v100):
+        cfg = engine(None)
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        assert cfg.scheduler_config.async_scheduling is False
+        with pytest.raises(ValueError, match=name):
+            icfg.Inkling2Sm70ModelConfig.verify_and_update_config(engine(True))
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -631,6 +678,8 @@ def _path_off(name):
         _inkling_dspark_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK_KERNELS":
         _inkling_dspark_kernels_off(name)
+    elif name == "VLLM_SM70_INKLING_ASYNC_SCHED":
+        _inkling_async_sched_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

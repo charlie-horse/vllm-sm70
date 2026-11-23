@@ -398,6 +398,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_DSPARK_KERNELS": kill_switch(
             "VLLM_SM70_INKLING_DSPARK_KERNELS"
         ),
+        # "0": the Inkling 2 config hook turns async scheduling off when it
+        # is unset and refuses --async-scheduling. Otherwise it leaves the
+        # setting to upstream, which turns it on when unset
+        # (inkling2_sm70/config.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_ASYNC_SCHED": kill_switch("VLLM_SM70_INKLING_ASYNC_SCHED"),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

@@ -214,6 +214,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_INKLING_GROUPED_MOE` | new (Inkling 2; kill switch: `0` sends the experts held in fp16 back to the torch expert sum, default on runs the sync-free grouped route on GPU tensors) |
 | `VLLM_SM70_INKLING_FUSED_ROUTING` | new (Inkling 2; kill switch: `0` sends batches of up to 64 routed slots back to the torch router and slot sort, default on routes them with the Triton routing kernels on GPU tensors) |
 | `VLLM_SM70_INKLING_TM_TUNE` | new (Inkling 2; kill switch: `0` leaves the TurboMind NVFP4 tuning knobs unset, default on has the engine-config hook set them for the Inkling 2 expert stages up to the decode graph cap when none is set) |
+| `VLLM_SM70_INKLING_ASYNC_SCHED` | new (Inkling 2; kill switch: `0` has the engine-config hook turn an unset async scheduling off and refuse `--async-scheduling`, default on leaves it to upstream, which turns it on when unset) |
 | `VLLM_SM70_INKLING_MERGED_PROJ` | new (Inkling 2; opt-in: default off keeps each projection in its own buffer and GEMM, `1` packs the projections that share an input and runs a small visit's projections as one GEMM) |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |
