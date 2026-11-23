@@ -29,12 +29,14 @@ route of visit_fusion.py (ops/visit.py ``prologue``).
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+from . import gemv
 from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_K, STREAM_V
 from .fused_small import on_fused
@@ -72,10 +74,14 @@ def project_qkvr(
 ) -> tuple[torch.Tensor, ...]:
     """(q, r, gate, sink, k, v) of the fused ``attn.qkvr.weight``; `sizes` are
     its row counts (``weights.qkvr_sizes``). A local layer passes one input
-    (`x_k` and `x_v` None) and runs one GEMM."""
+    (`x_k` and `x_v` None) and runs one GEMM; with three inputs, up to 8
+    tokens run one GEMV launch on the route of gemv.py."""
     if x_k is None and x_v is None:
-        return F.linear(x_q, weight).split(sizes, dim=-1)
+        return gemv.linear(x_q, weight).split(sizes, dim=-1)
     query_rows = sum(sizes[:4])
+    y = gemv.segments((x_q, x_k, x_v), weight, (query_rows, query_rows + sizes[4]))
+    if y is not None:
+        return y.split(sizes, dim=-1)
     w_query, w_k, w_v = weight.split((query_rows, sizes[4], sizes[5]), dim=0)
     q, r, gate, sink = F.linear(x_q, w_query).split(sizes[:4], dim=-1)
     return q, r, gate, sink, F.linear(x_k, w_k), F.linear(x_v, w_v)
@@ -105,10 +111,14 @@ def project_packed(
 
     One GEMM: with three inputs over [x_q; x_k; x_v], keeping each input's
     own columns (q, r, gate and sink of x_q; k and its taps of x_k; v and its
-    taps of x_v). Each output is the GEMM of its own input and rows."""
+    taps of x_v). Each output is the GEMM of its own input and rows. On the
+    route of gemv.py, one GEMV launch reads each row segment's own input."""
     splits = (*sizes, tap_rows, tap_rows)
+    bounds = tuple(itertools.accumulate(splits))[3 : 5 if not tap_rows else 7]
     if x_k is None and x_v is None:
-        parts = F.linear(x_q, weight).split(splits, dim=-1)
+        parts = gemv.linear(x_q, weight).split(splits, dim=-1)
+    elif (y := gemv.segments((x_q, x_k, x_v), weight, bounds)) is not None:
+        parts = y.split(splits, dim=-1)
     else:
         assert x_k is not None and x_v is not None
         y = F.linear(_stacked(x_q, x_k, x_v), weight)

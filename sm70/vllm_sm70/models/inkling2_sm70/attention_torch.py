@@ -28,7 +28,8 @@ in a global one, with the keys past the query's position masked; a key
 step is up to `OWN_KEY_STEPS` key chunks long when the batch has fewer rows.
 Rows with a negative slot are padding: their output is zero. On the route
 of fused_small.py the output gate of a decode-only batch is one launch
-(ops/small_ops.py ``gate``) that also zeroes the padding rows.
+(ops/small_ops.py ``gate``) that also zeroes the padding rows. The output
+projection of up to 8 rows is a GEMV on the route of gemv.py.
 
 Switch: the one-query rows of either kind of batch run one Triton kernel per
 call (ops/paged_attention.py), which reads only each row's own keys, unless
@@ -69,6 +70,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from vllm_sm70 import envs
 
+from . import gemv
 from .backend import is_decode_only
 from .fused_small import on_fused
 from .ops import _compat, small_ops
@@ -472,7 +474,7 @@ def _project(
     if out_weight is None:
         output.copy_(gated)
     elif out_weight.dtype == output.dtype == gated.dtype:
-        torch.mm(gated, out_weight.t(), out=output)
+        gemv.linear(gated, out_weight, out=output)
     else:
         output.copy_(torch.mm(gated.to(out_weight.dtype), out_weight.t()))
     return output

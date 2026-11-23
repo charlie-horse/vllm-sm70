@@ -4,8 +4,9 @@
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py with
 its split-KV pair,
 norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
-routing.py, dspark.py, small_ops.py, top1.py, visit.py) goes through Triton's
-compiler and ptxas for GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
+routing.py, dspark.py, small_ops.py, top1.py, visit.py, small_m_gemv.py,
+nvfp4_gemv.py) goes through Triton's compiler and ptxas for
+GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
 128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
 intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
 tokens, message-gate rank 64, d_rel 16, rel extent 1024; draft: 8-query
@@ -497,6 +498,52 @@ def test_mx_dequant_kernel():
             "BLOCK": grouped_gemm.DEQUANT_BLOCK,
             "MX_BLOCK": grouped_gemm.MX_BLOCK,
         },
+
+
+# --- small_m_gemv.py, nvfp4_gemv.py -----------------------------------------------
+
+
+@pytest.mark.parametrize("segments", [1, 5], ids=["one_input", "segments"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_segment_gemv_kernel(segments, rows):
+    small_m_gemv = _ops("small_m_gemv")
+    block_m, block_n, block_k, warps = small_m_gemv.config(rows)
+    _check(
+        small_m_gemv._segment_gemv_kernel,
+        {
+            **dict.fromkeys(
+                ("x0_ptr", "x1_ptr", "x2_ptr", "w_ptr", "out_ptr"), "*fp16"
+            ),
+            **_i32("stride_x0", "stride_x1", "stride_x2", "stride_w", "stride_out"),
+            **_i32("rows", "k_in", "n_out", "n1", "n2", "n3", "n4"),
+            **_i32("b1", "b2", "b3", "b4"),
+            "SEGMENTS": segments,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+        },
+        num_warps=warps,
+    )
+
+
+@pytest.mark.parametrize("stage", ["w13", "w2"])
+def test_nvfp4_slot_gemv_kernel(stage):
+    nvfp4_gemv = _ops("nvfp4_gemv")
+    block_k8, warps = nvfp4_gemv.config(stage)
+    _check(
+        nvfp4_gemv._nvfp4_slot_gemv_kernel,
+        {
+            **dict.fromkeys(("in_ptr", "scales_ptr", "out_ptr"), "*fp16"),
+            "codes_ptr": "*i32",
+            "expert_ptr": "*i32",
+            **_i32("stride_in", "stride_ce", "stride_se", "stride_out"),
+            **_i32("n_out", "k_in", "experts"),
+            "gate_cap": "fp32",
+            "up_cap": "fp32",
+            "SWIGLU": stage == "w13",
+            "BLOCK_K8": block_k8,
+        },
+        num_warps=warps,
     )
 
 

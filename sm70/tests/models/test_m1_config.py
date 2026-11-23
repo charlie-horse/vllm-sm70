@@ -191,6 +191,8 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_MXFP8_EXPERTS",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
         "VLLM_SM70_INKLING_VISIT_FUSION",
+        "VLLM_SM70_INKLING_SMALL_M_GEMV",
+        "VLLM_SM70_INKLING_NVFP4_GEMV",
         "VLLM_SM70_INKLING_MERGED_PROJ",
         "VLLM_SM70_INKLING_GREEDY_TOP1",
     }
@@ -536,6 +538,38 @@ def _inkling_visit_fusion_off(name):
         assert visit_fusion.on_visit(x, True, True) is False
 
 
+def _inkling_small_m_gemv_off(name):
+    """A 4-token fp16 GPU projection keeps cuBLAS (inkling2_sm70/gemv.py);
+    the kernel's own checks are tests/ops/test_m12_inkling2_small_m_gemv_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    import torch
+
+    from vllm_sm70.models.inkling2_sm70 import gemv
+
+    assert gemv.SMALL_M_SWITCH == name
+    x = SimpleNamespace(
+        ndim=2, shape=(4, 64), dtype=torch.float16, is_cuda=True, stride=lambda d: 1
+    )
+    with mock.patch.object(gemv._compat, "AVAILABLE", True):
+        assert gemv.on_small_m(x, x) is False
+
+
+def _inkling_nvfp4_gemv_off(name):
+    """One-row expert slots on the GPU keep the TurboMind stages
+    (inkling2_sm70/gemv.py, moe_tm.py); the kernel's own checks are
+    tests/quant/test_m12_inkling2_nvfp4_gemv_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import gemv
+
+    assert gemv.NVFP4_SWITCH == name
+    with mock.patch.object(gemv._compat, "AVAILABLE", True):
+        assert gemv.on_nvfp4(SimpleNamespace(is_cuda=True)) is False
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -797,6 +831,10 @@ def _path_off(name):
         _inkling_greedy_top1_off(name)
     elif name == "VLLM_SM70_INKLING_VISIT_FUSION":
         _inkling_visit_fusion_off(name)
+    elif name == "VLLM_SM70_INKLING_SMALL_M_GEMV":
+        _inkling_small_m_gemv_off(name)
+    elif name == "VLLM_SM70_INKLING_NVFP4_GEMV":
+        _inkling_nvfp4_gemv_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

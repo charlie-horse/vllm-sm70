@@ -6,9 +6,10 @@
                        visits, final norm; owns the caches of every visit
       lm_head          Inkling2Sm70LMHead: the unpadded vocabulary rows, or
                        this rank's part of them (weights.py ``head_sharded``)
-      logits_processor Inkling2Sm70LogitsProcessor: head GEMM in the model
-                       dtype, all-gather of a sharded head, cast to fp32,
-                       then the soft cap; greedy tokens of a batch the
+      logits_processor Inkling2Sm70LogitsProcessor: head GEMM (a GEMV of
+                       2 to 8 rows, gemv.py) in the model dtype,
+                       all-gather of a sharded head, cast to fp32, then
+                       the soft cap; greedy tokens of a batch the
                        V1 sampler hook admits without the logits (greedy.py)
       visual           Inkling2VisionEncoder (vision.py), or None when the
                        image limit per prompt is 0
@@ -39,7 +40,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -51,7 +51,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from . import act_quant, greedy
+from . import act_quant, gemv, greedy
 from .expert_weights import Inkling2ExpertLoader
 from .fp16_audit import walk_process_weights_after_loading
 from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
@@ -129,8 +129,12 @@ class Inkling2Sm70LMHead(nn.Module):
 def _head_logits(
     lm_head: Any, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None
 ) -> torch.Tensor:
-    """This rank's logits in the model dtype."""
-    logits = F.linear(hidden_states.to(lm_head.weight.dtype), lm_head.weight)
+    """This rank's logits in the model dtype (gemv.py from 2 rows)."""
+    logits = gemv.linear(
+        hidden_states.to(lm_head.weight.dtype),
+        lm_head.weight,
+        min_rows=gemv.HEAD_MIN_ROWS,
+    )
     if embedding_bias is not None:
         logits = logits + embedding_bias
     return logits

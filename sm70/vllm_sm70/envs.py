@@ -466,6 +466,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_VISIT_FUSION": kill_switch(
             "VLLM_SM70_INKLING_VISIT_FUSION"
         ),
+
+
+        # "0": the Inkling 2 dense projections of 1 to 8 tokens (qkvr with
+        # its k/v inputs and packed taps, the attention output projection,
+        # the LM head from 2 tokens) run on cuBLAS instead of one Triton
+        # GEMV launch each (inkling2_sm70/gemv.py). Env-only (no Sm70Config
+        # field), read per eager call and fixed at capture in a replayed CUDA
+        # graph; tensors off the GPU always take cuBLAS.
+        "VLLM_SM70_INKLING_SMALL_M_GEMV": kill_switch("VLLM_SM70_INKLING_SMALL_M_GEMV"),
+        # "0": the one-row expert slots of the Inkling 2 TurboMind experts
+        # (at most 80 routed slots) run the two TurboMind dense stages and
+        # the SwiGLU kernel instead of the Triton NVFP4 GEMV over the same
+        # banks, W13 with the SwiGLU in its epilogue (inkling2_sm70/gemv.py,
+        # moe_tm.py). Env-only (no Sm70Config field), read per eager call
+        # and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_NVFP4_GEMV": kill_switch("VLLM_SM70_INKLING_NVFP4_GEMV"),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r
