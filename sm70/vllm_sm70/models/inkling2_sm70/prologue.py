@@ -20,7 +20,9 @@ D values of a head, values in the rest.
 
 On the Triton route of sconv.py (``sconv.on_triton``) the K and V convs, the
 clip, the norm and the K/V store run as one kernel launch
-(ops/paged_conv.py ``key_value_conv``); q and r stay on torch.
+(ops/paged_conv.py ``key_value_conv``). In a decode-only batch on the route
+of fused_small.py the q and r clips, tau and the projection of r run as one
+launch (ops/small_ops.py ``query_rel``); otherwise q and r run on torch.
 """
 
 from __future__ import annotations
@@ -33,7 +35,8 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_K, STREAM_V
-from .ops import paged_conv
+from .fused_small import on_fused
+from .ops import paged_conv, small_ops
 from .ops.torch_ref import l2_clip, log_scale_tau, rms_norm
 from .sconv import (
     _block_tokens,
@@ -187,6 +190,36 @@ def store_key_value(
     kv_cache[block, :, token, head_dim:] = value[rows].to(kv_cache.dtype)
 
 
+def _query_rel_torch(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    q_scale: torch.Tensor,
+    rel_scale: torch.Tensor,
+    rel_proj: torch.Tensor,
+    attn_metadata: Any,
+    q_out: torch.Tensor,
+    rel_out: torch.Tensor,
+    n: int,
+    qk_clip: float,
+    rel_clip: float,
+    log_scaling: tuple[float, float] | None,
+) -> None:
+    """`q_out` and `rel_out` of `attention_prologue` on the torch ops."""
+    tau = None
+    if log_scaling is not None:
+        tau = log_scale_tau(attn_metadata.positions[:n], *log_scaling)
+    query_states(q[:n], q_scale, qk_clip, tau, out=q_out[:n])
+    q_out[n:] = 0
+    torch.matmul(
+        query_states(r[:n], rel_scale, rel_clip, tau), rel_proj, out=rel_out[:n]
+    )
+    rel_out[n:] = 0
+    if is_decode_only(attn_metadata):
+        padding = (attn_metadata.slot_mapping[:n] < 0)[:, None, None]
+        q_out[:n].masked_fill_(padding, 0.0)
+        rel_out[:n].masked_fill_(padding, 0.0)
+
+
 @eager_break_during_capture
 def attention_prologue(
     q: torch.Tensor,
@@ -244,19 +277,17 @@ def attention_prologue(
             f"vllm_sm70: K/V cache blocks hold {attn_owner.kv_cache.shape[2]} "
             f"tokens, the metadata has block size {attn_metadata.block_size}."
         )
-    tau = None
-    if log_scaling is not None:
-        tau = log_scale_tau(attn_metadata.positions[:n], *log_scaling)
-    query_states(q[:n], q_scale, qk_clip, tau, out=q_out[:n])
-    q_out[n:] = 0
-    torch.matmul(
-        query_states(r[:n], rel_scale, rel_clip, tau), rel_proj, out=rel_out[:n]
-    )
-    rel_out[n:] = 0
-    if is_decode_only(attn_metadata):
-        padding = (attn_metadata.slot_mapping[:n] < 0)[:, None, None]
-        q_out[:n].masked_fill_(padding, 0.0)
-        rel_out[:n].masked_fill_(padding, 0.0)
+    if on_fused(q, is_decode_only(attn_metadata)):
+        small_ops.query_rel(
+            q, r, q_scale, rel_scale, rel_proj, attn_metadata.slot_mapping,
+            attn_metadata.positions, q_out, rel_out, n,
+            q_clip=qk_clip, r_clip=rel_clip, log_scaling=log_scaling,
+        )  # fmt: skip
+    else:
+        _query_rel_torch(
+            q, r, q_scale, rel_scale, rel_proj, attn_metadata, q_out, rel_out, n,
+            qk_clip, rel_clip, log_scaling,
+        )  # fmt: skip
     if conv_metadata is None:
         return
     if _real_rows(k, conv_metadata) != n:

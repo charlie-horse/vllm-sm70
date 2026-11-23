@@ -337,9 +337,9 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
 
     short_conv = layers.short_conv
 
-    def conv(x, weight, owner, stream, out):
+    def conv(x, weight, owner, stream, out, **kwargs):
         conv_inputs[group.rank_in_group].append(x)
-        short_conv(x, weight, owner, stream, out)
+        short_conv(x, weight, owner, stream, out, **kwargs)
 
     monkeypatch.setattr(group, "all_reduce", counted)
     monkeypatch.setattr(group, "all_gather", logits_gather)

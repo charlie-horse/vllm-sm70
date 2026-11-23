@@ -216,6 +216,7 @@ default. Set a switch per model with `models.<name>.env`.
 | `VLLM_SM70_INKLING_TM_TUNE` | new (Inkling 2; kill switch: `0` leaves the TurboMind NVFP4 tuning knobs unset, default on has the engine-config hook set them for the Inkling 2 expert stages up to the decode graph cap when none is set) |
 | `VLLM_SM70_INKLING_ASYNC_SCHED` | new (Inkling 2; kill switch: `0` has the engine-config hook turn an unset async scheduling off and refuse `--async-scheduling`, default on leaves it to upstream, which turns it on when unset) |
 | `VLLM_SM70_INKLING_SHARDED_HEAD` | new (Inkling 2; kill switch: `0` keeps the whole LM head on every TP rank, default on splits its rows over the ranks when the vocabulary splits evenly and all-gathers the logits) |
+| `VLLM_SM70_INKLING_FUSED_SMALL_OPS` | new (Inkling 2; kill switch: `0` sends the small chains of decode-only batches (q/r clips and relative projection, attention output gate, TurboMind SwiGLU, short-conv padding masks) back to the torch ops, default on runs one Triton kernel each on GPU tensors) |
 | `VLLM_SM70_INKLING_MERGED_PROJ` | new (Inkling 2; opt-in: default off keeps each projection in its own buffer and GEMM, `1` packs the projections that share an input and runs a small visit's projections as one GEMM) |
 | `VLLM_SM70_FP8_MOE_DECODE` | new |
 | `VLLM_SM70_FP8_QPN8` | new name meaning (not the fork's TP4 one) |

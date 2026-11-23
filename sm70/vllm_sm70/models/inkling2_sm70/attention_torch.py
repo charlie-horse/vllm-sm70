@@ -26,7 +26,9 @@ mapping is a one-query request whose key range has a static length, the
 window in a sliding layer and the block-table width (times the block size)
 in a global one, with the keys past the query's position masked; a key
 step is up to `OWN_KEY_STEPS` key chunks long when the batch has fewer rows.
-Rows with a negative slot are padding: their output is zero.
+Rows with a negative slot are padding: their output is zero. On the route
+of fused_small.py the output gate of a decode-only batch is one launch
+(ops/small_ops.py ``gate``) that also zeroes the padding rows.
 
 Switch: the one-query rows of either kind of batch run one Triton kernel per
 call (ops/paged_attention.py), which reads only each row's own keys, unless
@@ -63,7 +65,8 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm_sm70 import envs
 
 from .backend import is_decode_only
-from .ops import _compat
+from .fused_small import on_fused
+from .ops import _compat, small_ops
 from .ops.paged_attention import decode_attention
 
 if TYPE_CHECKING:
@@ -443,6 +446,13 @@ def gate_and_project(
     `out_weight` [H, heads * D] when given. Written to `output`."""
     # The product promotes attn_output to fp32 inside the kernel.
     gated = (attn_output.flatten(1) * torch.sigmoid(gate.float())).to(attn_output.dtype)
+    return _project(gated, output, out_weight)
+
+
+def _project(
+    gated: torch.Tensor, output: torch.Tensor, out_weight: torch.Tensor | None
+) -> torch.Tensor:
+    """`gated` [P, heads * D] times `out_weight`^T when given, into `output`."""
     if out_weight is None:
         output.copy_(gated)
     elif out_weight.dtype == output.dtype == gated.dtype:
@@ -483,6 +493,13 @@ def attention_with_metadata(
         key_chunk=key_chunk,
         hf_rounding=hf_rounding,
     )
+    if on_fused(attn_output, is_decode_only(md)):
+        rows = min(output.shape[0], md.slot_mapping.shape[0])
+        if out_weight is None and output.dtype == attn_output.dtype:
+            return small_ops.gate(attn_output, gate, md.slot_mapping, rows, output)
+        gated = attn_output.new_empty(gate.shape)
+        small_ops.gate(attn_output, gate, md.slot_mapping, rows, gated)
+        return _project(gated, output, out_weight)
     return gate_and_project(attn_output, gate, output, out_weight)
 
 

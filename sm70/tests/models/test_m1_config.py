@@ -183,6 +183,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
         "VLLM_SM70_INKLING_ASYNC_SCHED",
         "VLLM_SM70_INKLING_SHARDED_HEAD",
+        "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -478,6 +479,20 @@ def _inkling_fused_routing_off(name):
         assert moe.on_fused_routing(x, 8) is False
 
 
+def _inkling_fused_small_ops_off(name):
+    """A decode-only GPU batch keeps the torch ops of the small chains
+    (inkling2_sm70/fused_small.py); the kernels' own checks are
+    tests/ops/test_m12_inkling2_fused_small_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import fused_small
+
+    assert fused_small.SWITCH == name
+    with mock.patch.object(fused_small._compat, "AVAILABLE", True):
+        assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -692,6 +707,8 @@ def _path_off(name):
         _inkling_async_sched_off(name)
     elif name == "VLLM_SM70_INKLING_SHARDED_HEAD":
         _inkling_sharded_head_off(name)
+    elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
+        _inkling_fused_small_ops_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

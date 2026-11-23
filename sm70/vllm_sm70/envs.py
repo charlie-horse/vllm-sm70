@@ -411,6 +411,16 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SHARDED_HEAD": kill_switch(
             "VLLM_SM70_INKLING_SHARDED_HEAD"
         ),
+        # "0": the small torch chains of Inkling 2 decode-only batches (the
+        # prologue's q/r clips and relative projection, the attention output
+        # gate, the TurboMind SwiGLU, the short convs' padding masks) run on
+        # torch instead of one Triton kernel each (inkling2_sm70/
+        # fused_small.py). Env-only (no Sm70Config field), read per eager
+        # call and fixed at capture in a replayed CUDA graph; other batches
+        # and tensors off the GPU always take the torch ops.
+        "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
+            "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
+        ),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

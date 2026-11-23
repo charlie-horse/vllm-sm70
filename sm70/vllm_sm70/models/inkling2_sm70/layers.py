@@ -43,6 +43,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from .attention_torch import paged_attention
 from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_ATTN, STREAM_MLP
+from .fused_small import on_fused
 from .moe import Inkling2Sm70Experts
 from .norms import Bank, Residual, normed_state, sublayer_inputs
 from .ops.torch_ref import message_gate, rms_norm
@@ -384,13 +385,19 @@ class Inkling2Sm70DecoderLayer(nn.Module):
         Returns the new residual stream.
         """
         dtype = hidden.dtype
+        decode_only = is_decode_only(cache_metadata(conv_owner))
         x_q, x_k, x_v = self._attention_inputs(hidden, bank, attn_query, messages)
         partial = self.attn(x_q, x_k, x_v, attn_owner, conv_owner)
         if partial_hook is not None:
             partial_hook(PARTIAL_SITES[0], partial)
         attn = all_reduce(partial, self.tp_size)
         attn_out = attn.new_empty(attn.shape)
-        short_conv(attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out)
+        # Padding rows of `attn` and `expert_sum` are zero on the fused route.
+        zero_padding = not on_fused(attn, decode_only)
+        short_conv(
+            attn, self.attn_sconv.weight, conv_owner, STREAM_ATTN, attn_out,
+            zero_padding=zero_padding,
+        )  # fmt: skip
         # A block boundary restarts the residual from the attention output.
         if self.starts_block:
             bank.append(hidden)
@@ -409,12 +416,15 @@ class Inkling2Sm70DecoderLayer(nn.Module):
             first=3,
         )
         partial = x.new_empty(x.shape)
-        self.mlp(x, partial, is_padding, is_decode_only(cache_metadata(conv_owner)))
+        self.mlp(x, partial, is_padding, decode_only)
         if partial_hook is not None:
             partial_hook(PARTIAL_SITES[1], partial)
         expert_sum = all_reduce(partial, self.tp_size)
         mlp_out = expert_sum.new_empty(expert_sum.shape)
-        short_conv(expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out)
+        short_conv(
+            expert_sum, self.mlp_sconv.weight, conv_owner, STREAM_MLP, mlp_out,
+            zero_padding=zero_padding,
+        )  # fmt: skip
         return residual.add(mlp_out, dtype)
 
 
