@@ -428,6 +428,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # own buffer and GEMM. Env-only (no Sm70Config field), read when the
         # model is built (inkling2_sm70/weights.py, layers.py).
         "VLLM_SM70_INKLING_MERGED_PROJ": opt_in("VLLM_SM70_INKLING_MERGED_PROJ"),
+        # "0": the Inkling 2 model does not opt in to the V1 hidden-state
+        # sampler, so every batch takes compute_logits (fp16 logit
+        # all-gather) and the upstream Sampler. Otherwise an all-greedy
+        # batch the F12 fast path admits takes the per-shard soft-capped
+        # top-1 kernels and a (value, id) pair all-gather (inkling2_sm70/
+        # greedy.py). Env-only (no Sm70Config field), read on every step.
+        "VLLM_SM70_INKLING_GREEDY_TOP1": kill_switch("VLLM_SM70_INKLING_GREEDY_TOP1"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {

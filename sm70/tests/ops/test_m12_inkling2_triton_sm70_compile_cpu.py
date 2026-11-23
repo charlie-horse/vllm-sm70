@@ -3,7 +3,7 @@
 
 Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
 norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
-routing.py, dspark.py, small_ops.py) goes through Triton's compiler and ptxas
+routing.py, dspark.py, small_ops.py, top1.py) goes through Triton's compiler and ptxas
 for GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
 128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
 intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
@@ -662,3 +662,27 @@ def test_gate_kernel():
         },
         enable_fp_fusion=False,
     )
+
+
+# --- top1.py ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("soft_cap", [True, False], ids=["cap", "no_cap"])
+def test_softcap_top1_kernel(soft_cap):
+    top1 = _ops("top1")
+    args = {
+        "logits_ptr": "*fp16",
+        "out_ptr": "*fp32",
+        **_i32("stride_row", "n_cols", "vocab_start"),
+        "cap": "fp32",
+        "SOFT_CAP": soft_cap,
+        "SPLIT": top1.SPLIT_COLS,
+        "BLOCK": top1.BLOCK,
+    }
+    _check(top1._softcap_top1_kernel, args)
+
+
+@pytest.mark.parametrize("block_n", [16, 32])
+def test_pick_kernel(block_n):
+    args = {"pairs_ptr": "*fp32", "out_ptr": "*i64", "n": "i32", "BLOCK_N": block_n}
+    _check(_ops("top1")._pick_kernel, args, num_warps=1)

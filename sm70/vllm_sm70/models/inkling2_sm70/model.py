@@ -8,7 +8,8 @@
                        this rank's part of them (weights.py ``head_sharded``)
       logits_processor Inkling2Sm70LogitsProcessor: head GEMM in the model
                        dtype, all-gather of a sharded head, cast to fp32,
-                       then the soft cap
+                       then the soft cap; greedy tokens of a batch the
+                       V1 sampler hook admits without the logits (greedy.py)
       visual           Inkling2VisionEncoder (vision.py), or None when the
                        image limit per prompt is 0
 
@@ -50,7 +51,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from . import act_quant
+from . import act_quant, greedy
 from .expert_weights import Inkling2ExpertLoader
 from .fp16_audit import walk_process_weights_after_loading
 from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
@@ -162,6 +163,18 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
                 return None
         return logits.float()
 
+    def get_top_tokens(
+        self,
+        lm_head: Any,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """int64 [rows]: the greedy tokens (greedy.py)."""
+        if not greedy.on_kernels(self, lm_head, hidden_states):
+            return super().get_top_tokens(lm_head, hidden_states, embedding_bias)
+        logits = _head_logits(lm_head, hidden_states, embedding_bias)
+        return greedy.top_tokens(logits, lm_head, self.soft_cap)
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Inkling2MultiModalProcessor,
@@ -171,6 +184,11 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
 class Inkling2LoopSm70ForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsEagle3
 ):
+    @property
+    def supports_sm70_topk_sampler(self) -> bool:
+        """The V1 sampler hook's opt-in (greedy.py)."""
+        return greedy.enabled()
+
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         from vllm.distributed import (

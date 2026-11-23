@@ -185,6 +185,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_SHARDED_HEAD",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
         "VLLM_SM70_INKLING_MERGED_PROJ",
+        "VLLM_SM70_INKLING_GREEDY_TOP1",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -493,6 +494,15 @@ def _inkling_fused_small_ops_off(name):
         assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
 
 
+def _inkling_greedy_top1_off(name):
+    """The Inkling 2 model does not opt in to the V1 sampler hook; the
+    kernels are checked in tests/sampler/test_m12_inkling2_greedy_top1_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import greedy
+
+    assert greedy.SWITCH == name and not greedy.enabled()
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -709,6 +719,8 @@ def _path_off(name):
         _inkling_sharded_head_off(name)
     elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
         _inkling_fused_small_ops_off(name)
+    elif name == "VLLM_SM70_INKLING_GREEDY_TOP1":
+        _inkling_greedy_top1_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
