@@ -165,7 +165,12 @@ class Inkling2AttentionMetadata(Inkling2SconvMetadata):
 
 class _TokenIndex:
     """Per-token request index, query start and position of a batch, in
-    buffers one builder owns for its lifetime (CUDA graphs capture them)."""
+    buffers one builder owns for its lifetime (CUDA graphs capture them).
+
+    A batch whose first n requests hold one token each and the rest none
+    (every decode batch, padded or not) has seq_idx = query_start = row on
+    rows [0, n) and 0 after them. The buffers keep that pattern between such
+    batches and are written only when n or P changes."""
 
     def __init__(self, device: torch.device, size: int) -> None:
         self.size = size
@@ -173,6 +178,25 @@ class _TokenIndex:
         self.seq_idx = torch.zeros(size, dtype=torch.int32, device=device)
         self.query_start = torch.zeros(size, dtype=torch.int32, device=device)
         self.positions = torch.zeros(size, dtype=torch.int64, device=device)
+        # (n, P) of the decode pattern rows [0, P) hold, or None.
+        self._pattern: tuple[int, int] | None = None
+
+    @staticmethod
+    def _decode_rows(cm: CommonAttentionMetadata, num_actual: int) -> bool:
+        """Whether request i < num_actual has token i alone and the rest no
+        token: with at most one token per request, the first num_actual
+        requests hold num_actual tokens (host data only)."""
+        if cm.max_query_len > 1 or num_actual > cm.num_reqs:
+            return False
+        return int(cm.query_start_loc_cpu[num_actual]) == num_actual
+
+    def _fill_decode(self, num_actual: int, num_padded: int) -> None:
+        if self._pattern == (num_actual, num_padded):
+            return
+        for buffer in (self.seq_idx, self.query_start):
+            buffer[:num_actual].copy_(self.arange[:num_actual])
+            buffer[num_actual:num_padded].zero_()
+        self._pattern = (num_actual, num_padded)
 
     def fill(self, cm: CommonAttentionMetadata, decode_only: bool) -> dict[str, Any]:
         num_reqs = cm.num_reqs
@@ -191,7 +215,13 @@ class _TokenIndex:
         seq_idx = self.seq_idx[:num_padded]
         query_start = self.query_start[:num_padded]
         positions = self.positions[:num_padded]
-        if num_reqs and num_padded:
+        own_positions = cm.positions is None
+        if not num_reqs or not num_padded:
+            pass
+        elif not own_positions and self._decode_rows(cm, num_actual):
+            self._fill_decode(num_actual, num_padded)
+        else:
+            self._pattern = None
             starts = cm.query_start_loc[: num_reqs + 1]
             ends = starts[1:].contiguous()
             token = self.arange[:num_padded]
@@ -200,11 +230,12 @@ class _TokenIndex:
             req = torch.searchsorted(ends, token, right=True).clamp_(max=num_reqs - 1)
             real = token < num_actual
             start = starts[req]
-            context = cm.seq_lens[:num_reqs] - (ends - starts[:-1])
             seq_idx.copy_(torch.where(real, req, 0))
             query_start.copy_(torch.where(real, start, 0))
-            positions.copy_(torch.where(real, context[req] + token - start, 0))
-        if cm.positions is not None:
+            if own_positions:
+                context = cm.seq_lens[:num_reqs] - (ends - starts[:-1])
+                positions.copy_(torch.where(real, context[req] + token - start, 0))
+        if not own_positions:
             positions = cm.positions[:num_padded]
         return {
             "num_actual_tokens": num_actual,
