@@ -136,7 +136,7 @@ def _segment_gemv_kernel(
 
 def config(rows: int) -> tuple[int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps) for `rows` input rows."""
-    block_m = triton.next_power_of_2(rows)
+    block_m = 1 << (rows - 1).bit_length()
     return (block_m, *CONFIGS[block_m])
 
 
@@ -162,7 +162,7 @@ def segment_gemv(
     assert all(a <= b for a, b in itertools.pairwise(edges)), edges
     starts = [0]
     for a, b in itertools.pairwise(edges):
-        starts.append(starts[-1] + triton.cdiv(b - a, block_n))
+        starts.append(starts[-1] + -(-(b - a) // block_n))
     grid = (starts[-1],)
     if not grid[0]:
         return out
