@@ -239,7 +239,22 @@ def _vllm_config(harness: hx.PagedHarness, rank: int, hf_config) -> SimpleNamesp
     return config
 
 
-def _build(tp_size: int, dtype: torch.dtype, checkpoint, target):
+def _head(rank: int, tp_size: int, dtype: torch.dtype, target, sharded: bool):
+    """The target's LM head as the model builds it: rank `rank`'s vocabulary
+    rows when `sharded` (weights.py ``head_sharded``), else whole."""
+    from vllm_sm70.models.inkling2_sm70.model import Inkling2Sm70LMHead
+
+    head_tp = tp_size if sharded else 1
+    head = Inkling2Sm70LMHead(
+        VOCAB, H, dtype, tp_size=head_tp, tp_rank=rank if sharded else 0
+    )
+    head.weight.data.copy_(target["lm_head"].chunk(head_tp)[rank % head_tp])
+    return head
+
+
+def _build(
+    tp_size: int, dtype: torch.dtype, checkpoint, target, *, sharded: bool = False
+):
     from vllm_sm70.models.inkling2_sm70.dspark import Inkling2DSparkSm70Model
 
     harness = hx.PagedHarness(tp_size, block_size=PAGE, dtype=dtype, num_blocks=96)
@@ -252,11 +267,10 @@ def _build(tp_size: int, dtype: torch.dtype, checkpoint, target):
             )
             loaded = model.load_weights(checkpoint.items())
             assert loaded == {name for name, _ in model.named_parameters()}
-            head = torch.nn.Linear(H, VOCAB, bias=False, dtype=dtype)
-            head.weight.data.copy_(target["lm_head"])
-            model.lm_head = head
-            model.attach_target(_Target(target, dtype))
+            model.lm_head = _head(rank, tp_size, dtype, target, sharded)
             models.append(model)
+    # A sharded head's fold is a collective.
+    harness.lockstep(lambda rank: models[rank].attach_target(_Target(target, dtype)))
     harness.bind()
     return harness, models
 
@@ -289,13 +303,15 @@ def _speculator(model, num_reqs: int, max_tokens: int, dtype: torch.dtype):
     return spec
 
 
-def run_rounds(tp_size: int, dtype: torch.dtype, seed: int = 0):
+def run_rounds(
+    tp_size: int, dtype: torch.dtype, seed: int = 0, *, sharded: bool = False
+):
     """Per round and request: (ctx_len, anchor, tokens, logits [7, V]) of
     every rank, and the fp32 features."""
     from vllm.forward_context import get_forward_context
 
     checkpoint, target = _checkpoint(seed), _target_weights(seed + 1)
-    harness, models = _build(tp_size, dtype, checkpoint, target)
+    harness, models = _build(tp_size, dtype, checkpoint, target, sharded=sharded)
     g = torch.Generator().manual_seed(seed + 2)
     total = {r: sum(rnd[r] for rnd in ROUNDS) for r in ROUNDS[0]}
     features = {r: torch.randn(n, TAPS * H, generator=g) for r, n in total.items()}
@@ -357,18 +373,19 @@ def fp32_run():
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "dtype"),
+    ("tp_size", "dtype", "sharded"),
     [
-        pytest.param(1, torch.float32, id="tp1-fp32"),
-        pytest.param(1, torch.float16, id="tp1-fp16"),
-        pytest.param(2, torch.float32, id="tp2-fp32"),
-        pytest.param(2, torch.float16, id="tp2-fp16"),
+        pytest.param(1, torch.float32, False, id="tp1-fp32"),
+        pytest.param(1, torch.float16, False, id="tp1-fp16"),
+        pytest.param(2, torch.float32, False, id="tp2-fp32-whole-head"),
+        pytest.param(2, torch.float32, True, id="tp2-fp32-sharded-head"),
+        pytest.param(2, torch.float16, True, id="tp2-fp16-sharded-head"),
     ],
 )
-def test_draft_logits_match_the_dense_reference(tp_size, dtype):
+def test_draft_logits_match_the_dense_reference(tp_size, dtype, sharded):
     if INTERPRETED and (tp_size, dtype) != (1, torch.float16):
         pytest.skip("the interpreted child runs the fp16 TP1 case")
-    results, features, checkpoint, target = run_rounds(tp_size, dtype)
+    results, features, checkpoint, target = run_rounds(tp_size, dtype, sharded=sharded)
     assert max(ctx for _, ctx, _, _ in results) > WINDOW + BLOCK + PAGE
     worst = 0.0
     for req, ctx_len, anchor, per_rank in results:
@@ -458,6 +475,21 @@ def test_draft_logits_are_fp32():
 
     spec = Inkling2DSparkSm70Speculator.__new__(Inkling2DSparkSm70Speculator)
     assert spec.draft_logits_spec(None) == (torch.float32, 0.0)
+
+
+def test_a_sharded_head_folds_and_gathers_the_whole_vocabulary():
+    """Each rank holds half of the LM head rows; the fold and the base
+    logits cover the whole vocabulary on every rank."""
+    checkpoint, target = _checkpoint(), _target_weights()
+    harness, models = _build(2, torch.float32, checkpoint, target, sharded=True)
+    m = "markov_head."
+    want = target["lm_head"] @ checkpoint[m + "hidden_out.weight"]
+    hidden = torch.randn(3, H, generator=torch.Generator().manual_seed(5))
+    base = harness.lockstep(lambda rank: models[rank].compute_base_logits(hidden))
+    for model, logits in zip(models, base, strict=True):
+        assert model.lm_head.weight.shape == (VOCAB // 2, H)
+        torch.testing.assert_close(model.model.markov_head.fold_weight, want)
+        torch.testing.assert_close(logits, hidden @ target["lm_head"].T)
 
 
 def test_the_fold_is_fp64_and_refills_in_place():

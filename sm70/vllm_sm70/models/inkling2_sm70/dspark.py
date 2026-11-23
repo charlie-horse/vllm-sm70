@@ -20,6 +20,10 @@ the MNNVL all-reduce. Differences:
   ``sliding_window_size`` positions before the block that it reads.
 * The Markov head's rnn_proj runs in fp32; the fold of hidden_out into the
   LM head is fp64, stored in the model dtype. Logits are fp32.
+* A TP-sharded target LM head (weights.py ``head_sharded``): each rank folds
+  its vocabulary rows and the ranks all-gather the fold once at load; the
+  base logits are all-gathered in the model dtype each draft step. Every
+  rank then holds the logits of the whole vocabulary.
 
 Kernels (ops/dspark.py) run on CUDA tensors and in Triton's interpreter;
 other tensors, or ``VLLM_SM70_INKLING_DSPARK_KERNELS=0``, take their torch
@@ -265,22 +269,35 @@ class Inkling2DraftMarkovHead(nn.Module):
         self.register_buffer("fold_bias", torch.empty(0, dtype=dtype), persistent=False)
 
     @torch.no_grad()
-    def fold(self, lm_head_weight: torch.Tensor) -> None:
+    def fold(self, lm_head_weight: torch.Tensor, head_tp: int = 1) -> None:
         """fold_weight = head @ hidden_out, fold_bias = head @ bias, in fp64.
-        A refold of the same shape refills the same tensors (CUDA graphs)."""
+        With ``head_tp`` > 1, `lm_head_weight` is this rank's share of the
+        vocabulary rows and the ranks all-gather the folded rows (a
+        collective). A refold of the same shape refills the same tensors
+        (CUDA graphs)."""
         rows = lm_head_weight.shape[0]
-        if self.fold_weight.shape[0] != rows:
+        total = rows * head_tp
+        if self.fold_weight.shape[0] != total:
             self.fold_weight = lm_head_weight.new_empty(
-                (rows, self.rank), dtype=self.dtype
+                (total, self.rank), dtype=self.dtype
             )
-            self.fold_bias = lm_head_weight.new_empty((rows,), dtype=self.dtype)
+            self.fold_bias = lm_head_weight.new_empty((total,), dtype=self.dtype)
+        weight, bias_out = self.fold_weight, self.fold_bias
+        if head_tp > 1:
+            weight = lm_head_weight.new_empty((rows, self.rank), dtype=self.dtype)
+            bias_out = lm_head_weight.new_empty((rows,), dtype=self.dtype)
         projection = self.hidden_out_weight.double()
         bias = self.hidden_out_bias.double()
         for start in range(0, rows, FOLD_ROWS):
             part = slice(start, start + FOLD_ROWS)
             head = lm_head_weight[part].double()
-            self.fold_weight[part].copy_(head @ projection)
-            self.fold_bias[part].copy_(head @ bias)
+            weight[part].copy_(head @ projection)
+            bias_out[part].copy_(head @ bias)
+        if head_tp > 1:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            self.fold_weight.copy_(tensor_model_parallel_all_gather(weight, dim=0))
+            self.fold_bias.copy_(tensor_model_parallel_all_gather(bias_out, dim=0))
 
     def context(self, hidden: torch.Tensor, f_rnn: torch.Tensor) -> torch.Tensor:
         """fp32 rnn_proj bias plus its [hidden, f_rnn] term for hidden
@@ -443,8 +460,19 @@ class Inkling2DSparkSm70Model(nn.Module):
     @torch.no_grad()
     def refresh_derived_weights(self) -> None:
         assert self.lm_head is not None
-        self.model.markov_head.fold(self.lm_head.weight)
+        self.model.markov_head.fold(self.lm_head.weight, self._head_tp())
         self.model.fuse_alpha.copy_(torch.softmax(self.model.fuse_weight.float(), -1))
+
+    def _head_tp(self) -> int:
+        """The number of ranks the shared LM head's vocabulary is split over."""
+        assert self.lm_head is not None
+        head_tp = int(getattr(self.lm_head, "tp_size", 1))
+        if head_tp not in (1, self.tp_size):
+            raise ValueError(
+                f"vllm_sm70: the Inkling 2 LM head is split over {head_tp} "
+                f"ranks, the draft runs on {self.tp_size}."
+            )
+        return head_tp
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.cache.prefix for layer in self.model.layers]
@@ -490,9 +518,15 @@ class Inkling2DSparkSm70Model(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Base logits [N, V] in the model dtype (whole LM head per rank)."""
+        """Base logits [N, V] of the whole vocabulary in the model dtype; a
+        sharded LM head's are all-gathered."""
         assert self.lm_head is not None
-        return F.linear(hidden_states, self.lm_head.weight)
+        logits = F.linear(hidden_states, self.lm_head.weight)
+        if self._head_tp() > 1:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            logits = tensor_model_parallel_all_gather(logits, dim=-1)
+        return logits
 
     def markov_step(
         self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
