@@ -39,6 +39,7 @@ from .layers import (
     Inkling2Sm70AttnRes,
     Inkling2Sm70DecoderLayer,
     Weights,
+    all_reduce,
     padding_mask,
 )
 from .norms import message_mix, message_sources, rms_norm, sublayer_inputs
@@ -150,11 +151,13 @@ class Inkling2Sm70LoopModel(nn.Module):
             )
         self.config = config
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.dtype = dtype
         self.eps = float(config.rms_norm_eps)
         self.weight_map = build_weight_map(
             config, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype
         )
+        self.embed_sharded = self.weight_map.embed_sharded
         self.merged = merged_enabled()
         specs = self.weight_map.params
         self.embed_tokens = Weights(specs, "model.embed_tokens", ("weight",))
@@ -190,8 +193,18 @@ class Inkling2Sm70LoopModel(nn.Module):
         self.partial_audit: PartialAudit | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Normed token embeddings [T, H]. Image features replace rows of it."""
-        embedded = F.embedding(input_ids, self.embed_tokens.weight)
+        """Normed token embeddings [T, H]. Image features replace rows of it.
+        A sharded embedding looks up the ids in this rank's rows, zeros the
+        others and sums the ranks' rows: each row comes from one rank."""
+        weight = self.embed_tokens.weight
+        if not self.embed_sharded:
+            embedded = F.embedding(input_ids, weight)
+        else:
+            local = input_ids - self.tp_rank * weight.shape[0]
+            outside = (local < 0) | (local >= weight.shape[0])
+            embedded = F.embedding(local.masked_fill(outside, 0), weight)
+            embedded = embedded.masked_fill_(outside.unsqueeze(-1), 0.0)
+            embedded = all_reduce(embedded, self.tp_size)
         return rms_norm(embedded, self.embed_norm.weight[0], self.eps)
 
     def _capture(self, state: torch.Tensor) -> torch.Tensor:

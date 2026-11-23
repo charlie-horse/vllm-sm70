@@ -254,7 +254,7 @@ def test_mxfp8_layer_of_the_tiny_checkpoint(dtype, tol):
     weights = ops["experts_mxfp8.0.in.top_k_weights"][rows]
     got = torch.full_like(x, float("nan"))
     _gg().grouped_expert_sum(
-        x, indices, weights, module.w13, module.w2,
+        x, indices, weights, *module.expert_weights(),
         module.gate_cap, module.up_cap, got, kernels=False,
     )  # fmt: skip
     if dtype == torch.float32:

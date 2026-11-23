@@ -20,7 +20,7 @@ import torch
 
 from vllm_sm70.models.inkling2_sm70 import expert_weights as ew
 from vllm_sm70.models.inkling2_sm70 import moe, quant_config, sm70_configs
-from vllm_sm70.models.inkling2_sm70.ops import torch_ref
+from vllm_sm70.models.inkling2_sm70.ops import grouped_gemm, torch_ref
 
 TINY = pathlib.Path(__file__).resolve().parents[1] / "models/fixtures/inkling2_tiny"
 NATIVE = safetensors_torch.load_file(TINY / "model.safetensors")
@@ -211,9 +211,11 @@ def test_fp16_rounds_the_fp32_sum_once(config, case):
     x = x.half()
     got = run(module, x, index, weights)
     assert got.dtype == torch.float16
-    ref = torch_ref.experts(
-        x, index, weights, module.w13, module.w2, module.gate_cap, module.up_cap
-    )
+    w13, w2 = (
+        w if isinstance(w, torch.Tensor) else grouped_gemm.dequantize(w, kernels=False)
+        for w in module.expert_weights()
+    )  # an fp16 MXFP8 layer is held 8-bit (moe.py)
+    ref = torch_ref.experts(x, index, weights, w13, w2, module.gate_cap, module.up_cap)
     assert torch.equal(got, ref)
     assert (got.float() - want).abs().max() <= 2e-2 * want.abs().max()
     partials = [

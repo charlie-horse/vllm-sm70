@@ -416,6 +416,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SHARDED_HEAD": kill_switch(
             "VLLM_SM70_INKLING_SHARDED_HEAD"
         ),
+        # "0": every TP rank holds the whole Inkling 2 token embedding.
+        # Otherwise, at TP > 1 with a padded vocabulary that splits evenly,
+        # each rank holds its own vocabulary rows, looks up the ids in them
+        # and the ranks all-reduce the rows (inkling2_sm70/weights.py,
+        # loop.py). Env-only, read when the model is built.
+        "VLLM_SM70_INKLING_SHARDED_EMBED": kill_switch(
+            "VLLM_SM70_INKLING_SHARDED_EMBED"
+        ),
+        # "0": the Inkling 2 MXFP8 expert layers are dequantized to the model
+        # dtype at load. Otherwise, in an fp16 model, they stay e4m3 codes
+        # with their per-32 exponent scales and the expert GEMMs decode them
+        # (inkling2_sm70/moe.py, ops/grouped_gemm.py). Env-only, read when a
+        # layer is loaded.
+        "VLLM_SM70_INKLING_MXFP8_EXPERTS": kill_switch(
+            "VLLM_SM70_INKLING_MXFP8_EXPERTS"
+        ),
         # "0": the small torch chains of Inkling 2 decode-only batches (the
         # prologue's q/r clips and relative projection, the attention output
         # gate, the TurboMind SwiGLU, the short convs' padding masks) run on

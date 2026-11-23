@@ -16,9 +16,9 @@
 Weights load through weights.py (parameters), expert_weights.py (experts,
 into each layer's ``mlp``) and the encoder's own loader. Each TP rank builds
 this class and loads its own shards: a slice of the attention heads and of
-the expert intermediate units and, when sharded, of the LM head rows;
-embedding, norms, convs, routers and the vision encoder are whole on every
-rank.
+the expert intermediate units and, when sharded, of the LM head and the
+token embedding rows; norms, convs, routers and the vision encoder are
+whole on every rank.
 
 DSpark draft features (``SupportsEagle3``): with aux layers set, ``forward``
 returns ``(final, [input of each listed visit..., final])``. A visit input

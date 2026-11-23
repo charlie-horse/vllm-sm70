@@ -219,7 +219,7 @@ def test_expert_shards_are_the_intermediate_slices_of_tp1(tp1, tp2):
 def test_other_parameters_are_whole_on_every_rank(tp1, tp2):
     whole = dict(tp1.models[0].named_parameters())
     sharded = (".attn.qkvr.", ".attn.wo_ud.", ".attn.q_scale", ".attn.r_scale")
-    sharded += (".k_sconv.", ".v_sconv.", "lm_head.")
+    sharded += (".k_sconv.", ".v_sconv.", "lm_head.", "embed_tokens.")
     replicated = [name for name in whole if not any(s in name for s in sharded)]
     assert "model.layers.0.attn_sconv.weight" in replicated
     assert "model.layers.0.mlp_sconv.weight" in replicated
@@ -311,9 +311,9 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
     tp2, sequences, monkeypatch
 ):
     """Per visit a rank all-reduces its o_proj partial, then its expert
-    partial, and nothing else (the logits all-gather once); the short convs
-    store the reduced tensors, so the ranks' conv streams hold the same
-    values."""
+    partial, and nothing else but the embedding rows once before the first
+    visit (the logits all-gather once); the short convs store the reduced
+    tensors, so the ranks' conv streams hold the same values."""
     from vllm_sm70.models.inkling2_sm70 import layers
     from vllm_sm70.models.inkling2_sm70.cache import STREAM_ATTN, STREAM_MLP
 
@@ -356,7 +356,11 @@ def test_two_all_reduces_per_visit_feed_the_replicated_convs(
         for model in tp2.models:
             model.model.partial_audit = None
     visits = tp2.num_visits
-    assert len(calls) == 2 * 2 * visits
+    assert len(calls) == 2 * (2 * visits + 1)
+    embeds = [calls.pop(i) for i in (0, 0)]  # each rank's first
+    assert sorted(rank for rank, _, _ in embeds) == [0, 1]
+    for _, sent, out in embeds:
+        assert sent.shape == out.shape == (9, tp2.hidden)
     # The body all-gathers nothing; the sharded head's logits once per rank,
     # in the model dtype.
     rows = tp2.models[0].lm_head.weight.shape[0]

@@ -413,6 +413,47 @@ def test_slot_gemv_kernel(row_div, k_in):
     )
 
 
+@pytest.mark.parametrize(
+    ("row_div", "k_in"), [(8, HIDDEN), (1, LOCAL_INTERMEDIATE)], ids=["w13", "w2"]
+)
+def test_slot_gemv_mx_kernel(row_div, k_in):
+    grouped_gemm = _ops("grouped_gemm")
+    _check(
+        grouped_gemm._slot_gemv_mx_kernel,
+        {
+            "in_ptr": "*fp16",
+            "w_ptr": "*u8",
+            "s_ptr": "*u8",
+            "out_ptr": "*fp16",
+            "expert_ptr": "*i32",
+            **_i32(
+                "stride_in", "stride_we", "stride_wn", "stride_se", "stride_sn",
+                "stride_out", "n_out", "k_in", "offset",
+            ),
+            "ROW_DIV": row_div,
+            "BLOCK_N": grouped_gemm.BLOCK_N,
+            "BLOCK_K": grouped_gemm.BLOCK_K,
+            "MX_BLOCK": grouped_gemm.MX_BLOCK,
+        },
+        enable_fp_fusion=False,
+    )  # fmt: skip
+
+
+def test_mx_dequant_kernel():
+    grouped_gemm = _ops("grouped_gemm")
+    _check(
+        grouped_gemm._mx_dequant_kernel,
+        {
+            "w_ptr": "*u8",
+            "s_ptr": "*u8",
+            "out_ptr": "*fp16",
+            **_i32("k_in", "stride_w", "stride_s", "stride_out", "offset"),
+            "BLOCK": grouped_gemm.DEQUANT_BLOCK,
+            "MX_BLOCK": grouped_gemm.MX_BLOCK,
+        },
+    )
+
+
 # --- routing.py ---------------------------------------------------------------------
 
 EXPERTS = 128

@@ -35,10 +35,12 @@ __all__ = [
     "EXPERTS_PER_CHUNK",
     "MXFP8",
     "MXFP8_BLOCK",
+    "MXFP8_MAX_SCALE",
     "NVFP4",
     "NVFP4_BLOCK",
     "ExpertLayer",
     "Inkling2ExpertLoader",
+    "Mxfp8Codes",
     "Nvfp4Codes",
     "PackedExpertWeight",
     "check_cast_range",
@@ -51,6 +53,9 @@ MXFP8 = "mxfp8"
 NVFP4_BLOCK = 16
 MXFP8_BLOCK = 32
 EXPERTS_PER_CHUNK = 8
+# Largest MXFP8 exponent byte whose 2 ** (s - 119) is a finite fp32 number
+# (the e4m3 decode of ops/grouped_gemm.py).
+MXFP8_MAX_SCALE = 246
 # transformers core_model_loading.py Inkling2LoopDequantizeExperts.E2M1_VALUES.
 E2M1_VALUES: tuple[float, ...] = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -122,6 +127,23 @@ class Nvfp4Codes:
     codes: torch.Tensor
     block_scale: torch.Tensor
     global_scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Mxfp8Codes:
+    """One MXFP8 weight of one rank, still 8-bit. value[e, n, k] =
+    ``e4m3(codes[e, n, k]) * 2 ** (scale[e, n, (k + offset) // 32] - 127)``.
+
+    ``codes`` uint8 [E, N, K] (the e4m3 bytes); ``scale`` uint8 [E, N, B],
+    the blocks that cover this rank's columns; ``offset`` is the first
+    column's place in its block. N is the output axis; ``w13`` rows are
+    gate-first.
+    """
+
+    name: str
+    codes: torch.Tensor
+    scale: torch.Tensor
+    offset: int
 
 
 @dataclass(frozen=True)
@@ -207,6 +229,42 @@ class PackedExpertWeight:
         return output
 
     @torch.no_grad()
+    def mxfp8_codes(
+        self, dtype: torch.dtype, *, range_check: RangeCheck | None = check_cast_range
+    ) -> Mxfp8Codes | None:
+        """The codes and scales of an MXFP8 weight, or None when a value is
+        not exact in ``dtype`` or a scale exceeds ``MXFP8_MAX_SCALE``: then
+        only ``dequantize`` gives the values. ``range_check`` sees the same
+        chunks as in ``dequantize``."""
+        if self.format != MXFP8:
+            raise ValueError(f"{self.name}: {self.format} weight has no MXFP8 codes")
+        num_experts = self.weight.shape[0]
+        exact = True
+        for start in range(0, num_experts, EXPERTS_PER_CHUNK):
+            experts = slice(start, min(start + EXPERTS_PER_CHUNK, num_experts))
+            values = self._chunk_values(experts)
+            cast = values.to(dtype)
+            if range_check is not None:
+                range_check(
+                    f"{self.name} (experts {experts.start}-{experts.stop - 1})",
+                    values,
+                    cast,
+                )
+            exact = exact and torch.equal(cast.float(), values)
+        if not exact:
+            return None
+        start, stop = self.columns
+        scale = self.scale[..., start // MXFP8_BLOCK : -(-stop // MXFP8_BLOCK)]
+        if scale.numel() and int(scale.max()) > MXFP8_MAX_SCALE:
+            return None
+        return Mxfp8Codes(
+            self.name,
+            self._gate_first(self.weight.view(torch.uint8)).contiguous(),
+            self._gate_first(scale).contiguous(),
+            start % MXFP8_BLOCK,
+        )
+
+    @torch.no_grad()
     def nvfp4_codes(self) -> Nvfp4Codes:
         """The unpacked codes and scales of an NVFP4 weight. The rank's
         column range must start and end on a block of 16."""
@@ -256,6 +314,15 @@ class ExpertLayer:
     def nvfp4_codes(self) -> tuple[Nvfp4Codes, Nvfp4Codes]:
         """(``w13``, ``w2``) unpacked codes of an NVFP4 layer."""
         return self.w13.nvfp4_codes(), self.w2.nvfp4_codes()
+
+    def mxfp8_codes(
+        self, dtype: torch.dtype, *, range_check: RangeCheck | None = check_cast_range
+    ) -> tuple[Mxfp8Codes, Mxfp8Codes] | None:
+        """(``w13``, ``w2``) codes of an MXFP8 layer, or None as
+        ``PackedExpertWeight.mxfp8_codes``; ``range_check`` sees both."""
+        w13 = self.w13.mxfp8_codes(dtype, range_check=range_check)
+        w2 = self.w2.mxfp8_codes(dtype, range_check=range_check)
+        return None if w13 is None or w2 is None else (w13, w2)
 
 
 def _text_config(config: Any) -> Any:

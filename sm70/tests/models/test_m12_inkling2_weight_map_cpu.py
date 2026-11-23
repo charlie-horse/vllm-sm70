@@ -265,7 +265,8 @@ def test_released_names_map_to_one_parameter_or_a_skip(mini_config, tp_size):
     shapes = {name: spec.shape for name, spec in wmap.params.items()}
     assert shapes["lm_head.weight"] == (200058 // tp_size, 2304)
     assert wmap.head_sharded is (tp_size > 1)
-    assert shapes["model.embed_tokens.weight"] == (201024, 2304)
+    assert shapes["model.embed_tokens.weight"] == (201024 // tp_size, 2304)
+    assert wmap.embed_sharded is (tp_size > 1)
     assert shapes["model.message_queries"] == (12, 4, 2304)
     assert shapes["model.attn_res.attn_queries.22"] == (3, 2304)
     # wq_du, wr_du, gate_attn, attn_sink_proj, wk_dv, wv_dv of the checkpoint.

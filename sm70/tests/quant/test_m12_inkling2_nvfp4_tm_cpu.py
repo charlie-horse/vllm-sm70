@@ -383,8 +383,9 @@ def test_admitted_module_holds_no_fp16_weights(tm, config):
 def test_mxfp8_layer_of_an_admitted_module_uses_torch(tm, config):
     module = build(config, layer=MXFP8_LAYER, dtype=torch.float16)
     assert module.tm_route is None and module.tm_rejection is None
-    assert module.w13.shape == (8, 64, 64) and module.w2.shape == (8, 64, 32)
-    assert not tm.prepared
+    w13, w2 = module.expert_weights()  # held 8-bit (moe.py)
+    assert w13.shape == (8, 64, 64) and w2.shape == (8, 64, 32)
+    assert module.mx13 is not None and not tm.prepared
     x = OPS["experts_mxfp8.0.in.hidden_states"].half()
     out = torch.full_like(x, float("nan"))
     module.expert_sum(
