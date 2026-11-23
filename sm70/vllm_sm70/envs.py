@@ -386,6 +386,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are measured in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "0": the Inkling 2 config hook refuses every --speculative-config
+        # again and Sm70CudaPlatform.get_speculator_cls (U6) returns None
+        # (inkling2_sm70/draft.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_DSPARK": kill_switch("VLLM_SM70_INKLING_DSPARK"),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r

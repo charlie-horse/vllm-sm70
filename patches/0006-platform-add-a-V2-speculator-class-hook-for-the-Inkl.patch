@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 05:27:58 +0000
+Subject: [PATCH] platform: add a V2 speculator class hook for the Inkling 2
+ DSpark draft
+
+What: Adds Platform.get_speculator_cls(vllm_config) (default None). The V2
+  init_speculator builds the class it returns with (vllm_config, device);
+  None keeps upstream's choice. SpeculativeConfig leaves a draft of
+  model_type inkling2_dspark out of the DeepSeek DSpark fallback, which
+  otherwise rewrites every unlisted DSpark draft to DSparkDraftModel.
+Why: v0.33.0 hard-codes DSparkSpeculator for method dspark
+  (vllm/v1/worker/gpu/spec_decode/__init__.py:53-58), and the Inkling 2
+  draft needs its own speculator (feature buffer, Markov head); the
+  fallback is at vllm/config/speculative.py:1543-1565.
+Upstream-files: vllm/platforms/interface.py,
+  vllm/v1/worker/gpu/spec_decode/__init__.py, vllm/config/speculative.py
+Kill-switch: hook returns None -> upstream (no plugin, or
+  VLLM_SM70_INKLING_DSPARK=0); no inkling2_dspark config type without the plugin
+Tests: sm70/tests/plugin/test_u6_speculator_hook.py
+Upstream-status: not-upstreamable (upstream main routes speculators
+  through SpeculativeConfig.speculator_config)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nZrmSqZTHqQyLTc5hsL6z
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 5c76282ff92e..ec8381da3f13 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1548,6 +1548,8 @@ class SpeculativeConfig:
+                     not in self.draft_model_config.architectures
+                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
+                     and "K3DSparkModel" not in self.draft_model_config.architectures
++                    and self.draft_model_config.hf_config.model_type
++                    != "inkling2_dspark"
+                 ):
+                     # DeepSeek-V4(.1) DSpark reuses the full target config
+                     # and its weights ship in the target checkpoint.
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 87f1ab5d3c62..f30585f92de4 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1235,6 +1235,12 @@ class Platform:
+         calls it for spec decode or structured output batches."""
+         return None
+ 
++    @classmethod
++    def get_speculator_cls(cls, vllm_config: "VllmConfig") -> Any:
++        """Return the V2 runner's speculator class for this config, built with
++        (vllm_config, device), or None for upstream's choice."""
++        return None
++
+     @classmethod
+     def get_punica_wrapper(cls) -> str:
+         """Return the punica wrapper for current platform."""
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index ccad8d5f953d..462707537590 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -19,6 +19,11 @@ def init_speculator(
+     """Build the speculator for this config."""
+     speculative_config = vllm_config.speculative_config
+     assert speculative_config is not None
++    from vllm.platforms import current_platform
++
++    speculator_cls = current_platform.get_speculator_cls(vllm_config)
++    if speculator_cls is not None:
++        return speculator_cls(vllm_config, device)
+     if speculative_config.method == "extract_hidden_states":
+         from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
+             ExtractHiddenStatesSpeculator,

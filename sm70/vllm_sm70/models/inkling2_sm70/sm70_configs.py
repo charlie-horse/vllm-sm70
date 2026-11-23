@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM70 config classes for Inkling 2: upstream's (configs.py), LM head dtype
-set to the model dtype.
+set to the model dtype. The DSpark draft's config (``inkling2_dspark``) is
+upstream's class unchanged.
 
 Upstream defaults ``head_dtype`` to float32 (configs.py:220), which sends
 logits through ``torch.mm(out_dtype=float32)``; vllm-sm70's samplers accept
@@ -14,7 +15,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .configs import Inkling2LoopMMConfig, Inkling2MMConfig, Inkling2ModelConfig
+from .configs import (
+    Inkling2DSparkConfig,
+    Inkling2LoopMMConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+)
 
 HEAD_DTYPE = "model"
 # Attribute the engine-config hook (config.py) sets on the model's hf_config:
@@ -50,4 +56,5 @@ CONFIG_CLASSES: dict[str, type] = {
     "inkling2": Inkling2Sm70MMConfig,
     "inkling2_loop": Inkling2LoopSm70MMConfig,
     "inkling2_model": Inkling2ModelConfig,
+    "inkling2_dspark": Inkling2DSparkConfig,
 }

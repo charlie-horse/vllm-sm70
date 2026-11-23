@@ -148,6 +148,29 @@ def test_hook_refuses_on_cpu_platform(monkeypatch, route_log):
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(_vllm_config())
 
 
+@pytest.mark.parametrize("switch", [None, "0"])
+def test_hook_takes_a_staged_dspark_draft_only(device, route_log, monkeypatch, switch):
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    device(7, 0)
+    monkeypatch.setattr(icfg, "tm_tuning_env", lambda *args: {})
+    if switch is None:
+        monkeypatch.delenv("VLLM_SM70_INKLING_DSPARK", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_INKLING_DSPARK", switch)
+    spec = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
+    )
+    cfg = _vllm_config(spec=spec)
+    if switch is None:
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+        return
+    with pytest.raises(ValueError, match="VLLM_SM70_INKLING_DSPARK=0"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
 @pytest.mark.parametrize("block_size", [None, 32])
 @pytest.mark.parametrize("async_scheduling", [None, False])
 @pytest.mark.parametrize("cache_dtype", ["auto", "float16"])

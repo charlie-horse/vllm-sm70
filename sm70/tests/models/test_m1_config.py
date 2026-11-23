@@ -179,6 +179,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_DSPARK",
         "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
@@ -483,6 +484,21 @@ def _inkling_tm_tune_off(name):
     assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
 
 
+def _inkling_dspark_off(name):
+    """The Inkling 2 hook refuses a staged DSpark draft and the U6 hook has
+    no speculator; the accepted case is in
+    tests/models/test_m12_inkling2_draft_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    hf_config = SimpleNamespace(model_type=draft.DRAFT_MODEL_TYPE)
+    spec = SimpleNamespace(
+        method="dspark", draft_model_config=SimpleNamespace(hf_config=hf_config)
+    )
+    assert name in draft.speculative_rejection(spec, None)
+    assert draft.speculator_cls(SimpleNamespace(speculative_config=spec)) is None
+
+
 def _inkling_decode_graph_off(name):
     """Inkling 2 cache builders declare no CUDA-graph support and mark no
     batch decode-only; the hook's modes are in
@@ -592,6 +608,8 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK":
+        _inkling_dspark_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

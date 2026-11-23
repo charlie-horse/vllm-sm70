@@ -5,8 +5,10 @@
 ``MODELS_CONFIG_MAP[ARCH]`` (a dict insert). UP calls it from
 ``VllmConfig.try_verify_and_update_config`` (UP config/vllm.py:1539).
 
-* Refuses anything other than fp16 on cc 7.0, a speculative config and
-  prompt embeddings (upstream models/inkling2/nvidia/model.py:556-559).
+* Refuses anything other than fp16 on cc 7.0, prompt embeddings
+  (upstream models/inkling2/nvidia/model.py:556-559) and a speculative
+  config other than method dspark with a staged ``inkling2_dspark`` draft
+  (draft.py ``speculative_rejection``).
 * Attention: the model owns its attention layers and KV caches, so no layer
   goes through the platform's backend selection (Flash-V100 or TRITON_ATTN).
   ``attention_config.backend`` stays unset and an explicit
@@ -83,8 +85,8 @@ def _log_routes_once(visit_dump_dir: str | None, cudagraph_mode: str) -> None:
     logger.info(
         "Inkling 2 SM70: fp16 on cc 7.0; model-owned attention and KV caches "
         "(neither FLASH_ATTN_V100 nor TRITON_ATTN); KV block size %d, no "
-        "async scheduling; cudagraph_mode %s; no speculative decoding, no "
-        "prompt embeddings; per-visit state dump %s.",
+        "async scheduling; cudagraph_mode %s; no prompt embeddings; "
+        "per-visit state dump %s.",
         KV_BLOCK_SIZE,
         cudagraph_mode,
         f"to {visit_dump_dir}" if visit_dump_dir else "off",
@@ -153,6 +155,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         from vllm_sm70.config import sm70_config
 
         from .backend import decode_graph_enabled
+        from .draft import speculative_rejection
         from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
 
         capability = (
@@ -172,11 +175,11 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 f"{ARCH} needs --dtype half (V100 has no bf16), got "
                 f"{model_config.dtype}."
             )
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                f"{ARCH} does not support speculative decoding; drop "
-                "--speculative-config."
-            )
+        spec_reason = speculative_rejection(
+            vllm_config.speculative_config, getattr(model_config, "hf_config", None)
+        )
+        if spec_reason is not None:
+            raise ValueError(f"{ARCH} {spec_reason}.")
         if getattr(model_config, "enable_prompt_embeds", False):
             raise ValueError(
                 f"{ARCH} does not support prompt embeddings; drop "

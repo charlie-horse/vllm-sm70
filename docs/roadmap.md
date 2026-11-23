@@ -28,7 +28,8 @@ The whole carry against upstream is these patches:
 | U3 | +20 | `fused_moe/runner/moe_runner.py:630, :907`, `platforms/interface.py` |
 | U4 | +35 | `v1/worker/gpu_model_runner.py:563, :4208, :4306`, `platforms/interface.py` |
 | U5 | 0 | none: K17's kernel is in `_sm70_C` and includes upstream's `csrc/custom_all_reduce.cuh` |
-| **total** | **~75** (U5 adds none) | |
+| U6 | +13 | `v1/worker/gpu/spec_decode/__init__.py:21`, `platforms/interface.py`, `config/speculative.py:1550` |
+| **total** | **~88** (U5 adds none) | |
 
 ## Phase 1: unpatched build
 
@@ -133,12 +134,13 @@ The "M8 verifier GEMVs" at the fork (cf9492a) are three routes. All three serve 
 
 | node | level | what | owner | depends | kill switch | exit test |
 |---|---|---|---|---|---|---|
+| U6 | 0 | V2 speculator hook `Platform.get_speculator_cls(vllm_config)`, asked first by `init_speculator`; a draft of model_type `inkling2_dspark` skips the DeepSeek DSpark fallback in `SpeculativeConfig` | Felipe | – | `VLLM_SM70_INKLING_DSPARK=0` (hook returns None) | CPU `sm70/tests/plugin/test_u6_speculator_hook.py`; `scripts/regen-patches.sh --check` |
 | M12 | 0 | `vllm_sm70.models.inkling2_sm70` package: upstream Inkling 2 config classes vendored byte-identical (vLLM c32251b), Sm70 config subclasses with `head_dtype` resolved to the model dtype, config types `inkling2` / `inkling2_loop` / `inkling2_model` registered before the SM70 gate, stub `Inkling2LoopSm70ForConditionalGeneration` registered behind it and selected with `--hf-overrides architectures` | – | K01 | none (reachable only through `--hf-overrides`) | CPU `sm70/tests/models/test_m12_inkling2_registration_cpu.py`: arch registered at cc 7.0 and absent at cc 8.0; the real `config.json` parses to 48 layer visits; vendored sha256 matches `PROVENANCE.md`; Flint and Qwen registry entries unchanged |
 
 ## Series order for `patches/`
 
 1. 0001–0099 build: 0001 trims the external projects that build nothing for sm_70 (`VLLM_SM70_TRIM_EXTERNALS=1`, set by nix/package.nix; unset or ≠1 → upstream). The remaining FetchContent sources are fed by Nix.
-2. 0100–0199 platform: U1, U2, U3, U4. U5 has no patch.
+2. 0100–0199 platform: U1, U2, U3, U4, U6. U5 has no patch.
 3. 0500–0699 models: none. The M7 subclass route works without a patch.
 4. 0700–0799 kv: none.
 

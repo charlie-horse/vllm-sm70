@@ -12,11 +12,13 @@ Why: vLLM v0.33.0 has no ``inkling2`` config type or architecture, and
   name keeps upstream's class untouched; serve args select ours with
   ``--hf-overrides '{"architectures":
   ["Inkling2LoopSm70ForConditionalGeneration"]}'``.
-Registration: the config classes go into vLLM's ``_CONFIG_REGISTRY``, the
+Registration: the config classes (``inkling2_dspark``, the DSpark draft's,
+  included) go into vLLM's ``_CONFIG_REGISTRY``, the
   renderer mode into its tokenizer and renderer registries and the parser
   names into its reasoning and tool parser managers in every process (a CPU
   process parses config.json, renders chat and parses output too); the model
-  class only when the visible GPUs are all cc 7.0.
+  class and the draft's ``Inkling2DSparkSm70Model`` (draft.py) only when the
+  visible GPUs are all cc 7.0.
 """
 
 from __future__ import annotations
@@ -111,7 +113,8 @@ def register_parsers() -> None:
 
 
 def register() -> bool:
-    """Register configs, renderer mode and parsers, then ``ARCH`` on SM70.
+    """Register configs, renderer mode and parsers, then ``ARCH`` and the
+    draft's architecture on SM70.
 
     Idempotent. The config classes, the renderer mode and the parser names
     register first, on any device. The model class is skipped (returns
@@ -143,17 +146,20 @@ def register() -> bool:
 
     from vllm.model_executor.models import ModelRegistry
 
-    ModelRegistry.register_model(ARCH, LAZY_TARGET)
-    entry = ModelRegistry.models.get(ARCH)
-    module_name, _, class_name = LAZY_TARGET.partition(":")
-    if (getattr(entry, "module_name", None), getattr(entry, "class_name", None)) != (
-        module_name,
-        class_name,
-    ):
-        raise RuntimeError(
-            f"vllm_sm70: {ARCH!r} resolves to {entry!r}, not {LAZY_TARGET}; "
-            "upstream registry semantics changed."
-        )
+    from .draft import DRAFT_ARCH, DRAFT_LAZY_TARGET
+
+    for arch, target in ((ARCH, LAZY_TARGET), (DRAFT_ARCH, DRAFT_LAZY_TARGET)):
+        ModelRegistry.register_model(arch, target)
+        entry = ModelRegistry.models.get(arch)
+        module_name, _, class_name = target.partition(":")
+        if (
+            getattr(entry, "module_name", None),
+            getattr(entry, "class_name", None),
+        ) != (module_name, class_name):
+            raise RuntimeError(
+                f"vllm_sm70: {arch!r} resolves to {entry!r}, not {target}; "
+                "upstream registry semantics changed."
+            )
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
     from .config import Inkling2Sm70ModelConfig

@@ -16,6 +16,10 @@ this class and loads its own shards: a slice of the attention heads and of
 the expert intermediate units; embedding, norms, convs, routers, the LM head
 and the vision encoder are whole on every rank.
 
+DSpark draft features (``SupportsEagle3``): with aux layers set, ``forward``
+returns ``(final, [input of each listed visit..., final])``. A visit input
+is the AttnRes partial block, upstream's ``stack[num_blocks]``.
+
 Images: ``embed_multimodal`` returns one ``[rows * cols, H]`` tensor per
 image; ``embed_input_ids`` writes them over the image-token rows of the
 normed text embeddings, so image rows skip ``embed_norm``. An image over
@@ -37,6 +41,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
 )
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -121,7 +126,9 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
     info=Inkling2ProcessingInfo,
     dummy_inputs=Inkling2DummyInputsBuilder,
 )
-class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
+class Inkling2LoopSm70ForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsEagle3
+):
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         from vllm.distributed import (
@@ -233,7 +240,20 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
         return self.visual(pixels, grid_thw).split(sizes)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Layer visits (loop passes counted) whose input is returned; an id
+        past the last visit adds nothing, the final state is always last."""
         self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """The checkpoint's ``mtp_config.target_layer_ids``."""
+        mtp_config = getattr(self.config, "mtp_config", None) or {}
+        layers = tuple(mtp_config.get("target_layer_ids", ()))
+        if not layers:
+            raise ValueError(
+                "vllm_sm70: this Inkling 2 checkpoint has no "
+                "mtp_config.target_layer_ids to capture."
+            )
+        return layers
 
     def embed_input_ids(
         self,
