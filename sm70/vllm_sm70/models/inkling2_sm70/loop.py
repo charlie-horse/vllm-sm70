@@ -42,7 +42,7 @@ from .layers import (
     padding_mask,
 )
 from .norms import message_mix, message_sources, rms_norm, sublayer_inputs
-from .weights import build_weight_map
+from .weights import build_weight_map, merged_enabled
 
 __all__ = ["Inkling2Sm70LoopModel", "PartialAudit", "VisitDump", "layer_visits"]
 
@@ -155,6 +155,7 @@ class Inkling2Sm70LoopModel(nn.Module):
         self.weight_map = build_weight_map(
             config, tp_size=tp_size, tp_rank=tp_rank, dtype=dtype
         )
+        self.merged = merged_enabled()
         specs = self.weight_map.params
         self.embed_tokens = Weights(specs, "model.embed_tokens", ("weight",))
         self.embed_norm = Weights(specs, "model.embed_norm", ("weight",))
@@ -166,6 +167,7 @@ class Inkling2Sm70LoopModel(nn.Module):
                 layer,
                 tp_size=tp_size,
                 dtype=dtype,
+                merged=self.merged,
             )
             for layer in range(config.num_hidden_layers)
         )

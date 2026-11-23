@@ -31,17 +31,24 @@ def rms_norm(
 
 
 def l2_clip(
-    x: torch.Tensor, threshold: float, scale: torch.Tensor | None = None
+    x: torch.Tensor,
+    threshold: float,
+    scale: torch.Tensor | None = None,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Shrink vectors of the last dim longer than `threshold` to it.
 
-    `scale` ([heads, D]) multiplies `x` ([..., heads, D]) first.
+    `scale` ([heads, D]) multiplies `x` ([..., heads, D]) first, in fp32.
+    The result, in the dtype of `x`, is written to `out` when given.
     """
-    y = x.float()
-    if scale is not None:
-        y = y * scale.float()
+    # The product promotes x to fp32 inside the kernel: no separate cast.
+    y = x.float() if scale is None else x * scale.float()
     norm = torch.linalg.vector_norm(y, dim=-1, keepdim=True)
-    return (y * (threshold / (norm + 1e-6)).clamp(max=1.0)).to(x.dtype)
+    y = y * (threshold / (norm + 1e-6)).clamp(max=1.0)
+    if out is not None:
+        return out.copy_(y)
+    return y.to(x.dtype)
 
 
 def log_scale_tau(

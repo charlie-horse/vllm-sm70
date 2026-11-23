@@ -53,6 +53,7 @@ from .processing import (
     Inkling2ProcessingInfo,
 )
 from .vision import Inkling2VisionEncoder
+from .weights import pack_parameters
 
 logger = init_logger("vllm.sm70.inkling2")
 
@@ -197,6 +198,8 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
             )
             self.max_image_tokens = (cap - 1) // self.visual.merge_size**2
         self.model.weight_map.with_visual = self.visual is not None
+        if self.model.merged:
+            pack_parameters(self, self.model.weight_map.packs, copy=False)
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -309,5 +312,12 @@ class Inkling2LoopSm70ForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def process_weights_after_loading(self) -> None:
         """vLLM calls this on the top-level model only; it reaches the
-        submodules' hooks."""
+        submodules' hooks. Packs a move to another device split apart again
+        (weights.py ``pack_parameters``)."""
+        if self.model.merged:
+            moved = pack_parameters(self, self.model.weight_map.packs)
+            if moved:
+                logger.info(
+                    "Inkling 2 rank %d: repacked %d packs", self.tp_rank, len(moved)
+                )
         walk_process_weights_after_loading(self)

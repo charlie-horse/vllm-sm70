@@ -175,6 +175,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_MERGED_PROJ",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -495,6 +496,15 @@ def _inkling_decode_graph_off(name):
         assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
 
 
+def _inkling_merged_proj_off(name):
+    """Models built now pack no projections; the packed and unpacked models
+    are compared in tests/models/test_m12_inkling2_merged_proj_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import weights
+
+    assert weights.MERGED_SWITCH == name and not weights.merged_enabled()
+
+
 ROUTE_CHECKS = {
     "VLLM_SM70_INKLING_TRITON_NORMS": _inkling_triton_norms_route,
 }
@@ -555,6 +565,8 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
+    elif name == "VLLM_SM70_INKLING_MERGED_PROJ":
+        _inkling_merged_proj_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:

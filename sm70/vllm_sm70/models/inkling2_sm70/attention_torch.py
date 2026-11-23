@@ -441,9 +441,8 @@ def gate_and_project(
     """`attn_output` [P, heads, D] times sigmoid(`gate` [P, heads * D]) in
     fp32, rounded to the dtype of `attn_output`, then the output projection
     `out_weight` [H, heads * D] when given. Written to `output`."""
-    gated = (attn_output.flatten(1).float() * torch.sigmoid(gate.float())).to(
-        attn_output.dtype
-    )
+    # The product promotes attn_output to fp32 inside the kernel.
+    gated = (attn_output.flatten(1) * torch.sigmoid(gate.float())).to(attn_output.dtype)
     if out_weight is None:
         output.copy_(gated)
     elif out_weight.dtype == output.dtype == gated.dtype:

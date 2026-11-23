@@ -385,6 +385,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are measured in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "0": the Inkling 2 projections that share an input are not packed
+        # into one buffer and run one GEMM each again: a global layer's
+        # q/k/v/r/gate/sink rows and conv taps, the controllers' gain and
+        # forget gates; no fp32 copies of the q/r clip scales. Env-only (no
+        # Sm70Config field), read when the model is built
+        # (inkling2_sm70/weights.py, layers.py).
+        "VLLM_SM70_INKLING_MERGED_PROJ": kill_switch("VLLM_SM70_INKLING_MERGED_PROJ"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {
