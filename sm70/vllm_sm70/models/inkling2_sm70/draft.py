@@ -131,7 +131,8 @@ def speculative_rejection(
     if k != draft.dspark_block_size:
         return (
             f"drafts {draft.dspark_block_size} tokens per step with "
-            f"{DRAFT_MODEL_TYPE}, got num_speculative_tokens {k}"
+            f"{DRAFT_MODEL_TYPE}, got num_speculative_tokens {k}; "
+            "sm70.inkling2.dspark_spec_tokens verifies fewer of them"
         )
     get_text = getattr(target_hf_config, "get_text_config", None)
     text = get_text() if callable(get_text) else target_hf_config

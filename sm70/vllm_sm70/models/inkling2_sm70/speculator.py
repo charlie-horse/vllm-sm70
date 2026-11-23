@@ -6,7 +6,9 @@ models/inkling2/speculator.py) onto the v0.33.0 DSpark speculator. It stores
 the raw target features (each draft layer mixes them itself) and runs the
 recurrent Markov head step by step. Draft logits are fp32 for greedy and
 probabilistic drafts alike; Sm70CudaPlatform.get_speculator_cls (U6)
-returns this class (draft.py).
+returns this class (draft.py). A step that verifies no drafts runs the
+inherited propose with num_speculative_tokens 0, which stores the context
+K/V only; f_rnn is recomputed at the next drafting step.
 """
 
 from __future__ import annotations
@@ -52,6 +54,20 @@ class Inkling2DSparkSm70Speculator(DSparkSpeculator):
         self.f_rnn = torch.zeros(
             self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device
         )
+
+    def init_cudagraph_manager(self, cudagraph_mode: Any) -> None:
+        """Every draft step runs the whole block, also under a dynamic
+        speculative-decoding schedule (spec_policy.py), whose tiers v0.33's
+        graph manager would capture as draft query lengths
+        (UP v1/worker/gpu/cudagraph_utils.py:276-296): it is built without
+        the schedule."""
+        spec = self.vllm_config.speculative_config
+        schedule = spec.num_speculative_tokens_per_batch_size
+        spec.num_speculative_tokens_per_batch_size = None
+        try:
+            super().init_cudagraph_manager(cudagraph_mode)
+        finally:
+            spec.num_speculative_tokens_per_batch_size = schedule
 
     def draft_logits_spec(self, vllm_config: Any) -> tuple[torch.dtype, float]:
         return torch.float32, 0.0

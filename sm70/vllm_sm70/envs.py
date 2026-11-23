@@ -395,6 +395,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # again and Sm70CudaPlatform.get_speculator_cls (U6) returns None
         # (inkling2_sm70/draft.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_DSPARK": kill_switch("VLLM_SM70_INKLING_DSPARK"),
+        # "0": the Inkling 2 config hook sets no speculative-decoding
+        # schedule, so every decode step of a DSpark engine verifies
+        # num_speculative_tokens drafts. Otherwise steps of more than
+        # sm70.inkling2.dspark_spec_max_reqs requests decode one token per
+        # request (inkling2_sm70/spec_policy.py). Env-only, read once per
+        # engine config.
+        "VLLM_SM70_INKLING_DSPARK_AUTO": kill_switch("VLLM_SM70_INKLING_DSPARK_AUTO"),
         # "0": the Inkling 2 draft (inkling2_sm70/dspark.py) runs the torch
         # forms of its norm, RoPE, block attention, SwiGLU, Markov gate and
         # soft-cap ops instead of the Triton kernels (inkling2_sm70/ops/

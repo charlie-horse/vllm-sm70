@@ -51,6 +51,8 @@ EFFECTIVE_DEFAULTS = {
         "visit_dump_dir": None,
         "max_image_encoder_tokens": 10817,
         "expert_act_fake_quant": False,
+        "dspark_spec_max_reqs": 1,
+        "dspark_spec_tokens": 7,
     },
 }
 
@@ -180,6 +182,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
         "VLLM_SM70_INKLING_DSPARK",
+        "VLLM_SM70_INKLING_DSPARK_AUTO",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
         "VLLM_SM70_INKLING_ASYNC_SCHED",
         "VLLM_SM70_INKLING_SHARDED_HEAD",
@@ -529,6 +532,21 @@ def _inkling_dspark_off(name):
     assert draft.speculator_cls(SimpleNamespace(speculative_config=spec)) is None
 
 
+def _inkling_dspark_auto_off(name):
+    """The Inkling 2 hook sets no speculative-decoding schedule; the schedules
+    it sets are checked in tests/models/test_m12_inkling2_spec_policy_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import spec_policy
+
+    assert spec_policy.SWITCH == name
+    spec = SimpleNamespace(num_speculative_tokens=7)
+    config = SimpleNamespace(
+        speculative_config=spec, scheduler_config=SimpleNamespace(max_num_seqs=8)
+    )
+    assert spec_policy.apply(config, sm70_config(_vc({})).inkling2) is None
+    assert not hasattr(spec, "num_speculative_tokens_per_batch_size")
+
+
 def _inkling_dspark_kernels_off(name):
     """The Inkling 2 draft ops take their torch forms, even on tensors the
     kernels could run; the forms are compared in
@@ -731,6 +749,8 @@ def _path_off(name):
         _inkling_tm_tune_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK":
         _inkling_dspark_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK_AUTO":
+        _inkling_dspark_auto_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK_KERNELS":
         _inkling_dspark_kernels_off(name)
     elif name == "VLLM_SM70_INKLING_ASYNC_SCHED":
@@ -794,6 +814,8 @@ def test_env_cannot_enable(monkeypatch, value):
             "visit_dump_dir": "/dump",
             "max_image_encoder_tokens": 1601,
             "expert_act_fake_quant": False,
+            "dspark_spec_max_reqs": 4,
+            "dspark_spec_tokens": 5,
         },
     }
     assert sm70_config(_vc(off)).model_dump() == off

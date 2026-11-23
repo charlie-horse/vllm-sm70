@@ -67,6 +67,18 @@ class Inkling2Config(BaseModel):
     unchanged. Set only through --additional-config. Not a graph field: the
     model is not compiled, and its decode graphs are captured with it."""
 
+    dspark_spec_max_reqs: int = Field(default=1, ge=1)
+    """With a DSpark --speculative-config: a step of at most this many
+    scheduled requests verifies drafts; a larger one decodes one token per
+    request (models/inkling2_sm70/spec_policy.py). Not a graph field: it
+    sets which decode graphs are captured, not what they compute.
+    Kill: VLLM_SM70_INKLING_DSPARK_AUTO=0 (every step verifies)."""
+
+    dspark_spec_tokens: int = Field(default=7, ge=1)
+    """Draft tokens a speculating step verifies, at most
+    num_speculative_tokens; the draft still drafts its whole block. Not a
+    graph field (as dspark_spec_max_reqs)."""
+
 
 class Sm70Config(BaseModel):
     """SM70 (Volta) kernel policy. Defaults are the effective cf9492a values."""
@@ -224,7 +236,7 @@ class Sm70Config(BaseModel):
 
     inkling2: Inkling2Config = Inkling2Config()
     """The Inkling 2 section (debug dump, image size cap, activation
-    fake-quant). No kill switch;
+    fake-quant, speculative-decoding policy). No field kill switch;
     not a graph field."""
 
 

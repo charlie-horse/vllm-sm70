@@ -23,7 +23,10 @@ driven by the paged engine harness under FULL_DECODE_ONLY:
   last) are decode-only; the builders declare UNIFORM_BATCH graphs and a
   reorder threshold of q with a speculative config, and keep
   UNIFORM_SINGLE_TOKEN_DECODE and 1 without one;
-- the engine-config hook counts the capture cap in requests of q tokens.
+- the engine-config hook counts the capture cap in requests of q tokens;
+- with a dynamic speculative-decoding schedule (spec_policy.py), steps of
+  q = 1 and of q = K + 1 are both decode-only, and requests that switch
+  between them mid-stream, after rejected drafts, match the eager route.
 """
 
 from __future__ import annotations
@@ -182,6 +185,64 @@ def test_padded_verify_step_is_static(engine, sequences):
     assert all(len(trace) > 1000 for trace in traces)
     for step, trace in enumerate(traces[1:], 1):
         assert trace == traces[0], f"verify step {step} launches other ops"
+
+
+# Steps of a schedule [(1, 1, K), (2, max, 0)]: q per request, then the
+# drafts rejected per request.
+SWITCHING = (
+    (Q, {"a": 5, "b": 0}),
+    (1, {}),
+    (1, {}),
+    (Q, {"a": 7, "b": 3}),
+    (1, {}),
+    (Q, {"a": 0, "b": 7}),
+)
+SCHEDULE = [(1, 1, K), (2, 8, 0)]
+
+
+def _switching(engine, sequences, *, padded):
+    """Prefill a and b, then the steps of SWITCHING; returns each step's
+    real rows."""
+    engine.reset()
+    engine.sequences = sequences
+    harness = engine.harness
+    for req_id, prompt in (("a", PROMPT_A), ("b", PROMPT_B)):
+        harness.add_request(req_id)
+        harness.step({req_id: prompt}, engine.forward)
+    outputs = []
+    for q, rejected in SWITCHING:
+        pad = PADDED_REQS - 2 if padded else 0
+        out = harness.step(
+            [("a", q), ("b", q)],
+            engine.forward,
+            pad_tokens=pad * q,
+            pad_reqs=pad,
+            metadata="full",
+            tamper=_fixed_width if padded else None,
+        )[0]
+        for md in harness.metadata[0].values():
+            assert md.decode_only is padded
+        assert torch.isfinite(out).all()
+        outputs.append(out[: harness.batch.num_tokens].clone())
+        for req_id, n in rejected.items():
+            harness.requests[req_id].computed -= n
+    return outputs
+
+
+def test_switching_steps_match_the_eager_route(engine, sequences, monkeypatch):
+    spec = engine.harness.vllm_config(0).speculative_config
+    monkeypatch.setattr(
+        spec, "num_speculative_tokens_per_batch_size", SCHEDULE, raising=False
+    )
+    monkeypatch.setenv(SWITCH, "0")
+    want = _switching(engine, sequences, padded=False)
+    monkeypatch.delenv(SWITCH)
+    got = _switching(engine, sequences, padded=True)
+    tol = TOLS[engine.harness.dtype]
+    for step, (g, w) in enumerate(zip(got, want, strict=True)):
+        assert g.shape == (2 * SWITCHING[step][0], w.shape[1])
+        err = ((g - w).abs().max() / w.abs().max()).item()
+        assert err <= tol, (step, err)
 
 
 # --- the builders' rule ------------------------------------------------------------
