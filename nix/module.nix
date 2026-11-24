@@ -110,11 +110,8 @@ let
       };
       args = [
         "--kv-cache-dtype" "auto"
-        # TODO(sm70-moe): the fork passed `--kernel-config.sm70_skinny_moe false`
-        # (TurboMind NVFP4 MoE route, ~40% faster decode than the skinny route).
-        # Upstream's KernelConfig rejects unknown fields (startup error), so it
-        # stays out until the patch series adds the field (Mara/Kai's MoE
-        # patches); then restore it here.
+        # No `--kernel-config.sm70_skinny_moe`: upstream's KernelConfig
+        # rejects unknown fields at startup.
         "--enable-prompt-tokens-details"
         "--tool-call-parser" "glm47"
         # glm47_sm70 = the fork's glm47 parser, ported in vllm_sm70/reasoning.py.
@@ -272,9 +269,9 @@ let
     DO_NOT_TRACK = "1";
   };
 
-  # TurboMind small-shape autotune + persisted GEMM LUT (fork T2/T3; see the
-  # `turbomind` options). Nothing is set while the options are at their
-  # defaults, so the C++ defaults (tuning off since #77) apply.
+  # TurboMind small-shape autotune + persisted GEMM LUT (see the `turbomind`
+  # options). Nothing is set while the options are at their defaults, so the
+  # C++ defaults apply.
   tm = cfg.turbomind;
   tmEnv =
     lib.optionalAttrs tm.tuneSmallShapes {
@@ -338,15 +335,8 @@ in
       description = "Interfaces on which the API port is opened (no authentication).";
     };
 
-    # Fork parity T2/T3 (docs/models/sm70-effective-defaults.md, "TurboMind
-    # small-shape autotune"). The fork tuned small shapes (M <= 64) by timing
-    # at startup; here that is off by default (#77) because per-instance
-    # timing made separate instances, and eager vs graph decode, pick
-    # different kernels. The intended production mode is tuning on with a
-    # LUT exported once (csrc/turbomind/PROVENANCE.md, "Pre-capture
-    # warmup"): every rank and every restart then use the same kernels.
-    # It stays off by default until the c4130 A/B (n = 1/4/8/20, tuned+LUT
-    # vs off) and the T4c determinism run pass; nix/README.md has the steps.
+    # TurboMind small-shape tuning and the GEMM LUT; export and use the LUT
+    # as in docs/nix.md, "TurboMind GEMM LUT".
     turbomind = {
       tuneSmallShapes = lib.mkOption {
         type = lib.types.bool;

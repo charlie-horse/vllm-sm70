@@ -10,7 +10,7 @@ QWEN_STAGE="${QWEN_STAGE:-$HOME/vllm-sm70-work/mara/qwen-weights}"
 OUT="${OUT:-$HOME/vllm-sm70-work/bea/qwen-phase2/$(date +%Y%m%dT%H%M)}"
 QP2_GPU_IDLE_MIB="${QP2_GPU_IDLE_MIB:-1024}"   # >1 GiB used => prod still up
 
-# Env defaults from docs/phase1-gpu-runbook.md section 4 (only if unset).
+# Env defaults (only if unset).
 # v0.33.0 no longer reads VLLM_ATTENTION_BACKEND; the backend goes on the
 # serve command line as --attention-backend.
 QP2_ATTN_BACKEND="${QP2_ATTN_BACKEND:-TRITON_ATTN}"

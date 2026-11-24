@@ -416,7 +416,7 @@ def _tokens_and_logprobs(completion):
 
 # Largest reference #1 - #2 logprob gap (nats) at which a candidate may take
 # the reference's #2 token. Below the fork's eager_vs_graphs decode set-mean
-# anchor (~0.024 nats: T4d's 1.5x limit is 0.0363, docs/m5-calibration-nov7.md),
+# anchor (~0.024 nats: T4d's 1.5x limit is 0.0363, docs/checks.md#gpu-gate),
 # i.e. under the per-token noise two kernel schedules of the same model show,
 # and about one FP16 ulp of a logit in [16, 32) (1/64).
 NEAR_TIE_NATS = 0.02

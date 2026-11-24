@@ -6,7 +6,7 @@
 # `checks.<system>.lmcache-patches-apply` checks they apply to the pinned sdist.
 [
   # Start the MP worker's heartbeat at KV-cache registration, so a worker that
-  # serves no full-chunk request within the registration grace (1 h) is not
-  # reaped while alive. docs/upstream/lmcache-heartbeat-issue.md.
+  # serves no full-chunk request within the registration grace is not reaped
+  # while alive (details in the patch header).
   ./0001-mp-worker-heartbeat-from-registration.patch
 ]
