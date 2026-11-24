@@ -1,6 +1,16 @@
-# Changes: format, kill switches, patches
+# Making a change
 
-The repo carries two kinds of change. Both use the same six header fields.
+vLLM itself is called **upstream** here. The repo changes upstream behaviour
+in two ways:
+
+- **Plugin code** in `sm70/`: new code vLLM doesn't have. vLLM loads it at
+  start-up through its plugin system. Almost every change belongs here.
+- **Patches** in `patches/`: small edits to upstream's own files, only where
+  vLLM offers no place for a plugin to plug in. Such an edit is a **hook**:
+  it asks the plugin first and, when the plugin has nothing to offer, does
+  what upstream always did.
+
+Both kinds describe themselves with the same six header fields.
 
 | kind | where it lives | where the header goes |
 |---|---|---|
@@ -16,7 +26,7 @@ call into `vllm_sm70`, so a rebase onto a new vLLM release only carries them.
 <area>(<scope>): <imperative summary, under 72 chars>
 
 What: <one or two sentences on what the change does>
-Why: <what Volta / CUDA 12.6 / V100 TP2 needs; link the upstream line or issue>
+Why: <what Volta / CUDA 12.6 needs; link the upstream line or issue>
 Upstream-files: <comma-separated upstream paths touched, or "none (sm70/ only)">
 Kill-switch: <VLLM_SM70_<THING>=0, or "none (build-time)", or "hook returns None -> upstream">
 Tests: <test that proves it, e.g. sm70/tests/plugin/test_u1_hooks.py or "build only">
@@ -43,6 +53,10 @@ and the fields go in the template's header block.
 
 ## Kill switches
 
+A **kill switch** is an environment variable that turns one plugin feature
+off, so vLLM falls back to its normal path. It makes every speed-up easy to
+rule out when something goes wrong.
+
 - Every behaviour change gets a runtime kill switch `VLLM_SM70_<THING>`,
   declared in its area's section of `sm70/vllm_sm70/envs.py` with a comment
   saying what `0` does.
@@ -59,7 +73,10 @@ and the fields go in the template's header block.
 
 ## Working on patches
 
-`patches/BASE` names the upstream tag, `patches/series` the apply order.
+The patches are kept as a **series**: numbered files applied in order on top
+of one upstream release. `patches/BASE` names that release (its git tag),
+`patches/series` the order. You edit them as commits on a git branch of
+upstream, then export them.
 
 1. Clone upstream vLLM and create the working branch on the base tag:
    `git switch -c sm70 $(cat patches/BASE)`.

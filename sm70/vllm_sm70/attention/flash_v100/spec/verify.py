@@ -1,30 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Verify-row expansion into persistent decode buffers (K07).
-
-Port of the smallq -> XQA route of fork cf9492a
-vllm/v1/attention/backends/flash_v100/spec/{verifier.py:292-400,
-smallq_metadata.py, verify_metadata.py, builder.py}, reduced to what v0.33.0
-needs:
+"""Verify-row expansion into persistent decode buffers.
 
 A causal query row r with L tokens over a context of S keys (its queries are
 positions S-L .. S-1) is exactly L independent decode rows: token j sees the
-first S - L + 1 + j keys through the same block table. The fork test
-test_sm70_flash_v100_mtp_smallq_exactness.py pins that equivalence.
+first S - L + 1 + j keys through the same block table.
 
-Capture safety: v0.33 builds attention metadata eagerly every step and
-replays the captured forward, which therefore must read only persistent
-tensors that build() refreshes. The expanded seq_lens and block-table rows
-live in buffers allocated once per builder (outside capture) and are
-rewritten in place with device ops (no host sync); forward reads fixed-size
-prefixes of them. The decode route itself (XQA / scalar) was already
-capture-safe (K06), so uniform verify batches can be captured
-(UNIFORM_BATCH) without the K06 downgrade.
+Capture safety: attention metadata is built eagerly every step and the
+captured forward is replayed, so it must read only persistent tensors that
+build() refreshes. The expanded seq_lens and block-table rows live in
+buffers allocated once per builder (outside capture) and are rewritten in
+place with device ops (no host sync).
 
-A1: on CUDA the expansion is one Triton launch (spec/smallq.py) instead of
-~20 torch launches; VLLM_SM70_FLASH_V100_SMALLQ_METADATA=0 (read when the
-builder is built) keeps the torch path, which CPU tensors always take.
-"""
+On CUDA the expansion is one Triton launch (spec/smallq.py);
+VLLM_SM70_FLASH_V100_SMALLQ_METADATA=0 keeps the torch path, which CPU
+tensors always take."""
 
 from __future__ import annotations
 

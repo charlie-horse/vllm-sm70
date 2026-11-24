@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks for the K13 fused router: admission, metadata gate, kill
-switch, the U3 provider contract and capture safety (R4).
-
-Admission cases ported from fork cf9492a
-tests/kernels/moe/test_sm70_flint_router_admission.py (227 lines, 3629e29f6);
-the fork's policy-object test is replaced by the env kill switch test.
-"""
+"""CPU checks for the fused router: admission, metadata gate, kill switch,
+the router provider hook contract and capture safety."""
 
 from __future__ import annotations
 
@@ -59,7 +54,7 @@ def test_non_sm70_keeps_generic_route(admitted, router_mod, monkeypatch):
 
 
 def test_no_admission_under_capture(admitted, router_mod, monkeypatch):
-    """R4: the workspace never comes from a graph pool."""
+    """The workspace never comes from a graph pool."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert router_mod.admit_flint_fused_router(make_runner()) is None
 
@@ -155,7 +150,7 @@ def test_try_route_defers_to_generic_route(admitted, router_mod):
 
 
 def test_provider_decides_once_per_layer(admitted, router_mod):
-    """U3 calls the provider on every forward; the route is cached."""
+    """The hook calls the provider on every forward; the route is cached."""
     runner = make_runner()
     other = make_runner(_fse_fuse_gate=True)
     first = router_mod.flint_router_provider(runner)
@@ -170,8 +165,8 @@ def test_provider_decides_once_per_layer(admitted, router_mod):
 def test_provider_under_capture_caches_and_allocates_nothing(
     admitted, router_mod, monkeypatch
 ):
-    """R4: an undecided layer seen first under capture gets no route, and
-    the decision waits for the next eager forward."""
+    """An undecided layer seen first under capture gets no route, and the
+    decision waits for the next eager forward."""
     runner = make_runner()
     allocations = []
     real_init = router_mod.FlintFusedRouter.__init__
@@ -218,7 +213,7 @@ def fake_runners(router_mod, monkeypatch):
 
 
 def test_prepare_model_admits_before_capture(admitted, router_mod, fake_runners):
-    """R4: kernel_warmup allocates every workspace eagerly, once."""
+    """kernel_warmup allocates every workspace eagerly, once."""
     good, other = _Runner(), _Runner(router=make_router(top_k=8))
     model = _Model(good, other, torch.nn.Linear(2, 2))
     assert router_mod.prepare_model(model) == 1
@@ -246,8 +241,8 @@ def test_prepare_model_noops(admitted, router_mod, fake_runners, monkeypatch):
 
 
 def test_u3_contract_present_in_vllm():
-    """Against vLLM with patches/0004 (PR #43): the getter exists and the
-    gate site asks it. Skips on a vLLM without U3."""
+    """Against vLLM with patches/0004: the getter exists and the gate site
+    asks it. Skips on a vLLM without the patch."""
     import inspect
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner

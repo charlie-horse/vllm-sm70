@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 DSpark draft routing (inkling2_sm70/draft.py), on CPU.
+"""Inkling 2 DSpark draft routing (inkling2_sm70/draft.py), on CPU.
 
 The staged draft directory from the Inkling 2 Mini config.json
 (data/inkling2_mini/) and a placeholder mtp.safetensors, parsed back through
 vLLM's config loader; the engine check the config hook runs; the speculator
-class the U6 platform hook returns; the kill switch.
+class the speculator platform hook returns; the kill switch.
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ def test_speculator_cls(draft_hf_config, monkeypatch):
 
 
 def test_rejection_refuses_v1_runner(draft_hf_config):
-    """The U6 hook lives only in the V2 runner, so V1 refuses the draft."""
+    """The speculator hook lives only in the V2 runner, so V1 refuses the draft."""
     reason = draft.speculative_rejection(
         _spec(draft_hf_config), None, v2_runner=False
     )

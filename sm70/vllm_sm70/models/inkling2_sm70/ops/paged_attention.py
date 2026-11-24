@@ -1,26 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 paged attention of one-query rows in Triton (sm_70: no tl.dot,
-no PDL).
-
-    decode_attention   every one-query row of a batch over its own keys,
-                       global or sliding                attention_torch.py
+no PDL). ``decode_attention``: every one-query row of a batch over its own
+keys, global or sliding (the torch form is attention_torch.py).
 
 Each row walks its keys one cache block at a time from the first key it may
-see to its own position, both read on the device, so a step costs the row's
-real context and the grid depends on the tensor shapes alone: no host sync.
-Dot products and the value sum are GEMV-style ``tl.sum`` reductions. Math
-and rounding as attention_torch.py ``_Softmax``, which stays the reference:
-q . k rounded to the query dtype, times D^-0.5 and plus the relative bias
-with a rounding each, then an fp32 running softmax over the sink logit and
-the keys.
-
-With ``splits`` > 1 (split-KV) the grid is (rows, heads, splits): a row
-cuts its key range on the device into at most ``splits`` chunks of a
-multiple of the block size, at least ``min_keys`` keys each. Each program
-folds one chunk into a partial (max, sum, weighted values) in fp32 scratch;
-a second launch (rows, heads) merges a row's partials with its sink. A row
-with one chunk writes its output from the first launch. ``splits`` == 1 is
-one launch of the unsplit kernel.
+see to its own position, both read on the device: no host sync, and the grid
+depends on the tensor shapes alone. Math and rounding as attention_torch.py
+``_Softmax``, the reference: q . k rounded to the query dtype, times D^-0.5
+and plus the relative bias with a rounding each, then an fp32 running softmax
+over the sink logit and the keys. With ``splits`` > 1 (split-KV) the grid is
+(rows, heads, splits): a row cuts its key range into at most ``splits``
+block-aligned chunks of at least ``min_keys`` keys, each folded into an fp32
+partial, and a second launch merges them with the sink.
 """
 
 from __future__ import annotations

@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashAttnV100Impl: Flash-V100 forward for vLLM v0.33.0 (K06).
+"""FlashAttnV100Impl: Flash-V100 forward for vLLM v0.33.0.
 
-Rebuilt from fork cf9492a vllm/v1/attention/backends/flash_v100/impl.py
-(1210 lines). Subclasses TritonAttentionImpl, as the fork did:
+Subclasses TritonAttentionImpl:
 
 * __init__ is upstream's (sinks, sliding window, the fp8/bf16 KV refusals
-  below SM89/SM80); the constructor arguments the lean kernels cannot serve
+  below SM89/SM80); the constructor arguments the kernels cannot serve
   (ALiBi, soft cap, chunk lookback, non-decoder layers, quantized KV) mark
   the layer for upstream's Triton forward instead.
 * do_kv_cache_update is upstream's (triton_reshape_and_cache_flash into the
@@ -15,8 +14,7 @@ Rebuilt from fork cf9492a vllm/v1/attention/backends/flash_v100/impl.py
   into strided K/V views (no copy), checks them once, runs decode rows then
   prefill groups (dispatch.py), and falls back to the Triton forward for
   per-step features the kernels lack (tensor `causal`, R-SWA, multimodal
-  prefix ranges, fused output quantization).
-"""
+  prefix ranges, fused output quantization)."""
 
 from __future__ import annotations
 
@@ -63,7 +61,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if self._fv100_reason is not None:
             _log_fallback_once(self._fv100_reason)
         self._kv_views_checked = False
-        dispatch.init_fused_decode(self)  # K14: counters before any capture
+        dispatch.init_fused_decode(self)  # counters before any capture
 
     def _unsupported_reason(self) -> str | None:
         if self.attn_type != AttentionType.DECODER:

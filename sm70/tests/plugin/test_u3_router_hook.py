@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U3 (patches/0004): MoE router provider hook at the runner gate."""
+"""patches/0004: MoE router provider hook at the runner gate."""
 
 import contextlib
 from types import SimpleNamespace

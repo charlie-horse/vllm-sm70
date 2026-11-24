@@ -1,44 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 routed experts held in the model dtype, without a host sync.
 
-    grouped_expert_sum   this rank's weighted expert sum of x [M, H] into
-                         `output`, the torch expert sum of moe.py as static
-                         shapes: the ops depend on M and the weight shapes
-                         alone, so one call captures in a CUDA graph
-
-A routed slot is a (token, expert) pair, S = M * top_k of them, each
-token's slots in ascending expert order. Tokens run in chunks of at most
-``CHUNK_TOKENS``. Per chunk, the slots go two ways:
-
-- capacity: each expert holds ``capacity(S, E)`` rows; a slot whose rank
-  among its expert's slots is below it is gathered there, and one cuBLAS
-  ``bmm`` per projection runs all experts (zero rows for empty places).
-  Capacity 0 (S <= ``SLOT_MAX``) skips this way.
-- slot: every other routed slot runs as a GEMV on its own expert's weights,
-  read in place: ``_slot_gemv_kernel`` once for W13 and once for W2, one
-  program per (slot, block of outputs); a program of a slot that runs
-  elsewhere writes zeros.
-
-Between the projections the soft-capped SwiGLU (activation.py) rounds the
-fp32 caps once to the model dtype. Each slot's W2 output is in the model
-dtype, as F.linear gives it; the routing weights apply in fp32 and a
-token's slots are summed in fp32 and rounded once into `output`. Slots
-with an expert id outside 0..E-1 add nothing; a row whose slots all are
-such is zero.
-
-``kernels=False`` runs the slot GEMVs and the SwiGLU as torch ops
-(per-slot weight gathers and ``bmm``) for tensors off the GPU.
-
-A weight is a tensor in the model dtype or an ``Mxfp8Weight`` (fp16
-model): e4m3 codes with one exponent byte per 32 values along K. The slot
-GEMVs decode the codes in registers (``_slot_gemv_mx_kernel``); the
-capacity way decodes ``DEQUANT_EXPERTS`` experts at a time into a
-temporary for its ``bmm``. Every decoded value is exact in fp16, so the
-products and sums are those of the dequantized weight.
-
-    routed_expert_sum    the same sum for a batch that routing.py routed
-                         (S <= SLOT_MAX): the slot way only, without the
-                         sort and masks, the sum in ``routing.combine``
+``grouped_expert_sum`` writes this rank's weighted expert sum of x [M, H] into
+`output` with static shapes, so one call captures in a CUDA graph. A routed
+slot is a (token, expert) pair, S = M * top_k, in ascending expert order per
+token; tokens run in chunks of at most ``CHUNK_TOKENS``. Per chunk each expert
+holds ``capacity(S, E)`` rows run by one cuBLAS ``bmm`` per projection (none
+when S <= ``SLOT_MAX``); every other slot runs ``_slot_gemv_kernel`` on its
+own expert's weights. The soft-capped SwiGLU (activation.py) rounds once to
+the model dtype; routing weights apply in fp32 and a token's slots are summed
+in fp32 and rounded once. Slots with an expert id outside 0..E-1 add nothing.
+A weight may be an ``Mxfp8Weight`` (fp16 model), decoded exactly.
+``routed_expert_sum``: the slot way for a batch routing.py routed.
 """
 
 from __future__ import annotations

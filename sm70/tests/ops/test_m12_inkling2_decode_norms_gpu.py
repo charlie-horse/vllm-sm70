@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 decode route of inkling2_sm70/norms.py on an SM70 GPU.
+"""Inkling 2 decode route of inkling2_sm70/norms.py on an SM70 GPU.
 
 - the gate kernels of ops/fused.py at the checkpoint's sizes (hidden 2304,
   gate rank 64) against the torch GEMMs within 2e-3, the fp16 blend within
@@ -10,9 +10,7 @@
 - launches: a gated sublayer of one token is four kernels (mix, gate_down,
   gate_up, blend_rms_norm), a residual add one;
 - a gated sublayer captured in a CUDA graph replays as it ran eagerly.
-
-The CPU interpreter version of the checks is
-test_m12_inkling2_triton_norms_cpu.py (_inkling2_norms.py).
+CPU interpreter version: test_m12_inkling2_triton_norms_cpu.py.
 
     pytest -m gpu sm70/tests/ops/test_m12_inkling2_decode_norms_gpu.py
 """

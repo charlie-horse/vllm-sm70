@@ -1,39 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 attention metadata and its builder (K06).
+"""Flash-V100 attention metadata and its builder.
 
-Rebuilt from fork cf9492a vllm/v1/attention/backends/flash_v100/metadata.py
-(455 lines) for v0.33.0. The builder extends TritonAttentionMetadataBuilder,
-so the metadata is a TritonAttentionMetadata (the impl can always fall back
-to upstream's kernel) plus the decode/prefill split:
+The builder extends TritonAttentionMetadataBuilder, so the metadata is a
+TritonAttentionMetadata (the impl can always fall back to upstream's
+kernel) plus the decode/prefill split:
 
-* reorder_batch_threshold = 1: decode rows (query length 1) come first.
-* Decode rows run the paged decode kernels on [0, num_decode_tokens).
-* Prefill rows are grouped by query length (the K05 prefill op takes one
-  query length M per launch); each group carries device row and token
-  indices built once per step and shared by every layer.
-
-v0.33.0 changes handled here (sec. 5.4-5.7 of section B):
-* No CommonAttentionMetadata.seq_lens_cpu: grouping uses
-  query_start_loc_cpu (exact for prefill rows); kernels read the device
-  seq_lens. compute_num_computed_tokens() is not needed: the paged kernels
-  place a row's queries at the end of its seq_len.
-* `causal` may be a tensor: recorded, and the impl falls back to Triton.
-* No cascade metadata, no build_for_drafting: draft-decode metadata update
-  stays off (supports_draft_decode_metadata_update = False, see K07 below).
+* Decode rows (query length 1) come first: [0, num_decode_tokens).
+* Prefill rows are grouped by query length (the prefill op takes one query
+  length M per launch); each group carries device row and token indices
+  built once per step and shared by every layer.
 * CUDA graphs: UNIFORM_BATCH. Everything the captured forward reads is a
-  persistent buffer refreshed in build(): the runner's block table, a
-  builder-owned copy of seq_lens, the K07 verify expansion, and arange
-  slices for a uniform prefill group.
-
-K07 (speculative decoding, spec/): with a speculative config the reorder
-threshold is 1 + num_speculative_tokens, and causal decode-region rows
-(verify rows) are expanded token-wise into decode rows (spec/verify.py) so
-the D256 XQA / scalar decode verifies them. Non-causal draft batches
-(DFlash) take the paged prefill path. VLLM_SM70_FLASH_V100_SPEC=0 restores
-K06: reorder threshold 1, verify rows as prefill groups, and graphs for
-single-token decode only.
-"""
+  persistent buffer refreshed in build().
+* With a speculative config, causal verify rows are expanded token-wise
+  into decode rows (spec/verify.py); non-causal draft batches (DFlash) take
+  the paged prefill. VLLM_SM70_FLASH_V100_SPEC=0 turns the expansion off."""
 
 from __future__ import annotations
 
@@ -88,9 +69,9 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     decode_block_table: torch.Tensor | None = None
     # Builder-owned (persistent) copy of seq_lens for the prefill route.
     fv_seq_lens: torch.Tensor | None = None
-    # K07: decode rows are the token-wise expansion of verify rows.
+    # Decode rows are the token-wise expansion of verify rows.
     spec_verify: bool = False
-    # B2: every decode request has exactly verify_query_len tokens, or is
+    # Verify kernel: every decode request has exactly verify_query_len tokens, or is
     # zero-token padding at the tail (so decode row = request *
     # verify_query_len + token); 0 when not uniform.
     verify_query_len: int = 0
@@ -157,7 +138,7 @@ def group_prefill_rows(
 
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-    # Off on purpose (K07): a drafter recording update_draft_decode_metadata
+    # Off: a drafter recording update_draft_decode_metadata
     # inside its graph would need the seq_lens copy and the verify expansion
     # to run in the captured region against the drafter's buffers; build()
     # does them eagerly instead (see the module docstring).
@@ -206,7 +187,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        # Verify batches are capture-safe through the K07 expansion; with the
+        # Verify batches are capture-safe through the verify expansion; with the
         # route off they run host-planned prefill groups, so graphs then
         # cover single-token decode only.
         if max_decode_query_len(vllm_config) > 1 and not spec_verify_enabled():

@@ -21,7 +21,7 @@ include = ["vllm_sm70*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# reference/ holds inert fork source (not a test tree); never collect it.
+# reference/ holds inert reference source (not a test tree); never collect it.
 norecursedirs = [".*", "build", "dist", "*.egg", "venv", "reference"]
 markers = [
   "gpu: needs an SM70 GPU (deselect with -m 'not gpu')",
@@ -29,5 +29,5 @@ markers = [
 ]
 
 [tool.ruff]
-# Verbatim fork source kept as reference; not ours to lint or format.
+# Verbatim reference source; not ours to lint or format.
 extend-exclude = ["reference"]

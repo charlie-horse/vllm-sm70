@@ -5,7 +5,7 @@ Implements ``/v1/models``, ``/version``, ``/tokenize`` (chat and prompt),
 ``/v1/completions`` (token-id prompts, ``prompt_logprobs``) and
 ``/v1/chat/completions`` (``return_token_ids``). Outputs are deterministic.
 
-``--bug`` emulates the max-num-seqs regression: when more than one request
+``--bug`` emulates a batching defect: when more than one request
 is in flight, logprobs past 64 tokens into the final assistant turn get much
 worse and greedy output turns into gibberish after 64 tokens.
 """

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fake paged caches of one Inkling 2 layer visit for the M12 CPU tests.
+"""Fake paged caches of one Inkling 2 layer visit for the CPU tests.
 
 ``PagedVisit`` owns the K/V cache and the conv-state cache of one visit of
 the tiny fixture's config, hands out physical blocks in a shuffled order and

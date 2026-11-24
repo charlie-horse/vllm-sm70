@@ -8,9 +8,8 @@ What: the parser registers as "glm47_sm70" (on import, and from
   and streaming. The fork cf9492a cases (tests/reasoning/
   test_glm47_reasoning_parser.py MODEL_OPENS_CASES) give the same
   reasoning/content. A GLM-4.7 template (prompt opens <think>) still honours
-  the switch. adjust_request keeps special tokens. Regression: upstream
-  v0.33.0 "glm47" leaks "<think>" into content for the same Flint request
-  (c4130 Nov 8, conc_bench3.py).
+  the switch. adjust_request keeps special tokens. Upstream v0.33.0 "glm47"
+  leaks "<think>" into content for the same Flint request.
 The tokenizer is a byte-level BPE built in memory (fork test helper).
 """
 

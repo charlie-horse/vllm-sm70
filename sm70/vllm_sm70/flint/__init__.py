@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Flint kernels on SM70 (Kai). K15: fused q/k RMSNorm + RoPE + KV write.
+"""Flint kernels on SM70: fused q/k RMSNorm + RoPE + KV write.
 
 This module stays light (no Triton, no vLLM model imports) because the
 platform hook imports it during ``check_and_update_config``. The kernel and
@@ -12,8 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 # Registered in the "vllm" torch library by qk_norm_rope_kv.py. Prefixed so
-# it cannot clash with an upstream op; the fork name was
-# vllm::qk_norm_rope_kv_cache_update (FORK qk_norm_rope_kv.py:27-30).
+# it cannot clash with an upstream op.
 QK_ROPE_KV_OP_NAME = "sm70_qk_norm_rope_kv_cache_update"
 # Splitting-op form. The op takes the layer name, like unified_kv_cache_update,
 # so it is split out of the compiled graph next to it.
@@ -25,12 +24,10 @@ def install_splitting_op(compilation_config: Any, *, enabled: bool) -> bool:
     """Add QK_ROPE_KV_SPLITTING_OP to splitting_ops wherever upstream splits
     out ``vllm::unified_kv_cache_update``. Returns True when it is present.
 
-    Port of FORK config/compilation.py:1172-1174. The fork appended inside
-    set_splitting_ops_for_v1; upstream calls that after the platform hook
-    (UP config/vllm.py:2067 hook, :2161 set_splitting_ops_for_v1). So when
-    splitting_ops is still None and upstream would take its default branch
-    (UP compilation.py:1175-1213), the default list is built here with
-    upstream's own method; the later call keeps a non-None list as is.
+    Upstream calls set_splitting_ops_for_v1 after the platform hook. So when
+    splitting_ops is still None and upstream would take its default branch,
+    the default list is built here with upstream's own method; the later
+    call keeps a non-None list as is.
     """
     if not enabled:
         return False

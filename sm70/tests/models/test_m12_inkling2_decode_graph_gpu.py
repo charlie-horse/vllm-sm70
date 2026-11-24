@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: a decode step captured in a CUDA graph on an SM70 GPU.
+"""Inkling 2: a decode step captured in a CUDA graph on an SM70 GPU.
 
 The tiny checkpoint (fixtures/inkling2_tiny) in fp16 at TP1 on the GPU,
 driven by the paged engine harness. Prefills run eagerly. The model body of
@@ -7,11 +7,9 @@ a decode step padded to PADDED tokens is captured once in a
 ``torch.cuda.CUDAGraph`` over static buffers: the input ids, and per cache
 owner the block table (at a fixed width), slot mapping and positions; the
 builders' own index buffers are static already. Every later decode step
-copies its metadata into those buffers and replays the graph, first with
-one real request and then with two. Each replay is compared with the same
-step run eagerly just before it (same caches, same metadata; a step writes
-the same cache slots with the same values each time). Before the capture
-the step runs under CUDA sync debugging at "error".
+copies its metadata into those buffers and replays the graph (one, then
+two real requests); each replay equals the same step run eagerly just
+before it. Before the capture the step runs under CUDA sync debugging.
 
     pytest -m gpu sm70/tests/models/test_m12_inkling2_decode_graph_gpu.py
 """

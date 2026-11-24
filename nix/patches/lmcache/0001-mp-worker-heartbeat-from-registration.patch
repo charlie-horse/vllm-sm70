@@ -13,8 +13,8 @@ Why: the worker starts its heartbeat only on its first STORE, RETRIEVE or
   rejected as unregistered and lookups miss until vLLM restarts.
 Upstream-files: lmcache/integration/vllm/vllm_multi_process_adapter.py (LMCache sdist)
 Kill-switch: none (build-time); workaround extraArgs --worker-registration-grace-seconds
-Tests: build-time apply + ast.parse; hardware check 6 pending
-Upstream-status: candidate (draft issue, not filed)
+Tests: build-time apply + ast.parse; scripts/check6-lmcache-reaper.py (GPU)
+Upstream-status: candidate
 
 --- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
 +++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py

@@ -2,26 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Engine-config hook for FlintSm70ForCausalLM.
 
-Port of charlie-horse/vLLM cf9492a ``vllm/model_executor/models/config.py``
-:341-417 (``FlintModelConfig``). ``vllm_sm70.models.flint_sm70.register()``
-installs it as ``MODELS_CONFIG_MAP["FlintSm70ForCausalLM"]``. That is a dict
-insert, with no edit to UP 4ba787e models/config.py:1211. UP calls it from
-``VllmConfig.try_verify_and_update_config`` (UP config/vllm.py:1539,
-2735-2764), which runs before ``set_splitting_ops_for_v1`` (UP :2161).
+``vllm_sm70.models.flint_sm70.register()`` installs it as
+``MODELS_CONFIG_MAP["FlintSm70ForCausalLM"]``. Upstream calls it from
+``VllmConfig.try_verify_and_update_config``, before
+``set_splitting_ops_for_v1``.
 
-v1 scope:
-
-* Refuse anything other than fp16 on cc 7.0. UP's own Flint asserts bf16 and
-  FlashInfer (UP models/flint/model.py:318, 321); this class is the SM70
-  variant.
-* Attention backend (fork :375-417, :276-305): unless the user picked one,
-  Flash-V100 (K06, ``AttentionBackendEnum.CUSTOM``) when its sink route
-  admits the engine (see ``flash_v100_sink_route_rejection``), else
-  TRITON_ATTN, which supports sinks (UP triton_attn.py:387) on every compute
-  capability (:405) but needs an FP16 KV cache on SM70 (fork :406-415).
+* Refuses anything other than fp16 on cc 7.0.
+* Attention backend: unless the user picked one, Flash-V100
+  (``AttentionBackendEnum.CUSTOM``) when its sink route admits the engine
+  (see ``flash_v100_sink_route_rejection``), else TRITON_ATTN, which
+  supports sinks but needs an FP16 KV cache on SM70.
   Kill switch: VLLM_SM70_FLASH_V100=0 -> TRITON_ATTN.
-* The fork's TP2 all-reduce + RMSNorm fusion (fork :308-372) is deferred. It
-  needs the fork-only ``pass_config.fuse_allreduce_add_rms_tp2``.
 """
 
 from typing import TYPE_CHECKING
@@ -37,25 +28,21 @@ logger = init_logger("vllm.sm70.flint")
 ARCH = "FlintSm70ForCausalLM"
 _FP16_KV = ("auto", "float16", "half")
 
-# ported from FORK vllm/model_executor/models/config.py:209-216. Head sizes
-# whose generic Flash-V100 paged prefill and decode apply the learned sinks;
+# Head sizes whose generic Flash-V100 paged prefill and decode apply the learned sinks;
 # the D256-specialized, XQA and FP8 kernels have no sink term.
 FLASH_V100_SINK_HEAD_SIZES = (128,)
 # The Flash-V100 paged kernels need a KV block size that is a multiple of 16.
 FLASH_V100_BLOCK_MULTIPLE = 16
 
 
-# ported from FORK vllm/model_executor/models/config.py:276-305
 def flash_v100_sink_route_rejection(vllm_config: "VllmConfig") -> str | None:
     """Why the Flash-V100 sink route cannot serve this Flint engine, or None.
 
-    Mirrors the fork's admission so an engine is never routed to a backend
-    whose layers would then fail closed. The fork's
-    ``attention_config.flash_v100.enabled`` maps to our kill switch, and its
-    ``flash_attn_v100.SUPPORTS_SINKS`` to ``vllm_sm70.ops.fv100.supports_sinks()``
-    (#80).
-    Two checks beyond the fork (Kai/Lena's audit): the KV block size must be a
-    multiple of 16, and CUSTOM must resolve to our Flash-V100 backend."""
+    An engine is never routed to a backend whose layers would then fail
+    closed. Checks the kill switch, the sink ops
+    (``vllm_sm70.ops.fv100.supports_sinks()``), that CUSTOM resolves to our
+    Flash-V100 backend, fp16, the head size, an FP16 KV cache, a KV block
+    size that is a multiple of 16, and no speculative decoding."""
     import torch
 
     from vllm_sm70 import attention
@@ -97,9 +84,7 @@ def flash_v100_sink_route_rejection(vllm_config: "VllmConfig") -> str | None:
     return None
 
 
-# ported from FORK vllm/model_executor/models/config.py:341-417
 class FlintSm70ModelConfig(VerifyAndUpdateConfig):
-    # ported from FORK vllm/model_executor/models/config.py:342-347
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Raises ValueError unless the device is cc 7.0 and dtype is fp16."""
@@ -125,7 +110,6 @@ class FlintSm70ModelConfig(VerifyAndUpdateConfig):
             )
         FlintSm70ModelConfig._select_attention_backend(vllm_config)
 
-    # ported from FORK vllm/model_executor/models/config.py:375-417
     @staticmethod
     def _select_attention_backend(vllm_config: "VllmConfig") -> None:
         """Pick an SM70 backend that applies Flint's learned sinks: Flash-V100

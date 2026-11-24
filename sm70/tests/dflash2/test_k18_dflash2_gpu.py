@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K18 GPU tests: DFlash2 FP16 M<=8 GEMM and compact FP16 top-64 on SM70.
+"""GPU tests: DFlash2 FP16 M<=8 GEMM and compact FP16 top-64 on SM70.
 
-Ported from fork cf9492a tests/kernels/quantization/test_sm70_dflash2_fp16_m8.py
-and tests/kernels/core/test_sm70_compact_half_topk.py. Changes: the shape set
-is the TP2 admitted set (DRAFT_SHAPES_TP2) instead of the fork's TP4 shards;
-new cases for M 1..7 (padded), misaligned inputs, the U1 GEMM callable and the
-kill switch. The fork's test_target_probe_preserves_dense_token_mask is not
-ported: it needs the fork-only DFlash2 sparse-rejection sampler.
+The shape set is the TP2 admitted set (DRAFT_SHAPES_TP2), plus M 1..7
+(padded), misaligned inputs, the GEMM callable and the kill switch.
 
     pytest -m gpu sm70/tests/dflash2
 """
@@ -24,8 +20,8 @@ pytestmark = pytest.mark.gpu
 
 @pytest.fixture(autouse=True)
 def _qwen38_engine(monkeypatch):
-    """K18 at its default (on) for a current engine that is the Qwen3.8
-    DFlash2 contract (dflash2.k18_wanted)."""
+    """The FP16 GEMM at its default (on) for a current engine that is the
+    Qwen3.8 DFlash2 contract (dflash2.k18_wanted)."""
     from vllm_sm70.ops import dflash2
 
     monkeypatch.delenv("VLLM_SM70_DFLASH2_FP16", raising=False)
@@ -37,9 +33,8 @@ def _qwen38_engine(monkeypatch):
 
 
 def _input_scale(n: int, k: int) -> float:
-    # The fork's per-shape scales (FORK test :17-25) by projection role: the
-    # M7 emulation feeds gate_up x/32, o_proj attention/256, down a
-    # transport-scaled SwiGLU product.
+    # Per-shape input scales by projection role: the draft feeds gate_up
+    # x/32, o_proj attention/256, down a transport-scaled SwiGLU product.
     if (n, k) in {(17408, 5120), (6144, 2048)}:  # gate_up
         return 1 / 32
     if (n, k) in {(5120, 2048), (2048, 2048)}:  # o_proj
@@ -209,8 +204,8 @@ def test_dynamic_prefill_trace_retains_m8_decode_dispatch(dflash2_gpu):
     assert len(compilations) == 1
     # M=1 (the commonest decode size) through the compiled route. Dynamo's
     # backed dynamic shapes specialize sizes 0 and 1, so M=1 fails the M>=2
-    # guard and compiles exactly one more graph, by design (the earlier
-    # "assert 2 == 1"). It must still dispatch to the M8 kernel bitwise.
+    # guard and compiles exactly one more graph. It must still dispatch to
+    # the M8 kernel bitwise.
     check(1)
     assert len(compilations) == 2
     x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.1

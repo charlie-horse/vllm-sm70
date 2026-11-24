@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K05 GPU: Flash-V100 vs torch SDPA for the Flint and Qwen shapes.
+"""GPU: Flash-V100 vs torch SDPA for the Flint and Qwen shapes.
 
-Every case reads K/V through upstream v0.33.0's KV layout (LBNHC: one
+Every case reads K/V through upstream's KV layout (LBNHC: one
 [blocks, block_size, H_kv, 2*D] buffer, K and V interleaved per head, so a
 K or V view has stride(2) == 2*D), split by fv100.split_lbnhc_kv_cache.
 The reference is fp32 torch.nn.functional.scaled_dot_product_attention with

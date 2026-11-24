@@ -1,23 +1,18 @@
-# vLLM inference service on 2x V100 (sm_70, TP=2), one model at a time.
-#
+# vLLM inference service on two Volta GPUs (sm_70, TP=2), one model at a time.
 # Host-agnostic: the host enables it and sets its own values, e.g.
 #
 #   services.vllm-sm70 = {
 #     enable = true;
 #     activeModel = "flint";
-#     firewallInterfaces = [ "eno1" "tailscale0" ];
+#     firewallInterfaces = [ "eth0" ];
 #   };
-#   services.lmcache-sm70.ui.firewallInterfaces = [ "eno1" "tailscale0" ];
-#
+#   services.lmcache-sm70.ui.firewallInterfaces = [ "eth0" ];
 # LMCache is its own module (./lmcache.nix); this one imports it, enables it
 # when the active model has `lmcache = true` and passes the chunk size.
 #
 # Switch models by setting `activeModel` and running nixos-rebuild switch.
 # `inputs` are this flake's inputs, bound by flake.nix; packages are built
 # with the host's `pkgs` (./packages-module.nix).
-#
-# Ported from charlie-horse/vLLM (cf9492a, nix/module.nix) with the option
-# surface unchanged, so this flake is a drop-in for the host's `vllm-fork`.
 { inputs }:
 {
   config,
@@ -42,9 +37,8 @@ let
   # DFlash2 speculative decoding with a local draft checkpoint (upstream
   # `method = "dflash"`; draft KV follows the target's FP16 KV).
   # No `attention_backend`: with none chosen, the sm70 platform picks
-  # Flash-V100 (K06, registered as AttentionBackendEnum.CUSTOM) for the
-  # target's and the draft's fp16 head-256 layers, the backend the fork ran
-  # as FLASH_ATTN_V100. Leaving it unchosen keeps VLLM_SM70_FLASH_V100=0
+  # Flash-V100 (registered as AttentionBackendEnum.CUSTOM) for the target's
+  # and the draft's fp16 head-256 layers. Leaving it unchosen keeps VLLM_SM70_FLASH_V100=0
   # (fall back to TRITON_ATTN) working; an explicit CUSTOM would bypass it.
   dflashConfig =
     draftDir:
@@ -65,28 +59,12 @@ let
     VLLM_SKIP_P2P_CHECK = "0";
   };
 
-  # Built-in models (see the `models` option for the fields).
-  #
-  # The Qwen entries carry the serve flags measured on c4130 (Phase 3 Block F,
-  # 2026-11-09): async scheduling on, V2 runner, Flash-V100 attention. The
-  # fork/1Cat serve flags measured 12-27% slower per step on this stack
-  # (--no-async-scheduling: rank skew), so they are an opt-in for A/B runs
-  # only. A host sets them per field (each built-in field is a mkDefault):
-  #
-  #   services.vllm-sm70.models."qwen3.8-27b" = {
-  #     asyncScheduling = false; # 1Cat: --no-async-scheduling
-  #     maxNumSeqs = 4;
-  #     gpuMemoryUtilization = 0.91; # 1Cat row 4; OOMs with LMCache on
-  #   };
-  #   services.vllm-sm70.models."qwen3.6-35b-a3b" = {
-  #     asyncScheduling = false;
-  #     maxNumSeqs = 4;
-  #   };
-  #
-  # The other 1Cat values (max-model-len, block sizes) are unchanged from the
-  # fork's entries below.
+  # Built-in models (see the `models` option for the fields). The Qwen entries
+  # run async scheduling, the V2 runner and Flash-V100 attention. Each
+  # built-in field is a mkDefault, so a host overrides one field, e.g.
+  #   services.vllm-sm70.models."qwen3.8-27b".asyncScheduling = false;
   builtinModels = {
-    # Flint NVFP4, per the fork's scripts/serve_flint_nvfp4_v100_pcie.sh.
+    # Flint NVFP4.
     # Weights: the fixed-output checkpoint converted from the GGUF
     # (./checkpoint.nix); its store path never changes with this flake.
     # LMCache's MP connector supports the hybrid (sliding-window + full
@@ -114,8 +92,7 @@ let
         # rejects unknown fields at startup.
         "--enable-prompt-tokens-details"
         "--tool-call-parser" "glm47"
-        # glm47_sm70 = the fork's glm47 parser, ported in vllm_sm70/reasoning.py.
-        # Upstream's glm47 leaks Flint's <think> into content when a request
+        # glm47_sm70 is vllm_sm70/reasoning.py's glm47 parser. Upstream's glm47 leaks Flint's <think> into content when a request
         # sends enable_thinking=false. "--reasoning-parser glm47" restores upstream.
         "--reasoning-parser-plugin" "vllm_sm70.reasoning"
         "--reasoning-parser" "glm47_sm70"
@@ -141,21 +118,29 @@ let
             dir = draftDir;
           }
         ];
-        # vLLM's attention block size for this model (aligned to the GDN page).
-        lmcacheChunkSize = 1056;
+        # Must be a multiple of vLLM's "kv lcm block sizes". The block is
+        # pinned below so it doesn't depend on the attention backend (vLLM only
+        # ever raises a pinned block). With these flags and the DFlash draft,
+        # Flash-V100 picks 1104 on its own, with KV groups of 1104 and 2208
+        # (LCM 2208). The VLLM_SM70_FLASH_V100=0 start check establishes
+        # TRITON_ATTN's LCM; if a start logs an LCM N that doesn't divide this
+        # chunk, set the chunk to N.
+        lmcacheChunkSize = 2208;
         asyncScheduling = true;
-        # Not measured above batch 1 yet (Bea's gate serve checks it starts:
-        # Mamba cache blocks must be >= max-num-seqs).
+        # Mamba cache blocks must be >= max-num-seqs.
         maxNumSeqs = 20;
         # DFlash candidate-head drafts need the V2 model runner ("Model Runner
         # V1 does not support: DFlash candidate-head drafts"); the wrapper
-        # defaults it to 0 for Flint (D2).
+        # defaults it to 0 for Flint.
         v2ModelRunner = true;
         env = qwenEnv;
         args = [
           "--tool-call-parser" "qwen3_coder"
           "--reasoning-parser" "qwen3"
           "--language-model-only"
+          # Kept for LMCache (see lmcacheChunkSize).
+          "--block-size" "1104"
+          "--mamba-block-size" "1104"
           "--mamba-cache-mode" "align"
           "--speculative-config" (dflashConfig draftDir)
         ];
@@ -178,21 +163,20 @@ let
             dir = draftDir;
           }
         ];
-        # >= 102K for the cold 100K-token TTFT exit (Phase 3).
+        # >= 102K, so a 100K-token prompt fits.
         maxModelLen = 150000;
-        # gpuMemoryUtilization: the module default 0.88. The fork's 0.91 OOMs
-        # at startup next to vllm-lmcache, which holds ~1.7 GiB on GPU0 at
-        # chunk 8192 (q3.8 run, 2026-11-12); 0.88 starts.
+        # gpuMemoryUtilization: the module default 0.88. 0.91 runs out of
+        # memory at startup next to vllm-lmcache (~1.7 GiB on GPU0 at chunk 8192).
         # Must be a multiple of vLLM's block size, which --mamba-block-size sets.
         lmcacheChunkSize = 8192;
         asyncScheduling = true;
-        # The DFlash2 verifier fast paths (K18, M9a, the QPN8 rerank) are M8
-        # paths: one drafting request. More requests fall back to the batched
-        # kernels (more total throughput, less tok/s per request).
+        # The DFlash2 verifier fast paths (incl. the QPN8 rerank) take one
+        # drafting request (M=8 rows). More requests fall back to the batched
+        # kernels (more total throughput, slower per request).
         maxNumSeqs = 8;
         # DFlash candidate-head drafts need the V2 model runner ("Model Runner
         # V1 does not support: DFlash candidate-head drafts"); the wrapper
-        # defaults it to 0 for Flint (D2).
+        # defaults it to 0 for Flint.
         v2ModelRunner = true;
         env = qwenEnv;
         args = [
@@ -288,7 +272,7 @@ in
   imports = [
     (import ./packages-module.nix { inherit inputs; })
     (import ./lmcache.nix { inherit inputs; })
-    # The options lived under c4130.vllm while this module was host config.
+    # Alias for the old option path.
     (lib.mkRenamedOptionModule
       [ "c4130" "vllm" "activeModel" ]
       [ "services" "vllm-sm70" "activeModel" ]
@@ -415,7 +399,7 @@ in
       }
     ];
     # With tuning off every TurboMind call takes the default kernel, and the
-    # warmup neither reads nor writes a LUT (PROVENANCE.md, "Pre-capture warmup").
+    # warmup neither reads nor writes a LUT.
     warnings =
       lib.optional
         (!tm.tuneSmallShapes && (tm.gemmLutPath != null || tm.gemmLutExportPath != null))

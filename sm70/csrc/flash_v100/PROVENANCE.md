@@ -1,92 +1,17 @@
-# Flash-V100 attention, lean subset: provenance (patches K05, K14)
+# Flash-V100 attention: provenance
 
-Source: charlie-horse/vLLM at **cf9492a01**, directory `flash-attention-v100/`
-(D. Skryabin's Flash-V100, BSD-3-Clause, `LICENSE`). Scope: Tier B section B
-(Ivy) of the SM70 carry map. Line counts are `wc -l`; "fork last-touch" is
-`git log -1 --format=%h -- <fork path>`. Re-verify with:
+Source: charlie-horse/vLLM at commit `cf9492a01`, directory
+`flash-attention-v100/` (D. Skryabin's Flash-V100). License: BSD-3-Clause,
+`LICENSE` in this directory. Line counts are `wc -l`; "fork last-touch" is
+`git log -1 --format=%h -- <fork path>`. Check with
+`sm70/tools/check_flash_v100_provenance.py [--fork <checkout at cf9492a>]`.
 
-```
-sm70/tools/check_flash_v100_provenance.py --fork <fork checkout at cf9492a>
-```
-
-Commit order on `kernels/k05-flash-v100`: (1) verbatim import of the seven
-fork files, (2) the carve (deletions only, plus removing the `} else `
-prefix of the last XQA dispatch branch), (3) the adaptations below, the new
-files, the build hook and the tests.
-
-## Status values
 | status | meaning |
 |---|---|
 | verbatim | byte-identical to the fork file / definition |
 | trimmed | deletions only (a line subsequence of the fork text) |
-| adapted | trimmed plus the edits listed under *Adaptations* |
+| adapted | trimmed plus the edits listed under *Changes from the source* |
 | new | no fork counterpart; the fork path is the file it replaces |
-
-## What the lean subset keeps
-
-| path | kept instantiations |
-|---|---|
-| decode, generic paged (`flash_attention_decode_partition_kernel` + `flash_attention_decode_reduce_kernel`) | D {128, 256} x partition {256, 512, 1024} x fp16 KV, not anchored; sinks and sliding window are runtime arguments |
-| decode, Flint grouped two-launch (`flash_attention_decode_gqa8_d128_{partition,reduce}_kernel`) | D128, GQA 8, fp16, with sinks, partition {256, 512, 1024} |
-| decode, one-launch fused sink decode (`flash_attention_decode_gqa8_d128_fused_kernel<256>`) | K14: D128, GQA 8, fp16 KV, with sinks, not anchored; under `#ifdef VLLM_SM70_FV100_FUSED_DECODE`, which `sources.cmake` now defines by default (see *K14* below) |
-| decode, Qwen tensor-core XQA (`flash_attention_decode_xqa_tc_partition_kernel_256_wide` + reducer) | D256 x GQA {4, 6, 8} x partition {256, 512, 1024} x padded smem {G6/P256 only, otherwise off}, fp16 KV, generic page size |
-| prefill, generic paged (`flash_attention_forward_kernel_paged`) | D {128, 256} x causal {0, 1} x fp16; the only path with sinks; window is runtime |
-| prefill, D256 low-SMEM | `<LOW_SMEM, CONTIG_FAST>` for page 16, `<LOW_SMEM>` otherwise, `<LOW_SMEM, OUTPUT_STRIDE_268, SW_PIPELINE_QK, SW_PIPELINE_PV>` for page 784 (the fork defaults) |
-| prefill, D256 BM32 phase | causal {0, 1} x ALL_P x PAIR_SCRATCH (the fork defaults) |
-
-KV cache views: the kernels take explicit block/token/head strides, so the
-LBNHC layout of upstream v0.33.0 (K and V interleaved per head, stride(2) =
-2*D) works without copies. `vllm_sm70/ops/fv100.py:check_kv_cache_views`
-checks it on the CPU.
-
-## Deleted regions (fork line numbers)
-
-`flash-attention-v100/kernel/flash_decode_paged.cu` (7382 -> 3254 lines):
-
-| fork lines | what |
-|---|---|
-| 51-52 | G6 dual-CTA / 8-warp pipeline thread counts |
-| 138-147 | staged-PV shared layout |
-| 153-531 | 66 env-policy probe and trace helpers, batch-context routing |
-| 1812-2784 | grouped DFlash2 / E4M3 verifier kernels |
-| 2893-3361 | staged XQA (G6) kernels |
-| 3479-3551 | `qk_scores` debug kernel |
-| 4513-4514 | anchored-SWA partition launch |
-| 4518-4535 | FP8 scalar decode branch (incl. TP2 E4M3 fast) |
-| 4697-4710, 4712 | FP8 branches of the XQA launcher |
-| 4753-5294 | E4M3 aligned-page dispatch, staged launcher, `qk_scores` launcher, grouped sparse page4 kernels |
-| 5297-5877 | host entries: grouped sparse page4 (+plan), E4M3 FP32 grouped, version probes, grouped verify |
-| 6057-6073 | FP8 cases of the sink-decode dispatch |
-| 6098-6109 | head dims 64/80/96/112 of the sink-decode dispatch |
-| 6282-6614 | E4M3 XQA host routes |
-| 6619-6841, 6877-7148 | page-specialised XQA routes (dual CTA, p1024 sawtooth/auto, block 4/16/784, E5M2, MTP5, QSA page4) |
-| 7163-7382 | staged XQA host entry, `qk_scores` host entry |
-
-`flash-attention-v100/kernel/fused_mha_forward_paged.cu` (4228 -> 3065 lines):
-
-| fork lines | what |
-|---|---|
-| 1848-1876 | anchored-SWA launch in `launcher_flash_attention_forward_paged_impl` |
-| 1921-2109 | split-KV merge kernel and launcher |
-| 2117 | unused page-size constant |
-| 2962-2981, 3015-3134 | split-KV3 BM32 kernels and launcher |
-| 3141-3147, 3149-3150, 3155-3166, 3170-3171, 3176-3187 | BM32 phase non-default (ALL_P / pair-scratch off) branches |
-| 3202-3220 | anchored branch of `launcher_flash_attention_forward_paged` |
-| 3261-3264, 3275-3288 | knob reads of the removed D256 variants |
-| 3290-3317, 3325-3326, 3328-3355, 3357-3358, 3367-3393, 3403-3404 | D256 low-SMEM variants behind non-default knobs (scalar QK, BM32, contig-fast off, partial SW pipeline) |
-| 3426-3574 | split-KV prefill host entry |
-| 3681-3686 | FP8 cases of the prefill dispatch |
-| 3693-3701 | head dims 16/32/64 |
-| 3747-4228 | BM32 pair-scratch / split-KV3 hosts, BFLA prefill, WMMA decode, DFlash2 BMHD |
-
-`flash-attention-v100/include/fused_mha.h`: declarations of every removed
-entry point (fork lines 10-20, 72-141, 160-219).
-
-Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.cu`,
-`flash_decode_turboquant.cu`, `fp8_kv_bridge.cu`, `paged_to_contiguous*.cu`,
-`contiguous_to_paged.cu`, `paged_kv_utils.cuh`, `h3/`, the Python package
-(re-written as `vllm_sm70/ops/fv100.py`), and the external FA2 stack
-(`cmake/patches/sm70_flash_attn_d256_*`, `csrc/attention/sm70_{v37,79t,grouped_long}`).
 
 ## Files
 
@@ -97,105 +22,49 @@ Not imported at all: `fused_mha_forward.cu` (dense `fwd`), `fused_mha_backward.c
 | `sm70/csrc/flash_v100/fp8_kv_utils.cuh` | `flash-attention-v100/kernel/fp8_kv_utils.cuh` | verbatim | 117 | 117 | ca0ea462c | `f885710cd191d858cd532fa95582ee39476376dd6be079fe2ee414e906a803ab` | `f885710cd191d858cd532fa95582ee39476376dd6be079fe2ee414e906a803ab` |
 | `sm70/csrc/flash_v100/fused_mma.h` | `flash-attention-v100/include/fused_mma.h` | verbatim | 442 | 442 | 8235544d4 | `6de64878a322cc93cbb98ef5b8a435450c273cca41dbcf5a378627c2a0560201` | `6de64878a322cc93cbb98ef5b8a435450c273cca41dbcf5a378627c2a0560201` |
 | `sm70/csrc/flash_v100/fused_mha.h` | `flash-attention-v100/include/fused_mha.h` | trimmed | 79 | 220 | 38f49201f | `e1ef557dbfe10354e12c77c7e018cbe3426c1742b0c43c2a9de7d3f5fff386a4` | `5557b25373de90406de39d6d404b76a79fd2f60de95c40574d80de8fc7f9e220` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash-attention-v100/kernel/flash_decode_paged.cu` | adapted | 3254 | 7382 | 38f49201f | `eddf0f86e370664b0487423261b8c48136f7b21f539c4295a7b09721241e6af7` | `ede98fc9d28bea2812b4a871fa3ca3e0b12cd2ae783b4a76e95c8aeac0144cbe` |
-| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash-attention-v100/kernel/fused_mha_forward_paged.cu` | adapted | 3065 | 4228 | 5f9c273a8 | `8393eff871d5120e7c9f64e97f97235084163913e4798a5d8fb6dc549c3949dd` | `12d5b8a5118a47b040fb1963040e5db8c1805b0145fda67733c867460e06b630` |
-| `sm70/csrc/flash_v100/fv100_config.h` | `flash-attention-v100/include/flash_v100_policy.h` | new | 56 | 466 | c8efae47b | `76ee201719ee9646c4b3e057a6be3912842de8220a1ae2ace349cf44669f0788` | `1fabfd62dfe0284695af025fc1cd0478451a7d123703f6035befd57fa98231a0` |
-| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 286 | 166 | 38f49201f | `c3b69f7777f2f61720188480aef5f6bc92b25b60716233fc796237c23a6abda2` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
-| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 64 | 143 | 8235544d4 | `ae5dcd7e2a34b911a54a5dd0ab819f6cdd3591bb00bb51ab4e52950a1c10c00c` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
-| `sm70/csrc/flash_v100/verify_decode.cu` | - | new | 546 | - | - | `02be03d5e4d7c720720c0c8a2e6a5628bac36328d3780e5d6131bc732c5ef290` | - |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash-attention-v100/kernel/flash_decode_paged.cu` | adapted | 3246 | 7382 | 38f49201f | `82822fbcaf655ff64484252ba569ae499838f5ab690e9b743ac4f879b2f2f91b` | `ede98fc9d28bea2812b4a871fa3ca3e0b12cd2ae783b4a76e95c8aeac0144cbe` |
+| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash-attention-v100/kernel/fused_mha_forward_paged.cu` | adapted | 3063 | 4228 | 5f9c273a8 | `5fe710fc568913b552e383f8e8d7a1fa86b4f70988333b0a5ee3e71cbbd902ab` | `12d5b8a5118a47b040fb1963040e5db8c1805b0145fda67733c867460e06b630` |
+| `sm70/csrc/flash_v100/fv100_config.h` | `flash-attention-v100/include/flash_v100_policy.h` | new | 46 | 466 | c8efae47b | `ee5d6e3f539b8832110d1e9e46160f71d9151fef263a6ce072be3deab114d17b` | `1fabfd62dfe0284695af025fc1cd0478451a7d123703f6035befd57fa98231a0` |
+| `sm70/csrc/flash_v100/fv100_ops.cpp` | `flash-attention-v100/kernel/fused_mha_api.cpp` | new | 266 | 166 | 38f49201f | `701e4dfb4ced2f387ecbd28ff8166bc5382ee25855a56705b04d17f5e67ce3cb` | `a83649ace10b975ca1a15ef0c93878ba4243c8a507f930793a31edf97ad9b165` |
+| `sm70/csrc/flash_v100/sources.cmake` | `flash-attention-v100/setup.py` | new | 51 | 143 | 8235544d4 | `ad1a0f195f737bcd4b5abf356cd0aa262dbec42c6b44587a27530b7cc9ac0b71` | `b926a26015b31bb8a6f1d135b8a1cbb2013f14a32a2965511a6f2cbc047a59a7` |
+| `sm70/csrc/flash_v100/verify_decode.cu` | - | new | 540 | - | - | `440cd55dbce6cc2792a8c760dbe7952f15e885340d584364545c750f13bde54a` | - |
 
-## Adaptations (commit 3)
+## Changes from the source
 
-- `flash_decode_paged.cu`, `fused_mha_forward_paged.cu`: line 1
-  `#include "flash_v100_policy.h"` -> `#include "fv100_config.h"`.
-- `fv100_config.h` (new, replaces `include/flash_v100_policy.h`): the six
-  `flash_v100::policy::Field`s the kept code reads, as `constexpr value()`
-  returning the fork's unset-variable defaults. No environment is read; the
-  fork's `PreparedPolicy`, `Scope`, `with_policy` and `observation()` are gone.
-- `flash_decode_paged.cu`:
-  - `#ifdef VLLM_SM70_FV100_FUSED_DECODE` ... `#endif` around the fused
-    kernel and `gqa8_d128_fused_ctas_per_head` (fork 3967-4377), around the
-    fused branch of `launch_flash_attention_decode_paged` (fork 4467-4493;
-    its `} else if (` is split into `} else` / `#endif` / `if (`), and
-    around `flash_attention_decode_paged_sinks_fused` (fork 6145-6162).
-  - `decode_paged_sinks_impl`: `TORCH_CHECK(!use_anchored, ...)` after
-    `use_anchored` (the anchored kernels are not compiled).
-  - `flash_attention_decode_paged_xqa`: `TORCH_CHECK(kv_dtype_code ==
-    KV_CACHE_DTYPE_FP16, ...)` (only fp16-KV XQA is compiled).
-- `fused_mha_forward_paged.cu`, `prefill_paged_forward`:
-  `TORCH_CHECK(!use_anchored, ...)`.
-- `fv100_ops.cpp` (new, replaces the pybind module `kernel/fused_mha_api.cpp`):
-  five `TORCH_LIBRARY_FRAGMENT(_sm70_C)` out ops, `fv100_{decode_paged,
-  decode_paged_sinks, decode_paged_xqa, prefill_paged, prefill_paged_sinks}`,
-  with CUDA impls that call the fork entry points (`out` passed as the
-  optional output, anchored arguments `std::nullopt, 0`).
-- `sources.cmake` (new, replaces `setup.py`'s `CUDAExtension`): the two
-  kernel files and `fv100_ops.cpp`, with the fork's nvcc flags.
+- `flash_decode_paged.cu`, `fused_mha_forward_paged.cu`: only the fp16-KV
+  decode, XQA (D256, GQA 4/6/8), grouped GQA-8 D128 sink decode and paged
+  prefill (D128/D256) paths are kept. Deleted: FP8 routes, anchored-SWA
+  kernels, split-KV prefill, staged/dual-CTA/page-specialised XQA routes,
+  DFlash2/E4M3 verifier kernels, debug kernels, env-policy probes and the
+  host entries of all of these. `#include "flash_v100_policy.h"` became
+  `#include "fv100_config.h"`.
+- `flash_decode_paged.cu`: the fused sink-decode kernel, its launch branch
+  and `flash_attention_decode_paged_sinks_fused` sit under
+  `#ifdef VLLM_SM70_FV100_FUSED_DECODE`. `decode_paged_sinks_impl` and
+  `flash_attention_decode_paged_xqa` refuse anchored windows and non-fp16
+  XQA KV with a `TORCH_CHECK`.
+- `fused_mha_forward_paged.cu`, `prefill_paged_forward`: refuses anchored
+  windows with a `TORCH_CHECK`.
+- `fused_mha.h`: declarations of the removed entry points deleted.
+- `fv100_config.h` replaces `include/flash_v100_policy.h`: the six policy
+  fields the kept code reads, as `constexpr` values equal to the fork's
+  defaults with the variable unset. No environment is read.
+- `fv100_ops.cpp` replaces the pybind module `kernel/fused_mha_api.cpp`:
+  `TORCH_LIBRARY_FRAGMENT(_sm70_C)` out ops `fv100_*` that call the fork
+  entry points (anchored arguments `std::nullopt, 0`).
+- `sources.cmake` replaces the `setup.py` `CUDAExtension`, with its nvcc
+  flags.
+- `verify_decode.cu`: new code, no fork counterpart.
+- Comments edited outside verbatim definitions.
+- Not imported: dense/backward kernels, TurboQuant and FP8 bridge kernels,
+  paged/contiguous converters, `h3/`, the Python package (rewritten as
+  `vllm_sm70/ops/fv100.py`).
 
-## K14 (C4): one-launch sink decode and the counter fix
-
-Branch `kernels/k14-fused-sink-decode`. The kernel came over verbatim in K05
-(rows `kGqaFusedMaxChunk`, `flash_attention_decode_gqa8_d128_fused_kernel`,
-`gqa8_d128_fused_ctas_per_head`, `flash_attention_decode_paged_sinks_fused`
-and the fused branch of `launch_flash_attention_decode_paged` below; fork
-`38f49201f`), compiled out. K14 changes no `.cu` line; it builds it and wires
-it up. Fork commits carried: `38f49201f` (fused kernel), `7f12d21b8` (never
-create counters under capture, two-launch fallback, prepare hook,
-`_ZERO_COUNTERS`), `89f751847` (per-device counters, capture report),
-`7e1c8c089` (quiet kill switch, cheap hook), `7b2bacefd` (INFO once, DEBUG
-as totals grow).
-
-| new location | fork cf9492a | status |
-|---|---|---|
-| `sources.cmake`: `option(VLLM_SM70_FV100_FUSED_DECODE ... ON)` | `flash-attention-v100/setup.py` (always built) | new; `-DVLLM_SM70_FV100_FUSED_DECODE=OFF` restores the K05 set |
-| `fv100_ops.cpp`: `decode_paged_sinks_fused` + `fv100_decode_paged_sinks_fused` def/impl, all under the `#ifdef` | `kernel/fused_mha_api.cpp:29-30` `decode_paged_sinks_fused_fwd` | new (out op; `Tensor sinks`, `Tensor(e!) counters`; no anchored args) |
-| `vllm_sm70/ops/fv100.py`: `FUSED_DECODE_COUNTER_CAPACITY`, `_FusedDecodeCounters`, counter cache, capture counts | `flash_attn_v100/flash_attn_interface.py:30-36, 59-71` | ported |
-| `fv100.py`: `fused_decode_enabled`, `_fused_decode_zero_counters_enabled` | `flash_attn_v100/legacy_policy.py:42-47`, `flash_attn_interface.py:141-150` | ported; `_runtime` policy dropped, env read per call |
-| `fv100.py`: `_FUSED_DECODE_OFF*`, `_warn_fused_decode_once`, `_normalized_device` | `flash_attn_interface.py:153-185` | ported |
-| `fv100.py`: `_fused_decode_counters` | `flash_attn_interface.py:198-233` | ported; `_fused_decode_counter_cache_for(_runtime)` (:188-195) dropped |
-| `fv100.py`: `fused_decode_available` | `flash_attn_interface.py:236-240` | ported (`has_op` instead of `hasattr(native, ...)`) |
-| `fv100.py`: `flash_attn_decode_paged_sinks_prepare` | `flash_attn_interface.py:243-259` | ported |
-| `fv100.py`: `flash_attn_decode_paged_sinks_capture_counts` | `flash_attn_interface.py:272-275` | ported; `_fused_decode_capture_counts_for(_runtime)` (:262-269) dropped |
-| `fv100.py`: `fused_decode_eligible` + fused branch of `flash_attn_decode_paged` | `flash_attn_interface.py:1366-1391, 1428-1433` | ported; `e4m3_fp32` and anchored terms dropped (not in the lean build) |
-| `vllm_sm70/attention/flash_v100/dispatch.py`: `_SINK_CAPTURE_*`, `_log_sink_capture_summary` | `vllm/v1/attention/backends/flash_v100/impl.py:49-70` | ported |
-| `dispatch.py`: `fused_decode_hook` | `impl.py:894-920` (`_prepare_fused_sink_decode`) + `:942-948` | ported onto the K06 hook point |
-| `dispatch.py`: `init_fused_decode` (called from `FlashAttnV100Impl.__init__`) | none | new (R4, below) |
-| `vllm_sm70/envs.py`: `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` (kill switch), `..._ZERO_COUNTERS` (`opt_in`, only "1" acts) | `vllm/envs.py:689-690, 10514-10535` | fork names and defaults |
-
-Dropped: the `_runtime`/`PythonPolicy` plumbing (`sink_fused_decode`,
-`sink_fused_zero_counters` fields, `config/flash_v100.py:869-872, 1313-1316`),
-the `*_configured` twin of the fused op, and `ops.py:get_flash_decode_sinks_prepare_ops`
-(the impl calls `fv100` directly).
-
-**R4 (capture-time state).** The fork prepared the counters on a sink layer's
-first eager forward, counting on the profile run. In v0.33.0 the profile run
-has no attention metadata (the K06 impl returns before its hook), so the
-first eager attention forward would be the warmup of the largest capture
-size. K14 therefore also prepares at layer construction
-(`init_fused_decode`), on the current CUDA device: the counters exist before
-any capture, and no zero-dependent state is ever created under capture (a
-capture that finds none, or too few, takes the two-launch kernels and warns
-once). The kernel's last CTA re-zeroes its counter, so graphs of every batch
-size share one per-device buffer; `retired` keeps outgrown buffers alive.
-
-**Admitted shape set (2xV100).** `fused_decode_eligible` (Python) and
-`gqa8_d128_decode_eligible` + `gqa8_d128_decode_aligned(out)` (C++):
-head dim 128, `H_q == 8 * H_kv`, sinks present (fp32 `[H_q]`), fp16 KV
-(`auto`/`float16`), not anchored, q/K/V/out/tmp_out 16-byte aligned with
-strides % 8. Flint per rank: TP1 32q/4kv, **TP2 16q/2kv**, TP4 8q/1kv; any
-`H_kv` works (grid `(B, H_kv, Z)`, counters `B * H_kv`). LBNHC K/V views
-(stride(2) = 2 * D) pass. Everything else (GQA 4/6, D256, no sinks, FP8)
-takes the two-launch or XQA kernels. `Z = min(ceil(SMs * occupancy / (B *
-H_kv)), tmp_out.size(2), 256)`; it never depends on sequence lengths, so
-captured grids replay at any length.
-
-## Definitions (fork function -> new file)
+## Definitions
 
 Top-level definitions of the kernel sources, matched to the fork by name
 and occurrence. `lines` excludes the comment block above a definition;
-`sha256` is over those lines joined with `\n`. Rows marked `verbatim` are
-byte-identical to the fork's `fork lines`, `trimmed` rows are deletions
-only, `adapted` rows are listed under *Adaptations* above.
+`sha256` is over those lines joined with `\n`.
 
 | new file | definition | lines | fork lines | status | sha256 |
 |---|---|---|---|---|---|
@@ -235,19 +104,19 @@ only, `adapted` rows are listed under *Adaptations* above.
 | `sm70/csrc/flash_v100/flash_decode_paged.cu` | `load_half8_as_float` | 1677-1688 | 3583-3594 | verbatim | `10a0cd8d9e7d5082fd923338120ed4c79d89cbca51e3d09113f5c8643c70b2f2` |
 | `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_gqa8_d128_partition_kernel` | 1703-1949 | 3609-3855 | verbatim | `81f24f9796b0afc30dda250d65305c3c22b82341edf33aa4b8753c7469188ca4` |
 | `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_gqa8_d128_reduce_kernel` | 1957-2059 | 3863-3965 | verbatim | `d734ed6fbe6513bf02387600cf12e02d84c46fe04483390d1643f5e3bbdfef00` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `kGqaFusedMaxChunk` | 2083-2085 | 3988-3990 | verbatim | `6c02a92677f4f8808e4ece70873a77903075f6f0c4bf64b6749f4720d33130c9` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_gqa8_d128_fused_kernel` | 2087-2445 | 3992-4350 | verbatim | `29f9f877aec0fb79089b356da32cb98ef1ebc0cdc0ca3b2adbe8c585da2779b0` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_fused_ctas_per_head` | 2451-2471 | 4356-4376 | verbatim | `b78defc80ef3ba8a1a3c23a16011ef57b72dbfae6eec9bfc8681d89536a2e5f2` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_decode_aligned` | 2475-2485 | 4379-4389 | verbatim | `7a135e12d6714f570f919194b273f3a157ca36017c6d5fae660a99e8c9aad491` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_decode_eligible` | 2487-2504 | 4391-4408 | verbatim | `2b38d6fa4b58e5775be6f20061c1d011e96fae29093590f0567be4f30db65cd3` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_paged` | 2506-2645 | 4410-4566 | adapted | `7e4d275676f35010bd2e9c15bb8f0c3c6dc3c1ef3a472f2408f637e6a67403f3` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_xqa_split_reduce` | 2647-2700 | 4568-4621 | verbatim | `066667ff7a2ffc5ac36004661d106009fb442b43fa22e2b56829a9dd51d0097b` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_paged_xqa_tc_256_wide` | 2702-2815 | 4623-4751 | trimmed | `3695bedac76b901d29cf7471abae65784e45a89a354bf396eb473ed5fcb437c2` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `decode_paged_sinks_impl` | 2819-3041 | 5878-6126 | adapted | `18d5b7ea2d4f5096b6338eb7b50f3cc5f1562351a2713a3ee1d5e1c695ef31e5` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_sinks` | 3043-3058 | 6128-6143 | verbatim | `f77b41627fcf367f9f71c060d8e1bfa2e5f4bc8a1162f94e9851fcc241728702` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_sinks_fused` | 3061-3077 | 6145-6161 | verbatim | `58bfce6720f0558e3c87c0ee6046d5b244381b31f7223b068e559719a3215a3d` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged` | 3081-3096 | 6164-6179 | verbatim | `8f6ee10b962968b5a730f7c17e416c51941b0bfd5c7feef7b9c6517c5ef5438c` |
-| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_xqa` | 3098-3254 | 6181-7162 | adapted | `66a7455964b2f5fe64a041bc59b4fad6b2b39484a85ad3cf30ee385162061b56` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `kGqaFusedMaxChunk` | 2075-2077 | 3988-3990 | verbatim | `6c02a92677f4f8808e4ece70873a77903075f6f0c4bf64b6749f4720d33130c9` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_gqa8_d128_fused_kernel` | 2079-2437 | 3992-4350 | verbatim | `29f9f877aec0fb79089b356da32cb98ef1ebc0cdc0ca3b2adbe8c585da2779b0` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_fused_ctas_per_head` | 2443-2463 | 4356-4376 | verbatim | `b78defc80ef3ba8a1a3c23a16011ef57b72dbfae6eec9bfc8681d89536a2e5f2` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_decode_aligned` | 2467-2477 | 4379-4389 | verbatim | `7a135e12d6714f570f919194b273f3a157ca36017c6d5fae660a99e8c9aad491` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `gqa8_d128_decode_eligible` | 2479-2496 | 4391-4408 | verbatim | `2b38d6fa4b58e5775be6f20061c1d011e96fae29093590f0567be4f30db65cd3` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_paged` | 2498-2637 | 4410-4566 | adapted | `7e4d275676f35010bd2e9c15bb8f0c3c6dc3c1ef3a472f2408f637e6a67403f3` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_xqa_split_reduce` | 2639-2692 | 4568-4621 | verbatim | `066667ff7a2ffc5ac36004661d106009fb442b43fa22e2b56829a9dd51d0097b` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `launch_flash_attention_decode_paged_xqa_tc_256_wide` | 2694-2807 | 4623-4751 | trimmed | `3695bedac76b901d29cf7471abae65784e45a89a354bf396eb473ed5fcb437c2` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `decode_paged_sinks_impl` | 2811-3033 | 5878-6126 | adapted | `4792869dcff0fe2529bf291e309024f85907e1c21593964059ff6fac2dcf7a7e` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_sinks` | 3035-3050 | 6128-6143 | verbatim | `f77b41627fcf367f9f71c060d8e1bfa2e5f4bc8a1162f94e9851fcc241728702` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_sinks_fused` | 3053-3069 | 6145-6161 | verbatim | `58bfce6720f0558e3c87c0ee6046d5b244381b31f7223b068e559719a3215a3d` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged` | 3073-3088 | 6164-6179 | verbatim | `8f6ee10b962968b5a730f7c17e416c51941b0bfd5c7feef7b9c6517c5ef5438c` |
+| `sm70/csrc/flash_v100/flash_decode_paged.cu` | `flash_attention_decode_paged_xqa` | 3090-3246 | 6181-7162 | adapted | `193a8eb743e8c3e26010d467e0f9ee257ae977b239d5c607ee54cb15b03c0199` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `using namespace nvcuda::wmma;` | 19-19 | 19-19 | verbatim | `3761f13bbff96f2d5d0e3dfdeb62778ea918b7186f9df805cd66de980155e59c` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `kv_cache_dtype_code_from_string` | 40-51 | 40-51 | verbatim | `253b83ce8a1309cf517960ffda0072eadcaff4737522fa60eb3eabfe2f035fcd` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `KernelConfig` | 83-173 | 83-173 | verbatim | `0575f1562e5473bed5c06bb79b65972f3a147ad240a5476486756198f9344ccd` |
@@ -287,7 +156,7 @@ only, `adapted` rows are listed under *Adaptations* above.
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash_attention_forward_paged_d256_bm32_phase_kernel` | 2725-2741 | 2944-2960 | verbatim | `e8dd85dc4ed4904e84bf8131e3144eadf19ce2e5d3473203004803dea8cb577c` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `launch_flash_attention_forward_paged_d256_bm32_phase_kernel` | 2743-2774 | 2982-3013 | verbatim | `17f26751957c3eaacc16382e19f333986ec46bab87e1c431e6bd75b00abf02ae` |
 | `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `launcher_flash_attention_forward_paged_d256_bm32_phase` | 2776-2794 | 3135-3188 | trimmed | `4397d01de46247908a77ad3723ae60c0f4b5985a31bb67559297b247132c1467` |
-| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `launcher_flash_attention_forward_paged` | 2796-2904 | 3190-3424 | trimmed | `4f761b95c465740bd5338516bcb8aa60a37d806add6023f5d4f6c8ce5f995133` |
-| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `prefill_paged_forward` | 2906-3035 | 3575-3716 | adapted | `55eb927277e48b5e790635c2f4c608c175a5880e705cf2b7fdb1bb52b79643d9` |
-| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash_attention_prefill_paged` | 3037-3049 | 3718-3730 | verbatim | `c2ff9c56c670982c3b0dc9a9727e82220a3668262d4c644bd046b0c20393e85c` |
-| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash_attention_prefill_paged_sinks` | 3053-3065 | 3734-3746 | verbatim | `420fea52ad1b20e81bc9d1d82428fa130257f7a60c72a4e99ec72c1390a0c4f1` |
+| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `launcher_flash_attention_forward_paged` | 2796-2902 | 3190-3424 | trimmed | `3a3ea295b6f1c1c141679157b508eaa232324b0c97510d7ac7742df101705a34` |
+| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `prefill_paged_forward` | 2904-3033 | 3575-3716 | adapted | `d6347f4c5334b472ee3bccfacc7d9340e6427caa01477866a3f974f94d66b104` |
+| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash_attention_prefill_paged` | 3035-3047 | 3718-3730 | verbatim | `c2ff9c56c670982c3b0dc9a9727e82220a3668262d4c644bd046b0c20393e85c` |
+| `sm70/csrc/flash_v100/fused_mha_forward_paged.cu` | `flash_attention_prefill_paged_sinks` | 3051-3063 | 3734-3746 | verbatim | `420fea52ad1b20e81bc9d1d82428fa130257f7a60c72a4e99ec72c1390a0c4f1` |

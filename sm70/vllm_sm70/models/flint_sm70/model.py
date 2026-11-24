@@ -1,48 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flint on SM70 (2x V100, fp16, TP2), on UP vLLM v0.33.0 (4ba787e) layers.
+"""Flint on SM70 (fp16), on upstream vLLM v0.33.0 layers.
 
-Port of charlie-horse/vLLM cf9492a ``vllm/models/flint/model.py`` (753 L). It
-reuses UP ``vllm.models.flint.configs.FlintConfig`` (identical to the fork's
-except one comment line, UP vllm/models/flint/configs.py:88). Each fork-only
-core hook is replaced as follows (UP paths under vllm/model_executor/layers/
-unless given in full):
-
-=====================================  =======================================
-fork (cf9492a)                         here (UP 4ba787e)
-=====================================  =======================================
-FusedMoE(expert_mapping=...) :211-226  FusedMoEFactory (UP fused_moe/layer.py:
-                                       92). RoutedExperts.load_weights builds
-                                       its own mapping (UP fused_moe/
-                                       routed_experts.py:1004-1008)
-runner.router_provider :229            K13 via U3's platform getter (M10a;
-                                       no model hook)
-Attention.forward(kv_cache_updated=)   K15's op (torch.ops.vllm.<QK_ROPE_KV_
-  :386                                 OP_NAME>), then K15's attention_after_
-                                       fused_write (vllm_sm70/flint/)
-kernel_config.sm70_flint_qk_rope_kv    sm70_config(vllm_config).flint_qk_rope_kv
-  :314-318
-layer_policy(...).value("flint_        supports_sm70_topk_sampler = True
-  sampler") :570-577, get_top_tokens  (K16 and F12 greedy top-1 on U4, M10)
-  :597-603
-AutoWeightsLoader(skip_prefixes=)      filter lm_head.* when tied (UP
-  :629-632                             AutoWeightsLoader has no skip_prefixes,
-                                       vllm/model_executor/models/
-                                       utils.py:242-248)
-FP16 rescale :87-107, :402-447, :623-  fp16_rescale.py
-  628, :647-668, :696-753
-=====================================  =======================================
-
-Not ported (fork cf9492a model.py): ``_expert_params_mapping`` :117-126 (UP
-RoutedExperts builds the mapping), ``get_expert_mapping`` :616-617, the
-sampler hooks ``_get_top_tokens`` :597-603 and ``_sample_topk_candidates``
-:605-614 (K16's U4 hook samples instead; M10 opts in), and the
-fused-router hook :227-229 (K13 binds through U3's platform getter, M10a).
+Reuses upstream's ``vllm.models.flint.configs.FlintConfig``. Routed experts
+are built by ``FusedMoEFactory``, which makes its own expert mapping. The
+fused q/k norm + RoPE + KV write is the op of vllm_sm70/flint/, followed by
+``attention_after_fused_write``. The model opts in to the SM70 top-k and
+greedy samplers with ``supports_sm70_topk_sampler``. FP16 range handling is
+in fp16_rescale.py.
 
 Quantization isn't special-cased here: dense ModelOpt W4A16 linears go to
-M3 (vllm_sm70/quant/nvfp4_linear.py) and routed experts to M4
-(vllm_sm70/quant/nvfp4_moe.py) through the quant config. The fp16 lm_head
-and router GEMMs go through Kai's U1 platform GEMM hook.
+vllm_sm70/quant/nvfp4_linear.py and routed experts to
+vllm_sm70/quant/nvfp4_moe.py through the quant config. The fp16 lm_head and
+router GEMMs go through the platform GEMM hook.
 """
 
 from collections.abc import Iterable, Iterator
@@ -86,14 +56,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.flint.configs import FlintConfig  # UP, reused as is
+from vllm.models.flint.configs import FlintConfig  # upstream, reused as is
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import _encode_layer_name
 
 from vllm_sm70.config import sm70_config
 
-# K15 (#54). Importing qk_norm_rope_kv registers the op in torch.ops.vllm.
+# Importing qk_norm_rope_kv registers the op in torch.ops.vllm.
 from vllm_sm70.flint import QK_ROPE_KV_OP_NAME
 from vllm_sm70.flint.qk_norm_rope_kv import (
     attention_after_fused_write,
@@ -104,12 +74,11 @@ from . import fp16_rescale
 
 logger = init_logger("vllm.sm70.flint")
 
-# K15's fused q/k norm + RoPE + KV-write op, torch.ops.vllm.<QK_ROPE_KV_OP_NAME>.
+# The fused q/k norm + RoPE + KV-write op, torch.ops.vllm.<QK_ROPE_KV_OP_NAME>.
 _QK_ROPE_KV_OP = getattr(torch.ops.vllm, QK_ROPE_KV_OP_NAME)
 
 # Shards that one fused linear loads. A fused NVFP4 linear keeps a single
-# global scale, so the shards' weight_scale_2 must agree (fork :76-84).
-# ported from FORK vllm/models/flint/model.py:76-84
+# global scale, so the shards' weight_scale_2 must agree.
 _MERGED_SHARDS = {
     ".q_proj.": ".qkv_proj.",
     ".k_proj.": ".qkv_proj.",
@@ -119,19 +88,16 @@ _MERGED_SHARDS = {
 }
 
 
-# ported from FORK vllm/models/flint/model.py:110-114
 def _sink_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    """Load this rank's heads of the [total_num_heads] sink tensor (fork
-    :110-114). UP's ``make_attention_sink`` (UP model_loader/weight_utils.py:
-    1584) would also do; this keeps the fork's fp32 in-place semantics."""
+    """Load this rank's heads of the [total_num_heads] sink tensor in place,
+    keeping the parameter's fp32 dtype."""
     heads_per_rank = param.shape[0]
     start = get_tensor_model_parallel_rank() * heads_per_rank
     param.data.copy_(loaded_weight.narrow(0, start, heads_per_rank))
 
 
-# ported from FORK vllm/models/flint/model.py:129-137
 def _layer_rope_parameters(config: FlintConfig, layer_idx: int) -> dict:
-    """fork :129-137, verbatim."""
+    """RoPE parameters of one layer, per layer type when the config has them."""
     rope_parameters = dict(config.rope_parameters or {})
     if rope_parameters and all(isinstance(v, dict) for v in rope_parameters.values()):
         layer_type = config.layer_types[layer_idx]
@@ -141,12 +107,10 @@ def _layer_rope_parameters(config: FlintConfig, layer_idx: int) -> dict:
     return rope_parameters
 
 
-# ported from FORK vllm/models/flint/model.py:140-170
 class FlintSm70MLP(nn.Module):
-    """fork :140-170 verbatim. Dense linears go to the SM70 NVFP4 kernel via
-    the quant config (Kai/Otto); nothing model-side."""
+    """Gated SiLU MLP. Dense linears go to the SM70 NVFP4 kernel via the
+    quant config; nothing model-side."""
 
-    # ported from FORK vllm/models/flint/model.py:141-165
     def __init__(
         self,
         hidden_size: int,
@@ -173,23 +137,20 @@ class FlintSm70MLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
 
-    # ported from FORK vllm/models/flint/model.py:167-170
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x, _ = self.down_proj(self.act_fn(gate_up))
         return x
 
 
-# ported from FORK vllm/models/flint/model.py:173-233
 class FlintSm70SparseMoeBlock(nn.Module):
-    """fork :173-233. Sigmoid top-k routed experts plus an ungated shared
-    expert, combined and all-reduced inside the MoE runner.
+    """Sigmoid top-k routed experts plus an ungated shared expert, combined
+    and all-reduced inside the MoE runner.
 
-    The routed-expert method (ModelOptNvFp4Sm70MoEMethod, Otto's
-    fused_moe/method.py) comes from the quant config, not from here.
+    The routed-expert method (ModelOptNvFp4Sm70MoEMethod) comes from the
+    quant config, not from here.
     """
 
-    # ported from FORK vllm/models/flint/model.py:177-229
     def __init__(
         self,
         config: FlintConfig,
@@ -197,16 +158,14 @@ class FlintSm70SparseMoeBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if config.router_score_function != "sigmoid":  # fork :184-188
+        if config.router_score_function != "sigmoid":
             raise ValueError(
                 "Flint routes with sigmoid scores, got "
                 f"router_score_function={config.router_score_function!r}"
             )
         if get_tensor_model_parallel_world_size() > config.num_experts:
             raise ValueError("Tensor parallel size exceeds the number of experts.")
-        # fork :196-203. UP GateLinear has out_dtype/force_fp32_compute
-        # (UP fused_moe/router/gate_linear.py:62-74). The fp16 GEMM backend is
-        # Kai's platform hook U1.
+        # The fp16 GEMM backend is the platform GEMM hook.
         self.gate = GateLinear(
             config.hidden_size,
             config.num_experts,
@@ -222,14 +181,9 @@ class FlintSm70SparseMoeBlock(nn.Module):
             reduce_results=False,
             prefix=f"{prefix}.shared_expert",
         )
-        # FORK vllm/models/flint/model.py:211-226 -> UP FusedMoEFactory
-        # (UP vllm/model_executor/layers/fused_moe/layer.py:92-147). Dropped:
-        # expert_mapping=, since UP builds the mapping
-        # (vllm/model_executor/layers/fused_moe/routed_experts.py:1007) from the
-        # default ckpt_names=("gate_proj","down_proj","up_proj")
-        # (vllm/model_executor/layers/fused_moe/layer.py:125); and the fork's
-        # runner.router_provider (:229; in M10a, K13 binds through U3's
-        # platform getter instead).
+        # The expert mapping comes from the default
+        # ckpt_names=("gate_proj", "down_proj", "up_proj"). The fused router
+        # binds through the platform getter, not here.
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -246,17 +200,15 @@ class FlintSm70SparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-    # ported from FORK vllm/models/flint/model.py:231-233
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The gate runs inside the runner, as in UP models/flint/model.py:240.
+        # The gate runs inside the runner.
         return self.experts(hidden_states=hidden_states, router_logits=hidden_states)
 
 
-# ported from FORK vllm/models/flint/model.py:236-388
 class FlintSm70Attention(nn.Module):
-    """fork :236-388."""
+    """Attention with q/k RMSNorm, RoPE and learned sinks; fused or unfused
+    q/k norm + RoPE + KV write, decided once per layer."""
 
-    # ported from FORK vllm/models/flint/model.py:237-347
     def __init__(
         self,
         config: FlintConfig,
@@ -302,8 +254,7 @@ class FlintSm70Attention(nn.Module):
 
         self.rotary_emb = None
         if layer_idx not in config.no_rope_layer_indices:
-            # fp16 cos/sin (default dtype), as the fork built it. K15 also
-            # admits fp32, which UP Flint uses (UP :287-292).
+            # fp16 cos/sin (default dtype); the fused op also admits fp32.
             self.rotary_emb = get_rope(
                 self.head_dim,
                 max_position=config.max_position_embeddings,
@@ -330,7 +281,7 @@ class FlintSm70Attention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.softmax_offset,
         )
-        # fork :312-347. The decision is made once and is static per layer.
+        # The decision is made once and is static per layer.
         is_sm70 = current_platform.is_cuda() and current_platform.is_device_capability(
             70
         )
@@ -344,8 +295,8 @@ class FlintSm70Attention(nn.Module):
             rotary_emb=self.rotary_emb,
             kv_cache_dtype=self.attn.kv_cache_dtype,
             attn_type=self.attn.attn_type,
-            # UP v0.33.0 Attention computes no KV scales at run time (no
-            # such attribute); the getattr keeps K15's gate if it returns.
+            # vLLM v0.33.0 Attention has no such attribute; the getattr
+            # keeps the gate correct if it exists.
             calculate_kv_scales=bool(
                 getattr(self.attn, "calculate_kv_scales", False)
             ),
@@ -360,11 +311,10 @@ class FlintSm70Attention(nn.Module):
         else:
             logger.info_once("Flint SM70: unfused q/k norm/RoPE because %s.", reason)
 
-    # ported from FORK vllm/models/flint/model.py:349-366
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Unfused route, fork :349-366 verbatim (stock Attention.forward)."""
+        """Unfused route (stock Attention.forward)."""
         qkv, _ = self.qkv_proj(hidden_states)
         if self.fused_qk_rope_kv:
             return self._forward_fused(positions, qkv)
@@ -379,13 +329,12 @@ class FlintSm70Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    # ported from FORK vllm/models/flint/model.py:368-388
     def _forward_fused(
         self, positions: torch.Tensor, qkv: torch.Tensor
     ) -> torch.Tensor:
-        """fork :368-388, on K15 (vllm_sm70/flint/qk_norm_rope_kv.py).
+        """Fused route on vllm_sm70/flint/qk_norm_rope_kv.py.
 
-        K15's registered op normalizes q/k, applies RoPE and writes the KV
+        The registered op normalizes q/k, applies RoPE and writes the KV
         cache (or hands the write to the backend's writer). We are compiled
         (@support_torch_compile), so we call the registered op; the platform
         hook makes it a splitting op next to ``unified_kv_cache_update``
@@ -414,11 +363,9 @@ class FlintSm70Attention(nn.Module):
         return out
 
 
-# ported from FORK vllm/models/flint/model.py:391-449
 class FlintSm70DecoderLayer(nn.Module):
-    """fork :391-449, with the FP16 stream scales from fp16_rescale."""
+    """Decoder layer, with the FP16 stream scales from fp16_rescale."""
 
-    # ported from FORK vllm/models/flint/model.py:392-429
     def __init__(
         self,
         config: FlintConfig,
@@ -458,7 +405,6 @@ class FlintSm70DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    # ported from FORK vllm/models/flint/model.py:431-449
     def forward(
         self,
         positions: torch.Tensor,
@@ -480,24 +426,22 @@ class FlintSm70DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-# ported from FORK vllm/models/flint/model.py:452-524 (FlintModel)
 @support_torch_compile
 class FlintSm70Model(nn.Module):
-    """fork :452-524."""
+    """Embedding, decoder layers and final norm."""
 
-    # ported from FORK vllm/models/flint/model.py:454-495
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: FlintConfig = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
-        # Per-layer sliding windows come from layer_types (fork :461-465).
+        # Per-layer sliding windows come from layer_types.
         if cache_config is not None:
             cache_config.sliding_window = None
 
         # Kill: VLLM_SM70_FLINT_QK_ROPE_KV=0 -> unfused q/k norm + RoPE and
-        # upstream's Attention.forward (fork read kernel_config, :312-318).
+        # upstream's Attention.forward.
         fused_enabled = bool(sm70_config(vllm_config).flint_qk_rope_kv)
 
         if get_pp_group().is_first_rank or (
@@ -529,11 +473,9 @@ class FlintSm70Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-    # ported from FORK vllm/models/flint/model.py:497-498
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    # ported from FORK vllm/models/flint/model.py:500-524
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -562,22 +504,17 @@ class FlintSm70Model(nn.Module):
         return hidden_states
 
 
-# ported from FORK vllm/models/flint/model.py:527-668
 class FlintSm70ForCausalLM(nn.Module, SupportsPP):
-    """fork :527-668. The fork's sampler hooks (:570-577, :597-614) are
-    replaced by the K16 opt-in below; the fused router (:227-229) needs no
-    hook here (M10a)."""
+    """Flint causal LM on SM70."""
 
-    # M10: opt in to Kai's K16 top-k candidate sampler (vllm_sm70/sample_v1.py
-    # MODEL_OPT_IN, replacing fork :570-577, :605-614). It samples from
-    # self.lm_head and self.logits_processor. VLLM_SM70_FLINT_SAMPLER=0 is
-    # read in Sm70CudaPlatform.get_hidden_state_sampler. The same opt-in
-    # admits the F12 greedy top-1 (vllm_sm70/sample_greedy.py, replacing
-    # fork get_top_tokens :571-578, :597-603); its kill switch is
+    # Opt in to the top-k candidate sampler (vllm_sm70/sample_v1.py
+    # MODEL_OPT_IN). It samples from self.lm_head and self.logits_processor.
+    # VLLM_SM70_FLINT_SAMPLER=0 is read in
+    # Sm70CudaPlatform.get_hidden_state_sampler. The same opt-in admits the
+    # greedy top-1 (vllm_sm70/sample_greedy.py); its kill switch is
     # VLLM_SM70_GREEDY_TOKEN_FASTPATH=0.
     supports_sm70_topk_sampler = True
 
-    # fork :528-542 == UP models/flint/model.py:600-614
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_proj": (".qkv_proj", "q"),
@@ -594,7 +531,6 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    # ported from FORK vllm/models/flint/model.py:544-580
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: FlintConfig = vllm_config.model_config.hf_config
@@ -605,8 +541,8 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
-            # Unquantized lm_head, plain embedding method (fork :555-564). Its
-            # fp16 GEMM goes through Kai's platform hook U1.
+            # Unquantized lm_head, plain embedding method. Its fp16 GEMM goes
+            # through the platform GEMM hook.
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -621,11 +557,9 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-    # ported from FORK vllm/models/flint/model.py:582-583
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    # ported from FORK vllm/models/flint/model.py:585-592
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -635,21 +569,19 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
     ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    # ported from FORK vllm/models/flint/model.py:594-595
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    # ported from FORK vllm/models/flint/model.py:619-636
-    # (+ :638-668 via fp16_rescale.LmHeadScale)
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """fork :619-636."""
+        """Load weights through the lm_head scale, global-scale check and,
+        in fp16, the FP16 rescale pipeline."""
         lm_head_scale = fp16_rescale.LmHeadScale()
         weights = lm_head_scale.intercept(weights)
         weights = _check_merged_global_scales(weights)
         if self.fp16:
             weights = fp16_rescale.fp16_weight_pipeline(weights)
         if self.config.tie_word_embeddings:
-            # Replaces the fork's AutoWeightsLoader(skip_prefixes=["lm_head."]).
+            # Tied: skip lm_head.* (AutoWeightsLoader has no skip_prefixes).
             weights = ((n, t) for n, t in weights if not n.startswith("lm_head."))
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -660,11 +592,10 @@ class FlintSm70ForCausalLM(nn.Module, SupportsPP):
         return loaded
 
 
-# ported from FORK vllm/models/flint/model.py:671-693
 def _check_merged_global_scales(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """fork :671-693 verbatim. Raise if the NVFP4 global scales of shards
+    """Raise if the NVFP4 global scales of shards
     fused into one linear differ."""
     seen: dict[str, torch.Tensor] = {}
     for name, tensor in weights:

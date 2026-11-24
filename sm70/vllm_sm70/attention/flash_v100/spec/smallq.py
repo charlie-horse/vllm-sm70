@@ -1,28 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""One-launch verify-row expansion (A1, small-query metadata).
+"""One-launch verify-row expansion (small-query metadata).
 
-Port of fork cf9492a
-vllm/v1/attention/backends/flash_v100/spec/smallq_metadata.py:24-140
-(`_sm70_prepare_smallq_decode_metadata_kernel`, the per-group kernel behind
-FUSED_SMALLQ_METADATA), reduced to what VerifyExpansion.expand writes. It
-replaces the torch expansion (repeat_interleave, index, index_select, adds
-and copies: ~20 launches) with one Triton launch per full-attention cache
-group. Bea's E2 trace of Qwen3.8 row 4 at TP2 shows 5 groups x ~56 us of
-those launches per verify step.
+One Triton launch per full-attention cache group writes what
+VerifyExpansion.expand writes, instead of about 20 torch launches
+(repeat_interleave, index, index_select, adds and copies).
 
-Not ported: the fork's grouped variant (GROUPED_SMALLQ_METADATA, one launch
-for every group). It needs a hook in the runner's prepare_attn (upstream
-mamba_hybrid.py) and saves only the remaining ~4 launches per step.
-
-Differences from the fork kernel, all to keep VerifyExpansion's contract:
 * Padding tokens [num_mapped_tokens, num_tokens) get seq_len 0 and their
-  block-table rows are left alone (the fork writes zeros); a zero seq_len
-  means the decode kernels never read them.
-* Visible length is seq_len - query_len + 1 + j with no max(seq_len,
-  query_len) clamp, as in the torch path.
-* The fork's query_start_loc refresh is dropped: the Flash-V100 decode
-  route does not read query_start_loc.
+  block-table rows are left alone; a zero seq_len means the decode kernels
+  never read them.
+* Visible length is seq_len - query_len + 1 + j, as in the torch path.
 
 Kill switch: VLLM_SM70_FLASH_V100_SMALLQ_METADATA=0 restores the torch
 expansion (only "0" acts).

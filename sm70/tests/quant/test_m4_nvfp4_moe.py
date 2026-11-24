@@ -1,27 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M4 nvfp4-moe-turbomind (vllm_sm70/quant/nvfp4_moe.py,
+"""Tests for the NVFP4 MoE TurboMind method (vllm_sm70/quant/nvfp4_moe.py,
 vllm_sm70/fused_moe/method.py).
 
-What: the CPU tests mock Kai's ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` / ``_C``
-  ops with pure-torch versions that have the same signatures and semantics.
-  They check: parameter parity with UP's ModelOptNvFp4FusedMoE.create_weights;
-  that process_weights_after_loading calls prepare per expert with UP-format
-  [K, N] codes and [K/16, N] fp16 scales with the global folded in; apply
-  against an independent ModelOpt-NVFP4 reference (dequant + top-k + SwiGLU
-  + weighted sum) for M in {1, 2, 64}, top-k 8, always on the materialized W13 route
-  (never the Qwen3.8-only indexed op, even when present); the K12 decode
-  wiring against a fake ``vllm_sm70.ops.flint_moe`` (admit_layer args and
-  policy, kill switch, one shared workspace per device allocated at load,
-  can_decode gating with int32/int64 IDs, exact flint_moe_decode_out args,
-  dense route otherwise); that workspaces are persistent (no allocation in
-  apply); and get_quant_method routing at cc 7.0 vs 8.0.
-  GPU (``-m gpu``, Bea on c4130, one V100, needs _sm70_C and vLLM's
-  _C/_moe_C): parity on the real Flint TP2 expert shapes (E256, H2048,
-  I_local 256, top-6), K12 decode == dense route for M in {1, 2} (int32
-  and int64 IDs), and CUDA-graph capture == eager:
+CPU tests mock ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` / ``_C`` ops with
+  pure-torch versions of the same signatures and semantics. They check
+  parameter parity with UP's ModelOptNvFp4FusedMoE.create_weights; prepare
+  per expert with [K, N] codes and [K/16, N] fp16 scales (global folded in);
+  apply against an independent ModelOpt-NVFP4 reference for M in {1, 2, 64},
+  top-k 8, on the materialized W13 route; the Flint decode wiring against a
+  fake ``vllm_sm70.ops.flint_moe``; persistent workspaces; and
+  get_quant_method routing at cc 7.0 vs 8.0.
+GPU (``-m gpu``, needs _sm70_C and vLLM's _C/_moe_C): parity on the Flint
+  TP2 expert shapes, decode == dense route for M in {1, 2}, graph == eager:
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m4_nvfp4_moe.py -m gpu
-Why: Flint's routed experts are most of its FLOPs; M4 is their only SM70 path.
-Kill-switch: VLLM_SM70_FLINT_MOE_QPN_DECODE covered below; VLLM_SM70_QUANT in M2.
 """
 
 import sys
@@ -61,7 +52,7 @@ SMALL = (64, 64, 16, 8)
 
 
 # --------------------------------------------------------------------------
-# Mocks: Kai's tm and UP's _moe_C/_C
+# Mocks: tm and UP's _moe_C/_C
 # --------------------------------------------------------------------------
 def _pack_n8(codes):
     k, n = codes.shape
@@ -134,7 +125,7 @@ def make_mock_tm(indexed=True):
 
 
 def make_fake_flint_moe(admit=True, ops_present=True, reject_reason=None):
-    """Fake vllm_sm70.ops.flint_moe (K12): records every call.
+    """Fake vllm_sm70.ops.flint_moe: records every call.
 
     admit_layer admits iff the policy is on and ``admit``; can_decode takes
     M in {1, 2}; flint_moe_decode_out computes the routed sum in torch (any
@@ -575,7 +566,7 @@ def _decode_calls(fm, kind):
 
 @pytest.mark.parametrize("admit", [True, False])
 def test_decode_admission_is_logged(mods, monkeypatch, admit):
-    """The K12 decision is visible in the engine log (vllm.sm70.* logger)."""
+    """The decode admission decision is in the engine log (vllm.sm70.*)."""
     fm = make_fake_flint_moe(admit=admit)
     m4, _tm = mods(flint=fm)
     assert m4.logger.name.startswith("vllm.sm70")
@@ -587,8 +578,8 @@ def test_decode_admission_is_logged(mods, monkeypatch, admit):
 
 
 def test_absent_flint_moe_hides_an_already_imported_module(mods, monkeypatch):
-    """Regression (Felix, c4130 with the built _sm70_C): flint=None must hide
-    a vllm_sm70.ops.flint_moe that is already in sys.modules."""
+    """flint=None must hide a vllm_sm70.ops.flint_moe that is already in
+    sys.modules (as on a host with the built _sm70_C)."""
     real = make_fake_flint_moe()
     monkeypatch.setitem(sys.modules, "vllm_sm70.ops.flint_moe", real)
     m4, _tm = mods(flint=None)
@@ -612,8 +603,8 @@ FLINT_TP2 = (256, 2048, 256, 6)
 
 @pytest.mark.parametrize("flint", ["absent", "no_ops"])
 def test_explicit_decode_switch_raises_when_ops_missing(mods, monkeypatch, flint):
-    """fork nvfp4_sm70_moe.py:240-251: VLLM_SM70_FLINT_MOE_QPN_DECODE=1 with
-    the K12 ops missing on a Flint TP2 layer is an error, not a fallback."""
+    """VLLM_SM70_FLINT_MOE_QPN_DECODE=1 with the decode ops missing on a
+    Flint TP2 layer is an error, not a fallback."""
     fm = None if flint == "absent" else make_fake_flint_moe(ops_present=False)
     m4, _tm = mods(flint=fm)
     method, layer, _ = _build(m4)
@@ -668,7 +659,7 @@ def test_admit_layer_gets_contract_banks_and_policy(mods):
     assert call[5] is layer.w2_tm_weight and call[6] is layer.w2_tm_scales
     assert isinstance(layer.sm70_nvfp4_decode_plan, fm.DecodePlan)
     assert layer.sm70_nvfp4_decode_ws.device == torch.device("cpu")
-    # the fork pre-wiring's per-layer partials/counters are gone
+    # no per-layer partials/counters
     assert not hasattr(layer, "sm70_nvfp4_decode_counters")
     assert not hasattr(layer, "sm70_nvfp4_decode_partials")
 
@@ -712,7 +703,7 @@ def test_decode_route_exact_args_and_no_dense(mods, monkeypatch, m, ids_dtype):
         )
         out = method.apply(layer, x, weights, ids, None, None)
     assert tm.calls == [] and TorchMoeOps.allocations == 0  # no dense stage
-    assert zeros == []  # output is torch.empty, fully overwritten by K12
+    assert zeros == []  # output is torch.empty, fully overwritten by the decode
     assert _decode_calls(fm, "can_decode") == [("can_decode", m, ids_dtype)]
     (call,) = _decode_calls(fm, "decode")
     _, d_out, inter, d_x, w13w, w13s, w2w, w2s, d_w, d_ids, ws, plan = call
@@ -782,7 +773,7 @@ def test_decode_kill_switch(mods, monkeypatch):
 
 
 def test_kill_switch_applies_even_if_policy_resolved_on(mods, monkeypatch):
-    """admit_layer ignores the env when given a policy; M4 must apply it."""
+    """admit_layer ignores the env when given a policy; the method must apply it."""
     fm = make_fake_flint_moe()
     m4, _tm = mods(flint=fm)
     method = m4.ModelOptNvFp4Sm70MoEMethod(_quant_config(), _moe_config(*SMALL))
@@ -833,7 +824,7 @@ def test_decode_workspace_keyed_by_device(mods):
 
 
 def test_real_flint_moe_refuses_small_contract(mods):
-    """With Kai's real module, a non-Flint-TP2 layer is not admitted."""
+    """With the real module, a non-Flint-TP2 layer is not admitted."""
     from vllm_sm70.ops import flint_moe as real
 
     m4, _tm = mods(flint=real)
@@ -843,7 +834,7 @@ def test_real_flint_moe_refuses_small_contract(mods):
 
 
 def test_no_private_k12_contract_copy():
-    """admit_layer owns the contract; M4 keeps no copy of the fork constants."""
+    """admit_layer owns the contract; the method keeps no copy of its constants."""
     import vllm_sm70.quant.nvfp4_moe as m4
 
     for name in (
@@ -934,7 +925,7 @@ def test_register_checks_m4_hook():
 
 
 # --------------------------------------------------------------------------
-# Compact slot groups (FORK nvfp4_sm70_moe.py:718-721, 1619-1636)
+# Compact slot groups
 # --------------------------------------------------------------------------
 # Small top-6 contract, so slot counts match Flint's (6M; 18..60 at M 3..10).
 SMALL6 = (64, 64, 32, 6)
@@ -943,8 +934,8 @@ FLINT_TOP_K = 6
 
 @pytest.mark.parametrize("m", range(1, 15))
 def test_compact_selection_by_slots_flint_top6(m):
-    """Flint top-6: compact iff 6M <= 80, i.e. M 1..13; the old per-expert
-    loop band (18..60 slots, M 3..10) is entirely compact."""
+    """Flint top-6: compact iff 6M <= 80, i.e. M 1..13; the band of 18..60
+    slots (M 3..10) is entirely compact."""
     slots = m * FLINT_TOP_K
     assert moe_rt.use_compact_grouped(m, FLINT_TOP_K) is (slots <= 80)
     if 3 <= m <= 10:
@@ -952,7 +943,7 @@ def test_compact_selection_by_slots_flint_top6(m):
 
 
 def test_compact_bound_edges():
-    assert moe_rt.COMPACT_MAX_SLOTS == 80  # FORK nvfp4_sm70_moe.py:88
+    assert moe_rt.COMPACT_MAX_SLOTS == 80
     assert not moe_rt.use_compact_grouped(0, 6)
     assert moe_rt.use_compact_grouped(10, 8)  # 80 slots: last compact
     assert not moe_rt.use_compact_grouped(11, 8)  # 88
@@ -1060,8 +1051,8 @@ def test_padding_routes_stay_in_bounds(mods, monkeypatch, m, pad, compact):
     """Padding tokens route to -1 (UP VLLM_MOE_SKIP_PADDING=1; in CUDA-graph
     capture dummy runs every token is padding). The permute sorts them to
     the sentinel id E. Compact groups must still pass only ids in [0, E):
-    the #97 capture crash on c4130 was the pointer table read at E. Real
-    tokens must match the reference on both routes."""
+    the pointer table has no entry E. Real tokens must match the reference
+    on both routes."""
     if not compact:
         monkeypatch.setenv("VLLM_SM70_FLINT_MOE_COMPACT", "0")
     m4, tm = mods()
@@ -1087,7 +1078,7 @@ def test_padding_routes_stay_in_bounds(mods, monkeypatch, m, pad, compact):
 
 def test_compact_duplicate_experts_stay_separate_groups(mods, monkeypatch):
     """Two tokens with the same top-k: every expert id appears twice in the
-    sorted ids; each slot remains its own one-row group (FORK :606-609)."""
+    sorted ids; each slot remains its own one-row group."""
     m4, tm = mods()
     method, layer, w = _build6(m4, monkeypatch)
     h, gi, e, k = SMALL6
@@ -1107,11 +1098,11 @@ def test_compact_duplicate_experts_stay_separate_groups(mods, monkeypatch):
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4])
 def test_k12_keeps_m_le_2_and_compact_takes_m_ge_3(mods, monkeypatch, m):
-    """With K12 admitted, M<=2 goes to the decode (no dense stage); M>=3 takes
-    the compact dense stage (the regression band)."""
+    """With the decode admitted, M<=2 goes to the decode (no dense stage);
+    M>=3 takes the compact dense stage."""
     fm = make_fake_flint_moe()
     m4, tm = mods(flint=fm)
-    method, layer, w = _build(m4)  # K12 fake admits any contract
+    method, layer, w = _build(m4)  # the fake decode admits any contract
     h, gi, e, k = SMALL
     seen = _record_stages(monkeypatch, tm)
     x = torch.randn(m, h, generator=torch.Generator().manual_seed(m)).half()
@@ -1154,7 +1145,7 @@ def test_compact_state_is_logged(mods, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# GPU (Bea, c4130)
+# GPU
 # --------------------------------------------------------------------------
 def _gpu_layer(m4):
     from vllm_sm70.ops import tm
@@ -1198,7 +1189,7 @@ def test_gpu_flint_tp2_parity(m):
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
 @pytest.mark.parametrize("m", [1, 2])
 def test_gpu_flint_tp2_decode_matches_dense(monkeypatch, m, ids_dtype):
-    """K12 decode route vs the dense-stage route on the same Flint TP2 layer."""
+    """Decode route vs the dense-stage route on the same Flint TP2 layer."""
     import vllm_sm70.quant.nvfp4_moe as m4
     from vllm_sm70.ops import flint_moe
 
@@ -1297,9 +1288,9 @@ def test_gpu_flint_tp2_compact_matches_per_expert(monkeypatch, m):
 @needs_cuda
 @pytest.mark.parametrize("m", [4, 8, 13])
 def test_gpu_compact_capture_with_all_padding_routes(m):
-    """The #97 crash: CUDA-graph capture where every token is padding (ids
-    -1, weights 0, as in vLLM's capture dummy runs), then replay with real
-    routing. Must not fault, and the replay must match eager per-expert."""
+    """CUDA-graph capture where every token is padding (ids -1, weights 0,
+    as in vLLM's capture dummy runs), then replay with real routing. Must
+    not fault, and the replay must match eager per-expert."""
     import vllm_sm70.quant.nvfp4_moe as m4
 
     torch.cuda.set_device(0)
@@ -1338,20 +1329,17 @@ def test_gpu_compact_capture_with_all_padding_routes(m):
 @pytest.mark.parametrize("pad_x", ["randn", "nan"])
 @pytest.mark.parametrize("m,pad", [(4, 1), (8, 3)])
 def test_gpu_compact_graph_mixed_real_and_padding(monkeypatch, m, pad, pad_x):
-    """The serving case (Quinn, #100): real and padding tokens in one batch
-    (UP VLLM_MOE_SKIP_PADDING=1; e.g. 3 requests padded to the 4-token
-    graph). The last `pad` tokens route to -1 with weight 0. Captured under a
-    CUDA graph with compact slot groups, then replayed: real rows match the
-    reference and the eager per-expert route, and padding rows are exactly 0
-    on both routes.
+    """Real and padding tokens in one batch (UP VLLM_MOE_SKIP_PADDING=1;
+    e.g. 3 requests padded to the 4-token graph). The last `pad` tokens
+    route to -1 with weight 0. Captured under a CUDA graph with compact slot
+    groups, then replayed: real rows match the reference and the eager
+    per-expert route, and padding rows are exactly 0 on both routes.
 
     UP's finalize skips every slot at or past offset[E]
-    (moe_permute_unpermute_kernel.inl:132, num_valid = offset[E]), so a
-    padding row keeps its zero fill. With finite padding activations
-    0 * weight would also give 0, so the "nan" case fills the padding rows of
-    x with NaN: compact still computes those slots (clamped to expert E-1),
-    and an exact 0 then shows that finalize never reads them and that they
-    don't leak into real rows."""
+    (moe_permute_unpermute_kernel.inl:132), so a padding row keeps its zero
+    fill. The "nan" case fills the padding rows of x with NaN: compact still
+    computes those slots (clamped to expert E-1), and an exact 0 then shows
+    that finalize never reads them and that they don't leak into real rows."""
     import vllm_sm70.quant.nvfp4_moe as m4
     from vllm_sm70.ops import tm
 

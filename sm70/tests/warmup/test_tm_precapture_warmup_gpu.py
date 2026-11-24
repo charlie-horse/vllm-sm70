@@ -30,8 +30,8 @@ def _env(**extra):
     for name in [k for k in env if k.startswith(("TM_GEMM_", "VLLM_SM70_"))]:
         if name != "VLLM_SM70_PLUGIN_STRICT":
             env.pop(name)
-    # Small-shape tuning defaults off since #77; these tests exercise the
-    # tuned mode (warmup + LUT), so turn it on unless a test overrides it.
+    # Small-shape tuning defaults off; these tests exercise the tuned mode
+    # (warmup + LUT), so turn it on unless a test overrides it.
     env["VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES"] = "1"
     env["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "1"
     env.update(extra)
@@ -92,7 +92,7 @@ def test_tp2_ranks_share_rank0_dispatch_cache(warmup_gpu, tmp_path):
 
 def test_lut_pins_specs_across_processes(warmup_gpu, tmp_path):
     """Run 1 exports a LUT; runs 2 and 3 (fresh processes) import it, time no
-    kernel and give bitwise-identical outputs (T4c at op level)."""
+    kernel and give bitwise-identical outputs."""
     lut = tmp_path / "tm-{arch}.bin"
 
     def probe(**env):

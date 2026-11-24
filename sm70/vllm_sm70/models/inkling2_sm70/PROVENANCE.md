@@ -11,11 +11,6 @@ in it; SM70 differences live in `sm70_configs.py`.
 | sha256 | `ed9a063b12c6cb0aeb35a74e74ea8656c6ca9220d18fccec2369b15014abb231` |
 | License | Apache-2.0 (upstream `LICENSE`; SPDX header kept in the file) |
 
-`sm70/tests/models/test_m12_inkling2_registration_cpu.py` checks the file
-against this sha256.
-
-The file imports only `transformers.configuration_utils.PreTrainedConfig`.
-
 `processing.py` is an adapted port of `vllm/models/inkling2/processing.py` at
 the same upstream commit; its module docstring lists the differences.
 
@@ -34,10 +29,7 @@ same upstream commit; they are not byte-identical copies.
 files of the same upstream commit. Each is its upstream file plus the patch
 `ops/patches/<file>.patch`; the patch header holds the upstream path, the
 commit and the hash of the unpatched file. Change a vendored file only
-together with its patch: `sm70/tests/ops/test_m12_inkling2_triton_norms_cpu.py`
-takes the patch back out and checks the hash. Kernels whose work is a GEMM
-(`tl.dot`) are not vendored. `ops/fused.py` is not vendored: the message-gate
-projections and the residual add of the decode route, written for SM70.
+together with its patch.
 
 `dspark.py`, `speculator.py` and `ops/dspark.py` are ported from the same
 upstream commit; they are not byte-identical copies. Each module docstring

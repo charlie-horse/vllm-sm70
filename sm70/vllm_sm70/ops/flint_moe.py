@@ -1,35 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flint NVFP4 MoE M<=2 QPN decode (K12): wrappers, fakes and admission.
+"""Flint NVFP4 MoE M<=2 QPN decode: wrappers, fakes and admission.
 
 Two `_sm70_C` out ops (sm70/csrc/flint_moe/nvfp4_moe_decode_qpn_sm70.cu):
+``nvfp4_moe_decode_w13_swiglu_sm70_out`` (W13 + SwiGLU for every routed
+slot, straight from the TurboMind-packed bank, split-K over 16 CTAs joined
+by arrival counters) and ``nvfp4_moe_decode_w2_reduce_sm70_out`` (W2 + the
+top-k weighted sum). The kernels are compiled for Flint at TP2 only (256
+experts, hidden 2048, local intermediate 256, top-6, M in {1, 2});
+``contract_rejection`` refuses anything else at load.
 
-* ``nvfp4_moe_decode_w13_swiglu_sm70_out``: W13 + SwiGLU for every routed
-  slot, straight from the TurboMind-packed bank and device expert IDs (no
-  permute), split-K over 16 CTAs joined by integer arrival counters.
-* ``nvfp4_moe_decode_w2_reduce_sm70_out``: W2 + the top-k weighted sum, one
-  FP16 [M, H] row per token.
-
-Ported from fork cf9492a: wrappers vllm/_sm70/moe.py:345-389, fakes
-:450-481, admission and workspace model_executor/layers/quantization/
-nvfp4_sm70_moe.py:120-130 and :180-290, both without the single-launch
-(persistent) variant and without ``native_policy``.
-
-The kernels are compiled for one shape only (C++ ``kFlint*``): Flint at TP2,
-i.e. 256 experts, hidden 2048, local intermediate 256 (moe_intermediate 512
-/ 2), top-6, M in {1, 2}. Everything else (Flint TP1, Qwen3.6 top-8, M>2)
-must stay on the dense-stage route; ``contract_rejection`` says so at load.
-
-CUDA graphs (risk R4): the only state is the split-K workspace, ``partials``
-(FP32, scratch) and ``counters`` (int32, zero between launches; the last CTA
-of each (route, tile) re-arms its counter, so a replay needs no reset).
-``allocate_workspace`` must run at load, before any capture, and refuses
-inside one. Nothing here allocates lazily; ``flint_moe_decode_out`` never
-allocates.
-
-Kill switch: ``VLLM_SM70_FLINT_MOE_QPN_DECODE=0`` (registered in
-vllm_sm70/envs.py, mirrored by Sm70Config.flint_moe_qpn_decode). It is read
-by ``admit_layer`` at load, where the decode path is chosen per layer.
+CUDA graphs: the only state is the split-K workspace (``partials`` and
+``counters``; the last CTA re-arms its counter). ``allocate_workspace`` runs
+at load, before any capture, and refuses inside one.
+Kill switch: ``VLLM_SM70_FLINT_MOE_QPN_DECODE=0``, read by ``admit_layer``.
 """
 
 from __future__ import annotations
@@ -83,7 +67,7 @@ def _op(name: str):
 
 
 def available() -> bool:
-    """Both K12 decode ops are present in the loaded _sm70_C."""
+    """Both decode ops are present in the loaded _sm70_C."""
     return all(has_op(name) for name in OPS)
 
 
@@ -91,12 +75,11 @@ def available() -> bool:
 # The compiled contract (C++ kFlint* constants, nvfp4_moe_decode_qpn_sm70.cu)
 # ---------------------------------------------------------------------------
 
-# (experts, hidden, local intermediate, top-k); fork nvfp4_sm70_moe.py:124.
+# (experts, hidden, local intermediate, top-k).
 FLINT_TP2: Final = (256, 2048, 256, 6)
 CONTRACTS: Final = frozenset({FLINT_TP2})
 MAX_TOKENS: Final = 2  # kFlintMaxTokens
-# Split-K workspace sizes in elements (kFlintPartials, kFlintCounters). The
-# fork allocated 96 + 32 counters; the 32 were the single-launch flags.
+# Split-K workspace sizes in elements (kFlintPartials, kFlintCounters).
 DECODE_PARTIALS: Final = 98304
 DECODE_COUNTERS: Final = 96
 # The kernels form prepared_scale * 2^(14 - shift) in FP16.
@@ -130,8 +113,7 @@ def contract_rejection(contract: tuple[int, int, int, int]) -> str | None:
 def scale_shift(scales: torch.Tensor) -> int | None:
     """Power-of-two pre-shift that keeps the decode scale product finite.
 
-    fork nvfp4_sm70_moe.py:180-195 (_decode_qpn_scale_shift). The kernels
-    expand E2M1 codes as code * 2^-14 and multiply by the prepared FP16 scale
+    The kernels expand E2M1 codes as code * 2^-14 and multiply by the prepared FP16 scale
     times 2^(14 - shift); the FP32 accumulator is then multiplied by 2^shift.
     Both factors are exact, so the weights stay e2m1 * e4m3 * global. Returns
     None when no shift fits (non-finite or out-of-range scales). Reads the
@@ -192,7 +174,7 @@ def admit_layer(
     *,
     policy_enabled: bool | None = None,
 ) -> DecodePlan | None:
-    """Load-time admission (fork nvfp4_sm70_moe.py:218-290, two-kernel form).
+    """Load-time admission.
 
     Returns the plan, or None (logged) when the layer must keep the dense
     stage: kill switch off, ops absent, shape outside the compiled contract,
@@ -233,7 +215,7 @@ def admit_layer(
 
 
 # ---------------------------------------------------------------------------
-# Workspace (R4: allocated at load, never under capture)
+# Workspace (allocated at load, never under capture)
 # ---------------------------------------------------------------------------
 
 
@@ -258,8 +240,7 @@ def allocate_workspace(device: torch.device | str) -> DecodeWorkspace:
 
     Refuses inside CUDA graph capture: a workspace created there would be
     zeroed only in the graph being captured, and every other graph would
-    replay on whatever the counters held (the C4 `--max-num-seqs 20`
-    gibberish, fork docs/design/sm70_flint_max_num_seqs_postmortem.md).
+    replay on whatever the counters held.
     """
     device = torch.device(device)
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -322,11 +303,10 @@ def can_decode(
 
 
 # ---------------------------------------------------------------------------
-# Ops: fork vllm/_sm70/moe.py
+# Ops
 # ---------------------------------------------------------------------------
 
 
-# fork vllm/_sm70/moe.py:345-367
 def nvfp4_moe_decode_w13_swiglu_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -349,7 +329,6 @@ def nvfp4_moe_decode_w13_swiglu_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:370-389
 def nvfp4_moe_decode_w2_reduce_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -370,7 +349,6 @@ def nvfp4_moe_decode_w2_reduce_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:450-464
 if has_op(W13_OP):
 
     @register_fake("_sm70_C::nvfp4_moe_decode_w13_swiglu_sm70_out")
@@ -387,7 +365,6 @@ if has_op(W13_OP):
         return None
 
 
-# fork vllm/_sm70/moe.py:467-481
 if has_op(W2_OP):
 
     @register_fake("_sm70_C::nvfp4_moe_decode_w2_reduce_sm70_out")
@@ -404,8 +381,7 @@ if has_op(W2_OP):
 
 
 # ---------------------------------------------------------------------------
-# Composite (fork fused_moe/sm70/fp4_codec.py:158-167 + :252-260, the
-# DECODE_QPN -> DECODE_REDUCE plan of nvfp4_sm70_moe.py:1443-1450)
+# Composite: W13 + SwiGLU, then W2 + reduce
 # ---------------------------------------------------------------------------
 
 

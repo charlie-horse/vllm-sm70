@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K18 DFlash2 FP16 M<=8 GEMM / compact top-k tests.
+"""Fixtures for the DFlash2 FP16 M<=8 GEMM / compact top-k tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C with the K18 ops. Run them from the repo root with:
+vllm_sm70._sm70_C with the DFlash2 ops. Run them from the repo root with:
 
     pytest -m gpu sm70/tests/dflash2
 """
@@ -52,8 +52,8 @@ def dflash2_stub():
 def dflash2_gpu():
     """vllm_sm70.ops.dflash2 on a real SM70 GPU with _sm70_C loaded, else skip.
 
-    On an SM70 GPU a missing extension or missing K18 ops fails the test, so
-    a nightly run cannot pass on stubs.
+    On an SM70 GPU a missing extension or missing DFlash2 ops fails the test,
+    so a run cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for transparent images on the M12 Inkling 2 serve path
+"""Tests for transparent images on the Inkling 2 serve path
 (vllm_sm70/models/inkling2_sm70/processing.py, Inkling2MultiModalDataParser).
 
 CPU only. Images go through vLLM's MediaConnector (data and http URLs) or

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 NVFP4 expert prefill on TurboMind's grouped stage, on CPU.
+"""Inkling 2 NVFP4 expert prefill on TurboMind's grouped stage, on CPU.
 
 - ``tm.nvfp4_moe_dense_stage_route`` (ops/tm.py) mirrors the launch form
   that ``nvfp4_moe_dense_stage_sm70_out`` picks: the shape sets, the row

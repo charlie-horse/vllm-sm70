@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 chat renderer (vllm_sm70/models/inkling2_sm70/).
+"""Tests for the Inkling 2 chat renderer (vllm_sm70/models/inkling2_sm70/).
 
 CPU only: upstream's Inkling 2 rendering cases with a fake one-id-per-char
 tokenizer, the request fields the renderer reads, payload splitting with a

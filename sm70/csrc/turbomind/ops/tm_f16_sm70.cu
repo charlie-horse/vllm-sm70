@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// TurboMind fp16 dense GEMM, fp16 gate-mul and interleaved SiLU (K03).
-// Moved verbatim from fork cf9492a csrc/sm70_turbomind/ops/awq_sm70_gemm.cu;
-// see ../PROVENANCE.md for the fork line range of every function.
+// TurboMind fp16 dense GEMM, fp16 gate-mul and interleaved SiLU.
+// Source: ../PROVENANCE.md.
 #include "tm_ops_common_sm70.cuh"
 
 #include <torch/library.h>
 
-// The fork defined this in the global namespace, next to a global
-// silu_and_mul() with the same name as upstream vLLM's op. Keep it in
-// vllm_sm70 so neither can collide with symbols from _C_stable_libtorch.
+// In vllm_sm70 so it cannot collide with upstream vLLM's silu_and_mul() or
+// other symbols from _C_stable_libtorch.
 namespace vllm_sm70 {
 
 void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input) {
@@ -343,25 +341,20 @@ void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
 }
 
 // ---------------------------------------------------------------------------
-// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// Op registration.
 // ---------------------------------------------------------------------------
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:661
   m.def(
       "sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
-  // fork csrc/torch_bindings.cpp:682
   m.def(
       "sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
-  // fork csrc/torch_bindings.cpp:1005
   m.def(
       "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_kernel, int k_ld, bool gated_silu) -> ()");
-  // fork csrc/torch_bindings.cpp:1139
   m.def(
       "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_gate_weight) -> ()");
-  // fork csrc/torch_bindings.cpp:596
   m.def(
       "silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
 }

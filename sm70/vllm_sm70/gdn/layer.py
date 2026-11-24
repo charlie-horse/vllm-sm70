@@ -1,24 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen GDN layer subclass (M11): routes non-spec decode and its warmup to K08.
+"""Qwen GDN layer subclass: routes non-spec decode and its warmup to FlashQLA.
 
-Upstream `QwenGatedDeltaNetAttention` (UP qwen_gdn_linear_attn.py:543) is a
-`PluggableLayer`, so `PluggableLayer.register_oot` (UP custom_op.py:83) makes
-every `QwenGatedDeltaNetAttention(...)` built by qwen3_5.py / qwen3_next.py
-an instance of this subclass. No upstream file is touched.
+Upstream `QwenGatedDeltaNetAttention` is a `PluggableLayer`, so
+`PluggableLayer.register_oot` makes every `QwenGatedDeltaNetAttention(...)`
+built by qwen3_5.py / qwen3_next.py an instance of this subclass.
 
-Overrides (fork cf9492a qwen_gdn_linear_attn.py):
-- `_forward_core_decode_non_spec` (UP :1981; fork :4649-4810): upstream's
-  conv1d update, then K08 `flashqla_decode` instead of the packed Triton
-  decode. Falls back to the packed Triton decode when K08 refuses the tensors.
-- `_warmup_prefill_kernels` (UP :1308-1448; fork :3458 + warmup/gdn.py):
-  upstream's warmup (its `self.chunk_gated_delta_rule` is K08's OOT op, so
-  prefill already warms FlashQLA), then one FlashQLA decode at 1 and 2
-  tokens, dense and at the real row stride.
-Kill switches are K08's: VLLM_SM70_GDN_DECODE_FLASHQLA=0 makes both
-overrides the upstream methods; VLLM_SM70_GDN_FLASHQLA_PREFILL=0 is read by
-the prefill op itself.
-"""
+Overrides:
+- `_forward_core_decode_non_spec`: upstream's conv1d update, then
+  `flashqla_decode` instead of the packed Triton decode. Falls back to the
+  packed Triton decode when FlashQLA refuses the tensors.
+- `_warmup_prefill_kernels`: upstream's warmup (its chunk op is already the
+  FlashQLA OOT op), then one FlashQLA decode at 1 and 2 tokens, dense and at
+  the real row stride.
+VLLM_SM70_GDN_DECODE_FLASHQLA=0 makes both overrides the upstream methods;
+VLLM_SM70_GDN_FLASHQLA_PREFILL=0 is read by the prefill op itself."""
 
 from __future__ import annotations
 
@@ -75,7 +71,7 @@ def register_qwen_gdn_layer():
                 conv_state_indices=idx,
                 validate_data=False,
             )
-            # split_ba() returns column views; K08 needs dense [T, Hv].
+            # split_ba() returns column views; FlashQLA needs dense [T, Hv].
             a, b = a[:n].contiguous(), b[:n].contiguous()
             out = core_attn_out[:n]
             scale = self.head_k_dim**-0.5
@@ -97,13 +93,9 @@ def register_qwen_gdn_layer():
             )
 
         def _warmup_prefill_kernels(self, qkv_or_qkvz, v_dim):
-            # Deviation from fork cf9492a (approved by Astro, 2026-11-08): the
-            # fork warmed the FlashQLA decode only with
-            # VLLM_SM70_FLASHQLA_DECODE_WARMUP=1 (default off, fork
-            # vllm/config/gdn.py:27), because its kernel was a pybind JIT.
-            # K08 is AOT, so here the decode warmup runs whenever the decode
-            # route is on: 4 tiny launches per layer, which load the module
-            # before graph capture and surface a broken kernel at startup.
+            # The decode warmup runs whenever the decode route is on: 4 tiny
+            # launches per layer, which load the module before graph capture
+            # and surface a broken kernel at startup.
             # VLLM_SM70_GDN_DECODE_FLASHQLA=0 skips it (only "0" acts).
             first = not self._prefill_kernels_warmed_up
             super()._warmup_prefill_kernels(qkv_or_qkvz, v_dim)
@@ -116,7 +108,7 @@ def register_qwen_gdn_layer():
             hv = self.num_v_heads // self.tp_size
             dev, dt = qkv_or_qkvz.device, qkv_or_qkvz.dtype
             _, state_dtype = self.get_state_dtype()
-            # Slot 0 is NULL_BLOCK_ID (K08 skips it); tokens use slots 1..t.
+            # Slot 0 is NULL_BLOCK_ID (the kernel skips it); tokens use slots 1..t.
             state = torch.zeros(
                 3, hv, self.head_v_dim, self.head_k_dim, device=dev, dtype=state_dtype
             )

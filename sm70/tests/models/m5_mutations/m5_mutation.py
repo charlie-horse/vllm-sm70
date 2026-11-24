@@ -1,44 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Planted bugs for the M5 mutation check (test-only; no model code changes).
-
-T4d and T7 must FAIL with each of these (Quinn, Nov 6). Select one with
-M5_MUTATION=<name> and put this directory first on PYTHONPATH; the
-``sitecustomize`` here then installs the hook in every Python process (the
-pytest process, the engine core and each TP worker inherit env and
-PYTHONPATH).
-
-Hook mutations patch ``qk_norm_rope_kv`` in K15's module
-``vllm_sm70.flint.qk_norm_rope_kv`` (#54), the one the model's fused route
-runs. That is the patch point because the registered op
-``torch.ops.vllm.<QK_ROPE_KV_OP_NAME>`` (vllm_sm70/flint) dispatches to the module
-function ``qk_norm_rope_kv_cache_update``, whose body looks
-``qk_norm_rope_kv`` up in the module globals at call time (both the
-direct-cache-write branch and the fallback branch), with the same argument
-names (positions, cos_sin_cache, key_cache, slot_mapping). Nothing else in
-the model imports it by name (model.py imports only fused_route_rejection
-and attention_after_fused_write), and the unfused route
-(VLLM_SM70_FLINT_QK_ROPE_KV=0) never calls it.
-Under torch.compile the op is opaque, so the Python body (and this wrapper)
-runs at run time, or at CUDA-graph capture, where its tensor ops are recorded
-into the graph.
-
-  rope_pos_decode  positions + 1 on calls with <= DECODE_MAX_TOKENS tokens
-                   (decode; also a prompt prefill that short)
-  kv_slot_decode   slot_mapping + 1 (padding -1 kept, wrapped in range) on
-                   calls with <= DECODE_MAX_TOKENS tokens: the token's K/V
-                   lands in the wrong cache slot
-  moe_decode_scale the K12 M<=2 MoE decode output x 1.01: patches
-                   flint_moe_decode_out in vllm_sm70.ops.flint_moe, which M4
-                   (quant/nvfp4_moe.py) looks up as a module attribute at
-                   call time. Catchable by T4d (ours vs fork) only: both T7
-                   arms run the same MoE. REQUIRED catch, by T4d's pooled-mean
-                   gate (Quinn, Nov 7).
-  moe_decode_scale_half  the same at x 1.005: INFO probe of the sensitivity
-                   floor, never a required catch.
-Config mutation (applied by the tests themselves, on the mutated side only):
-  rope_theta_1p01  hf_overrides with rope_theta x 1.01 (rope_parameters too);
-                   INFO only (Quinn): too weak at ~70-token positions to be
-                   a required catch.
+"""Planted bugs for sm70/scripts/m5_mutation_check.sh (test-only).
+T4d and T7 must FAIL with each required one. M5_MUTATION=<name> with this
+directory first on PYTHONPATH makes ``sitecustomize`` install it in every
+process. Hook mutations wrap ``qk_norm_rope_kv`` in
+``vllm_sm70.flint.qk_norm_rope_kv``: the registered op's body looks it up in
+the module globals at call time, so the wrapper runs (also at CUDA-graph
+capture); the unfused route never calls it.
+  rope_pos_decode   positions + 1 on calls with <= DECODE_MAX_TOKENS tokens
+  kv_slot_decode    slot_mapping + 1 (padding kept) on such calls
+  moe_decode_scale  M<=2 MoE decode output (flint_moe_decode_out) x 1.01;
+                    only T4d can catch it (required, by the pooled-mean gate)
+  moe_decode_scale_half  x 1.005: INFO probe, never required
+  rope_theta_1p01   config mutation (the tests apply it): rope_theta x 1.01;
+                    INFO only, too weak at short positions to be required
 """
 
 import functools
@@ -65,7 +39,7 @@ _FIRED: set = set()
 
 def _mark_fired(mutation: str) -> None:
     """Print once per process the first time a mutation actually changes a
-    call (Quinn: installed is not enough; it must be shown to have fired)."""
+    call (installed is not enough; it must be shown to have fired)."""
     if mutation in _FIRED:
         return
     _FIRED.add(mutation)

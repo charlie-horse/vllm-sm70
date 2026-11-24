@@ -2,11 +2,11 @@
 # Usage: run_one.sh INSTANCE_ID ATTEMPT
 #   pre-pull (global rate limit) -> agent (podman, niced, API retry/re-run)
 #   -> official eval (podman socket) -> image cleanup.
-# Output layout (unchanged, read by scripts/analyze.py):
+# Output layout (read by scripts/analyze.py):
 #   runs/attA/{agent/ID, eval/done_ID, log/ID.{agent,eval}.log}
 # done_ID may carry "infra": "pull_failed" | "api_failed".
 # Exit 3 = killed by the memory watchdog (no done_ marker -> re-run later).
-# Env knobs (unset = previous behavior):
+# Env knobs (unset = default):
 #   RUN_DIR=$R/runs      run root; output goes to $RUN_DIR/attA
 #   TASK_CPUS=N          task container --cpus (flint.yaml default: 6)
 #   KEEP_IMAGES=1        skip cleanup_image (images were pre-pulled)

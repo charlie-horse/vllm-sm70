@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K12 Flint NVFP4 MoE decode tests.
+"""Fixtures for the Flint NVFP4 MoE decode tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C with the K03 TurboMind ops (to prepare the expert banks)
-and the K12 decode ops. Run them from the repo root with the built package
+vllm_sm70._sm70_C with the TurboMind ops (to prepare the expert banks) and
+the Flint MoE decode ops. Run them from the repo root with the built package
 first on PYTHONPATH:
 
     pytest -m gpu sm70/tests/flint_moe
@@ -52,8 +52,8 @@ def flint_gpu():
     """(device, flint_moe, tm) on a real SM70 GPU, else skip.
 
     Like tm_gpu (tests/ops/conftest.py): with an SM70 GPU present, a missing
-    or K12-less _sm70_C is a broken build or a wrong PYTHONPATH, so the test
-    fails instead of skipping and the nightly run cannot pass on stubs.
+    _sm70_C or one without the Flint MoE ops is a broken build or a wrong
+    PYTHONPATH, so the test fails instead of skipping and cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

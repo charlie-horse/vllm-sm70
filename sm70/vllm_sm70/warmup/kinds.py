@@ -1,22 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run one plan Item at one M: the same TurboMind call the layer makes in forward.
 
-Dense kinds call the op with the operands the layer's apply passes; MoE
-kinds call the layer's own ``quant_method.apply`` with synthetic routing,
-so the route taken at each M (batched, compact M == 1, decomposed) and
+Dense kinds call the op with the operands the layer's apply passes (NVFP4
+through ``apply_prepared_linear``, so the GEMV/TurboMind choice and output
+padding match forward). MoE kinds call the layer's own
+``quant_method.apply`` with synthetic routing (``moe_routing``: balanced
+expert use, distinct experts per token), so the route taken at each M and
 therefore the dispatch keys are exactly the runtime's.
-
-ported from FORK cf9492a vllm/model_executor/warmup/awq_sm70_warmup.py:
-- nvfp4_dense: ``_warmup_fp4_dense_layers`` :721-793, nvfp4 non-prescaled,
-  non-scale-code branch; through M3's ``apply_prepared_linear`` so the K11
-  GEMV/TurboMind operator choice and output padding match forward.
-- fp8_dense / fp8_qpn8_tm: ``_warmup_fp8_dense_layers`` :620-718, the plain
-  TurboMind branch (:666-677, :680-696) and the block-QPN8 TurboMind-copy
-  branch (:635-640, :683-684).
-- nvfp4_moe / fp8_moe: replaces ``_warmup_nvfp4_moe_decode_layers``
-  :952-1051 and ``_warmup_moe_dense_stage_layers`` :796-878, which built the
-  stage operands by hand; ``_build_balanced_offsets`` :349-363 becomes the
-  routing in ``moe_routing`` (balanced expert use, distinct experts per token).
 """
 
 from __future__ import annotations
@@ -31,7 +21,7 @@ FP8_BLOCK = P.FP8_BLOCK
 def moe_routing(num_tokens: int, top_k: int, num_experts: int, device: Any):
     """topk ids/weights: slot j of token t -> expert (t * top_k + j) % E.
 
-    Every expert is used about equally (the fork's balanced offsets) and a
+    Every expert is used about equally and a
     token never picks one expert twice (top_k <= E).
     """
     import torch

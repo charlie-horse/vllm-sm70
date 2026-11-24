@@ -51,16 +51,16 @@ TUNE_VARS = (
 def _clean_env(monkeypatch):
     for name in TUNE_VARS:
         monkeypatch.delenv(name, raising=False)
-    # Prod's tuned mode: small-shape tuning on (the C++ default is 0 since
-    # #77, so the warmup and LUT only matter with these set). Tests that need
-    # the default or a mix set them again.
+    # Tuned mode: small-shape tuning on (the C++ default is 0, so the warmup
+    # and LUT only matter with these set). Tests that need the default or a
+    # mix set them again.
     for name in (
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
         "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES",
     ):
         monkeypatch.setenv(name, "1")
-    # K09's bound without importing vllm_sm70.ops.qpn8 (default 8).
+    # The QPN8 bound without importing vllm_sm70.ops.qpn8 (default 8).
     monkeypatch.setattr(P, "_qpn8_max_m", lambda: 8)
 
 
@@ -160,7 +160,7 @@ def vcfg(
     )
 
 
-# Flint TP2 per-rank NVFP4 dense (K, N): the K11 GEMV set (nvfp4_linear.py).
+# Flint TP2 per-rank NVFP4 dense (K, N): the GEMV shape set (nvfp4_linear.py).
 FLINT_DENSE = [
     (2048, 2560),
     (2048, 2048),
@@ -179,7 +179,7 @@ def flint_model():
 
 
 # Qwen3.8-27B FP8 TP2-like dense shapes: QPN8 serves M <= 8, the TurboMind
-# copy above; one projection stays on plain M6 TurboMind.
+# copy above; one projection stays on plain TurboMind.
 QWEN38_QPN8 = [(5120, 4096), (2048, 5120), (5120, 8704), (8704, 5120)]
 
 
@@ -212,11 +212,11 @@ def test_flint_tp2_plan():
     dense = by_kind[P.NVFP4_DENSE]
     assert [i.key[:2] for i in dense] == FLINT_DENSE  # deduplicated, in order
     for item in dense:
-        # K11 GEMV owns M <= 2; NVFP4 dense tunes up to M 64.
+        # The NVFP4 GEMV owns M <= 2; NVFP4 dense tunes up to M 64.
         assert item.ms == (4, 5, 8, 16, 24, 32, 40, 64)
     (moe,) = by_kind[P.NVFP4_MOE]
     assert moe.key == (256, 2048, 256, 6, True)
-    # K12 owns M <= 2; the MoE gate counts slots: 21 * 6 = 126 <= 128. MoE
+    # The decode owns M <= 2; MoE gate counts slots: 21 * 6 = 126 <= 128. MoE
     # warms every token count (eager MoE has no imported-cache reuse).
     assert moe.ms == tuple(range(3, 22))
     assert plan.calls() == FLINT_CALLS
@@ -949,8 +949,8 @@ def qwen_mixed_model():
 def test_tuning_on_with_lut_never_times_covered_shapes(
     tmp_path, monkeypatch, fp8_reuse
 ):
-    """Prod mode for T4c: small-shape tuning on + a LUT -> no timed kMeasure on
-    any rank, and both instances hold the exported specs."""
+    """Tuned mode: small-shape tuning on + a LUT -> no timed kMeasure on any
+    rank, and both instances hold the exported specs."""
     for name in (
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
@@ -988,7 +988,7 @@ def test_tuning_on_with_lut_never_times_covered_shapes(
 
 
 def test_tuning_off_needs_no_lut(tmp_path, monkeypatch):
-    """#77 mode: tuning off -> nothing to warm, LUT not read, kDefault."""
+    """Tuning off: nothing to warm, LUT not read, kDefault."""
     for name in (
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
@@ -1169,7 +1169,7 @@ def test_load_lut_absent_bad_and_stale_manifest(tmp_path):
 
 
 def test_default_tuning_off_plans_nothing(monkeypatch):
-    """#77: with the C++ default (tuning off) the warmup has nothing to tune;
+    """With the C++ default (tuning off) the warmup has nothing to tune;
     every call is kDefault, deterministic without a LUT."""
     for name in (
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
@@ -1183,9 +1183,8 @@ def test_default_tuning_off_plans_nothing(monkeypatch):
 
 
 def test_lut_summary_phrases_are_stable(tmp_path, monkeypatch):
-    """M5's runner (Mara) greps every engine log for these exact phrases; a
-    rename must fail here, not silently in a gate. They are logged on a
-    "vllm.sm70.*" logger so they reach the engine log (#76)."""
+    """Log checks match these exact phrases; a rename must fail here. They
+    are logged on a "vllm.sm70.*" logger so they reach the engine log."""
     from vllm_sm70 import warmup as W
 
     assert W.logger.name.startswith("vllm.sm70")

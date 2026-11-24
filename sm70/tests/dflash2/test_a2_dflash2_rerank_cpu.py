@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A2 CPU tests: DFlash2 draft candidate top-k by QPN8 support search + rerank.
+"""CPU tests: DFlash2 draft candidate top-k by QPN8 support search + rerank.
 
-No GPU or built _sm70_C: K09's prepare and GEMM are CPU references (prepare
-keeps the E4M3 weight and scales; the GEMM dequantizes and multiplies in
-FP32, rounding to FP16 like the kernel's output), the SM70 device check is
-patched, and the exact dots take the torch reference. Covers the chunking,
-admission and the kill switch, the chunked quantizer, prepare-once
-semantics (never inside a graph or a compile), the selection against an
-FP32 dense top-k, the scale and soft cap, the M limit and the gate.
+No GPU or built _sm70_C: the QPN8 prepare and GEMM are CPU references
+(prepare keeps the E4M3 weight and scales; the GEMM dequantizes and
+multiplies in FP32, rounding to FP16 like the kernel's output), the SM70
+device check is patched, and the exact dots take the torch reference.
+Covers the chunking, admission and the kill switch, the chunked quantizer,
+prepare-once semantics (never inside a graph or a compile), the selection
+against an FP32 dense top-k, the scale and soft cap, the M limit and the
+gate.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U4 (patches/0005): V1 hidden-state sampler hook before compute_logits."""
+"""patches/0005: V1 hidden-state sampler hook before compute_logits."""
 
 import inspect
 

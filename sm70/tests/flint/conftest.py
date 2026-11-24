@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K15 Flint q/k-norm + RoPE + KV-write tests.
+"""Fixtures for the Flint q/k-norm + RoPE + KV-write tests.
 
 ``interp`` runs the Triton kernels on the CPU through Triton's interpreter,
 so the kernel numerics and the KV-cache addressing are checked without a GPU.

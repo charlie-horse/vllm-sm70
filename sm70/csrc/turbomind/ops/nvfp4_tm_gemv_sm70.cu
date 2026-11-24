@@ -4,10 +4,10 @@
 // Single-token (M <= 2) NVFP4 GEMV over the resident TurboMind SM70 weights.
 //
 // It reads the TurboMind HMMA884 B/Pack1 codes ([N/32, K/8, 32] u32 words,
-// nibble order [0,2,4,6,1,3,5,7], see nvfp4_qpn2_layout.cuh) and the
+// nibble order [0,2,4,6,1,3,5,7]) and the
 // TurboMind FP16 group scales ([K/16, N] row-major, global scale already
 // folded in) directly: no second weight layout, no workspace, no allocation.
-//
+
 // Each lane loads one uint4: four adjacent columns of one K8 row. The lanes
 // of an mma.m8n8k4 quad pair supply both the B columns and the A rows, so a
 // quad pair can work on G different K8 rows at once: group g owns A rows and
@@ -18,11 +18,6 @@
 // reduced in a fixed order (shared memory, then a shuffle tree), so results
 // are deterministic. Rounds can be double buffered in registers: a warp's
 // next loads are in flight while it decodes the current ones.
-//
-// On V100 these single-token GEMVs are bound by per-kernel latency and SM
-// work, not DRAM: the same kernel with every weight resident in L2 is barely
-// faster. A plain streaming read of the same bytes reaches 260-700 GB/s for
-// these 0.7-8 MB layers.
 
 #include <torch/all.h>
 #include <torch/library.h>
@@ -34,7 +29,7 @@
 
 #include <cstdint>
 
-// K03, ops/tm_nvfp4_sm70.cu (global wrapper, same .so).
+// ops/tm_nvfp4_sm70.cu (global wrapper, same .so).
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                          torch::Tensor weight, torch::Tensor scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
@@ -45,8 +40,7 @@ namespace {
 constexpr int kTmGemvMaxRows = 2;
 
 // Per-shape launch table: (K, N, groups, warps, prefetch, pipelined,
-// min_blocks), measured on V100-PCIE-32GB with cold L2 under CUDA graph
-// replay (benchmarks/kernels/benchmark_sm70_nvfp4_m1.py). See kTmGemvTable.
+// min_blocks). See kTmGemvTable.
 #define VLLM_TM_GEMV_TABLE(X)                                  \
   X(2048, 2560, 2, 8, 2, true, 1)  /* qkv */                   \
   X(2048, 2048, 2, 8, 2, true, 1)  /* o */                     \
@@ -315,8 +309,7 @@ void launch_tm_gemv(const uint4* codes, const half* scales, const half* input,
                                                 scale_mul, out_mul);
 }
 
-// Instantiated launch configurations: only the measured table entries.
-// (The fork's VLLM_NVFP4_TM_GEMV_STANDALONE tuning list is not carried.)
+// Instantiated launch configurations: only the table entries.
 #define VLLM_TM_GEMV_SHAPES(X) VLLM_TM_GEMV_TABLE(X)
 
 template <int M>
@@ -382,9 +375,8 @@ bool tm_gemv_operands_ok(const torch::Tensor& out, const torch::Tensor& input,
          reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0;
 }
 
-// Launch table measured on V100-PCIE-32GB for the Flint TP2 dense shapes
-// (benchmarks/kernels/benchmark_sm70_nvfp4_m1.py: cold L2, CUDA graph
-// replay). Shapes outside the table keep TurboMind.
+// Launch table for the Flint TP2 dense shapes. Shapes outside the table keep
+// TurboMind.
 struct TmGemvEntry {
   int k;
   int n;
@@ -474,9 +466,7 @@ void nvfp4_tm_gemv_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 
 // ---------------------------------------------------------------------------
-// Op registration (K11). Schema: fork csrc/torch_bindings.cpp:956-961 minus
-// `str? native_policy`. The fork's standalone tuning entry (_tm_gemv_dev::
-// tune, VLLM_NVFP4_TM_GEMV_STANDALONE) is not carried.
+// Op registration.
 // ---------------------------------------------------------------------------
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {

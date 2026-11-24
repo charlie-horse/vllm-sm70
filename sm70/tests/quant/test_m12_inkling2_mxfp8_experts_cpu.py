@@ -1,22 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 MXFP8 experts held 8-bit (inkling2_sm70/moe.py,
+"""Inkling 2 MXFP8 experts held 8-bit (inkling2_sm70/moe.py,
 expert_weights.py, ops/grouped_gemm.py), on CPU.
 
 - the kill switch VLLM_SM70_INKLING_MXFP8_EXPERTS: an fp16 layer is held as
-  codes and scales (half the bytes), "0", an fp32 model, a value not exact
-  in fp16 or a scale byte above 246 dequantize it;
-- the codes decode to the dequantized values exactly, also for the column
-  slice of a TP2 rank that starts inside a block, and for the MXFP8 layer of
-  the tiny checkpoint;
-- the held layer equals the dequantized layer bit for bit on the torch form
-  of the grouped route (slot and capacity ways, chunks) and the torch
-  expert sum (batch and row-wise);
-- through Triton's interpreter: the decode of all 254 finite codes, the
-  dequant kernel, the slot GEMV kernel against the fp16 one, the whole
-  route and the module's fused-routing forward, all bit for bit.
-
+  codes and scales; "0", an fp32 model, a value not exact in fp16 or a
+  scale byte above 246 dequantize it;
+- the codes decode exactly, also for a TP2 rank's column slice that starts
+  inside a block and for the tiny checkpoint's MXFP8 layer;
+- the held layer equals the dequantized one bit for bit on the torch forms;
+- through Triton's interpreter: all 254 finite codes, the dequant kernel,
+  the slot GEMV kernel, the whole route and the fused-routing forward.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite). The AOT compile check is
+(test_interpreted_suite). AOT compile check:
 tests/ops/test_m12_inkling2_triton_sm70_compile_cpu.py.
 """
 
@@ -55,7 +50,7 @@ INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1"
 interpreted = pytest.mark.skipif(not INTERPRETED, reason="interpreted child run only")
 EXPERTS, HIDDEN, INTERMEDIATE, TOP_K = 8, 64, 32, 2
 GATE_CAP, UP_CAP = 4.0, 25.0
-# Real layers hold exponent bytes 113..118 (spikes S1).
+# Real layers hold exponent bytes 113..118.
 SCALES = (113, 119)
 FINITE = [c for c in range(256) if c & 0x7F != 0x7F]
 

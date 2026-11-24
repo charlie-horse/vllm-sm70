@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only admission of the SM70 vocab-parallel top-k candidate sampler.
 
-Port of FORK tests/v1/sample/test_sm70_topk_candidates_admission.py
-(cf9492a, 111 lines). Upstream's SamplingMetadata has no `top_k_cpu` /
-`temperature_cpu` / `top_p_cpu`, so the host top-k is a separate argument
-(the V1 hook reads it from the runner's InputBatch) and the host
-temperature/top-p copies are gone (the kernel reads the device tensors).
+Upstream's SamplingMetadata has no `top_k_cpu` / `temperature_cpu` /
+`top_p_cpu`, so the host top-k is a separate argument (the V1 hook reads it
+from the runner's InputBatch) and the kernel reads temperature and top-p
+from the device tensors.
 """
 
 import importlib.util

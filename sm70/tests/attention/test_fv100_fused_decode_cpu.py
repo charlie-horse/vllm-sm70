@@ -1,23 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K14 (C4) CPU checks: one-launch sink decode routing, counters, capture.
+"""CPU checks: one-launch sink decode routing, counters, capture.
 
-Port of the CPU cases of fork cf9492a
-tests/kernels/attention/test_sm70_flash_v100_sinks_decode.py :967-1316
-(fused entry point, counter allocation and capture rules, the prepare hook,
-the optional per-launch zero, the impl hook, capture counts, the kill switch
-and the grouped-shape gate), rewritten against vllm_sm70.ops.fv100 and
-vllm_sm70.attention.flash_v100.dispatch:
+Against vllm_sm70.ops.fv100 and vllm_sm70.attention.flash_v100.dispatch:
+`fv100._op` is a recorder and `fv100.has_op` reports the fused op as built
+(or not). Argument positions follow the `_sm70_C` schemas (out first), so
+sinks is args[18] and counters args[19].
 
-* The fork injected a pybind module; here `fv100._op` is a recorder and
-  `fv100.has_op` reports the fused op as built (or not).
-* Argument positions follow the `_sm70_C` schemas: out first, no anchored
-  arguments, so sinks is args[18] and counters args[19] (fork 20/21).
-* Dropped: the `_runtime` policy cases (fork :1304-1316 and the runtime
-  half of :1240-1266), the anchored-window shape (no anchored kernels in
-  the lean build), the routing-probe internals of :1199-1237.
-* New: the admitted shape set for Flint TP1/TP2/TP4 on 2xV100, a CPU model
-  of vLLM's descending capture order (R4), and the impl wiring (counters at
-  layer construction, before any capture).
+Covers the fused entry point, counter allocation and capture rules, the
+prepare hook, the optional per-launch zero, capture counts, the kill switch,
+the grouped-shape gate, the admitted Flint shapes per TP size, a CPU model
+of vLLM's descending capture order, and the impl wiring (counters at layer
+construction, before any capture).
 """
 
 from __future__ import annotations
@@ -32,7 +25,7 @@ torch = pytest.importorskip("torch")
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-# K06's builder fixture, LBNHC forward helper and stable-libtorch stub.
+# Backend test helpers: builder fixture, LBNHC forward helper, stable-libtorch stub.
 from test_fv100_backend_cpu import (  # noqa: E402,F401
     _forward_case,
     _stub_stable_libtorch,
@@ -122,11 +115,11 @@ def warned(load, monkeypatch):
     return seen
 
 
-# ------------------------------------------------------------ routing (fork)
+# ------------------------------------------------------------------ routing
 
 
 def test_grouped_sinks_take_the_fused_op(load):
-    """fork :967-985."""
+    """Grouped sink layers take the fused op with reused counters."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs()
     sinks = _sinks()
@@ -157,7 +150,7 @@ def test_sink_free_call_never_takes_the_fused_op(load):
 
 
 def test_counters_are_never_created_under_capture(load, monkeypatch, warned):
-    """fork :992-1012."""
+    """Under capture with no counters, sink decode takes two launches."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs()
     _capturing(monkeypatch, fv100, True)
@@ -172,7 +165,7 @@ def test_counters_are_never_created_under_capture(load, monkeypatch, warned):
 
 
 def test_counter_capacity_overflow_falls_back(load, monkeypatch, warned):
-    """fork :1015-1052: a capture needing more counters takes two launches,
+    """A capture needing more counters than allocated takes two launches,
     allocating nothing."""
     fv100, rec = load()
     monkeypatch.setattr(fv100, "FUSED_DECODE_COUNTER_CAPACITY", 2)
@@ -202,7 +195,7 @@ def test_counter_capacity_overflow_falls_back(load, monkeypatch, warned):
 
 
 def test_counters_normalise_the_cuda_device(load, monkeypatch):
-    """fork :1055-1062."""
+    """A bare cuda device maps to the current device index."""
     fv100, _ = load()
     monkeypatch.setattr(fv100.torch.accelerator, "current_device_index", lambda: 3)
     assert fv100._normalized_device(torch.device("cuda")) == torch.device("cuda", 3)
@@ -211,7 +204,7 @@ def test_counters_normalise_the_cuda_device(load, monkeypatch):
 
 
 def test_counters_allocated_eagerly_serve_later_captures(load, monkeypatch):
-    """fork :1065-1081."""
+    """Counters allocated by an eager call serve later captures."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs()
     sinks = _sinks()
@@ -227,7 +220,7 @@ def test_counters_allocated_eagerly_serve_later_captures(load, monkeypatch):
 
 
 def test_counter_capacity_refusal_and_eager_growth(load, monkeypatch):
-    """fork :1084-1100."""
+    """Under capture a larger request is refused; eagerly the buffer grows."""
     fv100, _ = load()
     device = torch.device("cpu")
     capacity = fv100.FUSED_DECODE_COUNTER_CAPACITY
@@ -246,7 +239,7 @@ def test_counter_capacity_refusal_and_eager_growth(load, monkeypatch):
 
 
 def test_prepare_hook(load, monkeypatch):
-    """fork :1103-1121."""
+    """The prepare hook allocates on CUDA only, never under capture or off."""
     fv100, _ = load()
     allocated: list[tuple[torch.device, int]] = []
 
@@ -276,7 +269,7 @@ def test_prepare_is_a_noop_without_the_fused_op(load):
 
 
 def test_optional_per_launch_zero(load, monkeypatch):
-    """fork :1124-1137: VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS=1."""
+    """VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS=1 zeroes the used rows."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs()
     sinks = _sinks()
@@ -296,7 +289,7 @@ def test_optional_per_launch_zero(load, monkeypatch):
 
 
 def test_capture_counts(load, monkeypatch, warned):
-    """fork :1240-1262 (minus the _runtime policy)."""
+    """Capture counts start at (0, 0) after clear_workspaces()."""
     fv100, _ = load()
     q, k, v, table, lens = _inputs(batch=4)
     sinks = _sinks()
@@ -322,7 +315,7 @@ def test_capture_counts(load, monkeypatch, warned):
 
 
 def test_kill_switch(load, monkeypatch):
-    """fork :1269-1279."""
+    """VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 forces two launches, no counters."""
     fv100, rec = load()
     monkeypatch.setenv(FUSED_ENV, "0")
     q, k, v, table, lens = _inputs()
@@ -359,7 +352,7 @@ def test_zero_counters_switch_semantics(monkeypatch, value, on):
     assert getattr(envs, ZERO_ENV) is on
 
 
-# ------------------------------------------------- shape set (Flint, 2xV100)
+# ------------------------------------------------------- shape set (Flint)
 
 
 @pytest.mark.parametrize(
@@ -368,8 +361,8 @@ def test_zero_counters_switch_semantics(monkeypatch, value, on):
     ids=["tp1-32q4kv", "tp2-16q2kv", "tp4-8q1kv"],
 )
 def test_flint_shapes_are_admitted(load, heads):
-    """Flint 32q/4kv per TP size (FORK models/flint/configs.py:27-41): the
-    TP2 shape that runs on 2xV100 is 16q/2kv, D128, GQA 8."""
+    """Flint's 32q/4kv split per TP size (16q/2kv at TP2), D128, GQA 8, takes
+    the fused op."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs(*heads)
     assert fv100.fused_decode_eligible(q, k, _sinks(heads[0]))
@@ -389,7 +382,7 @@ def test_flint_shapes_are_admitted(load, heads):
     ids=["gqa4", "gqa6", "d256", "fp8-kv"],
 )
 def test_other_shapes_keep_two_launches(load, heads, head_dim, kw):
-    """fork :1282-1301 (anchored case dropped: not in the lean build)."""
+    """Other GQA ratios, D256 and fp8 KV keep the two-launch ops."""
     fv100, rec = load()
     q, k, v, table, lens = _inputs(*heads, head_dim=head_dim)
     sinks = _sinks(heads[0])
@@ -408,20 +401,20 @@ def test_eligibility_needs_sinks(load):
     assert not fv100.fused_decode_eligible(q, k, None)
 
 
-# ------------------------------------------- R4: vLLM's descending capture
+# ------------------------------------------------ vLLM's descending capture
 
 
 @pytest.mark.parametrize("eager_first", [False, True], ids=["capture-only", "eager"])
 def test_descending_capture_never_allocates_counters_in_a_graph(
     load, monkeypatch, eager_first
 ):
-    """CPU model of fork :534-660 / :764 (the --max-num-seqs 20 bug).
+    """CPU model of vLLM's descending capture order.
 
     vLLM captures decode graphs largest batch first on persistent buffers.
     With counters prepared eagerly, every capture gets the same buffer; with
     none, every capture takes two launches and nothing is allocated under
     capture (a torch.zeros there would only be memset inside the first
-    graph, the original gibberish).
+    graph, so later graphs would read stale counters).
     """
     fv100, rec = load()
     rows = 20
@@ -470,7 +463,7 @@ def test_descending_capture_never_allocates_counters_in_a_graph(
 
 
 def test_hook_prepares_once_per_layer_and_reports_captures(monkeypatch):
-    """fork :1140-1196, on dispatch.fused_decode_hook."""
+    """dispatch.fused_decode_hook prepares once per layer and reports captures."""
     from vllm_sm70.attention.flash_v100 import dispatch
     from vllm_sm70.ops import fv100
 
@@ -588,8 +581,8 @@ def test_impl_marks_fused_sink_layers(impl_env, heads, head_size, with_sinks, fu
 
 @needs_vllm
 def test_impl_prepares_counters_at_construction(impl_env, monkeypatch):
-    """R4: the counters exist before vLLM's first capture, whatever runs
-    eagerly before it (v0.33.0's profile run has no attention metadata)."""
+    """The counters exist before vLLM's first capture, whatever runs eagerly
+    before it (the profile run has no attention metadata)."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)

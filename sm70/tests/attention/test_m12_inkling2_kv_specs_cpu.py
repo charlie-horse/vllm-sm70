@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: the Inkling 2 cache owners (models/inkling2_sm70/cache.py).
+"""CPU checks: the Inkling 2 cache owners (models/inkling2_sm70/cache.py).
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). Owners are
+Needs upstream vLLM's Python importable (skipped otherwise). Owners are
 built for the vendored Inkling 2 Mini config.json at TP2 in fp16. Covers the
 owner count and names, the visit-to-cache mapping, the published specs, the
 conv stream layout, and the planner's grouping at block 32.

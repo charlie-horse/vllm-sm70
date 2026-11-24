@@ -1,16 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboMind SM70 ops (K03): Python wrappers and fake impls over torch.ops._sm70_C.
+"""TurboMind SM70 ops: Python wrappers and fake impls over torch.ops._sm70_C.
 
-Ported from fork cf9492a vllm/_sm70/{auxiliary,linear,moe}.py. The fork's
-`native_policy` argument and `call_native()` indirection are gone (knobs are
-read in C++, sm70/csrc/turbomind/ops/tm_config.h), and `_C::` became
-`_sm70_C::`. Each fork function is marked with its source lines; see
-sm70/csrc/turbomind/PROVENANCE.md for the full move list.
-
-Importing this module registers the fakes for every op that the loaded
-`_sm70_C` provides (AWQ ops exist only in a VLLM_SM70_TM_AWQ build).
-Wrappers raise RuntimeError when their op is missing.
+Tuning knobs are read in C++ (sm70/csrc/turbomind/ops/tm_config.h), not
+passed from Python. Importing this module registers the fakes for every op
+that the loaded `_sm70_C` provides (AWQ ops exist only in a
+VLLM_SM70_TM_AWQ build). Wrappers raise RuntimeError when their op is
+missing.
 """
 
 from __future__ import annotations
@@ -50,16 +46,14 @@ def _op(name: str):
 
 
 # ---------------------------------------------------------------------------
-# fp16 helpers: from fork cf9492a vllm/_sm70/auxiliary.py
+# fp16 helpers
 # ---------------------------------------------------------------------------
 
 
-# fork vllm/_sm70/auxiliary.py:10-11
 def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
     _op("silu_and_mul_interleaved")(out, input)
 
 
-# fork vllm/_sm70/auxiliary.py:14-19
 if has_op("silu_and_mul_interleaved"):
 
     @register_fake("_sm70_C::silu_and_mul_interleaved")
@@ -68,7 +62,6 @@ if has_op("silu_and_mul_interleaved"):
         return None
 
 
-# fork vllm/_sm70/auxiliary.py:706-711
 def sm70_f16_gate_mul_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -77,7 +70,6 @@ def sm70_f16_gate_mul_out(
     _op("sm70_f16_gate_mul_out")(out, input, gate_weight)
 
 
-# fork vllm/_sm70/auxiliary.py:714-722
 if has_op("sm70_f16_gate_mul_out"):
 
     @register_fake("_sm70_C::sm70_f16_gate_mul_out")
@@ -89,11 +81,11 @@ if has_op("sm70_f16_gate_mul_out"):
         return None
 
 # ---------------------------------------------------------------------------
-# dense GEMM: from fork cf9492a vllm/_sm70/linear.py
+# dense GEMM
 # ---------------------------------------------------------------------------
 
 
-# fork vllm/_sm70/linear.py:78-94  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -110,7 +102,6 @@ def awq_sm70_prepare(
     )
 
 
-# fork vllm/_sm70/linear.py:97-118
 if has_op("awq_sm70_prepare"):
 
     @register_fake("_sm70_C::awq_sm70_prepare")
@@ -132,11 +123,11 @@ if has_op("awq_sm70_prepare"):
         )
         meta = torch.empty(
             (2,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [tm_weight, tm_scales, meta]
 
 
-# fork vllm/_sm70/linear.py:121-137  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_sm70_prepare_compact(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -153,7 +144,6 @@ def awq_sm70_prepare_compact(
     )
 
 
-# fork vllm/_sm70/linear.py:140-161
 if has_op("awq_sm70_prepare_compact"):
 
     @register_fake("_sm70_C::awq_sm70_prepare_compact")
@@ -175,11 +165,11 @@ if has_op("awq_sm70_prepare_compact"):
         )
         meta = torch.empty(
             (2,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [tm_weight, tm_scales, meta]
 
 
-# fork vllm/_sm70/linear.py:164-173  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_sm70_dequantize_out(
     out: torch.Tensor,
     qweight: torch.Tensor,
@@ -189,7 +179,6 @@ def awq_sm70_dequantize_out(
     _op("awq_sm70_dequantize_out")(out, qweight, scales, group_size)
 
 
-# fork vllm/_sm70/linear.py:176-187
 if has_op("awq_sm70_dequantize_out"):
 
     @register_fake("_sm70_C::awq_sm70_dequantize_out")
@@ -203,7 +192,7 @@ if has_op("awq_sm70_dequantize_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:190-206  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def uint4_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -220,7 +209,6 @@ def uint4_sm70_prepare(
     )
 
 
-# fork vllm/_sm70/linear.py:209-235
 if has_op("uint4_sm70_prepare"):
 
     @register_fake("_sm70_C::uint4_sm70_prepare")
@@ -247,11 +235,10 @@ if has_op("uint4_sm70_prepare"):
         )
         meta = torch.empty(
             (2,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [tm_weight, tm_scales, meta]
 
 
-# fork vllm/_sm70/linear.py:238-252
 def fp8_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -266,7 +253,6 @@ def fp8_sm70_prepare(
     )
 
 
-# fork vllm/_sm70/linear.py:255-276
 if has_op("fp8_sm70_prepare"):
 
     @register_fake("_sm70_C::fp8_sm70_prepare")
@@ -288,11 +274,10 @@ if has_op("fp8_sm70_prepare"):
         )
         meta = torch.empty(
             (2,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [tm_weight, tm_scales, meta]
 
 
-# fork vllm/_sm70/linear.py:279-288
 def fp8_sm70_dequantize_out(
     out: torch.Tensor,
     qweight: torch.Tensor,
@@ -302,7 +287,6 @@ def fp8_sm70_dequantize_out(
     _op("fp8_sm70_dequantize_out")(out, qweight, scales, group_size)
 
 
-# fork vllm/_sm70/linear.py:291-302
 if has_op("fp8_sm70_dequantize_out"):
 
     @register_fake("_sm70_C::fp8_sm70_dequantize_out")
@@ -316,14 +300,13 @@ if has_op("fp8_sm70_dequantize_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:350-364
 def nvfp4_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     group_size: int = 16,
     interleave_gated_silu: bool = False,
 ) -> list[torch.Tensor]:
-    """NVFP4 (W4A16, group 16) weight prepare for TurboMind (K03 contract).
+    """NVFP4 (W4A16, group 16) weight prepare for TurboMind.
 
     qweight: uint8 [K, N], one e2m1 code per byte. scales: fp16 [K/16, N],
     with the global scale already folded in by the caller. Returns
@@ -338,7 +321,6 @@ def nvfp4_sm70_prepare(
     )
 
 
-# fork vllm/_sm70/linear.py:367-392
 if has_op("nvfp4_sm70_prepare"):
 
     @register_fake("_sm70_C::nvfp4_sm70_prepare")
@@ -364,27 +346,25 @@ if has_op("nvfp4_sm70_prepare"):
         )
         meta = torch.empty(
             (2,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [tm_weight, tm_scales, meta]
 
 
-# fork vllm/_sm70/linear.py:395-398
 def sm70_f16_prepare(weight: torch.Tensor) -> list[torch.Tensor]:
     return _op("sm70_f16_prepare")(weight)
 
 
-# fork vllm/_sm70/linear.py:401-408
 if has_op("sm70_f16_prepare"):
 
     @register_fake("_sm70_C::sm70_f16_prepare")
     def _sm70_f16_prepare_fake(weight: torch.Tensor) -> list[torch.Tensor]:
         meta = torch.empty(
             (1,), dtype=torch.int64, device="cpu"
-        )  # K03: C++ returns a CPU tensor
+        )  # C++ returns a CPU tensor
         return [torch.empty_like(weight), meta]
 
 
-# fork vllm/_sm70/linear.py:432-450  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_gemm_sm70(
     input: torch.Tensor,
     qweight: torch.Tensor,
@@ -403,7 +383,6 @@ def awq_gemm_sm70(
     )
 
 
-# fork vllm/_sm70/linear.py:453-470
 if has_op("awq_gemm_sm70"):
 
     @register_fake("_sm70_C::awq_gemm_sm70")
@@ -423,7 +402,7 @@ if has_op("awq_gemm_sm70"):
         )
 
 
-# fork vllm/_sm70/linear.py:473-495  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -446,7 +425,6 @@ def awq_gemm_sm70_out(
     )
 
 
-# fork vllm/_sm70/linear.py:498-512
 if has_op("awq_gemm_sm70_out"):
 
     @register_fake("_sm70_C::awq_gemm_sm70_out")
@@ -463,7 +441,6 @@ if has_op("awq_gemm_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:572-610
 def fp8_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -500,7 +477,6 @@ def fp8_gemm_sm70_out(
     )
 
 
-# fork vllm/_sm70/linear.py:613-628
 if has_op("fp8_gemm_sm70_out"):
 
     @register_fake("_sm70_C::fp8_gemm_sm70_out")
@@ -518,7 +494,6 @@ if has_op("fp8_gemm_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:631-651
 def fp8_gemm_sm70_prefill_prescaled_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -539,7 +514,6 @@ def fp8_gemm_sm70_prefill_prescaled_out(
     )
 
 
-# fork vllm/_sm70/linear.py:654-667
 if has_op("fp8_gemm_sm70_prefill_prescaled_out"):
 
     @register_fake("_sm70_C::fp8_gemm_sm70_prefill_prescaled_out")
@@ -555,7 +529,6 @@ if has_op("fp8_gemm_sm70_prefill_prescaled_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:670-690
 def fp8_gemm_sm70_prescaled_m1_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -576,7 +549,6 @@ def fp8_gemm_sm70_prescaled_m1_out(
     )
 
 
-# fork vllm/_sm70/linear.py:693-706
 if has_op("fp8_gemm_sm70_prescaled_m1_out"):
 
     @register_fake("_sm70_C::fp8_gemm_sm70_prescaled_m1_out")
@@ -592,7 +564,6 @@ if has_op("fp8_gemm_sm70_prescaled_m1_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:1672-1698
 def fp8_gemm_sm70_prefill_dispatch_out(
     out: torch.Tensor,
     dense_weight_ptr: int,
@@ -619,7 +590,6 @@ def fp8_gemm_sm70_prefill_dispatch_out(
     )
 
 
-# fork vllm/_sm70/linear.py:1701-1718
 if has_op("fp8_gemm_sm70_prefill_dispatch_out"):
 
     @register_fake("_sm70_C::fp8_gemm_sm70_prefill_dispatch_out")
@@ -639,7 +609,6 @@ if has_op("fp8_gemm_sm70_prefill_dispatch_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:1763-1785
 def nvfp4_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -662,7 +631,6 @@ def nvfp4_gemm_sm70_out(
     )
 
 
-# fork vllm/_sm70/linear.py:1788-1802
 if has_op("nvfp4_gemm_sm70_out"):
 
     @register_fake("_sm70_C::nvfp4_gemm_sm70_out")
@@ -679,13 +647,13 @@ if has_op("nvfp4_gemm_sm70_out"):
         return None
 
 
-# K11: Flint NVFP4 M<=2 GEMV (sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu).
+# Flint NVFP4 M<=2 GEMV (sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu).
 # Per-rank (K, N) that the kernel's launch table covers: the Flint ModelOpt
 # W4A16 dense layers at TP2 (qkv, o, shared-expert gate/up and down,
 # dense-MLP gate/up and down). The op falls back to nvfp4_gemm_sm70_out for
 # every other shape, for M > 2, and for operands the GEMV can't read
 # (non-16-byte-aligned or badly strided activations). Admission (which
-# layers call this op) is M3's (vllm_sm70/quant/nvfp4_linear.py
+# layers call this op) is in vllm_sm70/quant/nvfp4_linear.py (
 # MODELOPT_NVFP4_GEMV_SHAPES); tests/ops/test_k11_nvfp4_tm_gemv_cpu.py keeps
 # the three sets equal.
 NVFP4_TM_GEMV_SHAPES = frozenset(
@@ -719,7 +687,6 @@ def nvfp4_tm_gemv_takes_gemv(
     )
 
 
-# fork vllm/_sm70/linear.py:1805-1828
 def nvfp4_tm_gemv_dispatch_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -743,7 +710,6 @@ def nvfp4_tm_gemv_dispatch_sm70_out(
     )
 
 
-# fork vllm/_sm70/linear.py:1831-1845
 if has_op("nvfp4_tm_gemv_dispatch_sm70_out"):
 
     @register_fake("_sm70_C::nvfp4_tm_gemv_dispatch_sm70_out")
@@ -760,7 +726,6 @@ if has_op("nvfp4_tm_gemv_dispatch_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:1848-1870
 def nvfp4_gemm_sm70_prescaled_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -783,7 +748,6 @@ def nvfp4_gemm_sm70_prescaled_out(
     )
 
 
-# fork vllm/_sm70/linear.py:1873-1887
 if has_op("nvfp4_gemm_sm70_prescaled_out"):
 
     @register_fake("_sm70_C::nvfp4_gemm_sm70_prescaled_out")
@@ -800,7 +764,6 @@ if has_op("nvfp4_gemm_sm70_prescaled_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:2001-2010
 def fp8_gemm_sm70_out_auto(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -810,7 +773,6 @@ def fp8_gemm_sm70_out_auto(
     _op("fp8_gemm_sm70_out_auto")(out, input, qweight, scales)
 
 
-# fork vllm/_sm70/linear.py:2013-2031
 def fp8_gemm_sm70_out_meta(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -829,12 +791,10 @@ def fp8_gemm_sm70_out_meta(
     )
 
 
-# fork vllm/_sm70/linear.py:2034-2037
 def sm70_f16_gemm(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _op("sm70_f16_gemm")(input, weight)
 
 
-# fork vllm/_sm70/linear.py:2040-2052
 if has_op("sm70_f16_gemm"):
 
     @register_fake("_sm70_C::sm70_f16_gemm")
@@ -849,7 +809,6 @@ if has_op("sm70_f16_gemm"):
         )
 
 
-# fork vllm/_sm70/linear.py:2055-2065
 def sm70_f16_gemm_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -860,7 +819,6 @@ def sm70_f16_gemm_out(
     _op("sm70_f16_gemm_out")(out, input, weight, k_ld, gated_silu)
 
 
-# fork vllm/_sm70/linear.py:2068-2079
 if has_op("sm70_f16_gemm_out"):
 
     @register_fake("_sm70_C::sm70_f16_gemm_out")
@@ -874,22 +832,19 @@ if has_op("sm70_f16_gemm_out"):
         return None
 
 
-# fork vllm/_sm70/linear.py:2103-2106
 def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
     return _op("sm70_gemm_import_cache")(device_hint, path)
 
 
-# fork vllm/_sm70/linear.py:2109-2112
 def sm70_gemm_export_cache(device_hint: torch.Tensor, path: str) -> int:
     return _op("sm70_gemm_export_cache")(device_hint, path)
 
 
 # ---------------------------------------------------------------------------
-# MoE: from fork cf9492a vllm/_sm70/moe.py
+# MoE
 # ---------------------------------------------------------------------------
 
 
-# fork vllm/_sm70/moe.py:837-863
 def nvfp4_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -916,7 +871,6 @@ def nvfp4_moe_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:866-882
 if has_op("nvfp4_moe_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::nvfp4_moe_dense_stage_sm70_out")
@@ -975,7 +929,6 @@ def nvfp4_moe_dense_stage_route(rows: int, num_experts: int, k: int, n: int) -> 
     return "per_expert"
 
 
-# fork vllm/_sm70/moe.py:1083-1099
 def awq_moe_build_strided_ptrs(
     tm_weights: torch.Tensor,
     tm_scales: torch.Tensor,
@@ -992,7 +945,6 @@ def awq_moe_build_strided_ptrs(
     )
 
 
-# fork vllm/_sm70/moe.py:1102-1116
 if has_op("awq_moe_build_strided_ptrs"):
 
     @register_fake("_sm70_C::awq_moe_build_strided_ptrs")
@@ -1009,7 +961,7 @@ if has_op("awq_moe_build_strided_ptrs"):
         return [torch.empty(buf, **opts), torch.empty(buf, **opts)]
 
 
-# fork vllm/_sm70/moe.py:1119-1145  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_gemm_sm70_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -1036,7 +988,7 @@ def awq_moe_gemm_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1148-1174  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_gemm_sm70_per_expert_dispatch_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -1063,7 +1015,6 @@ def awq_moe_gemm_sm70_per_expert_dispatch_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1177-1193
 if has_op("awq_moe_gemm_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_gemm_sm70_out")
@@ -1082,7 +1033,6 @@ if has_op("awq_moe_gemm_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1196-1212
 if has_op("awq_moe_gemm_sm70_per_expert_dispatch_out"):
 
     @register_fake("_sm70_C::awq_moe_gemm_sm70_per_expert_dispatch_out")
@@ -1101,7 +1051,7 @@ if has_op("awq_moe_gemm_sm70_per_expert_dispatch_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1215-1242  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1128,7 +1078,6 @@ def awq_moe_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1245-1261
 if has_op("awq_moe_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_dense_stage_sm70_out")
@@ -1147,7 +1096,7 @@ if has_op("awq_moe_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1316-1345  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_active_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1176,7 +1125,6 @@ def awq_moe_active_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1348-1365
 if has_op("awq_moe_active_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_active_dense_stage_sm70_out")
@@ -1196,7 +1144,6 @@ if has_op("awq_moe_active_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1368-1417
 def awq_moe_chunked_w2_sm70_out(
     out: torch.Tensor,
     chunk_output: torch.Tensor,
@@ -1245,7 +1192,6 @@ def awq_moe_chunked_w2_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1420-1447
 if has_op("awq_moe_chunked_w2_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_chunked_w2_sm70_out")
@@ -1275,7 +1221,7 @@ if has_op("awq_moe_chunked_w2_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1450-1477  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1302,7 +1248,6 @@ def awq_moe_single_token_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1480-1496
 if has_op("awq_moe_single_token_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_dense_stage_sm70_out")
@@ -1321,7 +1266,7 @@ if has_op("awq_moe_single_token_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1499-1526  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_indexed_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1348,7 +1293,6 @@ def awq_moe_single_token_indexed_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1529-1545
 if has_op("awq_moe_single_token_indexed_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_indexed_dense_stage_sm70_out")
@@ -1367,7 +1311,7 @@ if has_op("awq_moe_single_token_indexed_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1548-1583  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1402,7 +1346,6 @@ def awq_moe_single_token_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1586-1606
 if has_op("awq_moe_single_token_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_dense_w13_sm70_out")
@@ -1425,7 +1368,7 @@ if has_op("awq_moe_single_token_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1609-1644  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_indexed_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1460,7 +1403,6 @@ def awq_moe_single_token_indexed_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1647-1667
 if has_op("awq_moe_single_token_indexed_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_indexed_dense_w13_sm70_out")
@@ -1483,7 +1425,7 @@ if has_op("awq_moe_single_token_indexed_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1670-1709  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_compact_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1522,7 +1464,6 @@ def awq_moe_single_token_compact_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1712-1734
 if has_op("awq_moe_single_token_compact_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_compact_dense_w13_sm70_out")
@@ -1547,7 +1488,6 @@ if has_op("awq_moe_single_token_compact_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1737-1758
 def awq_moe_single_token_exact_layout_prepare(
     topk_ids: torch.Tensor,
     x: torch.Tensor,
@@ -1568,7 +1508,6 @@ def awq_moe_single_token_exact_layout_prepare(
     )
 
 
-# fork vllm/_sm70/moe.py:1761-1774
 if has_op("awq_moe_single_token_exact_layout_prepare"):
 
     @register_fake("_sm70_C::awq_moe_single_token_exact_layout_prepare")
@@ -1584,7 +1523,6 @@ if has_op("awq_moe_single_token_exact_layout_prepare"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1777-1796
 def awq_moe_single_token_weighted_reduce_out(
     sorted_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1603,7 +1541,6 @@ def awq_moe_single_token_weighted_reduce_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1799-1811
 if has_op("awq_moe_single_token_weighted_reduce_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_weighted_reduce_out")
@@ -1618,7 +1555,7 @@ if has_op("awq_moe_single_token_weighted_reduce_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1860-1915  # K04: registered only with VLLM_SM70_TM_AWQ
+# registered only with VLLM_SM70_TM_AWQ
 def awq_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -1673,7 +1610,6 @@ def awq_moe_single_token_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:1918-1973
 if has_op("awq_moe_single_token_sm70_out"):
 
     @register_fake("_sm70_C::awq_moe_single_token_sm70_out")
@@ -1731,7 +1667,6 @@ if has_op("awq_moe_single_token_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:1976-2002
 def fp8_moe_gemm_sm70_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -1758,7 +1693,6 @@ def fp8_moe_gemm_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2005-2031
 def fp8_moe_gemm_sm70_per_expert_dispatch_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -1785,7 +1719,6 @@ def fp8_moe_gemm_sm70_per_expert_dispatch_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2034-2050
 if has_op("fp8_moe_gemm_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_gemm_sm70_out")
@@ -1804,7 +1737,6 @@ if has_op("fp8_moe_gemm_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2053-2069
 if has_op("fp8_moe_gemm_sm70_per_expert_dispatch_out"):
 
     @register_fake("_sm70_C::fp8_moe_gemm_sm70_per_expert_dispatch_out")
@@ -1823,7 +1755,6 @@ if has_op("fp8_moe_gemm_sm70_per_expert_dispatch_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2072-2099
 def fp8_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1850,7 +1781,6 @@ def fp8_moe_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2102-2118
 if has_op("fp8_moe_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_dense_stage_sm70_out")
@@ -1869,7 +1799,6 @@ if has_op("fp8_moe_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2121-2148
 def fp8_moe_single_token_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1896,7 +1825,6 @@ def fp8_moe_single_token_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2151-2167
 if has_op("fp8_moe_single_token_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_dense_stage_sm70_out")
@@ -1915,7 +1843,6 @@ if has_op("fp8_moe_single_token_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2170-2197
 def fp8_moe_single_token_indexed_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1942,7 +1869,6 @@ def fp8_moe_single_token_indexed_dense_stage_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2200-2216
 if has_op("fp8_moe_single_token_indexed_dense_stage_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_indexed_dense_stage_sm70_out")
@@ -1961,7 +1887,6 @@ if has_op("fp8_moe_single_token_indexed_dense_stage_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2219-2254
 def fp8_moe_single_token_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1996,7 +1921,6 @@ def fp8_moe_single_token_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2257-2277
 if has_op("fp8_moe_single_token_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_dense_w13_sm70_out")
@@ -2019,7 +1943,6 @@ if has_op("fp8_moe_single_token_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2280-2315
 def fp8_moe_single_token_indexed_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -2054,7 +1977,6 @@ def fp8_moe_single_token_indexed_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2318-2338
 if has_op("fp8_moe_single_token_indexed_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_indexed_dense_w13_sm70_out")
@@ -2077,7 +1999,6 @@ if has_op("fp8_moe_single_token_indexed_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2341-2380
 def fp8_moe_single_token_compact_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -2116,7 +2037,6 @@ def fp8_moe_single_token_compact_dense_w13_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2383-2405
 if has_op("fp8_moe_single_token_compact_dense_w13_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_compact_dense_w13_sm70_out")
@@ -2141,7 +2061,6 @@ if has_op("fp8_moe_single_token_compact_dense_w13_sm70_out"):
         return None
 
 
-# fork vllm/_sm70/moe.py:2408-2485
 def fp8_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -2218,7 +2137,6 @@ def fp8_moe_single_token_sm70_out(
     )
 
 
-# fork vllm/_sm70/moe.py:2488-2529
 if has_op("fp8_moe_single_token_sm70_out"):
 
     @register_fake("_sm70_C::fp8_moe_single_token_sm70_out")
@@ -2263,7 +2181,7 @@ if has_op("fp8_moe_single_token_sm70_out"):
 
 
 # ---------------------------------------------------------------------------
-# Fakes the fork did not have, so that every _sm70_C op schema has one.
+# Further fakes, so that every _sm70_C op schema has one.
 # ---------------------------------------------------------------------------
 
 if has_op("fp8_gemm_sm70_out_auto"):
@@ -2307,7 +2225,7 @@ if has_op("sm70_gemm_export_cache"):
 
 
 # ---------------------------------------------------------------------------
-# Runtime ops (K02 gemm_runtime.cpp; tm_runtime_close is new in K03).
+# Runtime ops (gemm_runtime.cpp).
 # ---------------------------------------------------------------------------
 
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 // FlashQLA SM70 gated-delta-net kernels (Qwen team, Alibaba Group; MIT, see
-// LICENSE). Vendored for vllm-sm70 (K08) from fork cf9492a; the changes
-// against the fork are listed in PROVENANCE.md.
+// LICENSE). Source and changes: PROVENANCE.md.
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -274,8 +273,8 @@ __global__ void gdn_decode_mixed_qkv_global_state_kernel(
   const int hq = hv / (v_heads / q_heads);
   const int32_t slot = state_indices[t];
 
-  // K08: slot 0 is vLLM's NULL_BLOCK_ID (UP v1/attention/backends/utils.py:55)
-  // and upstream's packed decode skips state_idx <= 0; the fork skipped < 0.
+  // Slot 0 is vLLM's NULL_BLOCK_ID (v1/attention/backends/utils.py); skip it
+  // as upstream's packed decode skips state_idx <= 0.
   if (slot <= 0 || slot >= slots) {
     if (lane == 0) {
       const int64_t out_base = (static_cast<int64_t>(t) * v_heads + hv) * V;
@@ -634,15 +633,13 @@ void validate_same_device(const torch::Tensor& tensor,
               " must be on the same CUDA device as q");
 }
 
-// Columns of V handled per thread subgroup. The fork's thread-local policy
-// and FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK override are gone (K08); only
-// the shape heuristic remains.
+// Columns of V handled per thread subgroup, from a shape heuristic.
 int get_column_groups_per_block(int tokens,
                                 int q_heads,
                                 int v_heads) {
   // Real Qwen3.5/Qwen3.6 SM70 shapes are dominated by Hv=8/12/16/24/32
-  // after TP. V100 has no native bf16, so the default is derived from the
-  // fp16 production path.
+  // after TP. Volta has no native bf16, so the default is derived from the
+  // fp16 path.
   if (v_heads == 24 || v_heads == 48) {
     return 2;
   }
@@ -683,8 +680,7 @@ int64_t gdn_resolve_column_groups_per_block(int64_t tokens, int64_t q_heads,
 }
 
 // Writes output [1, T, Hv, V] and final_state [N, Hv, V, K] (fp32). The
-// fork allocated both and could validate cu_seqlens on the host (a device
-// sync); here the caller allocates them and cu_seqlens is trusted.
+// caller allocates both; cu_seqlens is trusted (no host-side validation).
 void gdn_forward_vlk_varlen_out(
     torch::Tensor output,
     torch::Tensor final_state,
@@ -993,8 +989,8 @@ void gdn_decode_mixed_qkv_global_state(torch::Tensor mixed_qkv,
   check_cuda(cudaGetLastError(), "gdn_decode_mixed_qkv_global_state launch");
 }
 
-// K08: registration in the _sm70_C namespace (replaces the fork's pybind11
-// module). Out ops return nothing; fakes live in vllm_sm70/gdn/kernels.py.
+// Registration in the _sm70_C namespace. Out ops return nothing; fakes live
+// in vllm_sm70/gdn/kernels.py.
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
   m.def(
       "gdn_forward_vlk_varlen_out(Tensor(a!) output, Tensor(b!) final_state, "

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M12 Inkling 2 image preprocessing and placeholder expansion
+"""Tests for Inkling 2 image preprocessing and placeholder expansion
 (vllm_sm70/models/inkling2_sm70/processing.py).
 
 CPU only: grid and token counts, fp16 raw pixels with -1 padding, alpha on the

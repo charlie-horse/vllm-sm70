@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""F12 CPU checks: the greedy vocab-parallel top-1 fast path on the U4 hook.
+"""CPU checks: the greedy vocab-parallel top-1 fast path on the sampler hook.
 
-* Identity: on a fake 2-rank vocab split (real ParallelLMHead shards and the
+* Identity: on a fake 2-rank vocab split (real ParallelLMHead shards, the
   real LogitsProcessor, a stand-in all-gather), every rank's token equals
-  ``argmax`` over the gathered, trimmed logits, which is what upstream's
+  ``argmax`` over the gathered, trimmed logits, as upstream's
   ``Sampler.greedy_sample`` returns on CUDA: random logits, exact ties
-  across and inside ranks (first index wins), a padded last shard whose
-  padding would otherwise win, and the Flint TP2 vocabulary.
+  across and inside ranks, a padded last shard whose padding would
+  otherwise win, and the Flint TP2 vocabulary.
 * The hook: all-greedy batches take the greedy route; every case upstream's
   Sampler would do more than argmax for returns None; switch=0 (env or
   Sm70Config) restores the upstream path, and with VLLM_SM70_FLINT_SAMPLER=0
   too there is no hook at all.
-
 No GPU and no built _sm70_C: a fake "cuda:0" that reports sm_70 (the
 capability query is patched) drives the admission branches.
 """
@@ -109,7 +108,7 @@ def _reference(lp, heads, hidden):
 
 
 def _fast_path(monkeypatch, vllm_env, lp, heads, hidden):
-    """Every rank's F12 token, with a stand-in for the pair all-gather."""
+    """Every rank's fast-path token, with a stand-in for the pair all-gather."""
     import vllm.model_executor.layers.logits_processor as lp_mod
 
     tp_size = len(heads)
@@ -172,7 +171,7 @@ def test_tp_sizes(monkeypatch, vllm_env, tp_size):
 
 def test_masked_padding_never_wins(monkeypatch, vllm_env):
     # 509 pads to 512 (64-aligned): rank 1 holds 253 tokens and 3 padding
-    # rows, poisoned to dominate. Upstream trims them; F12 masks them.
+    # rows, poisoned to dominate. Upstream trims them; the fast path masks them.
     g = torch.Generator().manual_seed(0)
     weight = torch.randn(509, 16, generator=g)
     hidden = torch.rand(4, 16, generator=g) + 0.5  # positive: poison wins unmasked
@@ -274,7 +273,7 @@ def test_device_reject_reason(monkeypatch):
     assert sample_greedy.device_reject_reason(torch.device("cuda", 0)) is None
 
 
-# ------------------------------------------------------------- the U4 hook
+# ---------------------------------------------------------- the sampler hook
 
 
 def _metadata(rows=1, **overrides):
@@ -575,8 +574,8 @@ def test_switch_zero_restores_the_upstream_path(hook, greedy_calls, monkeypatch)
     monkeypatch.setenv(GREEDY_SWITCH, "0")
     h = hook()
     assert not h.greedy_enabled
-    # The all-greedy batch now goes to K16's route, which rejects it
-    # (temperature 0) -> None: compute_logits + the upstream Sampler.
+    # The all-greedy batch now goes to the top-k sampler route, which rejects
+    # it (temperature 0) -> None: compute_logits + the upstream Sampler.
     assert h.route(_metadata()) == TOPK
     assert h.reject_reason(_model(), torch.empty(1, 8), _metadata(), _sched(), None)
     assert _try(h) is None

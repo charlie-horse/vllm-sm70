@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Cost of the captured-decode envelope (Quinn's #39 note), K07.
+"""Cost of the captured Flash-V100 decode envelope.
 
-Under CUDA-graph capture the Flash-V100 decode launches enough partitions
-for max_model_len (vllm_sm70/attention/flash_v100/dispatch.py), because a
-graph replays for any context. This script measures, per model shape,
-max_model_len and live context, the decode time per step for:
-
-  eager       uncaptured, grid sized for the live context (what PIECEWISE
-              graphs and eager mode run)
-  graph-env   captured with the max_model_len envelope (what FULL graphs
-              run today)
-  graph-ctx   captured with a grid sized for the live context (what a
-              context-bucketed capture would run)
-
-and the decode workspace (tmp_out + max_logits + exp_sums) for each sizing,
-with its partition size and the tokens it covers. An envelope of 32768 or
-more plans 1024-token partitions (fv100._select_default_decode_partition_size)
-where a shorter capture plans 256, so the envelope workspace can be the
-smaller one. One attention layer, one decode step; multiply by the layer
-count for a model step. Needs an SM70 GPU and _sm70_C with the K05 ops.
+Under CUDA-graph capture the Flash-V100 decode launches enough partitions for
+max_model_len, because a graph replays for any context. Per model shape,
+max_model_len and live context, this times one attention layer's decode step:
+  eager       uncaptured, grid sized for the live context (PIECEWISE / eager)
+  graph-env   captured with the max_model_len envelope (FULL graphs)
+  graph-ctx   captured with a grid sized for the live context
+and reports each sizing's decode workspace (tmp_out + max_logits + exp_sums),
+partition size and covered tokens. An envelope >= 32768 plans 1024-token
+partitions where a shorter one plans 256, so its workspace can be smaller.
+Needs an SM70 GPU and _sm70_C with the Flash-V100 ops.
 
   python sm70/tools/bench_fv100_capture.py [--batch 1] [--iters 200] [--json out.json]
 """

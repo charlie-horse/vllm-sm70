@@ -2,35 +2,17 @@
 """Inkling 2 (looped) on SM70: the registered model class.
 
     Inkling2LoopSm70ForConditionalGeneration
-      model            Inkling2Sm70LoopModel (loop.py): embedding, layer
-                       visits, final norm; owns the caches of every visit
-      lm_head          Inkling2Sm70LMHead: the unpadded vocabulary rows, or
-                       this rank's part of them (weights.py ``head_sharded``)
-      logits_processor Inkling2Sm70LogitsProcessor: head GEMM (a GEMV of
-                       2 to 8 rows, gemv.py) in the model dtype,
-                       all-gather of a sharded head, cast to fp32, then
-                       the soft cap; greedy tokens of a batch the
-                       V1 sampler hook admits without the logits (greedy.py)
-      visual           Inkling2VisionEncoder (vision.py), or None when the
-                       image limit per prompt is 0
+      model            Inkling2Sm70LoopModel (loop.py); owns every visit's caches
+      lm_head          Inkling2Sm70LMHead: the vocabulary rows (of this rank)
+      logits_processor head GEMM in the model dtype, all-gather, fp32 soft cap;
+                       greedy tokens without the logits (greedy.py)
+      visual           Inkling2VisionEncoder (vision.py), or None
 
-Weights load through weights.py (parameters), expert_weights.py (experts,
-into each layer's ``mlp``) and the encoder's own loader. Each TP rank builds
-this class and loads its own shards: a slice of the attention heads and of
-the expert intermediate units and, when sharded, of the LM head and the
-token embedding rows; norms, convs, routers and the vision encoder are
-whole on every rank.
-
-DSpark draft features (``SupportsEagle3``): with aux layers set, ``forward``
-returns ``(final, [input of each listed visit..., final])``. A visit input
-is the AttnRes partial block, upstream's ``stack[num_blocks]``.
-
-Images: ``embed_multimodal`` returns one ``[rows * cols, H]`` tensor per
-image; ``embed_input_ids`` writes them over the image-token rows of the
-normed text embeddings, so image rows skip ``embed_norm``. An image over
-``sm70.inkling2.max_image_encoder_tokens`` is refused (the processor refuses
-it first), and the encoder's attention takes its queries in chunks sized so
-that the math SDPA kernel stays inside ``VISION_ATTENTION_BUDGET`` too.
+Weights load through weights.py, expert_weights.py and the encoder's loader;
+each TP rank loads its own shards. With aux layers set (``SupportsEagle3``,
+the DSpark draft features) ``forward`` returns ``(final, [input of each
+listed visit..., final])``. An image over
+``sm70.inkling2.max_image_encoder_tokens`` is refused.
 """
 
 from __future__ import annotations
@@ -73,9 +55,7 @@ __all__ = [
     "vision_query_chunk",
 ]
 
-# Bytes the math SDPA kernel takes per (query, key, head) score in fp16:
-# 5.59 GiB for 6401 tokens and 16 heads on a V100. The memory-efficient
-# kernel torch picks there takes 0.012 GiB.
+# Bytes the math SDPA kernel takes per (query, key, head) score in fp16.
 MATH_SDPA_BYTES_PER_SCORE = 10
 # Bound on one vision attention call if torch falls to the math kernel.
 VISION_ATTENTION_BUDGET = 1 << 30

@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A2's Triton dot: exact FP32 logits of the reranked candidates.
+"""Triton dot for the DFlash2 rerank: exact FP32 logits of the candidates.
 
-FORK cf9492a vllm/model_executor/kernels/lm_head/fp32.py:12-43
-(``indexed_fp32_logits``): one program per (row, candidate) computes
-<x[row], weight[ids[row, c]]> in FP32 from the FP16 head, with no FP16
-rounding of the result. Here the dot loops over K in blocks instead of one
-next_pow2(K)-wide block. Kept apart from dflash2_rerank.py so that module
-imports without vLLM (CPU tests).
+One program per (row, candidate) computes <x[row], weight[ids[row, c]]> in
+FP32 from the FP16 head, with no FP16 rounding of the result; the dot loops
+over K in blocks. Kept apart from dflash2_rerank.py so that module imports
+without vLLM (CPU tests).
 """
 
 from __future__ import annotations

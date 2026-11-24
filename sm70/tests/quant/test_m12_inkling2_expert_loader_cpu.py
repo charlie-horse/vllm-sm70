@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 expert loader (expert_weights.py).
+"""Tests for the Inkling 2 expert loader (expert_weights.py).
 
 CPU, without the Hugging Face Inkling 2 classes: the packed experts of the
 tiny checkpoint (models/fixtures/inkling2_tiny/) are dequantized at TP1 and at

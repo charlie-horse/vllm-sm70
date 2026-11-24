@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 multimodal wiring (model.py, processing.py), on CPU.
+"""Inkling 2 multimodal wiring (model.py, processing.py), on CPU.
 
 The registered model class is built on the tiny checkpoint
 (fixtures/inkling2_tiny) with its vision encoder. The fixture's text + image
@@ -380,7 +380,7 @@ def test_query_chunk_bounds_the_math_kernel(engine):
     chunk = model_module.vision_query_chunk
     budget = model_module.VISION_ATTENTION_BUDGET
     per_score = model_module.MATH_SDPA_BYTES_PER_SCORE
-    # The measured point: 5.59 GiB at 6401 tokens and 16 heads.
+    # The budget covers 5.59 GiB of scores at 6401 tokens and 16 heads.
     assert 6401 * 6401 * 16 * per_score >= 5.59 * 2**30
     assert chunk(10817, 16) == 620
     for tokens, heads in ((10817, 16), (6401, 16), (1601, 16), (26, 2), (10**9, 16)):

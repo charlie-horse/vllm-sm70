@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 expert activation fake-quant (emulation of the upstream A4/A8 GEMMs).
 
-What: with ``sm70.inkling2.expert_act_fake_quant`` the expert input and the
-  post-activation value of every expert GEMM are quantized and dequantized in
-  fp32 and cast back to their dtype, as upstream quantizes them for its
-  NVFP4 and MXFP8 GEMMs. NVFP4 layers: per-token amax / 1536, blocks of 16,
-  the 6.0- or 4.0-based e4m3 block scale with the smaller absolute error
-  (UP vllm/models/inkling2/nvidia/ops/nvfp4.py ``_quantize_row``). MXFP8
-  layers: e4m3 values, a power-of-two scale rounded up per 32 values
-  (UP ops/mxfp8.py ``_mxfp8_block``). The post-activation value is
-  quantized without the route weight (UP ops/activation.py
-  ``swiglu_quantize`` multiplies it in first); its per-token amax spans
-  this rank's intermediate slice, as upstream's.
-Kill-switch: off by default; configuration turns it on.
-
-Every op is elementwise or a fixed-shape reduction: no host sync and no
-data-dependent shape, so it runs inside a captured decode graph.
+With ``sm70.inkling2.expert_act_fake_quant`` (off by default) the expert
+input and the post-activation value of every expert GEMM are quantized and
+dequantized in fp32 and cast back, as upstream quantizes them for its NVFP4
+and MXFP8 GEMMs. NVFP4 layers: per-token amax / 1536, blocks of 16, the 6.0-
+or 4.0-based e4m3 block scale with the smaller absolute error (upstream
+``ops/nvfp4.py`` ``_quantize_row``). MXFP8 layers: e4m3 values, a
+power-of-two scale rounded up per 32 values (``ops/mxfp8.py``). The
+post-activation value is quantized without the route weight; its per-token
+amax spans this rank's intermediate slice. Every op is elementwise or a
+fixed-shape reduction, so it runs inside a captured decode graph.
 """
 
 from __future__ import annotations

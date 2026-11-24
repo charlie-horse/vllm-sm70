@@ -1,25 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 grouped expert route (inkling2_sm70/ops/grouped_gemm.py) and
+"""Inkling 2 grouped expert route (inkling2_sm70/ops/grouped_gemm.py) and
 the soft-capped SwiGLU op (ops/activation.py), on CPU.
 
-- the kill switch VLLM_SM70_INKLING_GROUPED_MOE and the route choice of
-  moe.py; the capacity rule; the kernel sources hold nothing sm_70 rejects;
-- the torch form of the route against the torch expert sum of moe.py
-  (fp32 within 1e-5, fp16 within 2e-3) at M in {1, 2, 8, 40, 64, 512, 600}:
-  slots on the GEMV way only, on both ways, skewed routing past the
-  capacity, padding rows, ids outside 0..E-1, chunks; the MXFP8 layer of
-  the tiny checkpoint against the reference recording;
-- no host sync (inkling2_sync_guard) and the same ops on the same shapes
-  for two routings of one batch size, as a CUDA graph replays them;
+- the kill switch VLLM_SM70_INKLING_GROUPED_MOE, the route choice of moe.py,
+  the capacity rule; the kernel sources hold nothing sm_70 rejects;
+- the torch form of the route against the torch expert sum of moe.py (fp32
+  within 1e-5, fp16 within 2e-3) at M from 1 to 600, skewed routing, padding
+  rows, out-of-range ids, chunks, and the tiny checkpoint's MXFP8 layer;
+- no host sync and the same ops for two routings of one batch size;
 - through Triton's interpreter: the SwiGLU kernel within 1 fp16 ulp of the
-  torch form on random and saturating inputs, bounded by the caps' product
-  (inputs of tiny magnitude only in the GPU test);
-  the slot GEMV kernel; the whole route with its kernels, also through the
-  module and without a host sync.
-
+  torch form, the slot GEMV kernel, the whole route with its kernels.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite); in the parent they show as skipped. The AOT
-compile check is tests/ops/test_m12_inkling2_triton_sm70_compile_cpu.py.
+(test_interpreted_suite). AOT compile check:
+tests/ops/test_m12_inkling2_triton_sm70_compile_cpu.py.
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sm70CudaPlatform.kernel_warmup (U1) runs its steps in a fixed order.
+"""Sm70CudaPlatform.kernel_warmup runs its steps in a fixed order.
 
-(1) #78 TurboMind pre-capture warmup  (vllm_sm70.warmup.run)
-(2) K13 fused router admission       (vllm_sm70.router.prepare_model)
-(3) K16 top-k sampler prepare        (vllm_sm70.sample_v1.prepare_worker)
+(1) TurboMind pre-capture warmup  (vllm_sm70.warmup.run)
+(2) fused router admission        (vllm_sm70.router.prepare_model)
+(3) top-k sampler prepare         (vllm_sm70.sample_v1.prepare_worker)
 
 No step returns early past a later one; a worker without get_model skips
 only (2). A failure in (2) or (3) raises and stops startup (no later step
@@ -54,7 +54,7 @@ def _expected(*, with_model: bool, worker, model) -> list[tuple[str, object]]:
         out.append(("warmup", worker))
     if with_model and _present("vllm_sm70.router"):
         out.append(("router", model))
-    out.append(("sampler", worker))  # K16 is on main
+    out.append(("sampler", worker))
     return out
 
 

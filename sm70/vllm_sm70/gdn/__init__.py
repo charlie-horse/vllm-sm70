@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 gated-delta-net kernels and layer (K08). kernels.py: Kai; layer.py: Mara."""
+"""SM70 gated-delta-net (GDN) kernels and layer."""
 
 import logging
 

@@ -1,45 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 //
-// Two-kernel NVFP4 routed-expert decode for M <= 2 tokens on SM70.
-//
-// The quadpair-N m8n8k4 layout is derived from dnv2003/v100-skinny (MIT), as
-// in mxfp4_qpn_m1_sm70.cu. See LICENSE.v100-skinny in this directory.
-//
-// Both kernels read the TurboMind-packed expert banks in place
-// (w13_tm_weight [E, K, N / 8] int32 and w13_tm_scales [E, K / 16, N] FP16,
-// likewise for W2) and take routing from device expert IDs, so there is no
-// permute, no host synchronization and no data-dependent host branch inside
-// a captured graph:
-//
+// Two-kernel NVFP4 routed-expert decode for M <= 2 tokens on SM70. The
+// quadpair-N m8n8k4 layout is derived from dnv2003/v100-skinny (MIT); see
+// LICENSE.v100-skinny. Source: PROVENANCE.md. Python: ops/flint_moe.py.
 //   1. W13 + SwiGLU: one CTA per (route, 32 gate + 32 up columns, K slice).
-//      FP32 MMA accumulation. Each CTA joins its warps' K partitions in a
-//      fixed order; the last CTA of a (route, tile) to arrive (an integer
-//      arrival counter) sums the FP32 K-slice partials in slice order, rounds
-//      gate and up to FP16 and applies the eager FP16 SiLU-and-multiply
-//      arithmetic. It then re-arms the counter, so the kernel replays from a
-//      CUDA graph without a reset launch.
-//   2. W2 + weighted reduce: one CTA per (token, 32 output columns); one warp
-//      group per routed slot, FP32 accumulation, each routed output rounded
-//      to FP16 (the unfused W2 boundary), then the top-k weighted sum in slot
-//      order in FP32.
+//      The last CTA of a (route, tile) to arrive (integer arrival counter)
+//      sums the FP32 K-slice partials in slice order, rounds gate and up to
+//      FP16, applies the eager FP16 SiLU-and-multiply, then re-arms the
+//      counter, so graph replay needs no reset launch.
+//   2. W2 + weighted reduce: one CTA per (token, 32 output columns); each
+//      routed output is rounded to FP16, then summed with the top-k weights
+//      in slot order in FP32.
+
+// Both kernels read the TurboMind-packed expert banks in place
+// (w13_tm_weight [E, K, N / 8] int32, w13_tm_scales [E, K / 16, N] FP16,
+// likewise for W2) and take routing from device expert IDs: no permute, no
+// host sync, no data-dependent host branch inside a captured graph. Every
+// reduction has a fixed order and no floating-point atomics are used, so
+// results are deterministic. Each warp issues all of its weight, scale and
+// activation loads before its first MMA.
 //
-// Every reduction has a fixed order and no floating-point atomics are used,
-// so results are deterministic and independent of CTA scheduling. Each warp
-// issues all of its weight, scale and activation loads before its first MMA.
-//
-// Scale overflow guard: the decoder forms prepared_scale * 2^14 in FP16. A
-// prepared scale of 4 or more would overflow, so the host passes a power-of-
-// two shift s per projection (chosen at load time from the layer's largest
-// scale). The kernel then uses prepared_scale * 2^(14 - s) and multiplies the
-// FP32 accumulator by 2^s. Both factors are exact, so s = 0 is the unshifted
-// arithmetic.
-//
-// vllm-sm70 port (K12, from fork cf9492a csrc/sm70_turbomind/ops/
-// nvfp4_moe_decode_qpn_sm70.cu): the single-launch fused_decode_kernel and
-// its op are dropped; the ops register in TORCH_LIBRARY_FRAGMENT(_sm70_C)
-// below instead of the fork's csrc/torch_bindings.cpp:1463-1478. Python
-// side: vllm_sm70/ops/flint_moe.py. See PROVENANCE.md in this directory.
+// Scale overflow guard: the decoder forms prepared_scale * 2^14 in FP16,
+// which overflows for a prepared scale of 4 or more. The host passes a
+// power-of-two shift s per projection (from the layer's largest scale); the
+// kernel uses prepared_scale * 2^(14 - s) and multiplies the FP32
+// accumulator by 2^s. Both factors are exact; s = 0 is the unshifted path.
 
 #include <torch/all.h>
 #include <torch/library.h>
@@ -440,9 +426,8 @@ constexpr int kFlintTopK = 6;
 constexpr int kFlintExperts = 256;
 constexpr int kFlintTiles = kFlintIntermediate / 32;
 constexpr int kFlintMaxTokens = 2;
-// Tuned on V100-PCIE-32GB (CUDA graph, 8 rotating routings): W13 runs 16 K
-// slices of 128 per (route, tile) with two warps per projection (four K16
-// groups per warp); W2 runs two warps per routed slot.
+// W13 runs 16 K slices of 128 per (route, tile) with two warps per
+// projection (four K16 groups per warp); W2 runs two warps per routed slot.
 constexpr int kFlintW13SplitWarps = 2;
 constexpr int kFlintW13SplitCta = 16;
 constexpr int kFlintW2SplitWarps = 2;
@@ -623,7 +608,6 @@ void nvfp4_moe_decode_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
 }  // namespace vllm_sm70
 
 // Flint TP2 M<=2 routed-expert decode (W13+SwiGLU, then W2+reduce).
-// fork csrc/torch_bindings.cpp:1463-1478, minus `str? native_policy`.
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
   m.def(
       "nvfp4_moe_decode_w13_swiglu_sm70_out(Tensor(a!) out, Tensor input, "

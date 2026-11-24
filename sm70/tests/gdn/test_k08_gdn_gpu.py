@@ -1,28 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K08 GPU checks for the FlashQLA GDN kernels on SM70 (V100).
+"""GPU checks for the FlashQLA GDN kernels on SM70.
 
-What:
-- The GDN ops come from the built _sm70_C (port of fork
-  tests/kernels/mamba/test_sm70_flashqla_extension.py: there is no pybind
-  loader or JIT fallback any more, so the check is that the ops are
-  registered with CUDA kernels in the installed .so, plus the column-group
-  heuristic and torch.library.opcheck on the schemas and fakes).
-- Prefill route selection (adapted from fork tests/model_executor/layers/
-  test_gdn_prefill_backend_resolve.py): on SM70 the OOT ChunkGatedDeltaRule
-  routes to FlashQLA; VLLM_SM70_GDN_FLASHQLA_PREFILL=0 or a non-fp16 /
-  non-128 tensor keeps upstream Triton/FLA.
+- The GDN ops are registered with CUDA kernels in the built _sm70_C, plus
+  the column-group heuristic and torch.library.opcheck on schemas and fakes.
+- Prefill route selection: on SM70 the OOT ChunkGatedDeltaRule routes to
+  FlashQLA; VLLM_SM70_GDN_FLASHQLA_PREFILL=0 or a non-fp16 / non-128 tensor
+  keeps upstream Triton/FLA.
 - Exactness at the Qwen3.6 TP2 (H8/HV16) and Qwen3.8 TP2 (H8/HV24) shapes,
-  varlen with 2 sequences: FlashQLA prefill output and final state vs
-  upstream Triton fused_recurrent_gated_delta_rule, and FlashQLA decode
-  output and state vs upstream fused_recurrent_gated_delta_rule_packed_decode,
-  each rel-L2 < 1e-3; both also against a float64 recurrence. The prefill
-  comparison with upstream's Triton chunk_gated_delta_rule is opt-in
-  (SM70_TEST_TRITON_CHUNK=1): on sm_70 its kernels take ~10 min of ptxas per
-  shape, which made the 2026-11-06 c4130 run look hung. It runs in a
-  spawned child with a timeout.
-
+  varlen with 2 sequences: FlashQLA prefill and decode output and state vs
+  upstream's fused_recurrent kernels, rel-L2 < 1e-3, and against a float64
+  recurrence. The comparison with upstream's chunk_gated_delta_rule is
+  opt-in (SM70_TEST_TRITON_CHUNK=1, minutes of ptxas per shape on sm_70)
+  and runs in a spawned child with a timeout.
 Run from the repo root: pytest -m gpu sm70/tests/gdn
-(add SM70_TEST_TRITON_CHUNK=1 for the chunk comparison, ~10 min per shape)
 """
 
 from __future__ import annotations
@@ -220,10 +210,9 @@ CHUNK_TIMEOUT_ENV = "SM70_TEST_TRITON_CHUNK_TIMEOUT"
 @pytest.mark.parametrize("h, hv", SHAPES)
 def test_prefill_matches_triton_chunk(gdn_gpu, h, hv):
     """FlashQLA prefill vs upstream Triton chunk_gated_delta_rule. Opt-in:
-    on sm_70 its autotuned tl.dot (FMA-lowered) kernels take ~10 min of
-    ptxas per shape (c4130 run of 2026-11-06 looked hung). Runs in a spawned
-    child (never fork after CUDA init) with a timeout, so a stuck compile
-    fails the test instead of the run."""
+    on sm_70 its autotuned tl.dot (FMA-lowered) kernels take minutes of
+    ptxas per shape. Runs in a spawned child (never fork after CUDA init)
+    with a timeout, so a stuck compile fails the test instead of the run."""
     import multiprocessing as mp
     import os
 

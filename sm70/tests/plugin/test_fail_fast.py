@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""registered_areas(), and fail-fast on SM70 when an area fails (Astro)."""
+"""registered_areas(), and fail-fast on SM70 when an area fails."""
 
 from types import SimpleNamespace
 

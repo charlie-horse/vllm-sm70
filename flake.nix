@@ -1,7 +1,7 @@
 {
   description = "Upstream vLLM for V100 (sm_70): pinned tag + ordered patch series, built with Nix, with NixOS modules";
 
-  # nixpkgs is locked to nixos-26.05 @ 7dcdd87 (the Phase 1 pin sheet).
+  # nixpkgs follows nixos-26.05 (pinned in flake.lock).
   # Hosts should set `inputs.nixpkgs.follows = "nixpkgs"`.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";

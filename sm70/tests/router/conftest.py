@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K13 fused-router tests.
+"""Fixtures for the fused-router tests.
 
 CPU tests need torch and vLLM's Python source. GPU tests are marked `gpu`
-and need an SM70 device, a built vllm_sm70._sm70_C with the K13 op, and a
-built vLLM (the reference route uses its topk_sigmoid). From the repo root:
+and need an SM70 device, a built vllm_sm70._sm70_C with the router op, and
+a built vLLM (the reference route uses its topk_sigmoid). From the repo
+root:
 
     pytest -m gpu sm70/tests/router
 """

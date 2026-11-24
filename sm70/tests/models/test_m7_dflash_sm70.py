@@ -1,32 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M7 dflash2-fp16-range (vllm_sm70/models/qwen/dflash_sm70.py).
+"""Tests for DFlash2 FP16-range emulation (vllm_sm70/models/qwen/dflash_sm70.py).
 
-What: on CPU, checks that the torch-reference BF16-range emulation matches an
-  fp32 reference within BF16 tolerance on inputs where plain FP16 overflows
-  to inf. Also covers the bit-exact RNE helper, the o_proj input scale, the
-  module swap (parameter names unchanged), the gate (cc / draft dtype /
-  runtime dtype), the VLLM_SM70_DFLASH2_EMULATION kill switch, and the
-  ModelRegistry wiring with the GPU / _sm70_C probes mocked. The classes are checked
-  against UP 4ba787e.
-Why: the DFlash2 drafts are BF16-trained but run with --dtype half on V100;
-  without the emulation their residual and SwiGLU products leave FP16 range.
-Kill-switch: VLLM_SM70_DFLASH2_EMULATION is covered below.
+CPU: the torch-reference BF16-range emulation matches an fp32 reference
+within BF16 tolerance on inputs where plain FP16 overflows to inf; the
+bit-exact RNE helper, the o_proj input scale, the module swap (parameter
+names unchanged), the gate (cc / draft dtype / runtime dtype), the
+VLLM_SM70_DFLASH2_EMULATION kill switch, and the ModelRegistry wiring with
+the GPU / _sm70_C probes mocked, against UP 4ba787e. Volta has no BF16, so
+the BF16-trained drafts run with --dtype half and need the emulation.
 
-GPU tests (marker ``gpu``, see sm70/pyproject.toml) for Bea on c4130, with
-the vllm service stopped
-(`systemctl kill --signal=SIGKILL vllm && systemctl stop vllm`), from the
-repo root:
-
-  # Triton vs torch-reference parity: one GPU, no _sm70_C ops needed.
-  CUDA_VISIBLE_DEVICES=0 python -m pytest -q -p no:cacheprovider \\
-      sm70/tests/models/test_m7_dflash_sm70.py -m gpu -k triton
-
-  # Real target + draft end to end: both GPUs (TP2), the built _sm70_C
-  # extension, and the SM70 FP8 path for the target (M6).
-  DFLASH2_E2E_TARGET=/var/lib/vllm/models/Qwen3.8-27B-FP8 \\
-  DFLASH2_E2E_DRAFT=/var/lib/vllm/models/Qwen3.8-27B-DFlash2 \\
-      python -m pytest -q -p no:cacheprovider \\
-      sm70/tests/models/test_m7_dflash_sm70.py -m gpu -k e2e
+GPU (marker ``gpu``): ``-k triton`` (one GPU) checks Triton vs the torch
+reference; ``-k e2e`` (TP2, built _sm70_C, FP8 target) serves
+DFLASH2_E2E_TARGET with draft DFLASH2_E2E_DRAFT. Runs:
+docs/checks.md#qwen-matrix-m7-and-m8.
 """
 
 import os
@@ -420,7 +406,7 @@ def test_attention_forward_copy_matches_upstream_source():
 
 
 # --------------------------------------------------------------------------
-# GPU (Bea, c4130)
+# GPU
 # --------------------------------------------------------------------------
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")

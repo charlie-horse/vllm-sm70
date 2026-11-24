@@ -1,6 +1,6 @@
-# source ~/flint-swebench/env.sh  -- r440 SWE-bench harness environment
+# source ~/flint-swebench/env.sh  -- SWE-bench harness environment
 export R=$HOME/flint-swebench
-export FLINT_API_BASE=http://<c4130-lan-ip>:8000/v1   # c4130 vLLM over LAN (tailnet ACL blocks <c4130-tailnet-ip>)  [IPs redacted on import]
+export FLINT_API_BASE=http://<server-ip>:8000/v1   # the vLLM endpoint; set before use
 # podman (nix, rootless, cgroupfs; runtime dir under $R so it survives logout w/o linger)
 export XDG_RUNTIME_DIR=$R/run
 export CONTAINERS_CONF=$R/conf/containers.conf

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 Mini cache owners for the M12 CPU tests: the vendored
-config.json, a stand-in vLLM config, and the owners built from both."""
+"""Inkling 2 Mini cache owners for the CPU tests: the vendored config.json,
+a stand-in vLLM config, and the owners built from both."""
 
 from __future__ import annotations
 

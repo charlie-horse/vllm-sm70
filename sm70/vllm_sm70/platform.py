@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """vllm.platform_plugins entry point and SM70 readiness checks.
 
-`activate()` runs inside `vllm.platforms.resolve_current_platform_cls_qualname`
-(UP platforms/__init__.py:240-292), i.e. while `current_platform` is still
-unresolved. So this module must not import anything that reads
-`vllm.platforms.current_platform` at import time (that re-enters resolution).
-It only uses NVML, like upstream's cuda_platform_plugin
-(UP platforms/__init__.py:57-84), and never initialises CUDA.
+`activate()` runs while `vllm.platforms.current_platform` is still
+unresolved, so this module must not import anything that reads it at import
+time. It only uses NVML, like upstream's cuda_platform_plugin, and never
+initialises CUDA.
 
 `Sm70CudaPlatform` lives in `vllm_sm70._cuda_platform` and is resolved
 lazily via module `__getattr__`, because importing `vllm.platforms.cuda`
-needs the compiled `vllm._C_stable_libtorch` (UP platforms/cuda.py:23).
+needs the compiled `vllm._C_stable_libtorch`.
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kernels of the Inkling 2 DSpark draft (dspark.py) on sm_70: Triton, no
-tl.dot, no bf16, libdevice tanh/exp. Each op has a torch form, taken with
-``kernel=False``; the torch forms are the reference of the kernels.
+"""Kernels of the Inkling 2 DSpark draft (dspark.py) on sm_70 (no tl.dot, no
+bf16). Each op's torch form (``kernel=False``) is its reference.
 
     mix_rmsnorm      RMSNorm of an alpha-weighted sum of target features
     qk_norm_rope_    in place: per-head Q/K RMSNorm, then neox RoPE
@@ -11,11 +10,9 @@ tl.dot, no bf16, libdevice tanh/exp. Each op has a torch form, taken with
     markov_gate      the Markov head's GRU-style gate
     block_attention  a block of queries per request over its paged keys
 
-Math runs in fp32. Where upstream (vLLM c32251b models/inkling2/nvidia/
-ops/dspark.py) rounds to bf16, these round to the dtype of the tensors they
-store, the model dtype (fp16). block_attention: every query of a request's
-block sees the keys [seq_len - window, seq_len) (all keys with window 0);
-a request with seq_len 0 gets zeros.
+Math runs in fp32; where upstream rounds to bf16, these round to the model
+dtype. block_attention: a block sees keys [seq_len - window, seq_len) (all
+with window 0); a request with seq_len 0 gets zeros.
 """
 
 from __future__ import annotations

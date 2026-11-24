@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 engine-config hook (inkling2_sm70/config.py),
+"""Tests for the Inkling 2 engine-config hook (inkling2_sm70/config.py),
 the ``inkling2`` section of Sm70Config, and the Flint fast paths' answers
 for Inkling 2 shapes.
 
@@ -763,7 +763,7 @@ def router_mod(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FLINT_FUSED_ROUTER", raising=False)
     router._logged.clear()
     router.provider.cache_clear()
-    # U3 is a patch the CPU venv lacks.
+    # The platform-getter patch is absent in the CPU venv.
     monkeypatch.setattr(router, "_u3_present", lambda: True)
     yield router
     router.provider.cache_clear()
@@ -783,7 +783,7 @@ def test_router_admits_no_inkling2_layer(model, router_mod, monkeypatch):
 
 
 def test_router_rejects_an_inkling2_gate_linear(router_mod, monkeypatch):
-    """A real GateLinear with Inkling 2's shape and bias is not K13's GEMM."""
+    """A real GateLinear with Inkling 2's shape and bias is not the fused router's GEMM."""
     import vllm.distributed.parallel_state as ps
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 

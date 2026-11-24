@@ -1,33 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 direct-apply MoE base and its shared routing runtime (M4).
+"""SM70 direct-apply MoE base and its shared routing runtime.
 
-What: ``Sm70MoEMethodBase`` adapts the fork's SM70 MoE methods to the UP
-  4ba787e MoE interface in "direct apply" style: not monolithic and no
-  modular kernel (``moe_kernel`` stays None). ``Sm70MoEWorkspace`` holds the
-  persistent routing and activation scratch, allocated once per (device,
-  shape) in process_weights_after_loading and shared by all layers (they run
-  one after another). ``route()``, ``silu_and_mul()`` and ``unpermute()`` wrap
-  UP's ``_moe_C`` / ``_C`` ops.
-Why: with ``is_monolithic`` False and ``moe_kernel`` None, UP
-  ``MoERunner._apply_quant_method`` (runner/moe_runner.py:620-645) routes with
-  its own router (fp32 weights, int32 ids by default, router/base_router.py
-  :156-165) and calls ``quant_method.apply(layer, x, topk_weights, topk_ids,
-  shared_experts, shared_experts_input)`` through ``RoutedExperts.
-  forward_modular`` (routed_experts.py:1394-1404). ``_fused_output_is_reduced``
-  is then False (moe_runner.py:421-426), so the runner owns the single TP
-  all-reduce (:483-515). Methods here must never all-reduce. Shared experts
-  run in the runner (NO_OVERLAP, :616-618).
-Kill-switch: none here; each method carries its own.
+``Sm70MoEMethodBase`` implements vLLM's MoE interface in "direct apply"
+style: not monolithic and no modular kernel (``moe_kernel`` stays None).
+The runner then routes with its own router (fp32 weights, int32 ids) and
+calls ``quant_method.apply(layer, x, topk_weights, topk_ids, ...)``. The
+runner owns the single TP all-reduce, so methods here must never
+all-reduce. Shared experts run in the runner.
 
-Routing follows the K03 contract agreed with Kai (2026-11-05):
-metadata comes from UP ``_moe_C::moe_prepare_scatter`` (csrc/moe/
-torch_bindings.cpp:122-126) with the fork -> UP mapping
-inv_permuted_idx -> scatter_idx, permuted_idx -> sorted_rows,
-permuted_experts_id -> sorted_experts, and input_row_indices = sorted_rows //
-topk. ``moe_permute_with_scratch`` (:113-119) materializes the permuted input
-when the indexed W13 op is absent. ``moe_unpermute`` (:129-131) does the
-weighted top-k sum.
-"""
+``Sm70MoEWorkspace`` holds the persistent routing and activation scratch,
+allocated once per (device, shape) in process_weights_after_loading and
+shared by all layers. Routing metadata comes from ``_moe_C::
+moe_prepare_scatter`` (scatter_idx, sorted_rows, sorted_experts;
+input_row_indices = sorted_rows // topk). ``moe_unpermute`` does the
+weighted top-k sum. Each method carries its own kill switch."""
 
 from __future__ import annotations
 
@@ -56,27 +42,23 @@ logger = init_logger("vllm.sm70.fused_moe")
 # Validated topologies. TP4+ is out of scope and untested: refuse, never fall
 # back to upstream (which has no cc 7.0 MoE kernel either).
 SUPPORTED_TP_SIZES = (1, 2)
-DEFAULT_MAX_TOKENS = 8192  # FORK nix/module.nix serves --max-num-batched-tokens 8192
+DEFAULT_MAX_TOKENS = 8192
 # Largest routed-slot count (M * top_k) served as compact slot groups: the
 # TurboMind compact grouped bound (tm_moe_sm70.cu kNvfp4MaxCompactGroups).
-# ported from FORK nvfp4_sm70_moe.py:88 (_COMPACT_GROUPED_MAX_SLOTS)
 COMPACT_MAX_SLOTS = 80
 
 
 def use_compact_grouped(num_tokens: int, top_k: int) -> bool:
-    """Bound compact dispatch by its routed-row workload, not batch size.
-
-    ported from FORK nvfp4_sm70_moe.py:718-721 (_use_compact_grouped)
-    """
+    """Bound compact dispatch by its routed-row workload, not batch size."""
     total_slots = num_tokens * top_k
     return 0 < total_slots <= COMPACT_MAX_SLOTS
 
 
 # --------------------------------------------------------------------------
-# UP ops (one indirection, so CPU tests can substitute pure-torch versions)
+# vLLM ops (one indirection, so CPU tests can substitute pure-torch versions)
 # --------------------------------------------------------------------------
 class _UpstreamOps:
-    """UP ``_moe_C`` / ``_C`` ops used by the SM70 MoE route."""
+    """vLLM ``_moe_C`` / ``_C`` ops used by the SM70 MoE route."""
 
     @staticmethod
     def sort_workspace_size(rows: int, n_expert: int) -> int:
@@ -143,10 +125,8 @@ class WorkspaceKey:
 class Sm70MoEWorkspace:
     """Routing + activation scratch for up to ``max_tokens`` tokens.
 
-    ported from FORK fused_moe/sm70/fp4_workspace.py:20-97 (NvFp4MoEWorkspace.
-    allocate), with two changes. It covers every M up to max_tokens (the fork
-    allocated M>18 lazily in forward, :127-190, which K03 forbids), and it is
-    shared by all layers with the same key instead of being allocated per layer.
+    It covers every M up to max_tokens (nothing is allocated in forward) and
+    is shared by all layers with the same key.
     """
 
     _CACHE: ClassVar[dict[WorkspaceKey, Sm70MoEWorkspace]] = {}
@@ -178,8 +158,7 @@ class Sm70MoEWorkspace:
         )
         self.dense_expert_ids = torch.arange(key.experts, **i32)
         # Compact slot groups: group g is routed slot g (one row each), so the
-        # offsets are 0..slots. FORK nvfp4_sm70_moe.py:570-618 writes them per
-        # call with a Triton kernel; they are constant, so they are built once.
+        # offsets are 0..slots. They are constant, so they are built once.
         self.compact_offsets = torch.arange(COMPACT_MAX_SLOTS + 1, **i32)
         # Per-slot expert ids for the compact groups: the sorted ids clamped
         # to [0, experts) (see ModelOptNvFp4Sm70MoEMethod._stage_groups).
@@ -236,8 +215,7 @@ class Sm70MoEWorkspace:
 # Routing primitives
 # --------------------------------------------------------------------------
 def int32_topk_ids(buffers: dict[str, torch.Tensor], topk_ids: torch.Tensor):
-    """UP moe_prepare_scatter requires int32 ids (moe_permute_unpermute_op.cu:73)."""
-    # ported from FORK nvfp4_sm70_moe.py:1563-1564
+    """vLLM's moe_prepare_scatter requires int32 ids."""
     if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
         return topk_ids
     ids = buffers["topk_ids"]
@@ -253,8 +231,7 @@ def route_indexed(
 ) -> None:
     """Expert offsets, scatter indices and W13 input rows; no permuted copy.
 
-    ported from FORK nvfp4_sm70_moe.py:1566-1582 (moe_permute_metadata_with_
-    scratch), rewritten onto UP moe_prepare_scatter per Kai's mapping.
+    Built on vLLM's moe_prepare_scatter.
     """
     OPS.prepare_scatter(
         int32_topk_ids(buffers, topk_ids),
@@ -269,8 +246,8 @@ def route_indexed(
         buffers["sorted_rows"],
         buffers["topk_ids_for_sort"],
     )
-    # input_row_indices = floor(sorted_rows / topk) (fork
-    # permute_unpermute_kernels:117), into the preallocated buffer.
+    # input_row_indices = floor(sorted_rows / topk), into the preallocated
+    # buffer.
     torch.floor_divide(
         buffers["sorted_rows"].view(-1), top_k, out=buffers["input_row_indices"]
     )
@@ -284,10 +261,7 @@ def route_materialized(
     n_expert: int,
     top_k: int,
 ) -> None:
-    """Expert offsets, scatter indices and the permuted input copy.
-
-    ported from FORK nvfp4_sm70_moe.py:1562-1565, 1583-1603.
-    """
+    """Expert offsets, scatter indices and the permuted input copy."""
     slots = buffers["permuted_idx"].numel()
     buffers["permuted_idx"].fill_(slots)
     OPS.permute_with_scratch(
@@ -313,10 +287,7 @@ def route_materialized(
 def unpermute(
     buffers: dict[str, torch.Tensor], topk_weights: torch.Tensor, out: torch.Tensor
 ) -> torch.Tensor:
-    """Weighted top-k sum of sorted_output into out [M, H].
-
-    ported from FORK fused_moe/sm70/fp4_stages.py:99-106.
-    """
+    """Weighted top-k sum of sorted_output into out [M, H]."""
     OPS.unpermute(
         buffers["sorted_output"],
         topk_weights,
@@ -332,22 +303,15 @@ def unpermute(
 # Method base
 # --------------------------------------------------------------------------
 class Sm70MoEMethodBase(FusedMoEMethodBase):
-    """Direct-apply SM70 MoE lifecycle (R1 adapter).
-
-    ported from FORK fused_moe/sm70/method.py:14-70, minus the env policy.
-    """
+    """Direct-apply SM70 MoE lifecycle."""
 
     def __init__(self, moe: FusedMoEConfig) -> None:
-        # UP fused_moe_method_base.py:29-33
         FusedMoEMethodBase.__init__(self, moe)
         self.validate_topology(moe)
 
     @staticmethod
     def validate_topology(moe: FusedMoEConfig) -> None:
-        """TP 1 or 2 only: no TP4+, DP/EP/all2all or sequence parallel.
-
-        ported from FORK nvfp4_sm70_moe.py:752-756.
-        """
+        """TP 1 or 2 only: no TP4+, DP/EP/all2all or sequence parallel."""
         if moe.tp_size not in SUPPORTED_TP_SIZES:
             raise NotImplementedError(
                 f"SM70 MoE supports tensor_parallel_size in {SUPPORTED_TP_SIZES} "
@@ -359,25 +323,25 @@ class Sm70MoEMethodBase(FusedMoEMethodBase):
         if moe.is_sequence_parallel:
             raise NotImplementedError("SM70 MoE does not support sequence parallel.")
 
-    # ---- UP FusedMoEMethodBase surface (fused_moe_method_base.py) ---------
+    # ---- vLLM FusedMoEMethodBase surface ----------------------------------
     @property
-    def supports_internal_mk(self) -> bool:  # UP :35-39
+    def supports_internal_mk(self) -> bool:
         return False
 
     @property
-    def mk_can_overlap_shared_experts(self) -> bool:  # UP :41-47
+    def mk_can_overlap_shared_experts(self) -> bool:
         return False
 
     @property
-    def topk_indices_dtype(self) -> torch.dtype | None:  # UP :108-112
+    def topk_indices_dtype(self) -> torch.dtype | None:
         return None  # router default: int32 ids
 
     @property
-    def supports_eplb(self) -> bool:  # UP :126-128
+    def supports_eplb(self) -> bool:
         return False
 
     @property
-    def is_monolithic(self) -> bool:  # UP :134-141
+    def is_monolithic(self) -> bool:
         return False
 
     def maybe_roundup_sizes(
@@ -387,13 +351,13 @@ class Sm70MoEMethodBase(FusedMoEMethodBase):
         act_dtype: torch.dtype,
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> tuple[int, int]:
-        # UP :70-100. No rounding: TurboMind layouts use checkpoint shapes.
+        # No rounding: TurboMind layouts use checkpoint shapes.
         return hidden_size, intermediate_size_per_partition
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        return None  # no modular kernel (UP routed_experts.py:244-249)
+        return None  # no modular kernel
 
     def apply_monolithic(
         self,

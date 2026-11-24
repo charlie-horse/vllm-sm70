@@ -2,31 +2,17 @@
 """Inkling 2 expert routing and slot dispatch of a small batch as Triton
 kernels (sm_70: no tl.dot, libdevice exp).
 
-    router_logits   fp32 [M, E] = x [M, H] @ gate.weight [E, H]^T, x read in
-                    its own dtype and widened to fp32
-    route           one launch: the top-k of sigmoid(logits) + bias, the
-                    routing weights, and with ``dispatch`` the expert-sorted
-                    slot order, the TurboMind group tables and the gathered
-                    input rows
-    combine         one launch: each token's weighted expert outputs summed
-                    in fp32, rounded once into `out`
+    router_logits   fp32 [M, E] = x [M, H] @ gate.weight [E, H]^T
+    route           top-k of sigmoid(logits) + bias, the routing weights and,
+                    with ``dispatch``, the expert-sorted slot order, group
+                    tables and gathered input rows, in one launch
+    combine         each token's weighted expert outputs summed in fp32
 
-Router math as torch_ref.router (all fp32): weights are sigmoid(logits)
-over the chosen experts, divided by their sum + 1e-20, times route_scale.
-A token's chosen experts are written in ascending expert id. Top-k ties
-keep the lowest expert id, as torch.topk does on CUDA (the CPU kernel of
-torch.topk breaks ties another way); the logits must be finite. A row
-flagged in `is_padding` gets `pad_id` and weight 0 in every slot.
-
-``dispatch`` sorts the S = M * k slots by expert id, stable in token
-order, padding slots last: what moe_tm.py builds with torch.sort.
-``pos`` [M, k] is the sorted row of each slot; the sorted ids (padding
-clamped to E - 1), the per-expert offsets of those ids and the rows x[t]
-at their sorted places are written into the caller's buffers.
-
-Every launch has a grid of static size for static M, reads nothing back to
-the host and allocates only its outputs, so it captures in a CUDA graph.
-One program holds all M tokens: callers keep M * k <= ``MAX_SLOTS``.
+Router math as torch_ref.router. Top-k ties keep the lowest expert id, as
+torch.topk on CUDA; logits must be finite. A row flagged in `is_padding` gets
+`pad_id` and weight 0. ``dispatch`` sorts the slots by expert id, stable in
+token order, padding last. Every launch has a static grid, reads nothing back
+to the host and allocates only its outputs. Callers keep M * k <= ``MAX_SLOTS``.
 """
 
 from __future__ import annotations

@@ -2,20 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launch-config sweep of the Inkling 2 weight-streaming GEMVs on one V100.
 
-Times, under CUDA-graph replay with the weights rotated through copies
-larger than L2 (cold weights, as in a decode step):
-
-  dense   ops/small_m_gemv.py ``segment_gemv`` for each (BLOCK_N, BLOCK_K,
-          num_warps) candidate against cuBLAS F.linear, at the Inkling 2
-          Mini TP2 shapes: qkvr (one input, and three inputs as a gated
-          layer), wo, the LM head shard; 1, 2, 4 and 8 rows
-  nvfp4   ops/nvfp4_gemv.py for each (BLOCK_K8, num_warps) candidate
-          against the TurboMind compact stage (+ the SwiGLU kernel for W13),
-          8, 16, 32 and 64 one-row slots of distinct random experts
-
-and prints µs, GB/s and % of 900 GB/s per row, then the best candidate per
-row bucket and stage: the entries for small_m_gemv.CONFIGS and
-nvfp4_gemv.CONFIGS. Needs an SM70 GPU; the nvfp4 part needs _sm70_C.
+Times under CUDA-graph replay, weights rotated through copies larger than L2:
+  dense   ops/small_m_gemv.py ``segment_gemv`` per (BLOCK_N, BLOCK_K,
+          num_warps) candidate against cuBLAS F.linear at the Inkling 2 Mini
+          TP2 shapes (qkvr, wo, LM head shard); 1, 2, 4 and 8 rows
+  nvfp4   ops/nvfp4_gemv.py per (BLOCK_K8, num_warps) candidate against the
+          TurboMind compact stage (+ SwiGLU for W13); 8-64 one-row slots
+Prints µs, GB/s and % of 900 GB/s per row, then the best candidate per row
+bucket and stage (the entries for small_m_gemv.CONFIGS and
+nvfp4_gemv.CONFIGS). Needs an SM70 GPU; the nvfp4 part needs _sm70_C.
 
   python sm70/tools/bench_inkling2_gemv.py [--part dense|nvfp4|all] [--iters 50]
 """

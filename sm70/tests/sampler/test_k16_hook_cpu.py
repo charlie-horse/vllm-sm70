@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K16 CPU checks: the U4 hook consumer, the platform wiring, the shape
-guards for Flint TP2, R4, and the op bindings (no GPU, no built _sm70_C).
+"""CPU checks: the sampler hook consumer, the platform wiring, the shape
+guards for Flint TP2, capture safety, and the op bindings (no GPU, no built
+_sm70_C).
 
 The hook tests drive Sm70HiddenStateSampler.try_sample with stand-in runner,
 model and metadata objects. A fake "cuda:0" device that reports sm_70 (the
@@ -99,7 +100,7 @@ def _sched(structured=False):
 
 @pytest.fixture
 def fake_sm70(monkeypatch):
-    """A 'cuda:0' that reports sm_70 with the K16 ops present; no capture."""
+    """A 'cuda:0' that reports sm_70 with the sampler ops present; no capture."""
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 0))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -112,9 +113,9 @@ def fake_sm70(monkeypatch):
 
 @pytest.fixture
 def hook(fake_sm70, monkeypatch):
-    # K16 alone: the F12 greedy route of the same hook is off here, so
-    # all-greedy batches still show K16's own rejection ("greedy" case).
-    # F12: test_f12_greedy_fastpath_cpu.py.
+    # The top-k sampler alone: the greedy fast path of the same hook is off
+    # here, so all-greedy batches still show this route's own rejection
+    # ("greedy" case). The fast path: test_f12_greedy_fastpath_cpu.py.
     monkeypatch.setenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "0")
 
     def make(rows=1, top_k=20, fp64=False):
@@ -153,7 +154,7 @@ def _try(h, rows=1, model=None, metadata=None, sched=None, spec=None):
     )
 
 
-# ------------------------------------------------------------ U4 contract
+# ----------------------------------------------------------- hook contract
 
 
 def test_try_sample_signature_matches_u4_call():
@@ -400,7 +401,7 @@ def test_reject_reasons_name_each_case(hook, want, kw):
     assert hook().reject_reason(**args) == want
 
 
-# -------------------------------------------------------- prepare (R4) / warmup
+# ------------------------------------------------------------ prepare / warmup
 
 
 def test_prepare_creates_counter_only_on_sm70_with_ops(monkeypatch):
@@ -428,8 +429,8 @@ def test_prepare_refuses_during_capture(monkeypatch):
 
 
 def test_sampling_never_creates_the_counter():
-    """R4: only prepare() constructs _OverflowMonitor; the per-call path
-    looks it up and runs uncounted without it."""
+    """Only prepare() constructs _OverflowMonitor; the per-call path looks it
+    up and runs uncounted without it."""
     tree = ast.parse(inspect.getsource(sample))
     creators = set()
     for fn in ast.walk(tree):
@@ -493,7 +494,7 @@ def platform_cls(monkeypatch):
 
 @pytest.fixture
 def k16_alone(monkeypatch):
-    """The getter and kernel_warmup answer for K16 alone (F12 off)."""
+    """The getter and kernel_warmup answer for the top-k sampler alone."""
     monkeypatch.setenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "0")
 
 

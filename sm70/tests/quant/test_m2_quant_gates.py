@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M2 sm70-quant-gates (vllm_sm70/quant/configs.py). CPU only.
+"""Tests for the SM70 quant gates (vllm_sm70/quant/configs.py). CPU only.
 
-What: checks the capability gate for each (capability, SM70 ops) case,
-  registry identity, the VLLM_SM70_QUANT kill switch, unchanged upstream
-  behaviour at cc 8.0, and that upstream's own checks accept SM70: the
-  capability gate (UP 4ba787e config/vllm.py:926-936) and quant-method
-  detection (config/model.py:1382-1450). Fixtures use the real Flint and
-  Qwen FP8 checkpoint shapes.
-Why: the gate is the first thing an SM70 boot hits, and an upstream rebase
-  can silently undo the override (D4).
-Kill-switch: VLLM_SM70_QUANT is covered below.
+Checks the capability gate for each (capability, SM70 ops) case, registry
+identity, the VLLM_SM70_QUANT kill switch, unchanged upstream behaviour at
+cc 8.0, and that upstream's own checks accept SM70: the capability gate
+(config/vllm.py:926-936) and quant-method detection (config/model.py:
+1382-1450). Fixtures use the real Flint and Qwen FP8 checkpoint shapes.
 
 The device is faked in two places. ``vllm.platforms._current_platform``
 feeds upstream's own capability check, which upstream resolves lazily
-(vllm/platforms/__init__.py:302-321). K01's ``vllm_sm70.platform.is_sm70_ready``
+(vllm/platforms/__init__.py:302-321). ``vllm_sm70.platform.is_sm70_ready``
 gets its inputs patched: ``all_visible_gpus_are_sm70`` (NVML) and
 ``vllm_sm70._ext.is_loaded`` (the _sm70_C extension).
 """
@@ -41,8 +37,7 @@ import vllm_sm70.quant as sm70_quant
 from vllm_sm70 import _ext
 from vllm_sm70 import platform as sm70_platform
 
-# Flint config.json quantization_config (Theo, pinned checkpoint; FORK
-# cf9492a vllm/models/flint/convert_gguf.py:114-123).
+# Flint config.json quantization_config (pinned checkpoint).
 FLINT_QUANT_CFG = {
     "quant_method": "modelopt",
     "quantization": {
@@ -173,7 +168,7 @@ def test_registry_identity_and_register(load_configs):
     )
     assert issubclass(configs.Sm70Fp8Config, Fp8Config)
     assert issubclass(configs.Sm70ModelOptNvFp4Config, ModelOptNvFp4Config)
-    configs.register()  # D4 asserts pass
+    configs.register()  # the override's asserts pass
 
 
 def test_register_detects_overwritten_slot(load_configs):
@@ -305,7 +300,7 @@ def test_area_register_runs_checks_and_is_idempotent(
 def test_area_register_retries_after_failure(
     load_configs, fresh_quant_area, monkeypatch
 ):
-    """K03's import_kernels() retries a failed area once."""
+    """import_kernels() retries a failed area once."""
     configs = load_configs()
     real = configs.register
     outcomes = iter([RuntimeError("simulated failure"), None])

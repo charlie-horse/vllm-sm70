@@ -2,7 +2,7 @@
 //
 // Op registry for vllm_sm70._sm70_C. Every sm70 op lives in the `_sm70_C`
 // namespace so it can never collide with upstream's stable `_C` ops.
-// Later patches (K02+) add their defs here and their impls in csrc/.
+// Each area registers its own defs and impls in csrc/<area>/.
 
 #include <Python.h>
 #include <torch/library.h>

@@ -1,49 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M7 dflash2-fp16-range: BF16-range emulation for DFlash2 drafts on FP16.
+"""BF16-range emulation for DFlash2 drafts on FP16.
 
-What: the incoai/*-DFlash2 drafts (``DFlash2DraftModel``, model_type qwen3,
-  ``dtype`` bfloat16) were trained with BF16 activations. We serve them with
-  ``--dtype half`` on V100 (cc 7.0, no BF16 arithmetic). This module keeps
-  FP16 tensor-core transport and preserves BF16 range at the trained rounding
-  points:
+The DFlash2 drafts (``DFlash2DraftModel``, model_type qwen3, ``dtype``
+bfloat16) are trained with BF16 activations; Volta has no BF16 arithmetic and
+plain FP16 can overflow. This module keeps FP16 transport with BF16 range:
   - the residual stream is carried in FP32 and rounded to BF16 (RNE);
   - sublayer outputs travel as value/256 (attention: scaled before o_proj;
     MLP: per-row power-of-two transport scale);
   - the gate/up GEMM input is pre-divided by 32.
-  The plugin registers ``DFlash2SM70Qwen3ForCausalLM`` for the
-  "DFlash2DraftModel" architecture. Its decoder-layer and model subclasses
-  swap in DFlashSM70RMSNorm and DFlashSM70MLP after the upstream
-  ``__init__``, before weights load.
-Why: in plain FP16 the residual and SwiGLU products of these drafts can pass
-  65504 and become inf. The fork notes that the draft "was trained with BF16
-  activations, but Volta executes its dense GEMMs in FP16" (FORK cf9492a
-  vllm/model_executor/models/dflash_sm70.py:3-7). The fork enabled this by
-  default (its DFLASH2_BF16_EMULATION switch was effectively on).
-Kill-switch: VLLM_SM70_DFLASH2_EMULATION=0 (envs "models" section). The
-  plugin then neither registers the subclass nor applies it, and upstream's
-  DFlash2 runs in plain FP16.
-
-Gate: the emulation applies only when compute capability < 8.0, the draft's
-  declared dtype is bfloat16 and the runtime dtype is float16 (port of FORK
-  qwen3_dflash2.py:52-73 ``_use_sm70_bf16_emulation``).
-
-Port map (FORK = charlie-horse/vLLM cf9492a, vllm/model_executor/models/):
-  dflash_sm70.py 1-257, 330-419 -> this file (kernels, wrappers, modules).
-  dflash_sm70.py 119-163, 258-329 (layered RMSNorm, perf-only) -> dropped.
-  qwen3_dflash2.py 213-231, 465-482, 503-505 -> the layer/model subclasses.
-  qwen3_dflash.py 312-314 (o_proj input scale) -> DFlashSM70Qwen3Attention.
-  qwen3_dflash.py 675-683 (_normalize_context_states) -> _project_context_kv.
-
-Upstream hooks this rests on (UP = vllm 4ba787e), with no upstream edit:
-  - Arch -> class: ModelRegistry "DFlash2DraftModel" (models/registry.py:666),
-    resolved for the draft by model_loader/utils.py:85 -> :310 via
-    load_dflash_model (v1/worker/gpu/spec_decode/dflash/utils.py:45).
-  - Class factories: DFlashQwen3Model.decoder_layer_cls (qwen3_dflash.py:388,
-    used at :465) and DFlashQwen3ForCausalLM.model_cls (:737, used at :748).
-  - Layer modules are plain attributes set in DFlashQwen3DecoderLayer.__init__
-    (qwen3_dflash.py:352-362); DFlash2Qwen3DecoderLayer.__init__
-    (qwen3_dflash2.py:230-264) only adds the convs, which are linear in their
-    input, so the /256 transport commutes with them.
+The subclasses registered for "DFlash2DraftModel" swap in DFlashSM70RMSNorm
+and DFlashSM70MLP after the upstream ``__init__``, before weights load. The
+DFlash2 convs are linear, so the /256 transport commutes with them. Applies
+only when cc < 8.0, the draft declares bfloat16 and the runtime is float16.
+Kill switch: VLLM_SM70_DFLASH2_EMULATION=0.
 """
 
 from __future__ import annotations
@@ -64,7 +33,6 @@ except Exception:  # pragma: no cover - vllm not importable
     HAS_TRITON = False
     tl = triton = None  # type: ignore[assignment]
 
-# ported from FORK models/dflash_sm70.py:19-20
 DFLASH_SM70_GATE_UP_INPUT_SCALE = 32.0
 DFLASH_SM70_WIDE_OUTPUT_SCALE = 256.0
 # Largest power-of-two-friendly FP16 magnitude used for the row transport scale.
@@ -87,7 +55,6 @@ def _is_bf16_dtype(value: Any) -> bool:
 
 def draft_declared_bf16(config: Any) -> bool:
     """True if the draft HF config declares bfloat16 (``dtype`` or ``torch_dtype``)."""
-    # ported from FORK qwen3_dflash2.py:53-58
     declared = getattr(config, "dtype", None)
     if declared is None:
         declared = getattr(config, "torch_dtype", None)
@@ -115,8 +82,6 @@ def emulation_enabled(
     ``capability`` -1 means "query the current CUDA device". None means no
     CUDA device, so the emulation is off.
     """
-    # ported from FORK qwen3_dflash2.py:52-73 (plus the FP16-runtime check
-    # at :215-220, which here gates instead of raising)
     if not envs.VLLM_SM70_DFLASH2_EMULATION:
         return False
     if runtime_dtype != torch.float16 or not draft_declared_bf16(config):
@@ -131,7 +96,6 @@ def emulation_enabled(
 # --------------------------------------------------------------------------
 def round_fp32_to_bf16_rne(value: torch.Tensor) -> torch.Tensor:
     """Bit-exact twin of the Triton ``_round_fp32_to_bf16_rne`` (fp32 in/out)."""
-    # ported from FORK models/dflash_sm70.py:23-28 (Triton) as torch bit ops
     bits = value.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
     rounded = torch.where(rounded >= 2**31, rounded - 2**32, rounded)
@@ -145,7 +109,6 @@ def _bf16(x: torch.Tensor) -> torch.Tensor:
 def silu_and_mul_reference(
     gate_up: torch.Tensor, gate_up_scale: float = DFLASH_SM70_GATE_UP_INPUT_SCALE
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # ported from FORK models/dflash_sm70.py:169-180
     gate, up = gate_up.float().chunk(2, dim=-1)
     gate = _bf16(gate * gate_up_scale)
     up = _bf16(up * gate_up_scale)
@@ -163,7 +126,6 @@ def scale_output_reference(
     row_scales: torch.Tensor,
     residual_scale: float = DFLASH_SM70_WIDE_OUTPUT_SCALE,
 ) -> torch.Tensor:
-    # ported from FORK models/dflash_sm70.py:241-244
     n_cols = output.shape[-1]
     flat = output.float().reshape(-1, n_cols)
     scaled = flat * (row_scales.reshape(-1, 1).float() / residual_scale)
@@ -177,7 +139,6 @@ def rmsnorm_reference(
     residual: torch.Tensor | None = None,
     residual_scale: float = DFLASH_SM70_WIDE_OUTPUT_SCALE,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    # ported from FORK models/dflash_sm70.py:346-363 (DFlashSM70RMSNorm._reference)
     orig_dtype = x.dtype
     value = x.float()
     residual_output = None
@@ -199,7 +160,6 @@ if HAS_TRITON:
 
     @triton.jit
     def _round_fp32_to_bf16_rne(value):
-        # ported from FORK models/dflash_sm70.py:23-28
         bits = value.to(tl.uint32, bitcast=True)
         rounded_bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
         return rounded_bits.to(tl.float32, bitcast=True)
@@ -213,7 +173,6 @@ if HAS_TRITON:
         gate_up_scale: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # ported from FORK models/dflash_sm70.py:31-60
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -243,7 +202,6 @@ if HAS_TRITON:
         residual_scale: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # ported from FORK models/dflash_sm70.py:63-81
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -267,7 +225,6 @@ if HAS_TRITON:
         HAS_RESIDUAL: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # ported from FORK models/dflash_sm70.py:84-116
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -292,7 +249,6 @@ def _use_triton(t: torch.Tensor) -> bool:
 
 
 def _num_warps(n_cols: int) -> int:
-    # ported from FORK models/dflash_sm70.py:165-166
     return max(min(triton.next_power_of_2(triton.cdiv(n_cols, 256)), 16), 4)
 
 
@@ -303,7 +259,6 @@ def dflash_silu_and_mul_sm70(
     gate_up: torch.Tensor,
     gate_up_scale: float = DFLASH_SM70_GATE_UP_INPUT_SCALE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # ported from FORK models/dflash_sm70.py:183-221
     if gate_up.ndim < 2 or gate_up.shape[-1] % 2:
         raise ValueError(
             "DFlash SM70 SwiGLU expects [..., 2 * intermediate_size], "
@@ -342,7 +297,6 @@ def dflash_scale_output_sm70(
     row_scales: torch.Tensor,
     residual_scale: float = DFLASH_SM70_WIDE_OUTPUT_SCALE,
 ) -> torch.Tensor:
-    # ported from FORK models/dflash_sm70.py:224-255
     if output.ndim < 2:
         raise ValueError(f"DFlash SM70 output must have ndim >= 2, got {output.ndim}.")
     if residual_scale <= 0:
@@ -380,7 +334,6 @@ class DFlashSM70RMSNorm(nn.Module):
     sublayer output divided by ``residual_scale``.
     """
 
-    # ported from FORK models/dflash_sm70.py:330-404
     def __init__(
         self,
         hidden_size: int,
@@ -440,7 +393,6 @@ class DFlashSM70MLP(nn.Module):
     Returns ``true_output / DFLASH_SM70_WIDE_OUTPUT_SCALE``.
     """
 
-    # ported from FORK models/dflash_sm70.py:407-419
     def __init__(self, mlp: nn.Module) -> None:
         super().__init__()
         self.gate_up_proj = mlp.gate_up_proj
@@ -458,8 +410,7 @@ def sm70_attention_forward(
 ) -> torch.Tensor:
     """DFlashQwen3Attention.forward plus the o_proj input scale.
 
-    Copy of UP qwen3_dflash.py:268-295 (28 lines). The only change is the
-    division before o_proj, ported from FORK qwen3_dflash.py:312-314.
+    Upstream's forward; the only change is the division before o_proj.
     """
     qkv, _ = self.qkv_proj(hidden_states)
     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -483,7 +434,7 @@ _ATTN_CLS_CACHE: dict[type, type] = {}
 
 
 def sm70_attention_cls(base: type) -> type:
-    """Subclass of ``base`` (UP DFlashQwen3Attention) whose forward scales o_proj input."""
+    """Subclass of ``base`` (upstream DFlashQwen3Attention) whose forward scales o_proj input."""
     if getattr(base, "_sm70_bf16_attention", False):
         return base
     cls = _ATTN_CLS_CACHE.get(base)
@@ -502,7 +453,6 @@ def apply_layer_emulation(layer: nn.Module, config: Any, dtype: torch.dtype) -> 
 
     Must run before weight loading; the parameter names are unchanged.
     """
-    # ported from FORK qwen3_dflash2.py:213-231
     attn = layer.self_attn
     attn.output_input_scale = DFLASH_SM70_WIDE_OUTPUT_SCALE
     # Swap the class to a cached subclass that overrides forward() only.
@@ -521,7 +471,6 @@ def apply_layer_emulation(layer: nn.Module, config: Any, dtype: torch.dtype) -> 
 
 def apply_model_emulation(model: nn.Module, config: Any, dtype: torch.dtype) -> None:
     """Swap the model-level norms (context hidden_norm with no residual scale)."""
-    # ported from FORK qwen3_dflash2.py:465-482
     model.hidden_norm = DFlashSM70RMSNorm(
         config.hidden_size, config.rms_norm_eps, dtype, residual_scale=1.0
     )
@@ -542,7 +491,6 @@ def _build_classes() -> dict[str, type]:
     )
 
     class DFlash2SM70Qwen3DecoderLayer(DFlash2Qwen3DecoderLayer):
-        # UP signature: qwen3_dflash2.py:230-239
         def __init__(
             self,
             vllm_config,
@@ -565,10 +513,9 @@ def _build_classes() -> dict[str, type]:
             self.use_sm70_bf16_emulation = emulation_enabled(config, dtype)
             if self.use_sm70_bf16_emulation:
                 apply_layer_emulation(self, config, dtype)
-                # K18: flag the draft projections for the M<=8 FP16 GEMM
-                # (packed in load_weights below). FORK qwen3_dflash2.py:280-298.
-                # M9a: with the DFlash2 verifier on (k=7), also flag them for
-                # the channel-FP8 M8..32 route. FORK qwen3_dflash2.py:295-297.
+                # Flag the draft projections for the M<=8 FP16 GEMM (packed in
+                # load_weights below). With the DFlash2 verifier on, also flag
+                # them for the channel-FP8 M8..32 route.
                 from vllm_sm70.ops import dflash2, dflash2_fp8
 
                 dflash2.mark_draft_linears(
@@ -580,7 +527,6 @@ def _build_classes() -> dict[str, type]:
     class DFlash2SM70Qwen3Model(DFlash2Qwen3Model):
         decoder_layer_cls = DFlash2SM70Qwen3DecoderLayer
 
-        # UP signature: qwen3_dflash2.py:364-370
         def __init__(self, *, vllm_config, start_layer_id: int = 0, prefix: str = ""):
             super().__init__(
                 vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
@@ -597,8 +543,7 @@ def _build_classes() -> dict[str, type]:
         def _project_context_kv(
             self, context_states, num_ctx, num_layers, num_kv_heads, head_dim
         ):
-            # UP qwen3_dflash.py:581-619 with the hidden_norm call swapped in
-            # (FORK qwen3_dflash.py:659, 675-683). 25 lines copied.
+            # Upstream's _project_context_kv with the hidden_norm call swapped in.
             if not self.use_sm70_bf16_emulation:
                 return super()._project_context_kv(
                     context_states, num_ctx, num_layers, num_kv_heads, head_dim
@@ -622,20 +567,19 @@ def _build_classes() -> dict[str, type]:
             return all_kv[0], all_kv[1]
 
     class DFlash2SM70Qwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
-        # UP factory: DFlashQwen3ForCausalLM.model_cls (qwen3_dflash.py:737, :748)
+        # Upstream builds the model from model_cls.
         model_cls = DFlash2SM70Qwen3Model
 
-        # UP signature: qwen3_dflash2.py:397
         def __init__(self, *, vllm_config, prefix: str = "") -> None:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
             from vllm_sm70.ops import dflash2_rerank
 
-            # A2: decided once per draft model (M1 contract + switches).
+            # Decided once per draft model.
             self.use_sm70_qpn8_rerank = dflash2_rerank.rerank_wanted(vllm_config)
 
         def compute_candidates(self, hidden_states):
-            # UP qwen3_dflash2.py:408-413. A2: QPN8 support search + exact
-            # FP32 rerank for one drafting request; upstream otherwise.
+            # QPN8 support search + exact FP32 rerank for one drafting
+            # request; upstream otherwise.
             if self.use_sm70_qpn8_rerank:
                 from vllm_sm70.ops import dflash2_rerank
 
@@ -650,8 +594,7 @@ def _build_classes() -> dict[str, type]:
             return super().compute_candidates(hidden_states)
 
         def load_weights(self, weights):
-            # UP qwen3_dflash.py:851. K18: pack the flagged projections once
-            # the weights are final, before profiling and graph capture, so
+            # Pack the flagged projections once the weights are final, before profiling and graph capture, so
             # the packed copies count in the model's memory.
             loaded = super().load_weights(weights)
             from vllm_sm70.ops import dflash2
@@ -695,9 +638,8 @@ def register() -> bool:
     visible GPU is cc 7.0 (debug log). Raises when every visible GPU is cc 7.0
     but _sm70_C is missing, and when the registry did not take the override. The
     lazy "<module>:<class>" form keeps CUDA and vllm model imports out of
-    plugin load (UP models/registry.py:1176-1212). It overwrites UP's entry
-    (registry.py:666), logged at debug. Call it before the first
-    get_model_architecture, which caches per model (model_loader/utils.py:340-356).
+    plugin load. It overwrites upstream's entry, logged at debug. Call it
+    before the first get_model_architecture, which caches per model.
     Every plugin process runs it, because vllm.general_plugins load in all of
     them.
     """
@@ -711,11 +653,9 @@ def register() -> bool:
         logger.debug("No cc 7.0 GPUs visible: DFlash2 SM70 emulation not registered.")
         return False
     if not _ext.is_loaded():
-        # A cc 7.0 host without _sm70_C is broken, not "not SM70". Nothing on
-        # main fails fast on it: _ext.load() only logs at info (_ext.py:16-28),
-        # and Sm70CudaPlatform.check_and_update_config just imports the areas
-        # (_cuda_platform.py:72-77). So raise; vllm_sm70._register_area logs
-        # it at ERROR (__init__.py:60-66) and the area stays unregistered.
+        # A cc 7.0 machine without _sm70_C is broken, not "not SM70", and
+        # _ext.load() only logs. So raise; vllm_sm70._register_area logs it at
+        # ERROR and the area stays unregistered.
         msg = (
             "vllm_sm70: every visible GPU is cc 7.0 but _sm70_C is not loaded; "
             "the BF16-trained DFlash2 draft would run in plain FP16 (overflow). "

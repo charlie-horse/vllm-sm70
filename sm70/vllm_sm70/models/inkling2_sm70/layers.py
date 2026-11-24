@@ -7,31 +7,12 @@
                                norms, attention, experts and both short convs
     Inkling2Sm70AttnRes        the learned queries of the AttnRes mixes
 
-Parameters carry the names, shapes and dtypes of the weight map
-(weights.py); every module creates them from the map's specs. Tensors are
-[T, ...] over the padded batch tokens, no batch dim.
-
-At TP > 1 a rank holds a contiguous slice of the query heads (with their
-relative, gate and sink rows), of the KV heads and of the expert
-intermediate units. A layer has two all-reduces: the o_proj partials and the
-expert partials. Everything else, both short convs included, runs on the
-replicated hidden state.
-
-With ``merged`` (weights.py ``merged_enabled``), projections whose
-parameters ``weights.pack_parameters`` packed run as one GEMM: the three
-inputs of a visit with up to ``prologue.STACKED_MAX_TOKENS`` tokens over the
-whole qkvr (and tap) rows, and the gain and forget gates of a message gate.
-The q and r clip scales are then read in fp32 copies made after loading.
-
-On the route of visit_fusion.py the attention output conv runs inside the
-MLP input mix, and a visit's MLP output conv and residual add run inside
-the next visit's attention input mix (``defer``) or as one launch.
-
-Rounding as the reference (transformers modeling_inkling2_loop.py): the
-residual stream and the block states are in the model dtype between visits;
-AttnRes mixes, message gates, norms and residual adds run in fp32; each norm
-rounds to the model dtype, and so do the conv outputs and the expert sum
-before the fp32 add.
+Parameters follow the weight map (weights.py); tensors are [T, ...] over the
+padded batch tokens. At TP > 1 a rank holds a slice of the query heads, KV
+heads and expert units; a layer has two all-reduces (o_proj and expert
+partials). With ``merged``, packed projections run as one GEMM. Rounding as
+the reference: the residual stream and block states are in the model dtype
+between visits; mixes, gates, norms and residual adds run in fp32.
 """
 
 from __future__ import annotations

@@ -1,30 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 cache-plumbing stub (test tree, M12 C4).
+"""Inkling 2 cache-plumbing stub (test tree).
 
-A weightless model that owns the cache layers of the real model (one K/V
-cache and one conv state per layer visit) and runs no attention. Each
-forward writes a record per token into every cache and reads records of
-earlier positions back through the block tables:
-
-    record(position q) = (h_q, q, owner, head, stream)
-    h_q = sum of mix(token_i, i) for i <= q, modulo 2**30
-
-``h`` continues from the record of the position before the batch, so it is a
-function of the whole request and is right only if that record survived in
-the cache. The next token is a function of ``h`` and of every value read
-back, summed over the TP ranks, so a caller that knows the token ids can
-predict each generated token (``Reference``). A record with the wrong
-position or owner makes the model emit ``ERROR_TOKEN``.
-
-Reads of the token at position p, per owner (window W, owner index g):
-
-    conv state      p-1 .. p-(W-1)
-    sliding K/V     p-1, p-(W-1), p-1-((7p+g) mod (W-1))
-    full K/V        p-1, 0, (31p+g) mod p
-
-``register()`` adds the architecture ``STUB_ARCH`` to vLLM; an engine selects
-it with ``--hf-overrides '{"architectures": ["Inkling2CachePlumbingStub"]}'``
-and ``--load-format dummy``.
+A weightless model with the real model's cache layers (a K/V cache and a
+conv state per visit), no attention. Each forward writes a record
+(h_q, q, owner, head, stream) per token into every cache, with
+h_q = sum of mix(token_i, i) for i <= q mod 2**30 continued from the stored
+record before the batch, and reads earlier records back through the block
+tables. The next token depends on ``h`` and every value read (summed over TP
+ranks), so ``Reference`` predicts it; a wrong position or owner gives
+``ERROR_TOKEN``. Reads at position p (window W, owner index g): conv state
+p-1 .. p-(W-1); sliding K/V p-1, p-(W-1), p-1-((7p+g) mod (W-1)); full K/V
+p-1, 0, (31p+g) mod p. ``register()`` adds ``STUB_ARCH``; select it with
+``--hf-overrides '{"architectures": ["Inkling2CachePlumbingStub"]}'`` and
+``--load-format dummy``.
 """
 
 from __future__ import annotations

@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""F12: _sm70_C custom-AR greedy top-1 exchange against the all-gather.
+"""_sm70_C custom-AR greedy top-1 exchange against the all-gather.
 
-Two V100s. Each rank builds its [rows, 2] FP32 (value, global id) pairs as
-get_top_tokens does (ids increasing by rank); the reference is upstream's
-reduction after an NCCL all-gather of the pairs (UP logits_processor.py:
+Two SM70 GPUs (TP2). Each rank builds its [rows, 2] FP32 (value, global id)
+pairs as get_top_tokens does (ids increasing by rank); the reference is
+upstream's reduction after an NCCL all-gather (UP logits_processor.py:
 241-247). ``sample_greedy.exchange_custom_ar`` must return the same int64
 token on both ranks, for 1-128 rows, ties across ranks, NaN and -inf, with
 the allocator in default and expandable-segments mode, and interleaved with
-upstream's own custom all-reduce on the same buffers and flags (so the
-staged barrier keeps the signal protocol in step). Before each exchange the
-staging buffer holds stale pairs that would win with a rank-0 id, and one
-case puts every row's winner on rank 1 at a local id that is also valid on
-rank 0: a stale staging read or a missing shard offset returns that id.
+upstream's own custom all-reduce on the same buffers and flags. The staging
+buffer holds stale pairs that would win with a rank-0 id, and one case puts
+every row's winner on rank 1 at a local id also valid on rank 0, so a stale
+staging read or a missing shard offset returns a wrong id.
 
     pytest -m gpu sm70/tests/distributed/test_f12_top1_custom_ar_gpu.py
 """

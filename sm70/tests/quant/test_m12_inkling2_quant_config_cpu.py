@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M12 inkling2-sm70-quant (vllm_sm70/models/inkling2_sm70/quant_config.py).
+"""Tests for inkling2-sm70-quant (vllm_sm70/models/inkling2_sm70/quant_config.py).
 
 CPU only: upstream's quant-method detection (UP config/model.py:1382-1450)
 resolves the Inkling 2 Mini config to "inkling2" at faked cc 7.0 and 8.0 and

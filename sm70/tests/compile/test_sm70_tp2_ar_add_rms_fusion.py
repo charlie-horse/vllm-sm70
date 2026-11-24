@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K17 TP2 all-reduce + fused_add_rms_norm: pattern, admission, runtime gate.
+"""TP2 all-reduce + fused_add_rms_norm: pattern, admission, runtime gate.
 
-Ported from fork cf9492a tests/compile/passes/test_sm70_tp2_ar_add_rms_fusion.py.
-CPU only, and none of it needs the custom_ar kernel (U5) in _sm70_C. The
+CPU only, and none of it needs the custom_ar kernel in _sm70_C. The
 patterns are matched on fake-tensor graphs built like the post-grad graph of
 a decoder: the all-reduce, an optional elementwise scale or two summed
-partial outputs, then the fused_add_rms_norm IR op.
-
-Differences from the fork: the fork's model-config hook and communication
-policy are gone; admission is ar_rms_fusion.rejection() plus register()'s
-kill-switch / kernel gate, and the runtime gate is can_fuse().
+partial outputs, then the fused_add_rms_norm IR op. Admission is
+ar_rms_fusion.rejection() plus register()'s kill-switch / kernel gate; the
+runtime gate is can_fuse().
 """
 
 from __future__ import annotations
@@ -125,7 +122,7 @@ def _apply(
 
 
 # ---------------------------------------------------------------------------
-# Pattern matching (fork tests, unchanged in substance)
+# Pattern matching
 # ---------------------------------------------------------------------------
 
 
@@ -243,7 +240,7 @@ def test_unfused_boundary_counter(tp_group):
 
 
 def test_op_schema_and_fake(fusion):
-    """The op the pattern targets; Penny/Mara rely on this exact interface."""
+    """The op the pattern targets; its interface must stay exactly this."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     schema = str(_fused_op()._schema)
@@ -268,11 +265,11 @@ def test_op_schema_and_fake(fusion):
 
 
 # ---------------------------------------------------------------------------
-# Admission: engine config (fork tp2_add_rms_rejection)
+# Admission: engine config
 # ---------------------------------------------------------------------------
 
 
-FLINT = "FlintSm70ForCausalLM"  # production arch (M5)
+FLINT = "FlintSm70ForCausalLM"  # the plugin's Flint architecture
 FLINT_UPSTREAM = "FlintForCausalLM"
 QWEN36_LIKE = "Qwen3_5MoeForConditionalGeneration"  # hidden 2048, GemmaRMSNorm
 
@@ -326,7 +323,7 @@ def test_pass_admission(fusion, monkeypatch, overrides, tp, has_kernel, reason):
 
 
 # ---------------------------------------------------------------------------
-# Registration: kill switch and U5 (kernel) presence
+# Registration: kill switch and custom_ar kernel presence
 # ---------------------------------------------------------------------------
 
 
@@ -436,7 +433,7 @@ def test_apply_logs_first_fused_graph_once(fusion, monkeypatch, caplog):
 
 
 def test_passes_area_without_kernel_registers_nothing(clean_registry, monkeypatch):
-    # The real build state of the CPU suite: _sm70_C absent or without U5.
+    # The real build state of the CPU suite: _sm70_C absent or without custom_ar.
     from vllm_sm70 import ar_rms_fusion
 
     if ar_rms_fusion.kernel_available():
@@ -559,7 +556,7 @@ def test_op_falls_back_to_the_unfused_ops(fusion, monkeypatch, sum2, scale):
 
 
 def test_fork_keys_on_the_flint_architecture(fusion):
-    # Production serves M5's FlintSm70ForCausalLM; upstream's class too.
+    # Both the plugin's FlintSm70ForCausalLM and upstream's Flint class count.
     assert set(fusion[0].FLINT_ARCHITECTURES) == {FLINT, FLINT_UPSTREAM}
     assert "Flint-only" in fusion[0].rejection(SimpleNamespace(model_config=None), 2)
 

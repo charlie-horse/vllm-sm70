@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 model body at TP1 (model.py, loop.py, layers.py), on CPU.
+"""Inkling 2 model body at TP1 (model.py, loop.py, layers.py), on CPU.
 
 The registered model class is built on the tiny checkpoint
 (fixtures/inkling2_tiny), loaded through its own ``load_weights`` and driven

@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed dense/grouped views keep their strides and live replay inputs.
 
-Ported from fork cf9492a tests/kernels/quantization/
-test_sm70_packed_gemm_lifecycle.py (156ec4deb). Changes: the native-policy
-bindings (NativeBindings, Sm70NativeConfig, KernelConfig, runtime release)
-are gone, so the ops are called through vllm_sm70.ops.tm. AWQ and MXFP4 are
-not in K03 (AWQ moves to K04; MXFP4 is dropped).
+The ops are called through vllm_sm70.ops.tm.
 """
 
 from __future__ import annotations

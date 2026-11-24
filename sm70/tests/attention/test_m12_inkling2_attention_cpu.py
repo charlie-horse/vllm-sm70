@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: the paged torch attention of Inkling 2
+"""CPU checks: the paged torch attention of Inkling 2
 (models/inkling2_sm70/attention_torch.py) against the dense reference
 (models/inkling2_sm70/ops/torch_ref.py), fp32.
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). A sliding
+Needs upstream vLLM's Python importable (skipped otherwise). A sliding
 layer (window 8, 4 heads on 2 KV heads) and a global layer (6 heads on 2 KV
 heads, bias extent 8, log scaling from position 16) run over a fake paged
 cache with 4 tokens per block. Sequence lengths 7, 8 and 9 put the last

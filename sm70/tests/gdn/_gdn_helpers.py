@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers shared by the K08 GDN tests (not a conftest: tests/ops has one
-with the same module name)."""
+"""Helpers shared by the GDN tests (not a conftest: tests/ops has one with
+the same module name)."""
 
 from __future__ import annotations
 

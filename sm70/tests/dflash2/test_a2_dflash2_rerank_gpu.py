@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A2 GPU tests: DFlash2 QPN8 support search + exact FP32 rerank on SM70.
+"""GPU tests: DFlash2 QPN8 support search + exact FP32 rerank on SM70.
 
 A random FP16 head of the Qwen3.8 TP2 shard shape (124160 x 5120, two
-62080-row chunks; not the checkpoint's weights: the row 4 A/B against
-VLLM_SM70_DFLASH2_QPN8_RERANK=0 checks real weights) with
-K09's channel-FP8 GEMM and the Triton exact dots. Checks: the Triton dots
-against an FP32 reference; the route's top-16 equals the FP32 dense top-16
-and its values match it; against upstream's FP16 dense head the ids agree
-except where FP16 rounding reorders near-ties; a captured graph replays
-fresh hidden states; the E4M3 copy's size.
+62080-row chunks; not the checkpoint's weights) with the QPN8 channel-FP8
+GEMM and the Triton exact dots. Checks: the Triton dots against an FP32
+reference; the route's top-16 equals the FP32 dense top-16 and its values
+match it; against upstream's FP16 dense head the ids agree except where
+FP16 rounding reorders near-ties; a captured graph replays fresh hidden
+states; the E4M3 copy's size.
 
     pytest -m gpu sm70/tests/dflash2/test_a2_dflash2_rerank_gpu.py
 """

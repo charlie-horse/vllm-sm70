@@ -1,49 +1,26 @@
 #!/usr/bin/env bash
-# M5 window runner (Bea, c4130, inside the downtime window, Flint stopped).
-# Runs every M5 GPU gate (T1-T7), each test node in its own pytest process
-# (so one engine's GPU state cannot leak into the next), tees every log, and
-# prints the per-prompt verdict lines (T2/T4/T5/T7) plus PASS/FAIL per node.
-# A node PASSes only if pytest exits 0 AND its junit XML shows >0 tests and
-# no failures, errors or skips (a skip, e.g. a missing env var, is a FAIL).
-# One exception (Quinn, Nov 7): exact T4b runs only on TRITON attention
-# (VLLM_SM70_FLASH_V100=0); under Flash-V100 every t4b case skips with
-# "covered by T4e", reported SKIPPED (by design), and T4e gates replay.
-#
-# Required env: VLLM_PY (venv python with pytest), FLINT_SM70_CHECKPOINT,
-# FLINT_SM70_GOLDEN (T5), and for the teacher-forced gates (T4a/T4c/T4d/T4e/T7,
-# from m5_teacher_forced.py, see docs/checks.md#gpu-gate):
-#   FLINT_SM70_T4_SEQS_DIR      setK.json, >= 3 prompt sets (gen, on ours)
-#   FLINT_SM70_T4_ENVELOPE      the fork's envelope JSON (envelope; built on or
-#                               after Nov 7, with over_1_0 and eager_vs_graphsonly)
-#   FLINT_SM70_FORK_SCORES_DIR  the fork's setK/{eager,eager2,graphs,unfused,graphsonly}.json
-# Needed by T5 only if a golden-stable prompt diverges early at a near-tie:
-#   FLINT_SM70_T5_FORK_GOLDEN_SCORES  the fork's forced decode of the golden
-#                               sequences (seqs-from-golden + score --mode graphs)
-# FLINT_SM70_OURS_NOISE defaults to $OUT/ours_eager_vs_eager.json: T4c (two
-# separate eager engine instances) writes it and T4a/T4d/T4e/T7 print it on
-# every gate line, so t4c runs first. T4c must PASS (with the tuning-off
-# setting below) before T4a/T4d/T4e/T7 count; if it fails they are reported
-# NOT COUNTED.
-# Model loads per node: t4c 2, t4a 2, t4b 4 (TRITON only; 0 under
-# Flash-V100), t4e 2, t4d 1, t5 1 (+1 to score near-tie golden sequences),
-# t7 2, t3 1, t6 1 (t1/t2: tiny model / kernels only). Default (Flash-V100):
-# 12 loads, 13 with a T5 near-tie.
-# Optional: OUT (log dir), M5_NODES (space-separated subset of the names
-# below, default: all, in this order), M5_MUTATION (mutation check only; see
-# m5_mutation_check.sh).
+# Runs the Flint GPU gates (T1-T7), one pytest process per test node, tees
+# every log and prints the verdict lines plus PASS/FAIL per node. A node
+# passes only if pytest exits 0 and its junit XML has >0 tests and no
+# failures, errors or skips. Exception: under Flash-V100 every t4b case skips
+# with "covered by T4e" (exact T4b needs VLLM_SM70_FLASH_V100=0); that skip is
+# accepted only if t4e passes in the same run.
+# Required env: VLLM_PY, FLINT_SM70_CHECKPOINT, FLINT_SM70_GOLDEN,
+# FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR
+# (inputs from m5_teacher_forced.py, see docs/checks.md#gpu-gate). Optional:
+# FLINT_SM70_T5_FORK_GOLDEN_SCORES (T5 near-tie scoring), OUT (log dir),
+# M5_NODES (subset of the node names below), M5_MUTATION (m5_mutation_check.sh).
+# FLINT_SM70_OURS_NOISE defaults to $OUT/ours_eager_vs_eager.json, which t4c
+# writes, so t4c runs first; if t4c fails, t4a/t4d/t4e/t7 are NOT COUNTED.
 set -uo pipefail
 
-# Deterministic kernel choice (Quinn/Astro, Nov 6): TurboMind's small-shape
-# autotune times kernels at engine start, so each instance may pick different
-# kernels (Bea: 7/8 prompts split between two eager instances; identical with
-# tuning off). Until Kai's persisted tuning table lands, every M5 gate runs
-# with it off, on both stacks. M5_ALLOW_TUNING=1 opts out (diagnostics only).
+# TurboMind's small-shape autotune picks kernels per engine start, so engine
+# instances can differ; the gates run with it off unless M5_ALLOW_TUNING=1.
 if [[ "${M5_ALLOW_TUNING:-0}" != 1 ]]; then
   for q in NVFP4 FP8 AWQ MXFP4; do export "VLLM_SM70_${q}_TUNE_SMALL_SHAPES=0"; done
 fi
-# Quinn (Nov 7, after #87): a gate may run with tuning on only against a
-# persisted TurboMind LUT in strict mode, so a missing or stale LUT fails
-# instead of silently re-tuning per engine.
+# Tuning on is allowed only with a persisted TurboMind LUT in strict mode, so
+# a missing or stale LUT fails instead of re-tuning per engine.
 if [[ "${M5_ALLOW_TUNING:-0}" == 1 && -n "${VLLM_SM70_GEMM_LUT_PATH:-}" \
       && "${VLLM_SM70_GEMM_LUT_STRICT:-}" != 1 ]]; then
   echo "M5_ALLOW_TUNING=1 with VLLM_SM70_GEMM_LUT_PATH set needs VLLM_SM70_GEMM_LUT_STRICT=1"
@@ -61,7 +38,7 @@ for d in "$FLINT_SM70_T4_SEQS_DIR" "$FLINT_SM70_FORK_SCORES_DIR"; do
   [[ -d "$d" ]] || { echo "not a directory: $d"; exit 2; }
 done
 [[ -f "$FLINT_SM70_T4_ENVELOPE" ]] || { echo "missing $FLINT_SM70_T4_ENVELOPE"; exit 2; }
-OUT="${OUT:-$HOME/vllm-sm70-work/bea/m5-window/$(date +%Y%m%dT%H%M)}"
+OUT="${OUT:-./out/m5-window/$(date +%Y%m%dT%H%M)}"
 mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 2; }
 export FLINT_SM70_OURS_NOISE="${FLINT_SM70_OURS_NOISE:-$OUT/ours_eager_vs_eager.json}"
 F=sm70/tests/models/test_m5_flint_sm70.py
@@ -111,7 +88,7 @@ PY
 
 used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; }
 if used_mib | awk '$1 > 1024 {busy=1} END {exit !busy}'; then
-  echo "a GPU has >1 GiB in use (is prod still up?):"; used_mib; exit 2
+  echo "a GPU has >1 GiB in use (is a server still running?):"; used_mib; exit 2
 fi
 
 declare -A RC SKIPPED
@@ -142,8 +119,7 @@ grep -hE '^(T2 n=|T4[abcde] |T5 |T7 |ours_eager_vs_eager|M5_MUTATION |junit: )' 
 echo
 echo "== summary"
 rc=0
-# Quinn (Nov 7): exact T4b may only be skipped by design when T4e gates
-# replay in the same run; otherwise replay would pass with nothing gating it.
+# t4b may be skipped by design only when t4e gates replay in the same run.
 if [[ -v "SKIPPED[t4b]" ]]; then
   if [[ ! -v "RC[t4e]" ]]; then
     echo "t4b skipped by design but t4e is not in this run (M5_NODES): FAIL"; rc=1

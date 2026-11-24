@@ -2,34 +2,16 @@
 """Inkling 2 NVFP4 experts on the TurboMind W4A16 dense stage.
 
 One ``Nvfp4TmExperts`` per NVFP4 layer and TP rank holds the two packed banks
-(``tm.nvfp4_sm70_prepare`` per expert, gate-first W13) and their strided
-pointer tables. ``expert_sum`` sorts the routed slots by expert, runs W13
-(k = H, n = 2 * I / tp), the soft-capped SwiGLU in fp32, W2 (k = I / tp,
-n = H), and sums a token's experts in fp32, as the torch path of moe.py does.
-
-The slots run in chunks of at most ``CHUNK_ROWS`` rows, so the stage scratch
-and the fp32 temporaries do not grow with the batch. Stage call forms per
-chunk: up to ``COMPACT_MAX_SLOTS`` slots each slot is its own one-row group
-(one launch per stage; ``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off); a
-batch of up to ``COMPACT_BATCH_MAX_SLOTS`` slots runs in compact chunks of
-``COMPACT_MAX_SLOTS``; above that the groups are the per-expert offsets over
-all experts.
-
-Every routed slot runs, so ``expert_sum`` reads nothing back to the host: a
-slot with no expert (padding) is computed on expert E - 1 and zeroed.
-``routed_expert_sum`` takes the router logits of a small batch instead and
-routes, sorts and gathers the slots in one launch and sums them in another
-(ops/routing.py); the stages and the SwiGLU are those of ``expert_sum``.
-
-On the route of gemv.py the compact one-row slots skip both stages and the
-SwiGLU kernel: one Triton GEMV launch runs W13 with the SwiGLU in its
-epilogue and one runs W2, over the same banks (ops/nvfp4_gemv.py). It needs
-banks of the real extension laid out as the dense NVFP4 GEMV reads them
-(k_ld = 32 * K, q_ld = N; ``Nvfp4TmExperts.slot_gemv``).
-
-Switch: the route is on where ``rejection`` admits a layer;
-``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer on the torch path of
-moe.py, which holds all experts in fp16.
+(gate-first W13, W2) and their pointer tables. ``expert_sum`` sorts the
+routed slots by expert, runs W13, the soft-capped SwiGLU in fp32 and W2, and
+sums a token's experts in fp32, as moe.py's torch path does. Slots run in
+chunks of at most ``CHUNK_ROWS``; small batches run one-row compact groups
+(``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off). Every slot runs, so
+nothing is read back to the host: a padding slot is computed on expert E - 1
+and zeroed. ``routed_expert_sum`` routes from the router logits via
+ops/routing.py. On the route of gemv.py compact slots take the NVFP4 GEMV
+(ops/nvfp4_gemv.py) over the same banks. The route is on where ``rejection``
+admits a layer; ``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer on moe.py.
 """
 
 from __future__ import annotations
@@ -60,14 +42,14 @@ REQUIRED_OPS: Final = (
 )
 # (hidden, global intermediate, experts, top-k)
 INKLING_CONTRACTS: Final = frozenset({(2304, 1152, 128, 8)})
-# Only the TP2 bank shapes (W13 n=1152, W2 k=576) have run on a GPU.
+# TP sizes the route admits (bank shapes W13 n=1152, W2 k=576 at TP2).
 INKLING_TP_SIZES: Final = (2,)
 # tm.nvfp4_sm70_prepare packs 8 codes of the output axis into one int32.
 CODES_PER_WORD: Final = 8
 FP16_MIN_NORMAL: Final = 2.0**-14
 FP16_MAX: Final = 65504.0
-# Routed slots per stage call: bounds the workspace (TP2: 4096 x 6336 fp16,
-# 52 MB per device) and the fp32 temporaries of one call.
+# Routed slots per stage call: bounds the workspace and the fp32 temporaries
+# of one call.
 CHUNK_ROWS: Final = 4096
 # Batches of up to this many slots run as chunks of COMPACT_MAX_SLOTS compact
 # slot groups, because the per-expert groups over all 128 experts cost about

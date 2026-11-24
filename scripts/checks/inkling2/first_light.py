@@ -2,32 +2,17 @@
 """Inkling 2 first light: a running server against the HF goldens.
 
 Replays the short text cases of a golden run file teacher-forced (one
-/v1/completions request per case with prompt_logprobs; it starts no server)
-and compares:
-
-  logprobs  top-1 agreement, flips with a reference top-1/top-2 gap at or
-            above --gap-max, a mean top-20 truncated KL (over the reference's
-            listed tokens; not S5's full-vocabulary KL), and the
-            |logprob delta| of the reference top-1 (max and p99), pooled over
-            the output positions of all cases.
-  states    the per-visit dump of `sm70.inkling2.visit_dump_dir`
-            (<dir>/rank<r>/forward<n>/visit<v>_layer<l>_pass<p>.pt) against
-            <states-dir>/<id>.states.npz at the case's golden
-            `state_positions`: relative L2 per position, median over the
-            positions, per visit; the first failing visit is reported.
-
-The server must run with --max-num-seqs 1 and nothing else may send requests:
-the forwards a request adds to the dump directory are taken as that request's
-token rows, in order. Run it where the dump directory is readable. Give each
-server start a fresh dump directory: a restarted server numbers its forwards
-from 0 again and overwrites the old ones, which the script refuses.
-
-Exit status 1 when a threshold fails or a file is missing.
-
-Usage:
-  first_light.py --base-url http://127.0.0.1:8000 --model NAME \\
-      --goldens GOLDENS_DIR [--dump-dir DIR] [--out report.json]
-  first_light.py --goldens GOLDENS_DIR --captured run.json   # compare only
+/v1/completions request per case, prompt_logprobs; starts no server):
+  logprobs  top-1 agreement, flips with a top-1/top-2 gap >= --gap-max, mean
+            top-20 truncated KL, |logprob delta| of the reference top-1
+  states    the `sm70.inkling2.visit_dump_dir` dump against
+            <states-dir>/<id>.states.npz: relative L2 per visit
+The server must run with --max-num-seqs 1 and serve nothing else: each
+request's forwards in the dump dir are its token rows, in order. Use a fresh
+dump dir per server start (forward numbering restarts at 0). Exit 1 when a
+threshold fails or a file is missing.
+  first_light.py --base-url URL --model NAME --goldens DIR [--dump-dir DIR]
+  first_light.py --goldens DIR --captured run.json   # compare only
 """
 
 from __future__ import annotations
@@ -44,8 +29,8 @@ import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "greedy"))
 import teacher_forced
 
-# Defaults: the suggested short-context thresholds of the fp16 noise-floor
-# measurement on the HF reference (each at least 3x the floor).
+# Defaults: short-context thresholds, each at least 3x the fp16 noise floor
+# of the HF reference.
 MIN_AGREEMENT = 0.98
 GAP_MAX = 0.5
 MAX_REAL_FLIPS = 0

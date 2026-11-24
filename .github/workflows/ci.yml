@@ -139,7 +139,7 @@ jobs:
       - name: Install CPU torch + vLLM at BASE
         if: steps.detect.outputs.run == 'true'
         env:
-          # Skips compiling the CUDA extension (K01's build backend).
+          # Skips compiling the CUDA extension (see sm70's build backend).
           VLLM_SM70_SKIP_EXT: "1"
           TORCH_VERSION: "2.14.0" # docs/pins.md
         run: |
@@ -200,9 +200,9 @@ jobs:
           python -m pytest -q "${xdist[@]}" "${dirs[@]}" -m "not gpu"; rc=$?
           [[ $rc == 0 || $rc == 5 ]] || exit $rc
 
-  # Owned by Felix (flake, PR #2); he may extend this job. It must never build
-  # vllm/tree/venv (hours of CUDA compile): eval only, plus the cheap `source`
-  # output (fetch + patch), which proves the series applies under Nix's `patch`.
+  # This job must never build vllm/tree/venv (hours of CUDA compile): eval
+  # only, plus the cheap `source` output (fetch + patch), which proves the
+  # series applies under Nix's `patch`.
   nix-eval:
     name: Nix eval + source
     runs-on: ubuntu-latest

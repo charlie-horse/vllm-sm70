@@ -1,27 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Quality / speed probe for the Qwen Phase 2 matrix (stdlib only).
+"""Quality / speed probe for the Qwen serving matrix (stdlib only).
 
 Talks to a running `vllm serve` over the OpenAI-compatible HTTP API:
-
   probe.py health  --url URL
   probe.py run     --url URL --model NAME --row ROW --out results.json
                    --max-model-len N [--spec] [--no-gate]
   probe.py summary --out-dir DIR
   probe.py ab-run     --url URL --model NAME --label on|off --out ab.json
   probe.py ab-compare --on on/ab.json --off off/ab.json --out ab_summary.json
-
-Phases of `run`: math (10 problems, exact numeric answer), code (5 tiny
-functions, asserts executed in a subprocess with a timeout), needle in a
-haystack at ~max-model-len (3 trials), no-gibberish at concurrency 20, and
-single-stream decode tok/s at ~4K context. For --spec rows it also diffs the
-vllm:spec_decode_* counters from /metrics around each phase.
-
-`ab-run` / `ab-compare` are the M8 QPN8 A/B (m8_qpn8_ab.sh): decode tok/s at
-concurrency 1..4 (~1K-token prompt, 256 forced tokens, median of 3 rounds)
-and greedy outputs for 5 fixed prompts, compared on vs off.
-
-Quality requests are greedy (temperature 0) and send
-chat_template_kwargs.enable_thinking=false explicitly.
+`run` phases: math (exact answers), code (asserts in a subprocess), needle
+at ~max-model-len, no-gibberish at concurrency 20, decode tok/s at ~4K
+context; --spec rows also diff vllm:spec_decode_* counters per phase.
+`ab-run` / `ab-compare` serve m8_qpn8_ab.sh. Quality requests are greedy
+and send chat_template_kwargs.enable_thinking=false.
 """
 
 from __future__ import annotations
@@ -543,14 +534,14 @@ def cmd_summary(a) -> int:
 
 
 # --------------------------------------------------------------------------
-# M8 QPN8 A/B
+# QPN8 A/B (m8_qpn8_ab.sh)
 # --------------------------------------------------------------------------
 AB_CONCURRENCY = (1, 2, 3, 4)
 AB_PROMPT_TOKENS = 1024
 AB_DECODE_TOKENS = 256
 AB_ROUNDS = 3
 AB_MATCH_TOKENS = 32
-AB_RATIO_MIN = 0.98  # QPN8 / M6 decode tok/s; below this is a regression
+AB_RATIO_MIN = 0.98  # QPN8 on / off decode tok/s; below this is a regression
 AB_GREEDY_PROMPTS = [
     "List the first ten prime numbers and explain how you found them.",
     "Explain in plain words what a CUDA graph is.",

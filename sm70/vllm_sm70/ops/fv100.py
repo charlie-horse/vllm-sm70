@@ -1,35 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 attention ops (K05): Python wrappers and fakes over torch.ops._sm70_C.
+"""Flash-V100 attention ops: Python wrappers and fakes over torch.ops._sm70_C.
 
-Ported from fork cf9492a flash-attention-v100/flash_attn_v100/
-flash_attn_interface.py (the lean subset of Ivy's section B). Differences
-from the fork:
-
-* The pybind module `flash_attn_v100_cuda` became five `_sm70_C::fv100_*`
-  out ops. Each takes `out` first and returns None; the wrappers below keep
-  the fork signatures and return `out`.
-* No policy object (`_runtime`, `legacy_policy`): the fork defaults are
-  constants here. Decode workspaces are shared across batch sizes
-  (fork VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE unset -> on) and the launch
-  grid follows the runtime length (VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS
-  unset -> on). VLLM_FLASH_V100_DECODE_PARTITION_SIZE is gone; pass
-  `partition_size_hint` instead.
-* No anchored SWA, FP8 KV, staged XQA or DFlash2 split.
-* K14 (C4): Flint sink layers (GQA 8, D128, fp16 KV) decode in one launch
-  through `fv100_decode_paged_sinks_fused` when the op is built and
-  VLLM_SM70_FLINT_ATTN_FUSED_DECODE is not "0". Its int32 arrival counters
-  are per device, allocated and zeroed only outside CUDA-graph capture (the
-  `--max-num-seqs 20` gibberish fix, fork 7f12d21b8); a capture without them
-  decodes in two launches. See "Fused one-launch sink decode" below.
+The `_sm70_C::fv100_*` ops are out ops: each takes `out` first and returns
+None; the wrappers return `out`. Decode workspaces are shared across batch
+sizes and the launch grid follows the runtime length; pass
+`partition_size_hint` to pick a partition size. Flint sink layers (GQA 8,
+D128, fp16 KV) decode in one launch through `fv100_decode_paged_sinks_fused`
+when it is built and VLLM_SM70_FLINT_ATTN_FUSED_DECODE is not "0"; see
+"Fused one-launch sink decode" below.
 
 KV cache views: `k_cache`/`v_cache` are [num_blocks, block_size, H_kv, D]
 views with any strides in the first three dims and a contiguous last dim.
-`check_kv_cache_views()` checks that on the CPU (metadata only), and
-`split_lbnhc_kv_cache()` builds the views from an upstream v0.33.0 KV cache
-(LBNHC: K and V interleaved per head, so stride(2) == 2 * D). Wiring the
-backend to that layout is K06.
-"""
+`check_kv_cache_views()` checks that on the CPU, and
+`split_lbnhc_kv_cache()` builds the views from vLLM's KV cache (LBNHC: K
+and V interleaved per head, so stride(2) == 2 * D)."""
 
 from __future__ import annotations
 
@@ -75,7 +60,7 @@ def _op(name: str):
 
 
 def available() -> bool:
-    """All K05 Flash-V100 ops are present in the loaded _sm70_C."""
+    """All Flash-V100 ops are present in the loaded _sm70_C."""
     return all(has_op(name) for name in OPS)
 
 
@@ -86,10 +71,7 @@ SINK_OPS = ("fv100_prefill_paged_sinks", "fv100_decode_paged_sinks")
 def supports_sinks() -> bool:
     """The loaded _sm70_C applies learned attention sinks.
 
-    True iff both K05 sink ops are registered. Replaces the fork's
-    `flash_attn_v100.SUPPORTS_SINKS` (cf9492a flash_attn_v100/__init__.py,
-    computed from `prefill_paged_sinks_fwd` and `decode_paged_sinks_fwd`;
-    read by vllm/model_executor/models/config.py:218-229). Unlike
+    True iff both sink ops are registered. Unlike
     FlashAttnV100Backend.supports_sink(), which is a constant class flag,
     this reflects the build. Sinks apply on head size 128 only (the D256
     kernels have no sink term).
@@ -108,14 +90,13 @@ OPS = (
     "fv100_prefill_paged_sinks",
 )
 
-# fork flash_attn_interface.py:20-21
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 # Head sizes the lean build instantiates (decode: 128/256; XQA: 256).
 SUPPORTED_HEAD_SIZES = (128, 256)
 XQA_GQA_RATIOS = (4, 6, 8)
 
-# K14 (C4): optional sixth op, built unless VLLM_SM70_FV100_FUSED_DECODE=OFF.
+# Optional sixth op, built unless VLLM_SM70_FV100_FUSED_DECODE=OFF.
 FUSED_DECODE_OP = "fv100_decode_paged_sinks_fused"
 FUSED_DECODE_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
 FUSED_DECODE_ZERO_COUNTERS_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS"
@@ -123,7 +104,7 @@ FUSED_DECODE_ZERO_COUNTERS_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTER
 # gqa8_d128_decode_eligible): D128, 8 query heads per KV head, with sinks.
 FUSED_DECODE_HEAD_DIM = 128
 FUSED_DECODE_GQA = 8
-# fork flash_attn_interface.py:32-34: int32 arrival counters, one per
+# int32 arrival counters, one per
 # (row, KV head), 1024 rows x 16 KV heads (64 KiB) per device.
 FUSED_DECODE_COUNTER_CAPACITY = 1024 * 16
 
@@ -132,7 +113,7 @@ _decode_workspace_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
-# KV cache views (K05 decision 3: arbitrary strides, LBNHC interleave)
+# KV cache views (arbitrary strides, LBNHC interleave)
 # ---------------------------------------------------------------------------
 
 
@@ -152,7 +133,7 @@ def check_kv_cache_views(
       * last dim contiguous, D in SUPPORTED_HEAD_SIZES;
       * strides of dims 0-2 multiples of 8 elements and 16-byte aligned base
         pointers, so LBNHC (stride(2) == 2 * D, K and V interleaved per
-        head) and the fork's separate-K/V layout both pass.
+        head) and a separate-K/V layout both pass.
     """
     problems = []
     for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
@@ -192,7 +173,7 @@ def split_lbnhc_kv_cache(
     """K and V views of an upstream v0.33.0 per-layer KV cache.
 
     `kv_cache` is the logical (num_blocks, H_kv, block_size, 2 * head_size)
-    tensor upstream TritonAttention receives (UP triton_attn.py:655-657).
+    tensor upstream TritonAttention receives.
     Returns two [num_blocks, block_size, H_kv, head_size] views, no copy.
     """
     if kv_cache.dim() != 4 or kv_cache.shape[-1] != 2 * head_size:
@@ -205,7 +186,7 @@ def split_lbnhc_kv_cache(
 
 
 # ---------------------------------------------------------------------------
-# Helpers: fork flash_attn_interface.py:94-135
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -248,7 +229,6 @@ def _round_decode_partition_capacity(required_num_partitions: int) -> int:
     return 1 << (required_num_partitions - 1).bit_length()
 
 
-# fork flash_attn_interface.py:282-289
 def _cuda_graph_capture_active() -> bool:
     is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
     if is_capturing is None:
@@ -260,8 +240,7 @@ def _cuda_graph_capture_active() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Decode plan and workspace: fork flash_attn_interface.py:52-92, 292-590,
-# 840-889 (policy reads replaced by the fork defaults)
+# Decode plan and workspace
 # ---------------------------------------------------------------------------
 
 
@@ -368,7 +347,7 @@ def _get_decode_plan(
         and _cuda_graph_capture_active()
     ):
         # Capture the full workspace envelope: replay re-runs the captured
-        # fill_ of active_num_partitions, not this planning (fork :170-182).
+        # fill_ of active_num_partitions, not this planning.
         effective_max_seq_len = max(
             effective_max_seq_len,
             effective_workspace_seq_capacity,
@@ -426,7 +405,7 @@ def _assert_decode_launch_covers_seq_lens(
     """The launch grid must cover the batch's true longest sequence.
 
     Runs only with a workspace capacity hint, outside CUDA-graph capture
-    (fork :452-500: one device sync, never on the plain q=1 path).
+    (one device sync, never on the plain q=1 path).
     """
     if workspace_seq_capacity_hint is None or _cuda_graph_capture_active():
         return
@@ -461,10 +440,10 @@ def _get_decode_workspace_for_plan(
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
-    # B2's verify workspace keeps its exact partition count (round_partitions
-    # False); the K05 decode rounds to a power of two (fork behaviour).
+    # The verify workspace keeps its exact partition count (round_partitions
+    # False); the paged decode rounds to a power of two.
     capacity_of = _round_decode_partition_capacity if round_partitions else int
-    # Rows are shared across batch sizes (fork default share_workspace=on).
+    # Rows are shared across batch sizes.
     partition_capacity = capacity_of(plan.workspace_num_partitions)
     key = (
         device_index,
@@ -528,10 +507,8 @@ def clear_workspaces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fused one-launch sink decode (K14, C4): fork flash_attn_interface.py:30-36,
-# 59-71, 141-275 and the counter fix 7f12d21b8 / 89f751847 / 7e1c8c089 /
-# 7b2bacefd. The policy object is gone: the switches are read from the
-# environment on each call, as the fork's legacy_policy.py:42-47 did.
+# Fused one-launch sink decode. The switches are read from the environment
+# on each call.
 # ---------------------------------------------------------------------------
 
 
@@ -579,12 +556,12 @@ def fused_decode_enabled() -> bool:
 
 
 def _fused_decode_zero_counters_enabled() -> bool:
-    """Opt-in (fork default off): one counter memset per fused launch."""
+    """Opt-in: one counter memset per fused launch."""
     return os.environ.get(FUSED_DECODE_ZERO_COUNTERS_ENV) == "1"
 
 
 def fused_decode_available() -> bool:
-    """The fused op is built and not switched off (fork :236-240)."""
+    """The fused op is built and not switched off."""
     return has_op(FUSED_DECODE_OP) and fused_decode_enabled()
 
 
@@ -594,7 +571,7 @@ def fused_decode_eligible(
     sinks: torch.Tensor | None,
     kv_cache_dtype: str = "auto",
 ) -> bool:
-    """Shapes the one-launch kernel takes (fork :1366-1377).
+    """Shapes the one-launch kernel takes.
 
     Flint per rank: TP1 32q/4kv and TP2 16q/2kv (and TP4 8q/1kv), D128,
     sinks. The C++ side re-checks this and the 16-byte alignment of q, K, V,
@@ -685,7 +662,7 @@ def flash_attn_decode_paged_sinks_capture_counts() -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Sink validation: fork flash_attn_interface.py:1437-1451, 2103-2121
+# Sink validation
 # ---------------------------------------------------------------------------
 
 
@@ -732,11 +709,10 @@ def _window(window_size: tuple) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Public wrappers (fork signatures minus anchored SWA and `_runtime`)
+# Public wrappers
 # ---------------------------------------------------------------------------
 
 
-# fork flash_attn_interface.py:1273-1434
 def flash_attn_decode_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -761,7 +737,7 @@ def flash_attn_decode_paged(
     `sinks` (fp32 [H], natural-log units) adds exp(sink) to each softmax
     denominator with no value row; None keeps the sink-free kernels. With
     sinks, GQA-8 D128 layers (Flint) take the one-launch fused kernel when
-    it is built, switched on and has counters (K14), else the grouped
+    it is built, switched on and has counters, else the grouped
     two-launch kernel.
     """
     if softmax_scale is None:
@@ -788,7 +764,7 @@ def flash_attn_decode_paged(
     _assert_decode_launch_covers_seq_lens(
         plan, seq_lens, workspace_seq_capacity_hint=workspace_seq_capacity_hint
     )
-    # K14 (fork :1366-1391): with the fused decode switched off or not built,
+    # With the fused decode switched off or not built,
     # nothing here touches counters or capture state.
     fused_ok = (
         fused_decode_eligible(q, k_cache, sinks, kv_cache_dtype)
@@ -843,7 +819,6 @@ def flash_attn_decode_paged(
     return out
 
 
-# fork flash_attn_interface.py:1616-1811
 def flash_attn_decode_paged_xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -864,8 +839,8 @@ def flash_attn_decode_paged_xqa(
 ) -> torch.Tensor:
     """Tensor-core XQA decode for D=256, GQA 4/6/8, fp16 KV, no window/sinks.
 
-    `batch_context_routing` is accepted for the fork signature; the lean
-    build has no batch-context route, so it only sets the (unused) hint.
+    `batch_context_routing` is accepted but there is no batch-context
+    route, so it only sets the (unused) hint.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -931,7 +906,7 @@ def flash_attn_decode_paged_xqa(
 
 
 def xqa_supported(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
-    """Shapes flash_attn_decode_paged_xqa accepts (fork routing.py:133-135)."""
+    """Shapes flash_attn_decode_paged_xqa accepts."""
     if q.dim() != 3 or k_cache.dim() != 4 or k_cache.shape[2] <= 0:
         return False
     if q.shape[2] != 256 or q.shape[1] % k_cache.shape[2] != 0:
@@ -940,7 +915,7 @@ def xqa_supported(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# B2: DFlash2 verify attention (verify_decode.cu, new code)
+# DFlash2 verify attention (verify_decode.cu)
 # ---------------------------------------------------------------------------
 VERIFY_OP = "fv100_decode_verify"
 VERIFY_QUERY_LEN = 8  # tokens per request (DFlash2 k = 7 plus the anchor)
@@ -950,9 +925,7 @@ VERIFY_MAX_PARTITIONS = 12000  # verify_decode.cu kMaxPartitions
 # Bytes of verify workspace allowed per (device, stream). The workspace is
 # rows x H_q x partitions x (256 fp16 partial + 2 fp32 stats) = 520 B per
 # (row, head, partition), partitions = ceil(max_model_len / 128), exact (not
-# rounded to a power of two). Qwen3.8 TP2 (12 q heads): 1.6 MB per row at a
-# 32768 envelope (cap 168 rows = 21 requests), 7.3 MB per row at 150000
-# (cap 32 rows = 4 requests). Larger verify batches keep K07's XQA path.
+# rounded to a power of two). Larger verify batches keep the XQA expansion.
 VERIFY_WORKSPACE_BUDGET = 256 * 2**20
 
 
@@ -986,11 +959,11 @@ def flash_attn_decode_verify(
     max_seq_len_hint: int | None = None,
     workspace_seq_capacity_hint: int | None = None,
 ) -> torch.Tensor:
-    """DFlash2 verify rows, KV read once per request (B2).
+    """DFlash2 verify rows, KV read once per request.
 
     q / out [rows, H_q, 256] with rows = requests * 8, token-major (row =
     request * 8 + token); seq_lens [rows] and block_table [rows, blocks] are
-    K07's expansion (visible length per token; the 8 rows of a request share
+    the verify expansion (visible length per token; the 8 rows of a request share
     one table row). The grid covers max_seq_len_hint keys (the live length
     eagerly, the max_model_len envelope under CUDA-graph capture). The
     workspace is sized for workspace_seq_capacity_hint, which callers set to
@@ -1046,7 +1019,6 @@ def flash_attn_decode_verify(
     return out
 
 
-# fork flash_attn_interface.py:1950-2100 (DFlash2 split route dropped)
 def flash_attn_prefill_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,

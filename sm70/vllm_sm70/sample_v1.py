@@ -1,58 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""V1 runner hook for the top-k candidate sampler (K16) and the greedy
-top-1 fast path (F12), both on patch U4.
+"""V1 runner hook for the top-k candidate sampler and the greedy top-1 path.
 
-Patch U4 (patches/0005) adds ``Platform.get_hidden_state_sampler()``. The V1
+patches/0005 adds ``Platform.get_hidden_state_sampler()``. The V1
 ``GPUModelRunner`` reads it once in ``__init__`` and, before
-``compute_logits``, calls
+``compute_logits``, calls ``try_sample(model, sample_hidden_states,
+sampling_metadata, scheduler_output, spec_decode_metadata)``. A returned
+``SamplerOutput`` replaces ``compute_logits`` and ``_sample``; None keeps
+both. Per step: an all-greedy batch takes vocab-parallel top-1
+(sample_greedy.py) when the greedy fast path is on; otherwise the top-k
+candidate sampler (sample.py) when VLLM_SM70_FLINT_SAMPLER is on.
 
-    try_sample(model, sample_hidden_states, sampling_metadata,
-               scheduler_output, spec_decode_metadata)
-
-A returned ``SamplerOutput`` replaces ``compute_logits`` and ``_sample``;
-None keeps both. ``Sm70CudaPlatform.get_hidden_state_sampler`` returns a new
-``Sm70HiddenStateSampler`` unless both ``VLLM_SM70_FLINT_SAMPLER=0`` and
-``VLLM_SM70_GREEDY_TOKEN_FASTPATH=0``.
-
-Two routes, chosen per step from the sampling metadata:
-
-* all-greedy batch (temperature 0), and the greedy fast path on
-  (``Sm70Config.greedy_token_fastpath``, kill VLLM_SM70_GREEDY_TOKEN_FASTPATH
-  =0): vocab-parallel top-1 (vllm_sm70/sample_greedy.py). Port of FORK
-  runner :7646-7695 ``_can_use_greedy_token_fastpath`` and :7845-7862
-  ``_sample_greedy_token_fastpath``. Rejected batches log
-  "SM70 greedy top-1 fast path rejected: <reason>" once per reason.
-* otherwise, with VLLM_SM70_FLINT_SAMPLER on: K16 below.
-
-This is the only runner-facing code of K16; the sampling itself
-(vllm_sm70/sample.py) takes plain arguments, so a V2 hook (D2) can reuse it.
-
-Port of the fork's runner gate (FORK v1/worker/gpu_model_runner.py:
-7104-7125, :7698-7800 ``_can_use_topk_candidate_sampler``, ``:7828-7843``
-``_non_argmax_logits_processors_inactive``) and the Flint model's opt-in
-(FORK models/flint/model.py:570-577, :605-614). Differences:
-
-* The runner calls us; there is no runner-side ``logits = None`` gate.
-* The per-row top-k host copy comes from the runner's ``InputBatch``
-  (``top_k_cpu``), since upstream's ``SamplingMetadata`` has no
-  ``top_k_cpu``. The runner is bound in ``prepare()``.
-* ``prepare()`` runs from ``Sm70CudaPlatform.kernel_warmup`` (patch U1),
-  i.e. after the model is loaded and before CUDA graph capture. It creates
-  the overflow counter (R4) and reads ``use_fp64_gumbel``. Until it has run,
-  ``try_sample`` returns None.
-* Models opt in with a true ``supports_sm70_topk_sampler`` attribute (the
-  fork attached ``sample_topk_candidates`` to the Flint model; M10 sets the
-  attribute on the Flint model).
-
-Returns None (upstream path) for: no prepare(); a model that has not opted
-in or has no ``lm_head``/``logits_processor``; spec decode; structured output
-(the grammar bitmask needs logits); FP64 Gumbel noise (upstream
-``use_fp64_gumbel``: the kernel reproduces FP32 noise only); a running CUDA
-graph capture; thinking-budget requests; active non-argmax-invariant logits
-processors (min-tokens, logit bias, custom); penalties (they need
-``output_token_ids``, which async scheduling refreshes only inside
-``_sample``, after this hook); and every batch ``sample.py`` does not admit.
-"""
+``prepare()`` runs from ``Sm70CudaPlatform.kernel_warmup``, before CUDA
+graph capture; until then ``try_sample`` returns None. Models opt in with a
+true ``supports_sm70_topk_sampler`` attribute. ``reject_reason`` lists the
+cases that take the upstream path."""
 
 from __future__ import annotations
 
@@ -66,13 +27,13 @@ from vllm_sm70 import sample, sample_greedy
 
 logger = logging.getLogger("vllm.sm70")
 
-# The attribute a model sets to opt in (M10 sets it on the Flint model).
+# The attribute a model sets to opt in (the Flint model sets it).
 MODEL_OPT_IN = "supports_sm70_topk_sampler"
 
 
 def non_argmax_logits_processors_inactive(sampling_metadata: Any) -> bool:
-    """FORK gpu_model_runner.py:7828-7843: only empty min-tokens / logit-bias
-    processors may be among the non-argmax-invariant ones."""
+    """Only empty min-tokens / logit-bias processors may be among the
+    non-argmax-invariant ones."""
     for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
         min_toks = getattr(processor, "min_toks", None)
         if min_toks is not None:
@@ -93,7 +54,7 @@ GREEDY = "greedy top-1 fast path"
 
 
 class Sm70HiddenStateSampler:
-    """U4 hidden-state sampler: TP-local exact top-k (k <= 20) sampling, and
+    """Hidden-state sampler: TP-local exact top-k (k <= 20) sampling, and
     vocab-parallel top-1 for all-greedy batches."""
 
     def __init__(self, *, topk: bool = True, greedy: bool = True) -> None:
@@ -111,7 +72,7 @@ class Sm70HiddenStateSampler:
         return self._runner is not None
 
     def prepare(self, runner: Any, vllm_config: Any) -> None:
-        """Bind the V1 runner and create device state, before capture (R4)."""
+        """Bind the V1 runner and create device state, before capture."""
         from vllm_sm70.config import sm70_config
 
         model_config = getattr(vllm_config, "model_config", None)
@@ -136,7 +97,7 @@ class Sm70HiddenStateSampler:
 
     def route(self, sampling_metadata: Any) -> str | None:
         """GREEDY for an all-greedy batch with the fast path on, else TOPK
-        with K16 on, else None (nothing to do: upstream)."""
+        with the top-k sampler on, else None (nothing to do: upstream)."""
         if self._greedy and getattr(sampling_metadata, "all_greedy", False):
             return GREEDY
         return TOPK if self._topk else None
@@ -247,7 +208,7 @@ class Sm70HiddenStateSampler:
 
 
 def prepare_worker(worker: Any) -> None:
-    """Called from Sm70CudaPlatform.kernel_warmup (U1): bind the runner's
+    """Called from Sm70CudaPlatform.kernel_warmup: bind the runner's
     hidden-state sampler, if it is ours, before CUDA graph capture."""
     runner = getattr(worker, "model_runner", None)
     hook = getattr(runner, "_hidden_state_sampler", None)

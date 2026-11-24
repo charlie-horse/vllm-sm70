@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """Gate A: output-coherence checks for a vLLM OpenAI-compatible server.
 
-A1  teacher-forced NLL of known-good assistant turns (SWE-bench trajectories
-    from the seqs=2 server), rendered with the server's own chat template via
-    ``/tokenize`` and scored with ``/v1/completions`` ``prompt_logprobs=1``,
-    ``max_tokens=1``. Run at every concurrency level in fixed waves (the same
-    requests are in flight together at each level).
+A1  teacher-forced NLL of known-good assistant turns (SWE-bench trajectories),
+    rendered with the server's chat template via ``/tokenize`` and scored with
+    ``/v1/completions`` ``prompt_logprobs=1``, ``max_tokens=1``, at every
+    concurrency level in fixed waves.
 A2  greedy generation (temperature 0, fixed seed) of 24 prompts through
-    ``/v1/chat/completions`` with a pool of N concurrent requests. Compared
-    with the concurrency-1 output (exact token prefix) and screened for
-    gibberish (zlib ratio, n-gram repetition, non-ASCII ratio, python
-    ``ast`` parse of fenced code).
+    ``/v1/chat/completions`` with N concurrent requests, compared with the
+    concurrency-1 output (exact token prefix) and screened for gibberish
+    (zlib ratio, n-gram repetition, non-ASCII ratio, ``ast`` parse of code).
+Stdlib only. Exit status: 0 PASS, 1 FAIL, 2 could not run.
 
-Stdlib only. Exit status: 0 overall PASS, 1 FAIL, 2 could not run.
-
-    .venv/bin/python gate_a.py --base-url http://HOST:8000/v1 --model flint \\
+    gate_a.py --base-url http://HOST:8000/v1 --model flint \\
         --concurrency 1,4,16 --out runs/<name>
 """
 

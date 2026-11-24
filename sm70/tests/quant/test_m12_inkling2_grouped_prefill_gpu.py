@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the M12 Inkling 2 grouped expert prefill (TurboMind).
+"""GPU tests for the Inkling 2 grouped expert prefill (TurboMind).
 
-One V100 with vllm_sm70._sm70_C built. The C++ knobs are read once per
+One SM70 GPU with vllm_sm70._sm70_C built. The C++ knobs are read once per
 process, so each setting runs in a child process: the default (grouped
 stage) and VLLM_SM70_INKLING_TM_GROUPED_PREFILL=0 (per-expert loop), both
 with VLLM_SM70_PROFILE_TRACE=1. At the real TP2 per-rank shapes with random
-codes, for prefill batches of 512, 2048 and 3867 tokens:
-- each stage call is one TurboMind GEMM launch on the grouped route and
-  128 on the loop;
-- the route log names the Inkling 2 grouped prefill, outside capture;
-- both routes match the fp16 torch path of moe.py within 1e-2 (max-abs-rel)
-  and each other within 1e-2;
-- the grouped route is faster. Times per layer visit go to the JSON file
-  named by INKLING2_SM70_TIMING_OUT when it is set.
+codes, for prefill batches of 512, 2048 and 3867 tokens: each stage call is
+one TurboMind GEMM launch on the grouped route and 128 on the loop; the
+route log names the grouped prefill, outside capture; both routes match the
+fp16 torch path of moe.py and each other within 1e-2; the grouped route is
+faster. INKLING2_SM70_TIMING_OUT names a JSON file for the times.
 
     python -m pytest -q -p no:cacheprovider \
         sm70/tests/quant/test_m12_inkling2_grouped_prefill_gpu.py -m gpu

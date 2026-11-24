@@ -2,23 +2,15 @@
 """When an Inkling 2 DSpark engine speculates: a batch-size schedule.
 
 The engine-config hook (config.py) sets upstream's dynamic speculative
-decoding schedule, ``SpeculativeConfig.num_speculative_tokens_per_batch_size``
-(UP config/speculative.py:524), from ``sm70.inkling2``:
-
-    [(1, T, K), (T + 1, max_num_seqs, 0)]
-
-with T = ``dspark_spec_max_reqs`` and K = ``dspark_spec_tokens``. The V2
-scheduler looks up K by the number of scheduled requests of a step (UP
-v1/core/sched/scheduler.py:1710-1714). The drafts proposed after that step
-are cut to K: K = 0 stores the draft's context K/V only and skips its block
-pass (UP v1/worker/gpu/spec_decode/dflash/speculator.py:546-553), so the
-draft's caches hold every committed position whichever tier a step takes.
-The next step then verifies K drafts, or decodes one token per request.
-A step's tier depends on that step alone.
-
-No schedule is set when K = num_speculative_tokens and T >= max_num_seqs
-(every step speculates), when ``--speculative-config`` already holds one,
-or with ``VLLM_SM70_INKLING_DSPARK_AUTO=0``.
+decoding schedule, ``SpeculativeConfig.num_speculative_tokens_per_batch_size``,
+from ``sm70.inkling2``: [(1, T, K), (T + 1, max_num_seqs, 0)] with
+T = ``dspark_spec_max_reqs`` and K = ``dspark_spec_tokens``. The V2 scheduler
+looks up K by the number of scheduled requests of a step and cuts the drafts
+proposed after that step to K. K = 0 stores the draft's context K/V only and
+skips its block pass, so the draft's caches hold every committed position
+whichever tier a step takes. No schedule is set when K =
+num_speculative_tokens and T >= max_num_seqs, when ``--speculative-config``
+already holds one, or with ``VLLM_SM70_INKLING_DSPARK_AUTO=0``.
 """
 
 from __future__ import annotations

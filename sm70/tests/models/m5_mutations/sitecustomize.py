@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M5 mutation check: installs the M5_MUTATION hook in every Python process.
+"""Mutation check: installs the M5_MUTATION hook in every Python process.
 
 Put this directory FIRST on PYTHONPATH (sm70/scripts/m5_mutation_check.sh
 does). Python imports the first ``sitecustomize`` on sys.path at startup, so

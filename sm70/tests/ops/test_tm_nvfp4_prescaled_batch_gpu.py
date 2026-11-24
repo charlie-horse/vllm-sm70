@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pre-scaled NVFP4 batch GEMM must equal the ordinary one bit for bit.
 
-Ported from fork cf9492a tests/kernels/quantization/
-test_sm70_nvfp4_prescaled_batch.py (a42e887cf). Changes:
-- `_prescale_nvfp4_batch_scales` (fork vllm/model_executor/layers/
-  quantization/sm70_turbomind.py:485-490, Mara's quant layer) is copied here.
-- The fork's env knob VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=64 is now the default
-  (tm_config.h kNvfp4DenseTuneMaxMDefault).
-- The QPN2 dispatch test belongs with the QPN2 ops (Rosa) and is not ported.
+`_prescale_nvfp4_batch_scales` below is a test-local copy of the scale fold.
+The dense tune max M default is tm_config.h kNvfp4DenseTuneMaxMDefault.
 """
 
 from __future__ import annotations

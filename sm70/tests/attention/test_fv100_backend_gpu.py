@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K06 GPU: the Flash-V100 backend end to end against upstream TRITON_ATTN.
+"""GPU: the Flash-V100 backend end to end against upstream TRITON_ATTN.
 
 Both backends get the same inputs on the same upstream (LBNHC) KV cache:
 the new tokens' K/V are written with upstream's do_kv_cache_update
@@ -12,7 +12,7 @@ rebuilding the metadata before each replay as the V1 runner does.
 
 Shapes: Flint D128 GQA8 (16q/2kv) with sliding window 513 and sinks, and full
 attention with sinks; Qwen3.8/3.6 D256 GQA6 (12q/2kv) and GQA8 (8q/1kv).
-Needs upstream v0.33.0 Python importable and an SM70 GPU with _sm70_C.
+Needs upstream vLLM's Python importable and an SM70 GPU with _sm70_C.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ pytestmark = pytest.mark.gpu
 
 @pytest.fixture(autouse=True)
 def _upstream():
-    """Upstream v0.33.0 Python must be importable (checked at run time, so
+    """Upstream vLLM's Python must be importable (checked at run time, so
     CPU collection never imports vLLM)."""
     pytest.importorskip("vllm.v1.attention.backends.triton_attn")
 

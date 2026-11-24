@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K09 CPU checks for the QPN8 ops (no GPU, no built _sm70_C).
+"""CPU checks for the QPN8 ops (no GPU, no built _sm70_C).
 
 What: the QPN8 schemas in sm70/csrc/qpn8 are the three carried ops, with
   `Tensor(a!)` outputs, CUDA impls and no `native_policy` or raw-pointer
   argument; every op has a fake in vllm_sm70/ops/qpn8.py whose arguments
   match the schema and whose shapes match the C++ op; the gemm guards admit
-  M in [1, 8] and no longer name a TP4 shape; every TP2 Qwen3.6/3.8 dense
-  FP8 shape is admitted and gets a split-K the kernel accepts; the
-  qpn8_native_linear custom op picks QPN8 / TurboMind / dequantize+mm by M
-  (ports the kernel-level parts of fork tests/quantization/
-  test_block_fp8_qpn8_capabilities.py).
+  M in [1, 8] and name no model shape; every TP2 Qwen3.6/3.8 dense FP8
+  shape is admitted and gets a split-K the kernel accepts; the
+  qpn8_native_linear custom op picks QPN8 / TurboMind / dequantize+mm by M.
 """
 
 from __future__ import annotations
@@ -74,8 +72,8 @@ def _gemm_checks() -> str:
 
 
 def test_gemm_guards_are_shape_generic():
-    """The TP4-only lesson (#34/#40): no guard may name a model shape, and
-    block scales are not refused above M=8 any more."""
+    """No guard may name a model shape, and block scales are not refused
+    above M=8."""
     joined = _gemm_checks()
     for literal in re.findall(r"\b\d{3,}\b", joined):
         assert literal in ("128",), f"shape literal {literal} in a guard"

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the M12 Inkling 2 NVFP4 TurboMind expert route (moe_tm.py).
+"""GPU tests for the Inkling 2 NVFP4 TurboMind expert route (moe_tm.py).
 
-One V100 with vllm_sm70._sm70_C built. The TurboMind route is compared with
+One SM70 GPU with vllm_sm70._sm70_C built. The TurboMind route is compared with
 the fp16 torch path of moe.py (max-abs-rel under 1e-2):
 - at the real per-rank shapes (128 experts, top-8; TP2 and TP1) with random
   codes and scales in the checkpoint's range, in both stage call forms;

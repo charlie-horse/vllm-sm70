@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Top-k candidate sampler op registration (patch K16).
-//
-// Adapted from the fork's sidecar fragment
-// csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp (cf9492a): the
-// declarations at :34-41 and the defs at :82-92. The fork registered them in
-// `_C` from a separate `_sm70_sampler_C` module; here they are two more ops of
-// `_sm70_C`. The schemas are the fork's, unchanged. The other defs of that
-// fragment (sorted/chunked top20 Philox samplers, sampler graph branches) are
-// not carried (see PROVENANCE.md).
+// Top-k candidate sampler op registration in `_sm70_C`. Source:
+// PROVENANCE.md.
 //
 // The kernels allocate only their outputs and one per-call scratch tensor
 // (through the caching allocator, so graph capture takes them from the graph
 // pool). The optional overflow counter is created by the caller once, before
-// any capture (vllm_sm70/sample.py:prepare, R4); the ops never create state.
+// any capture (vllm_sm70/sample.py:prepare); the ops never create state.
 
 #include <torch/all.h>
 #include <torch/library.h>

@@ -1,62 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: torch attention over the paged K/V cache.
 
-`paged_attention` is the runtime torch path of one attention layer visit: an
-eager break that reads the owner's metadata from the forward context.
-`attention_with_metadata` is the same op on an explicit cache and metadata,
-the oracle of the attention kernels. Both read what the prologue produced:
-clipped queries, relative-position logits, sink logits, the output gate, and
-K/V already written to the cache for every token of the batch.
-
-    logit[q, h, k] = q . k * D^-0.5 + rel_logits[q, h, d],  d = q_pos - k_pos
-    (the bias is zero outside 0 <= d < extent)
-    keys: 0 <= d, and d < sliding_window in a sliding layer
-    one sink column per query and head, fp32 softmax, sink column dropped
-    out = (weights @ v) * sigmoid(gate)
-
-Keys are gathered through the block table in steps of at most `key_chunk`
-key tokens and folded into a running fp32 softmax, so memory does not grow
-with the context. A request with more than one query shares one key range
-per `query_chunk` queries (a sliding layer reads the window only); requests
-with one query are batched with a key range each, `OWN_KEY_STEPS *
-key_chunk` gathered keys per step.
-
-A decode-only batch (backend.py) reads no host data: every row of the slot
-mapping is a one-query request whose key range has a static length, the
-window in a sliding layer and the block-table width (times the block size)
-in a global one, with the keys past the query's position masked; a key
-step is up to `OWN_KEY_STEPS` key chunks long when the batch has fewer rows.
-Rows with a negative slot are padding: their output is zero. On the route
-of fused_small.py the output gate of a decode-only batch is one launch
-(ops/small_ops.py ``gate``) that also zeroes the padding rows. The output
-projection of up to 8 rows is a GEMV on the route of gemv.py.
-
-Switch: the one-query rows of either kind of batch run one Triton kernel per
-call (ops/paged_attention.py), which reads only each row's own keys, unless
-VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0 or `hf_rounding`. Tensors off the GPU
-take the torch ops below, except in Triton's interpreter. Its key range is
-split over several programs per row and head with a merge launch after
-(split-KV), the chunk count bounded by the shapes and the largest context
-(the block-table width in a decode-only batch), unless
-VLLM_SM70_INKLING_SPLIT_KV_ATTN=0. The switches are read on every eager
-call; a replayed CUDA graph keeps the route it was captured with.
-
-Transient memory of one step, beside the op's inputs and output:
-
-    scores  at most 4 live tensors of query_chunk * key_chunk * heads fp32
-            values: 4 * 4 B * 256 * 1024 * 24 = 101 MB at the defaults with
-            the 24 heads of an Inkling 2 Mini global layer
-    split   the split-KV partials, (D + 2) * 4 B per program of at most
-            8 per SM: 333 KB with D 128 on a V100
-    K | V   the gathered keys in the cache dtype and the values in fp32,
-            kv_heads * D * 8 B per key: 8 MB for key_chunk keys of a request
-            with several queries, 67 MB for the single-query requests
-
-`hf_rounding` is a debug switch: the softmax of all keys runs in one step and
-its weights are rounded to the value dtype before they multiply V, as the
-reference does (transformers modeling_inkling2_loop.py). Memory then grows
-with the context.
-
+`paged_attention` runs one attention layer visit (an eager break that reads
+the owner's metadata); `attention_with_metadata` is the same op on an explicit
+cache and metadata, the oracle of the kernels. With d = q_pos - k_pos:
+logit = q . k * D^-0.5 + rel_logits[d] (zero outside 0 <= d < extent) over
+keys with 0 <= d (and d < sliding_window in a sliding layer), plus one zero
+sink column; fp32 softmax; out = (weights @ v) * sigmoid(gate). Keys are
+gathered in steps of at most `key_chunk` into a running softmax. A
+decode-only batch reads no host data. Rows with a negative slot are zero.
+One-query rows run ops/paged_attention.py (split-KV unless
+VLLM_SM70_INKLING_SPLIT_KV_ATTN=0) unless VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0
+or `hf_rounding` (debug: softmax weights rounded as the reference).
 Shapes: P padded batch tokens, T real tokens, R requests, D head dim.
 """
 

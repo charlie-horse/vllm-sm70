@@ -26,4 +26,4 @@ Depends on (PRs):
 - [ ] Upstream edits are text-only, minimal, and no-ops without the plugin
 - [ ] The kill switch restores the upstream path, and is tested
 - [ ] Docs follow the CLAUDE.md documentation policy and changed with the code
-- [ ] No secrets, credentials, IPs or tailnet names in code, logs or this description (host names like r440 or c4130 are fine)
+- [ ] No secrets, credentials, IPs or tailnet names in code, logs or this description

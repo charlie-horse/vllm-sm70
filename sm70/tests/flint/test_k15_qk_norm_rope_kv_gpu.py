@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K15 GPU checks: fused q/k RMSNorm + RoPE + FP16 paged KV write vs the
+"""GPU checks: fused q/k RMSNorm + RoPE + FP16 paged KV write vs the
 unfused upstream ops, on an SM70 GPU.
 
-Port of FORK tests/kernels/core/test_sm70_flint_qk_norm_rope_kv.py (197).
-Changes: the cache is upstream v0.33.0's per-layer layout (logical
-(blocks, Hkv, page, 2D), physical LBNHC, viewed with transpose(1, 2).split
-as in TritonAttentionImpl.do_kv_cache_update) instead of the fork's
-[blocks, 2, page, Hkv, D] + unbind(1); an FP32 RoPE table is also checked
+The cache is upstream's per-layer layout (logical (blocks, Hkv, page, 2D),
+physical LBNHC, viewed with transpose(1, 2).split as in
+TritonAttentionImpl.do_kv_cache_update); an FP32 RoPE table is also checked
 (upstream Flint builds it in FP32); shapes are Flint TP2 (16/2) and TP1
 (32/4). The kernel is pure Triton, so _sm70_C is not needed.
 

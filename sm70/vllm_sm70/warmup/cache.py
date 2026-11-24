@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """TurboMind dispatch-cache moves: whole-cache bytes and the optional file.
 
-ported from FORK cf9492a vllm/model_executor/warmup/sm70_native_cache.py
-(``import_cache`` :64-95, ``packed_cache_bytes`` :125-127) and
-awq_sm70_warmup.py:79-88 (``_resolve_lut_path``), :124-144
-(``_load_lut_cache``), :147-165 (``_save_lut_cache``), :168-187 (``_export_lut_bytes``, ``_import_lut_bytes``).
-
-The fork kept one table per native-policy partition (``SM70POLICY1`` files,
-partition keys hashed from policy tokens). We have no policy tokens
-(tm_config.h reads knobs from the environment once), so every table is the
-fork's "legacy" partition: a raw file is imported as is, and a partitioned
-file contributes only its "legacy" entry.
+A LUT file is either a raw TurboMind table or a partitioned ``SM70POLICY1``
+file; a raw table is imported as is, and a partitioned file contributes
+only its "legacy" entry (tm_config.h reads knobs from the environment, so
+there are no other partitions).
 """
 
 from __future__ import annotations
@@ -24,8 +18,8 @@ from typing import Any
 
 logger = logging.getLogger("vllm.sm70.warmup")
 
-MAGIC = b"SM70POLICY1\n"  # FORK sm70_native_cache.py:16
-LEGACY_KEY = "legacy"  # FORK sm70_native_cache.py:55-57 (_key(()))
+MAGIC = b"SM70POLICY1\n"
+LEGACY_KEY = "legacy"
 IMPORT_OP = "sm70_gemm_import_cache"
 EXPORT_OP = "sm70_gemm_export_cache"
 
@@ -51,8 +45,7 @@ def _hint(device: Any):
 
 
 def resolve_path(template: str | None, device_index: int, rank: int) -> str | None:
-    """FORK awq_sm70_warmup.py:79-88; "{rank}" is the TP rank here (the fork
-    substituted the device index for it)."""
+    """Substitute "{device}", "{rank}" (the TP rank) and "{arch}" in ``template``."""
     if not template:
         return None
     return (
@@ -66,7 +59,7 @@ def legacy_table(payload: bytes) -> bytes | None:
     """The raw TurboMind table inside a file's bytes (None: nothing usable).
 
     A raw table is returned unchanged; a ``SM70POLICY1`` file yields its
-    "legacy" partition (FORK sm70_native_cache.py:67-95).
+    "legacy" partition.
     """
     if not payload.startswith(MAGIC):
         return payload
@@ -153,7 +146,7 @@ def call_id(kind: str, key: tuple, m: int) -> tuple:
 def tuning_snapshot() -> dict[str, Any]:
     """Every registered knob that can change a TurboMind launch spec: the
     "ops" section of vllm_sm70.envs (tm_config.h's knobs, read once by the
-    C++, plus the K09/K18 opt-ins), minus diagnostics. Values as envs
+    C++, plus the QPN8/DFlash2 switches), minus diagnostics. Values as envs
     returns them (raw strings, None when unset)."""
     from vllm_sm70 import envs
 
@@ -240,7 +233,7 @@ def write_lut(
 
 class Lut:
     """A loaded LUT file: the raw table and the calls it covers (None:
-    unknown, e.g. a fork file without a manifest)."""
+    unknown, e.g. a file without a manifest)."""
 
     def __init__(self, path: str, table: bytes, covers: set[tuple] | None):
         self.path = path
@@ -277,15 +270,14 @@ def load_lut(
     identity differs refuses the LUT: a WARNING naming each difference, None
     returned, so nothing is imported and the warmup tunes as without a LUT.
     A stale cache is an expected state after a rebuild or a knob change, so
-    it is not fatal. A LUT without a manifest (fork files) cannot be
-    checked and keeps the fork behaviour (every call tuned, then imported).
+    it is not fatal. A LUT without a manifest cannot be checked: every call
+    is tuned, then the LUT imported.
 
-    ``strict`` (VLLM_SM70_GEMM_LUT_STRICT=1, gate runs): a missing or
+    ``strict`` (VLLM_SM70_GEMM_LUT_STRICT=1): a missing or
     unreadable LUT file, or any manifest problem (missing, unreadable, not
     version MANIFEST_VERSION, sha256 not matching the table, identity
     differing) raises LutRefused listing them, instead of the INFO/WARNING
-    and re-tune.
-    """
+    and re-tune."""
     import hashlib
 
     p = Path(path)

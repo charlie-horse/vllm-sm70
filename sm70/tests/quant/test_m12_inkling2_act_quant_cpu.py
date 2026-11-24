@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 expert activation fake-quant (act_quant.py).
+"""Tests for the Inkling 2 expert activation fake-quant (act_quant.py).
 
 CPU, on the tiny checkpoint (models/fixtures/inkling2_tiny/). The oracle is
-the S5 spike's fake-quant (``s5_*`` below, the functions of its script
-verbatim), applied as the spike applied it: to every expert GEMM input and
-post-activation value, NVFP4 in the NVFP4 layers and MXFP8 in the MXFP8
-layers. Checked: the quantizers against it and against the float8 cast, the
-expert module on its grouped, one-token and row-wise paths (fp32, 1e-5), the
-TurboMind route with the pure-torch ``tm`` of test_m12_inkling2_nvfp4_tm_cpu
-(both rewrite points reached), the TP2 rank partials, no host sync, the
-switch (off: no op added, outputs bit-identical) and the whole model against
-the dense oracle with the same fake-quant.
+the reference fake-quant (``s5_*`` below), applied to every expert GEMM
+input and post-activation value, NVFP4 in the NVFP4 layers and MXFP8 in the
+MXFP8 layers. Checked: the quantizers against it and against the float8
+cast, the expert module on its grouped, one-token and row-wise paths (fp32,
+1e-5), the TurboMind route with the pure-torch ``tm`` of
+test_m12_inkling2_nvfp4_tm_cpu (both rewrite points reached), the TP2 rank
+partials, no host sync, the switch (off: no op added, outputs
+bit-identical) and the whole model against the dense oracle with the same
+fake-quant.
 """
 
 import json
@@ -59,7 +59,7 @@ FP32_MAX = 3.4028234663852886e38
 
 
 # --------------------------------------------------------------------------
-# The S5 fake-quant (goldens/scripts/s5.py), verbatim
+# The reference fake-quant
 # --------------------------------------------------------------------------
 def s5_e4m3_round(v):
     _, e = torch.frexp(v)
@@ -108,13 +108,13 @@ def s5_mxfp8_fq(x):
 
 
 def s5_fq(fmt):
-    """S5's ``fq``: fp32 in, the input dtype out."""
+    """The reference ``fq``: fp32 in, the input dtype out."""
     fn = s5_nvfp4_fq if fmt == ew.NVFP4 else s5_mxfp8_fq
     return lambda x: fn(x.float()).to(x.dtype)
 
 
 def s5_experts(x, index, weights, gate_up, down, gate_cap, up_cap, fq):
-    """torch_ref.experts with S5's two rewrite points."""
+    """torch_ref.experts with the reference's two rewrite points."""
     x = fq(x)
     total = torch.zeros_like(x, dtype=torch.float32)
     for expert in index.unique().tolist():
@@ -196,7 +196,7 @@ def run(module, x, rowwise=False):
 
 
 def reference(module, oracle_weights, layer, x, fq):
-    """The S5 expert sum of the module's own routing, on the oracle's
+    """The reference expert sum of the module's own routing, on the oracle's
     independent dequant of the checkpoint."""
     _, weights, index = module.route(x)
     gate_up, down = oracle_weights.experts(layer)
@@ -241,8 +241,9 @@ def test_mxfp8_equals_s5(seed):
 
 @pytest.mark.parametrize("seed", range(4))
 def test_nvfp4_equals_s5_but_for_error_ties(seed):
-    """Upstream sums a block's error pairwise, S5 with ``sum``: the two pick
-    another block scale only where both candidates' errors agree to rounding."""
+    """Upstream sums a block's error pairwise, the reference with ``sum``: the
+    two pick another block scale only where both candidates' errors agree to
+    rounding."""
     x = random_rows(seed)
     got = aq.nvfp4_fake_quant(x)
     want, (err6, err4) = s5_nvfp4_fq(x, return_errors=True)
@@ -275,7 +276,7 @@ def test_zero_and_tiny_rows_stay_finite(fmt):
 
 
 def test_quantization_error_is_the_s5_size():
-    """S5 measured a relative RMS error of 8.6-8.8% (NVFP4), 2.7% (MXFP8)."""
+    """Relative RMS error of the fake-quant: NVFP4 7-11%, MXFP8 2-3.5%."""
     x = torch.randn(512, 2304, generator=torch.Generator().manual_seed(0))
     for fn, low, high in ((aq.nvfp4_fake_quant, 0.07, 0.11), (aq.mxfp8_fake_quant, 0.02, 0.035)):  # fmt: skip
         err = float((fn(x) - x).norm() / x.norm())
@@ -541,7 +542,7 @@ def ids():
 
 
 def _oracle_rows(engine, ids, fake_quant):
-    """The dense oracle's [T, visits * H + H + vocab] rows, with S5's
+    """The dense oracle's [T, visits * H + H + vocab] rows, with the reference
     fake-quant in every expert GEMM when `fake_quant`."""
     import inkling2_ref
     from inkling2_ref import Inkling2Oracle

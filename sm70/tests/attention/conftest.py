@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K05 Flash-V100 op tests.
+"""Fixtures for the Flash-V100 op tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C with the K05 ops. Run them from the repo root with the
-built package first on PYTHONPATH (see test_fv100_ops_cpu.py for the CPU
+vllm_sm70._sm70_C with the Flash-V100 ops. Run them from the repo root with
+the built package first on PYTHONPATH (see test_fv100_ops_cpu.py for the CPU
 side):
 
     pytest -m gpu sm70/tests/attention
@@ -19,8 +19,8 @@ def fv100_gpu():
     """(device, vllm_sm70.ops.fv100) on a real SM70 GPU, else skip.
 
     Like tm_gpu (tests/ops/conftest.py): with an SM70 GPU present, a missing
-    or K05-less _sm70_C is a broken build or a wrong PYTHONPATH, so the test
-    fails instead of skipping and the nightly run cannot pass on stubs.
+    _sm70_C or one without the Flash-V100 ops is a broken build or a wrong
+    PYTHONPATH, so the test fails instead of skipping and cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

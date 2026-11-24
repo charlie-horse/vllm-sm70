@@ -26,3 +26,6 @@ patches/*.patch~
 
 # sm70 extension built in place
 sm70/vllm_sm70/*.so
+
+# Default output dir of sm70/scripts
+/out/

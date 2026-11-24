@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM70 custom ops: Python wrappers and fake impls over torch.ops._sm70_C.
 
-K02/K03: TurboMind (tm.py). K05: Flash-V100 attention (fv100.py).
-K16: top-k candidate sampler (sampler.py).
-K18: DFlash2 draft FP16 M<=8 GEMM + compact FP16 top-64 (dflash2.py).
-K12: Flint NVFP4 MoE M<=2 QPN decode (flint_moe.py).
+TurboMind GEMMs (tm.py), Flash-V100 attention (fv100.py), top-k candidate
+sampler (sampler.py), QPN8 FP8 GEMV (qpn8.py), DFlash2 draft FP16 M<=8 GEMM
+and compact FP16 top-64 (dflash2.py), Flint NVFP4 MoE M<=2 decode
+(flint_moe.py).
 """
 
 import logging
@@ -39,8 +39,8 @@ def register() -> None:
         logger.debug("vllm_sm70.ops: _sm70_C not loaded; TurboMind ops skipped")
         return
     from vllm_sm70.ops import tm  # noqa: F401  (registers the fakes)
-    from vllm_sm70.ops import fv100  # noqa: F401  (K05: Flash-V100 fakes)
-    from vllm_sm70.ops import sampler  # noqa: F401  (K16: sampler fakes)
-    from vllm_sm70.ops import qpn8  # noqa: F401  (K09: QPN8 fakes + linear op)
-    from vllm_sm70.ops import dflash2  # noqa: F401  (K18: DFlash2 fakes)
-    from vllm_sm70.ops import flint_moe  # noqa: F401  (K12: decode fakes)
+    from vllm_sm70.ops import fv100  # noqa: F401  (Flash-V100 fakes)
+    from vllm_sm70.ops import sampler  # noqa: F401  (sampler fakes)
+    from vllm_sm70.ops import qpn8  # noqa: F401  (QPN8 fakes + linear op)
+    from vllm_sm70.ops import dflash2  # noqa: F401  (DFlash2 fakes)
+    from vllm_sm70.ops import flint_moe  # noqa: F401  (Flint MoE decode fakes)

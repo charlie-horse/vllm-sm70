@@ -1,39 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: checkpoint tensors -> model parameters (non-expert).
 
-One table, built from the text config, maps every checkpoint tensor of the
-language model to one parameter (``Route``) or to an owner outside this module
-(``Skip``: expert weights, vision tower). Parameter names are the checkpoint
-names after ``RENAMES``, with the per-layer projections fused as in
-``QKVR_SHARDS`` and ``NORM_SHARDS`` (upstream vLLM's layout,
-vllm/models/inkling2/nvidia/model.py ``_renames`` / ``_shards``). Each rank
-keeps its slice of the head-sharded tensors and, when ``head_sharded``, its
-rows of the LM head; everything else is replicated.
-
-LM head: at TP > 1 with an unpadded vocabulary that splits evenly, rank r
-holds vocabulary rows [r V/tp, (r + 1) V/tp) (``head_sharded``).
-``VLLM_SM70_INKLING_SHARDED_HEAD=0`` keeps the whole head on every rank.
-
-Token embedding: at TP > 1 with a padded vocabulary that splits evenly,
-rank r holds rows [r V/tp, (r + 1) V/tp) of it (``embed_sharded``) and
-loop.py all-reduces the looked-up rows. ``VLLM_SM70_INKLING_SHARDED_EMBED=0``
-keeps the whole embedding on every rank.
-
-Dtypes: a parameter whose Hugging Face name contains an entry of
-``HF_FP32_MODULES`` is float32; every other parameter is in the model dtype.
-Checkpoint values are cast (bf16 -> fp16 for the released checkpoint) and are
-otherwise unchanged: queries are not pre-scaled. Every cast to fp16 goes
-through the map's ``Fp16Audit`` (fp16_audit.py), and the map refuses a config
-that differs from ``HARD_CODED_CONFIG``.
-
-Packs: ``packs`` lists parameters of one layer that read one input (or one
-input per row block) and are stored back to back in one buffer by
-``pack_parameters``, so a single GEMM covers them (``rows_view``): a global
-layer's ``attn.qkvr.weight`` with its two conv tap projections, and per core
-layer the four controller ``down_weight`` and the ``gain_weight``,
-``forget_weight`` pairs. Names, shapes and dtypes of the parameters do not
-change. Packing is opt-in: ``VLLM_SM70_INKLING_MERGED_PROJ=1`` packs; unset
-or any other value packs nothing.
+One table, built from the text config, maps every language-model checkpoint
+tensor to one parameter (``Route``) or to another owner (``Skip``: experts,
+vision tower). Parameter names are the checkpoint names after ``RENAMES``,
+with projections fused as in ``QKVR_SHARDS`` and ``NORM_SHARDS`` (upstream's
+layout). Each rank keeps its slice of head-sharded tensors; everything else
+is replicated, except the LM head (``head_sharded``, off with
+VLLM_SM70_INKLING_SHARDED_HEAD=0) and token embedding (``embed_sharded``, off
+with VLLM_SM70_INKLING_SHARDED_EMBED=0) rows at TP > 1. Parameters named in
+``HF_FP32_MODULES`` are fp32, others the model dtype; values are only cast,
+through ``Fp16Audit``. ``pack_parameters`` stores the ``packs`` of a layer
+back to back for one GEMM; VLLM_SM70_INKLING_MERGED_PROJ=1 turns it on.
 """
 
 from __future__ import annotations

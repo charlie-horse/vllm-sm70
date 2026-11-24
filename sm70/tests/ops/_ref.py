@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference dequantizers and random weights for the K03 GPU tests."""
+"""Reference dequantizers and random weights for the TurboMind GPU tests."""
 
 from __future__ import annotations
 
 import torch
 
-# e2m1 code -> value; bit 3 is the sign (as fork awq_sm70_gemm.cu:565-568).
+# e2m1 code -> value; bit 3 is the sign.
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
