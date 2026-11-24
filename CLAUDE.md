@@ -29,12 +29,12 @@ this file. How everything works: [docs/README.md](docs/README.md).
    what the code declares (pins, hashes, options, defaults, kill switches,
    model entries, versions): read it from the source. Docs hold only what the
    code can't say: procedures, and rules whose breach the code can't prevent.
-   Name no specific host, GPU model or GPU count beyond what a procedure
-   needs; say "the serving host" or "the build host".
+   Docs cover only the code in this repository and the Volta chip it runs
+   on: no hosts, deployments, services in production or environments.
 2. **Docs say how things work now.** No history, dates of past events,
    rationale ("why"), measurements of past runs, plans, decisions, open
-   questions, owners or status notes. Present tense, terse. A constraint you
-   must follow is written as a rule.
+   questions, owners or status notes. Present tense. A constraint you must
+   follow is written as a rule.
 3. **Tasks live in the project, not in git.** No TODO/FIXME/XXX, follow-ups
    or "later" notes in code or docs.
 4. **Where docs live.** Prose goes in `docs/`; [docs/README.md](docs/README.md)
@@ -48,3 +48,5 @@ this file. How everything works: [docs/README.md](docs/README.md).
    lines; longer prose goes to the doc, with a one-line pointer in the code.
 7. **Docs change in the same PR as the code.** Moving or renaming a doc or
    heading fixes every link to it.
+8. **Plain language.** Write so a reader new to GPUs and vLLM can follow:
+   short sentences, and define each term of art on first use.

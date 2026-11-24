@@ -1,6 +1,8 @@
 # Pins
 
-Every pin is declared in code; read the versions and hashes there.
+A **pin** fixes the exact version of something the build uses, so every
+build gets the same result. Every pin is declared in code; read the versions
+and hashes there.
 
 | pin | where |
 |---|---|
@@ -12,6 +14,8 @@ Every pin is declared in code; read the versions and hashes there.
 | LMCache sdist | `nix/lmcache-build.nix` |
 
 ## Rules
+
+These keep the build working on Volta ([volta.md](volta.md)).
 
 - CUDA stays on 12.x: CUDA 13 cannot target sm_70, and nvcc ≥ 12.8 drops
   arch 7.0 from vLLM's default list.

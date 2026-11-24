@@ -1,13 +1,15 @@
 # Docs
 
-Procedures and rules for building, changing and serving vllm-sm70. What is
-built and how it is configured: read the Nix and Python source. Rules for
-these docs: [CLAUDE.md](../CLAUDE.md#documentation-policy).
+These docs explain the code in this repository and the chip it runs on.
+Anything the code states (versions, options, defaults) is read from the
+code itself; the docs point to where. Rules for writing them:
+[CLAUDE.md](../CLAUDE.md#documentation-policy).
 
-| Doc | Procedures and rules for |
+| Doc | What it explains |
 | --- | --- |
-| [patch-header.md](patch-header.md) | Change format, kill switches, the patch workflow and series order |
-| [pins.md](pins.md) | Where pins live, pin rules, moving to a new vLLM release, LMCache |
-| [nix.md](nix.md) | Using the flake from a host, serving models, the TurboMind GEMM LUT, LMCache, the Flint checkpoint |
-| [checks.md](checks.md) | GPU tests on the serving host, the GPU gate, LMCache checks |
-| [release.md](release.md) | Moving the `latest` branch |
+| [volta.md](volta.md) | The Volta chip: what it can and can't do, and what the code does about it |
+| [patch-header.md](patch-header.md) | How a change is made: plugin code vs. vLLM patches, kill switches, the patch workflow |
+| [pins.md](pins.md) | Which versions are fixed, where, and how to move to a new vLLM release |
+| [nix.md](nix.md) | Using the flake and its NixOS modules, model settings, kill switches, Inkling 2 rules, the GEMM tuning table, LMCache, the Flint weights |
+| [checks.md](checks.md) | Testing the code on a Volta GPU, including the GPU gate |
+| [release.md](release.md) | The `latest` branch and when it moves |

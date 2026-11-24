@@ -1,10 +1,14 @@
-# Nix: using the flake from a host and operating the modules
+# Nix: using the flake and its modules
 
-Outputs: `flake.nix`. Options and built-in models: `nix/module.nix`
-(`services.vllm-sm70`) and `nix/lmcache.nix` (`services.lmcache-sm70`).
-Commands marked sudo run with sudo.
+The build is a [Nix flake](https://nixos.org): a file (`flake.nix`) that says
+exactly what to build and from which pinned sources. Its outputs are the
+vLLM package and two **NixOS modules**, settings blocks a NixOS machine
+imports to run vLLM (`services.vllm-sm70`, in `nix/module.nix`) and its
+**LMCache** server (a cache that keeps already-computed prompt data so
+repeated text is not recomputed; `services.lmcache-sm70`, in
+`nix/lmcache.nix`). Those files list every option and built-in model.
 
-## Add the flake to a host
+## Use the flake in a NixOS configuration
 
 ```nix
 # flake.nix
