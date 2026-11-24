@@ -53,6 +53,10 @@ class _FakeCuda(Platform):
 
 @pytest.fixture
 def device(monkeypatch):
+    # The hook's lazy import, done on the real (CPU) platform: under a faked
+    # CUDA one, vLLM's import-time probes need _C and the flash-attn extension.
+    from vllm_sm70.models.inkling2_sm70 import moe_tm  # noqa: F401
+
     def _set(major, minor, ext=True):
         cls = type("Dev", (_FakeCuda,), {})
         cls.capability = DeviceCapability(major, minor)

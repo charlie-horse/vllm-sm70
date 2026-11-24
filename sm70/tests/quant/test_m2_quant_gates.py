@@ -104,7 +104,11 @@ def device(monkeypatch):
 @pytest.fixture
 def load_configs(monkeypatch):
     """Import vllm_sm70.quant.configs fresh under the given env, then put
-    upstream's registry of customized quant configs back."""
+    upstream's registry of customized quant configs and the module's classes
+    back, so the two name the same class objects for later tests."""
+    import vllm_sm70.quant.configs as configs
+
+    module_state = dict(vars(configs))
     saved = dict(me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
     def _load(quant_env: str | None = None):
@@ -114,13 +118,12 @@ def load_configs(monkeypatch):
             monkeypatch.setenv("VLLM_SM70_QUANT", quant_env)
         for name in ("fp8", "modelopt_fp4"):
             me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.pop(name, None)
-        import vllm_sm70.quant.configs as configs
-
         return importlib.reload(configs)
 
     yield _load
     me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.clear()
     me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.update(saved)
+    vars(configs).update(module_state)
 
 
 def _ours(configs, name):
