@@ -14,6 +14,11 @@ LM head: at TP > 1 with an unpadded vocabulary that splits evenly, rank r
 holds vocabulary rows [r V/tp, (r + 1) V/tp) (``head_sharded``).
 ``VLLM_SM70_INKLING_SHARDED_HEAD=0`` keeps the whole head on every rank.
 
+Token embedding: at TP > 1 with a padded vocabulary that splits evenly,
+rank r holds rows [r V/tp, (r + 1) V/tp) of it (``embed_sharded``) and
+loop.py all-reduces the looked-up rows. ``VLLM_SM70_INKLING_SHARDED_EMBED=0``
+keeps the whole embedding on every rank.
+
 Dtypes: a parameter whose Hugging Face name contains an entry of
 ``HF_FP32_MODULES`` is float32; every other parameter is in the model dtype.
 Checkpoint values are cast (bf16 -> fp16 for the released checkpoint) and are
@@ -46,6 +51,7 @@ from vllm_sm70 import envs
 from .fp16_audit import Fp16Audit, check_hard_coded_config
 
 __all__ = [
+    "EMBED_SWITCH",
     "HEAD_SWITCH",
     "HF_FP32_MODULES",
     "MERGED_SWITCH",
@@ -65,6 +71,7 @@ __all__ = [
     "pack_parameters",
     "qkvr_sizes",
     "rows_view",
+    "sharded_embed_enabled",
     "sharded_head_enabled",
 ]
 
@@ -72,6 +79,8 @@ MERGED_SWITCH = "VLLM_SM70_INKLING_MERGED_PROJ"
 merged_enabled = envs.environment_variables()[MERGED_SWITCH]
 HEAD_SWITCH = "VLLM_SM70_INKLING_SHARDED_HEAD"
 sharded_head_enabled = envs.environment_variables()[HEAD_SWITCH]
+EMBED_SWITCH = "VLLM_SM70_INKLING_SHARDED_EMBED"
+sharded_embed_enabled = envs.environment_variables()[EMBED_SWITCH]
 
 # transformers modeling_inkling2_loop.py ``_keep_in_fp32_modules_strict``,
 # verbatim; matched as substrings of the Hugging Face parameter name.
@@ -246,6 +255,11 @@ class Inkling2WeightMap:
             and tp_size > 1
             and self.config.unpadded_vocab_size % tp_size == 0
         )
+        self.embed_sharded = (
+            sharded_embed_enabled()
+            and tp_size > 1
+            and self.config.padded_vocab_size % tp_size == 0
+        )
         self.params: dict[str, ParamSpec] = {}
         self.routes: dict[str, Route] = {}
         self.packs: list[Pack] = []
@@ -304,7 +318,10 @@ class Inkling2WeightMap:
         row = (1, hidden)
 
         self._add(
-            "embed.weight", "embed_tokens.weight", (text.padded_vocab_size, hidden)
+            "embed.weight",
+            "embed_tokens.weight",
+            (text.padded_vocab_size, hidden),
+            tp_dim=0 if self.embed_sharded else None,
         )
         self._add(
             "unembed.weight",

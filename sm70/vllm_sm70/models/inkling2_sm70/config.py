@@ -21,13 +21,19 @@
   in-flight tokens (UP config/vllm.py ``max_in_flight_tokens``). With
   VLLM_SM70_INKLING_ASYNC_SCHED=0 an unset value becomes off and
   ``--async-scheduling`` is refused.
+* Speculative decoding: sets the batch-size schedule of
+  ``spec_policy.apply`` (``sm70.inkling2.dspark_spec_max_reqs`` and
+  ``dspark_spec_tokens``) unless ``--speculative-config`` holds one.
 * CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY:
   decode-only batches (one token per request, or 1 + num_speculative_tokens
-  in a verify step: q = backend.py ``decode_query_len``) replay a FULL
-  graph and every other batch runs eagerly. A mode with FULL decode graphs
-  sets ``max_cudagraph_capture_size`` q x min(``DECODE_GRAPH_MAX_BATCH``,
-  max_num_seqs) tokens when neither it nor the capture sizes are set, and
-  refuses set sizes above q x ``DECODE_GRAPH_MAX_BATCH``. The ops of a
+  in a verify step: q = backend.py ``decode_query_len``; each q of
+  ``decode_query_lens`` with a schedule) replay a FULL graph and every
+  other batch runs eagerly. A mode with FULL decode graphs sets
+  ``max_cudagraph_capture_size`` q x min(``DECODE_GRAPH_MAX_BATCH``,
+  max_num_seqs) tokens when neither it nor the capture sizes are set (with
+  a schedule: the capture sizes q x n of each tier's steps of n requests,
+  and the draft's block x n of each drafting step), and refuses set sizes
+  above q x ``DECODE_GRAPH_MAX_BATCH``. The ops of a
   decode-only batch read
   device metadata only (backend.py); those of other batches branch on the
   batch on the host, so a mode whose mixed batches are FULL (FULL) is
@@ -103,13 +109,34 @@ def _log_routes_once(
     )
 
 
+def _schedule_capture_sizes(schedule: Any, query_len: int, max_reqs: int) -> list[int]:
+    """Capture sizes under a dynamic speculative-decoding `schedule`: q x n
+    for each q it gives and n up to the most requests (<= `max_reqs`) it
+    gives q, and the draft's `query_len` x n up to the most requests of a
+    drafting step (v0.33's managers round a size up to a multiple of q, UP
+    v1/worker/gpu/cudagraph_utils.py)."""
+    from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+    lookup = build_dynamic_sd_schedule_lookup(schedule, max_reqs, query_len - 1)
+    widest = {1 + n: reqs for reqs, n in enumerate(lookup) if reqs}
+    drafting = max((reqs for reqs, n in enumerate(lookup) if reqs and n), default=0)
+    sizes = {q * n for q, reqs in widest.items() for n in range(1, reqs + 1)}
+    sizes.update(query_len * n for n in range(1, drafting + 1))
+    return sorted(sizes)
+
+
 def _cap_decode_graph_batch(
-    compilation_config: Any, scheduler_config: Any, query_len: int = 1
+    compilation_config: Any,
+    scheduler_config: Any,
+    query_len: int = 1,
+    schedule: Any = None,
 ) -> None:
     """max_cudagraph_capture_size = `query_len` tokens per request times
     min(DECODE_GRAPH_MAX_BATCH, max_num_seqs) requests unless the capture
     sizes or their maximum are set; set ones above `query_len` x
-    DECODE_GRAPH_MAX_BATCH raise ValueError."""
+    DECODE_GRAPH_MAX_BATCH raise ValueError. With a dynamic
+    speculative-decoding `schedule` the capture sizes are
+    ``_schedule_capture_sizes`` up to that many requests instead."""
     sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
     largest = getattr(compilation_config, "max_cudagraph_capture_size", None)
     if sizes:
@@ -127,7 +154,12 @@ def _cap_decode_graph_batch(
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
     if isinstance(max_num_seqs, int) and max_num_seqs > 0:
         cap = min(cap, max_num_seqs)
-    compilation_config.max_cudagraph_capture_size = cap * query_len
+    if not schedule:
+        compilation_config.max_cudagraph_capture_size = cap * query_len
+        return
+    sizes = _schedule_capture_sizes(schedule, query_len, cap)
+    compilation_config.cudagraph_capture_sizes = sizes
+    compilation_config.max_cudagraph_capture_size = sizes[-1]
 
 
 def tm_tuning_env(
@@ -171,6 +203,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         from vllm_sm70 import envs as sm70_envs
         from vllm_sm70.config import sm70_config
 
+        from . import spec_policy
         from .backend import decode_graph_enabled, decode_query_len
         from .draft import speculative_rejection
         from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
@@ -241,6 +274,7 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 )
             scheduler_config.async_scheduling = False
         inkling2 = sm70_config(vllm_config).inkling2
+        spec_schedule = spec_policy.apply(vllm_config, inkling2)
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
         decode_graph = decode_graph_enabled(vllm_config)
@@ -279,7 +313,9 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
             )
         query_len = decode_query_len(vllm_config)
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
-            _cap_decode_graph_batch(compilation_config, scheduler_config, query_len)
+            _cap_decode_graph_batch(
+                compilation_config, scheduler_config, query_len, spec_schedule
+            )
         hf_config = getattr(model_config, "hf_config", None)
         tuning = tm_tuning_env(compilation_config, hf_config, query_len)
         if tuning:
@@ -295,6 +331,12 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 hf_config,
                 IMAGE_ENCODER_TOKEN_CAP_ATTR,
                 inkling2.max_image_encoder_tokens,
+            )
+        if spec_schedule is not None:
+            logger.info(
+                "Inkling 2 SM70: speculative-decoding schedule %s "
+                "(first and last request count, drafts verified).",
+                spec_schedule,
             )
         _log_routes_once(
             inkling2.visit_dump_dir,

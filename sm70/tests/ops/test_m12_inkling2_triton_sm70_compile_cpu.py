@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
 
-Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py,
+Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py with
+its split-KV pair,
 norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
-routing.py, dspark.py, small_ops.py) goes through Triton's compiler and ptxas
-for GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
+routing.py, dspark.py, small_ops.py, top1.py, visit.py, small_m_gemv.py,
+nvfp4_gemv.py) goes through Triton's compiler and ptxas for
+GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
 128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
 intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
 tokens, message-gate rank 64, d_rel 16, rel extent 1024; draft: 8-query
@@ -223,6 +225,51 @@ def test_decode_attention_kernel(indexed, slots):
     )
 
 
+def _split_args(indexed: bool, slots: bool) -> dict:
+    return {
+        "rows_ptr": "*i64",
+        "pos_ptr": "*i64",
+        "slot_ptr": "*i64",
+        "part_ptr": "*fp32",
+        "stat_ptr": "*fp32",
+        **_i32("window", "splits", "min_keys"),
+        "D": HEAD_DIM,
+        "BLOCK_N": KV_BLOCK,
+        "BLOCK_D": HEAD_DIM,
+        "INDEXED": indexed,
+        "SLOTS": slots,
+    }
+
+
+@pytest.mark.parametrize("indexed", [False, True], ids=["first_rows", "indexed"])
+@pytest.mark.parametrize("slots", [False, True], ids=["eager", "padded"])
+def test_split_kv_kernels(indexed, slots):
+    ops = _ops("paged_attention")
+    split = {
+        **_split_args(indexed, slots),
+        **dict.fromkeys(
+            ("q_ptr", "rel_ptr", "sink_ptr", "cache_ptr", "out_ptr"), "*fp16"
+        ),
+        "seq_ptr": "*i32",
+        "table_ptr": "*i32",
+        **_i32(
+            "stride_q0", "stride_q1", "stride_r0", "stride_r1", "stride_s0",
+            "stride_o0", "stride_o1", "stride_cb", "stride_ch", "stride_cn",
+            "stride_bt", "extent",
+        ),
+        "scale": "fp32",
+        "GROUPS": Q_HEADS // KV_HEADS,
+    }  # fmt: skip
+    _check(ops._split_kv_kernel, split, num_warps=4, enable_fp_fusion=False)
+    merge = {
+        **_split_args(indexed, slots),
+        **dict.fromkeys(("sink_ptr", "out_ptr"), "*fp16"),
+        **_i32("stride_s0", "stride_o0", "stride_o1"),
+        "BLOCK_S": ops.MAX_SPLITS,
+    }
+    _check(ops._split_kv_merge_kernel, merge, num_warps=4, enable_fp_fusion=False)
+
+
 # --- norm.py, attn_res.py, loop.py ------------------------------------------------
 
 
@@ -410,6 +457,94 @@ def test_slot_gemv_kernel(row_div, k_in):
             "BLOCK_K": grouped_gemm.BLOCK_K,
         },
         enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_div", "k_in"), [(8, HIDDEN), (1, LOCAL_INTERMEDIATE)], ids=["w13", "w2"]
+)
+def test_slot_gemv_mx_kernel(row_div, k_in):
+    grouped_gemm = _ops("grouped_gemm")
+    _check(
+        grouped_gemm._slot_gemv_mx_kernel,
+        {
+            "in_ptr": "*fp16",
+            "w_ptr": "*u8",
+            "s_ptr": "*u8",
+            "out_ptr": "*fp16",
+            "expert_ptr": "*i32",
+            **_i32(
+                "stride_in", "stride_we", "stride_wn", "stride_se", "stride_sn",
+                "stride_out", "n_out", "k_in", "offset",
+            ),
+            "ROW_DIV": row_div,
+            "BLOCK_N": grouped_gemm.BLOCK_N,
+            "BLOCK_K": grouped_gemm.BLOCK_K,
+            "MX_BLOCK": grouped_gemm.MX_BLOCK,
+        },
+        enable_fp_fusion=False,
+    )  # fmt: skip
+
+
+def test_mx_dequant_kernel():
+    grouped_gemm = _ops("grouped_gemm")
+    _check(
+        grouped_gemm._mx_dequant_kernel,
+        {
+            "w_ptr": "*u8",
+            "s_ptr": "*u8",
+            "out_ptr": "*fp16",
+            **_i32("k_in", "stride_w", "stride_s", "stride_out", "offset"),
+            "BLOCK": grouped_gemm.DEQUANT_BLOCK,
+            "MX_BLOCK": grouped_gemm.MX_BLOCK,
+        },
+    )
+
+
+# --- small_m_gemv.py, nvfp4_gemv.py -----------------------------------------------
+
+
+@pytest.mark.parametrize("segments", [1, 5], ids=["one_input", "segments"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_segment_gemv_kernel(segments, rows):
+    small_m_gemv = _ops("small_m_gemv")
+    block_m, block_n, block_k, warps = small_m_gemv.config(rows)
+    _check(
+        small_m_gemv._segment_gemv_kernel,
+        {
+            **dict.fromkeys(
+                ("x0_ptr", "x1_ptr", "x2_ptr", "w_ptr", "out_ptr"), "*fp16"
+            ),
+            **_i32("stride_x0", "stride_x1", "stride_x2", "stride_w", "stride_out"),
+            **_i32("rows", "k_in", "n_out", "n1", "n2", "n3", "n4"),
+            **_i32("b1", "b2", "b3", "b4"),
+            "SEGMENTS": segments,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+        },
+        num_warps=warps,
+    )
+
+
+@pytest.mark.parametrize("stage", ["w13", "w2"])
+def test_nvfp4_slot_gemv_kernel(stage):
+    nvfp4_gemv = _ops("nvfp4_gemv")
+    block_k8, warps = nvfp4_gemv.config(stage)
+    _check(
+        nvfp4_gemv._nvfp4_slot_gemv_kernel,
+        {
+            **dict.fromkeys(("in_ptr", "scales_ptr", "out_ptr"), "*fp16"),
+            "codes_ptr": "*i32",
+            "expert_ptr": "*i32",
+            **_i32("stride_in", "stride_ce", "stride_se", "stride_out"),
+            **_i32("n_out", "k_in", "experts"),
+            "gate_cap": "fp32",
+            "up_cap": "fp32",
+            "SWIGLU": stage == "w13",
+            "BLOCK_K8": block_k8,
+        },
+        num_warps=warps,
     )
 
 
@@ -662,3 +797,265 @@ def test_gate_kernel():
         },
         enable_fp_fusion=False,
     )
+
+
+# --- top1.py ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("soft_cap", [True, False], ids=["cap", "no_cap"])
+def test_softcap_top1_kernel(soft_cap):
+    top1 = _ops("top1")
+    args = {
+        "logits_ptr": "*fp16",
+        "out_ptr": "*fp32",
+        **_i32("stride_row", "n_cols", "vocab_start"),
+        "cap": "fp32",
+        "SOFT_CAP": soft_cap,
+        "SPLIT": top1.SPLIT_COLS,
+        "BLOCK": top1.BLOCK,
+    }
+    _check(top1._softcap_top1_kernel, args)
+
+
+@pytest.mark.parametrize("block_n", [16, 32])
+def test_pick_kernel(block_n):
+    args = {"pairs_ptr": "*fp32", "out_ptr": "*i64", "n": "i32", "BLOCK_N": block_n}
+    _check(_ops("top1")._pick_kernel, args, num_warps=1)
+
+
+# --- routing.py: the fused router and route ---------------------------------------
+
+
+@pytest.mark.parametrize("tokens", [1, 8])
+@pytest.mark.parametrize("has_pad", [False, True], ids=["no_pad", "pad"])
+@pytest.mark.parametrize("dispatch", [False, True], ids=["route", "dispatch"])
+def test_router_route_kernel(tokens, has_pad, dispatch):
+    routing = _ops("routing")
+    block_m = max(2, tokens)
+    _check(
+        routing._router_route_kernel,
+        {
+            "x_ptr": "*fp16",
+            "w_ptr": "*fp32",
+            "logits_ptr": "*fp32",
+            "counter_ptr": "*i32",
+            "bias_ptr": "*fp32",
+            "pad_ptr": "*i1" if has_pad else "*i32",
+            "ids_ptr": "*i32",
+            "weights_ptr": "*fp32",
+            "pos_ptr": "*i32",
+            "sorted_ptr": "*i32",
+            "offsets_ptr": "*i32",
+            "src_ptr": "*fp16" if dispatch else "*i32",
+            "rows_ptr": "*fp16" if dispatch else "*i32",
+            **_i32(
+                "tokens",
+                "experts",
+                "hidden",
+                "stride_x",
+                "stride_w",
+                "stride_src",
+                "stride_rows",
+                "pad_id",
+            ),
+            "route_scale": "fp32",
+            "TOP_K": TOP_K,
+            "BLOCK_M": block_m,
+            "BLOCK_E": EXPERTS,
+            "BLOCK_TOP": TOP_K,
+            "BLOCK_H": routing.BLOCK_H,
+            "BLOCK_K": routing._fused_block_k(block_m),
+            "HAS_PAD": has_pad,
+            "DISPATCH": dispatch,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+# --- visit.py -------------------------------------------------------------------------
+
+
+def _conv_args() -> dict:
+    return {
+        "x_ptr": "*fp16",
+        "w_ptr": "*fp16",
+        "cache_ptr": "*fp16",
+        "pos_ptr": "*i64",
+        "seq_ptr": "*i32",
+        "qstart_ptr": "*i32",
+        "slot_ptr": "*i64",
+        "table_ptr": "*i32",
+        **_i32(
+            "num_tokens",
+            "stride_x",
+            "stride_w0",
+            "stride_w1",
+            "stride_cb",
+            "stride_ch",
+            "stride_cn",
+            "cache_block",
+            "offset",
+            "stride_bt",
+            "max_blocks",
+        ),
+        "divisor": "fp32",
+        "WS": HIDDEN // KV_HEADS,
+        "H": KV_HEADS,
+        "W": TAPS,
+    }
+
+
+@pytest.mark.parametrize("stack", [1, 4])
+@pytest.mark.parametrize("has_base", [False, True], ids=["no_base", "base"])
+@pytest.mark.parametrize("residual", [False, True], ids=["addend", "residual"])
+@pytest.mark.parametrize("norm", [False, True], ids=["mix", "mix_norm"])
+def test_conv_mix_kernel(stack, has_base, residual, norm):
+    visit = _ops("visit")
+    block_a = 2048  # next_power_of_2(HIDDEN + 1) // 2
+    _check(
+        visit._conv_mix_kernel,
+        {
+            **_conv_args(),
+            **dict.fromkeys(("base_ptr", "update_ptr", "conv_out_ptr"), "*fp16"),
+            "state_ptr": "*fp16",
+            "stack_ptr": "*fp32",
+            "query_ptr": "*fp32",
+            "norm_w_ptr": "*fp32",
+            "out_ptr": "*fp16" if norm else "*fp32",
+            **_i32("T", "stride_s", "stride_t"),
+            **dict.fromkeys(("eps", "norm_eps", "q_scale"), "fp32"),
+            "D": HIDDEN,
+            "N_STACK": stack,
+            "HAS_BASE": has_base,
+            "RESIDUAL": residual,
+            "APPLY_NORM": norm,
+            "BLOCK_N": triton_next_power_of_2(stack + 1),
+            "BLOCK_A": block_a,
+            "BLOCK_B": 256,
+        },
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize("has_base", [False, True], ids=["no_base", "base"])
+def test_conv_residual_kernel(has_base):
+    visit = _ops("visit")
+    _check(
+        visit._conv_residual_kernel,
+        {
+            **_conv_args(),
+            **dict.fromkeys(("base_ptr", "update_ptr", "state_ptr"), "*fp16"),
+            "D": HIDDEN,
+            "HAS_BASE": has_base,
+            "BLOCK_C": 1024,
+        },
+        enable_fp_fusion=False,
+    )
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["sliding", "global"])
+def test_prologue_kernel(dynamic):
+    visit = _ops("visit")
+    args = {
+        **dict.fromkeys(
+            ("q_ptr", "r_ptr", "proj_ptr", "q_out_ptr", "rel_out_ptr"), "*fp16"
+        ),
+        **dict.fromkeys(("q_scale_ptr", "r_scale_ptr"), "*fp16"),
+        "attn_slot_ptr": "*i64",
+        "attn_pos_ptr": "*i64",
+        **dict.fromkeys(
+            ("k_ptr", "v_ptr", "wk_ptr", "wv_ptr", "dk_ptr", "dv_ptr"), "*fp16"
+        ),
+        "cache_ptr": "*fp16",
+        "kv_ptr": "*fp16",
+        "pos_ptr": "*i64",
+        "seq_ptr": "*i32",
+        "qstart_ptr": "*i32",
+        "slot_ptr": "*i64",
+        "table_ptr": "*i32",
+        **_i32(
+            "num_tokens",
+            "stride_q",
+            "stride_r",
+            "stride_qo0",
+            "stride_qo1",
+            "stride_ro0",
+            "stride_ro1",
+            "stride_p",
+            "extent",
+            "stride_k",
+            "stride_v",
+            "stride_wk0",
+            "stride_wk1",
+            "stride_wv0",
+            "stride_wv1",
+            "stride_dk",
+            "stride_dv",
+            "stride_cb",
+            "stride_ch",
+            "stride_cn",
+            "cache_block",
+            "offset_k",
+            "offset_v",
+            "stride_bt",
+            "max_blocks",
+            "stride_kvb",
+            "stride_kvh",
+            "stride_kvn",
+            "kv_block",
+        ),
+        **dict.fromkeys(
+            ("q_clip", "r_clip", "alpha", "n_floor", "divisor", "eps"), "fp32"
+        ),
+        "QH": Q_HEADS,
+        "D": HEAD_DIM,
+        "DR": D_REL,
+        "BLOCK_D": HEAD_DIM,
+        "BLOCK_R": D_REL,
+        "BLOCK_E": 256,
+        "LOG_SCALE": dynamic,
+        "H": KV_HEADS,
+        "W": TAPS,
+        "DYNAMIC": dynamic,
+    }
+    _check(visit._prologue_kernel, args, enable_fp_fusion=False)
+
+
+@pytest.mark.parametrize("weight", ["*fp16", "*fp32"])
+def test_gate_blend_kernel(weight):
+    visit = _ops("visit")
+    blocks_d = HIDDEN // visit.GATE_BLOCK_D
+    _check(
+        visit._gate_blend_kernel,
+        {
+            "Dest": "*fp32",
+            "Message": "*fp32",
+            **dict.fromkeys(
+                [f"{kind}{s}" for kind in ("Down", "Gain", "Forget") for s in range(3)],
+                weight,
+            ),
+            "NormW": "*fp32",
+            **dict.fromkeys(("Low", "Blend", "Partial"), "*fp32"),
+            "Out": "*fp16",
+            "ticket_ptr": "*i32",
+            "rows_ptr": "*i32",
+            **_i32("stride_dest_s", "stride_w_s", "T"),
+            "eps": "fp32",
+            "norm_eps": "fp32",
+            "D": HIDDEN,
+            "R": GATE_RANK,
+            "BLOCK_R": visit.GATE_BLOCK_R,
+            "BLOCK_K": visit.GATE_BLOCK_K,
+            "BLOCK_D": visit.GATE_BLOCK_D,
+            "BLOCK_N": visit.GATE_BLOCK_N,
+            "BLOCKS_R": GATE_RANK // visit.GATE_BLOCK_R,
+            "BLOCKS_D": blocks_d,
+            "BLOCK_P": triton_next_power_of_2(blocks_d),
+        },
+        enable_fp_fusion=False,
+    )
+
+
+def triton_next_power_of_2(n: int) -> int:
+    return 1 << (n - 1).bit_length()

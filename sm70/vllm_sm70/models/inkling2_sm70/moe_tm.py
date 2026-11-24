@@ -21,6 +21,12 @@ slot with no expert (padding) is computed on expert E - 1 and zeroed.
 routes, sorts and gathers the slots in one launch and sums them in another
 (ops/routing.py); the stages and the SwiGLU are those of ``expert_sum``.
 
+On the route of gemv.py the compact one-row slots skip both stages and the
+SwiGLU kernel: one Triton GEMV launch runs W13 with the SwiGLU in its
+epilogue and one runs W2, over the same banks (ops/nvfp4_gemv.py). It needs
+banks of the real extension laid out as the dense NVFP4 GEMV reads them
+(k_ld = 32 * K, q_ld = N; ``Nvfp4TmExperts.slot_gemv``).
+
 Switch: the route is on where ``rejection`` admits a layer;
 ``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer on the torch path of
 moe.py, which holds all experts in fp16.
@@ -37,9 +43,11 @@ from vllm.logger import init_logger
 from vllm_sm70 import envs
 from vllm_sm70.fused_moe.method import COMPACT_MAX_SLOTS
 
+from . import gemv
 from .expert_weights import NVFP4_BLOCK, Nvfp4Codes, RangeCheck
 from .ops import routing, torch_ref
 from .ops.activation import softcapped_swiglu_out
+from .ops.nvfp4_gemv import TILE_N, nvfp4_slot_gemv
 
 logger = init_logger("vllm.sm70.models.inkling2.moe_tm")
 
@@ -225,6 +233,8 @@ class Bank:
         self.ptrs_w, self.ptrs_s = tm.awq_moe_build_strided_ptrs(
             self.weight, self.scales, k_ld, q_ld, experts
         )
+        # The layout ops/nvfp4_gemv.py reads (that of the dense NVFP4 GEMV).
+        self.gemv_layout = k_ld == 32 * k and q_ld == n and n % TILE_N == 0
 
     def nbytes(self) -> int:
         return sum(
@@ -328,6 +338,13 @@ class Nvfp4TmExperts:
             )
         self.num_experts = self.w13.num_experts
         self.hidden_size, self.local_intermediate = hidden, local
+        # Whether compact slots may take the NVFP4 GEMV (module doc).
+        self.slot_gemv = (
+            _real_extension()
+            and self.w13.gemv_layout
+            and self.w2.gemv_layout
+            and local % TILE_N == 0
+        )
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         self.workspace = Workspace.get(device, self.num_experts, hidden, local)
         self.workspace.reserve(max_slots)
@@ -420,7 +437,8 @@ class Nvfp4TmExperts:
         torch.index_select(x, 0, tokens, out=rows)
         offsets, expert_ids, groups = self.stage_groups(sorted_ids)
         self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
-                     act_quant, fused_act)  # fmt: skip
+                     act_quant, fused_act,
+                     compact=self.compact and slots <= COMPACT_MAX_SLOTS)  # fmt: skip
         weighted = sorted_out.float() * weights[:, None]
         total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
 
@@ -435,10 +453,20 @@ class Nvfp4TmExperts:
         groups: int,
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None,
         fused_act: bool = False,
+        compact: bool = False,
     ) -> None:
         """W13, the soft-capped SwiGLU in fp32 (one kernel with `fused_act`)
         and W2 of the expert-sorted `rows` into `sorted_out`, through the
-        scratch `gate_up` and `act`."""
+        scratch `gate_up` and `act`. `compact`: row s is a group of its own,
+        of expert expert_ids[s], and may take the NVFP4 GEMV."""
+        if compact and self.slot_gemv and gemv.on_nvfp4(rows):
+            caps = (self.gate_cap, self.up_cap)
+            w13, w2 = self.w13, self.w2
+            nvfp4_slot_gemv(rows, w13.weight, w13.scales, expert_ids, act, caps)
+            if act_quant is not None:
+                act.copy_(act_quant(act))
+            nvfp4_slot_gemv(act, w2.weight, w2.scales, expert_ids, sorted_out)
+            return
         stage = self.tm.nvfp4_moe_dense_stage_sm70_out
         stage(
             gate_up, rows, offsets, expert_ids,
@@ -508,7 +536,7 @@ class Nvfp4TmExperts:
                 ws.expert_offsets, ws.dense_expert_ids, self.num_experts,
             )  # fmt: skip
         self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
-                     act_quant, fused_act)  # fmt: skip
+                     act_quant, fused_act, compact=compact)  # fmt: skip
         routing.combine(sorted_out, routed, self.num_experts, output)
 
 

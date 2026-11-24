@@ -242,3 +242,51 @@ def test_tp1_bf16_bytes_per_token():
     assert {s.page_size_bytes for s in specs.values()} == {PAGE}
     full = [s for s in specs.values() if isinstance(s, FullAttentionSpec)]
     assert sum(s.page_size_bytes // s.block_size for s in full) == 32_768
+
+
+# --- capacity: one batch in flight (sync) against two (async) -----------------------
+
+MODEL_LEN = 8192
+
+
+def _capacity(batched_tokens: int, batches: int, num_blocks: int, model_len: int):
+    """Upstream's reported KV tokens and per-request worst-case blocks."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
+
+    _, _, groups = _plan(32, LAYER_OUTER)
+    vllm_config = _vllm_config(32, LAYER_OUTER, batched_tokens)
+    vllm_config.max_in_flight_tokens = batches * batched_tokens
+    vllm_config.model_config = SimpleNamespace(max_model_len=model_len)
+    for group in groups:
+        group.host_resident = False
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=groups, num_blocks=num_blocks, hisparse_host_num_blocks=None
+    )
+    tokens, _ = get_kv_cache_capacity(vllm_config, kv_cache_config)
+    per_request = sum(
+        math.ceil(
+            g.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            / g.kv_cache_spec.page_size_bytes
+        )
+        for g in groups
+    )
+    return tokens, per_request
+
+
+@pytest.mark.parametrize(
+    "batched_tokens, num_blocks, sync, async_",
+    [
+        # Pool blocks inferred from the measured sizes (perf P7, 8K model
+        # length); the pool is the same with one or two batches in flight.
+        (512, 31_692, (202_670, 1281), (121_944, 2129)),
+        (2048, 31_608, (67_694, 3825), (35_878, 7217)),
+    ],
+)
+def test_async_halves_the_reported_capacity_not_the_pool(
+    batched_tokens, num_blocks, sync, async_
+):
+    """The worst case per request counts window - 1 plus every in-flight
+    token in each conv and sliding-window group: 6 conv groups of 4-token
+    blocks dominate it."""
+    assert _capacity(batched_tokens, 1, num_blocks, MODEL_LEN) == sync
+    assert _capacity(batched_tokens, 2, num_blocks, MODEL_LEN) == async_

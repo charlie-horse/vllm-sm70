@@ -47,6 +47,9 @@ def test_interpreted_suite():
         pytest.skip("this is the interpreted child run")
     env = dict(os.environ, TRITON_INTERPRET="1")
     env.pop(SWITCH, None)
+    # The norm kernels one launch each; test_m12_inkling2_visit_fusion_model_cpu.py
+    # checks the merged launches.
+    env["VLLM_SM70_INKLING_VISIT_FUSION"] = "0"
     proc = subprocess.run(
         [
             sys.executable,

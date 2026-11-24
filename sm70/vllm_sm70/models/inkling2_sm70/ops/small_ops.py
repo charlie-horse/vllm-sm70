@@ -54,8 +54,10 @@ def _clip(src, scale, cols, mask, clip):
     return y * tl.minimum(tl.div_rn(1.0, norm + 1e-6) * clip, 1.0)
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
-def _query_rel_kernel(
+@triton.jit
+def _query_rel_head(
+    row,
+    head,
     q_ptr,
     r_ptr,
     q_scale_ptr,
@@ -85,8 +87,7 @@ def _query_rel_kernel(
     BLOCK_E: tl.constexpr,
     LOG_SCALE: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    head = tl.program_id(1)
+    """q_out and rel_out of one (row, query head)."""
     real = row < num_tokens
     slot = tl.load(slot_ptr + row, mask=real, other=-1)
     keep = real & (slot >= 0)
@@ -126,6 +127,48 @@ def _query_rel_kernel(
         ).to(tl.float32)
         rel = tl.sum(r[:, None] * p, axis=0)
         tl.store(out + e, rel.to(rel_out_ptr.dtype.element_ty), mask=e_mask)
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _query_rel_kernel(
+    q_ptr,
+    r_ptr,
+    q_scale_ptr,
+    r_scale_ptr,
+    proj_ptr,
+    slot_ptr,
+    pos_ptr,
+    q_out_ptr,
+    rel_out_ptr,
+    num_tokens,
+    stride_q,
+    stride_r,
+    stride_qo0,
+    stride_qo1,
+    stride_ro0,
+    stride_ro1,
+    stride_p,
+    extent,
+    q_clip,
+    r_clip,
+    alpha,
+    n_floor,
+    D: tl.constexpr,
+    DR: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    LOG_SCALE: tl.constexpr,
+):
+    _query_rel_head(
+        tl.program_id(0), tl.program_id(1),
+        q_ptr, r_ptr, q_scale_ptr, r_scale_ptr, proj_ptr, slot_ptr, pos_ptr,
+        q_out_ptr, rel_out_ptr, num_tokens, stride_q, stride_r, stride_qo0,
+        stride_qo1, stride_ro0, stride_ro1, stride_p, extent, q_clip, r_clip,
+        alpha, n_floor,
+        D=D, DR=DR, BLOCK_D=BLOCK_D, BLOCK_R=BLOCK_R, BLOCK_E=BLOCK_E,
+        LOG_SCALE=LOG_SCALE,
+    )  # fmt: skip
 
 
 def query_rel(

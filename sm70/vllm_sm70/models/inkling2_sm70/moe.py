@@ -16,6 +16,12 @@ The NVFP4 layers that ``moe_tm.rejection`` admits run on the TurboMind
 dense stage instead (moe_tm.py) and hold no fp16 expert weights;
 ``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer here.
 
+Switch: in an fp16 model an MXFP8 layer whose values are all exact in fp16
+keeps its e4m3 codes and exponent scales (``grouped_gemm.Mxfp8Weight``,
+half the bytes) and every route decodes them, to the same values, unless
+VLLM_SM70_INKLING_MXFP8_EXPERTS=0, which dequantizes it at load. Read when
+a layer is loaded.
+
 Switch: the layers held in the model dtype take ``ops/grouped_gemm.py``
 (no host sync at any batch size, one Triton GEMV launch per projection for
 the slots outside the per-expert capacity) unless
@@ -29,6 +35,8 @@ TurboMind or the grouped route is routed by ops/routing.py (router GEMV,
 then top-k, weights, slot sort and row gather in one launch, the weighted
 sum in another) unless VLLM_SM70_INKLING_FUSED_ROUTING=0, which keeps the
 torch router and the torch sort of those routes. Read and fixed as above.
+On a decode-only batch the router GEMV runs inside the route launch
+(visit_fusion.py).
 """
 
 from __future__ import annotations
@@ -43,14 +51,17 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm_sm70 import envs
 
 from . import act_quant, moe_tm
-from .expert_weights import NVFP4, ExpertLayer, RangeCheck, check_cast_range
+from .expert_weights import MXFP8, NVFP4, ExpertLayer, RangeCheck, check_cast_range
 from .fused_small import on_fused
 from .ops import _compat, grouped_gemm, routing, torch_ref
+from .visit_fusion import on_decode
 
 SWITCH = "VLLM_SM70_INKLING_GROUPED_MOE"
 _enabled = envs.environment_variables()[SWITCH]
 FUSED_SWITCH = "VLLM_SM70_INKLING_FUSED_ROUTING"
 _fused_enabled = envs.environment_variables()[FUSED_SWITCH]
+MXFP8_SWITCH = "VLLM_SM70_INKLING_MXFP8_EXPERTS"
+mxfp8_enabled = envs.environment_variables()[MXFP8_SWITCH]
 
 
 def on_grouped(x: torch.Tensor) -> bool:
@@ -105,7 +116,8 @@ class Inkling2Sm70Experts(nn.Module):
     [E, H, I / tp]; both are filled by ``load_expert_layer``. When the shape
     is admitted to the TurboMind route (``tm_rejection`` is None) they stay
     empty until a layer that needs them is loaded, and an NVFP4 layer is held
-    in ``tm_route`` instead.
+    in ``tm_route`` instead, and a held MXFP8 layer in ``mx13`` / ``mx2``
+    (``expert_weights()`` gives the pair the routes read).
     """
 
     def __init__(
@@ -150,12 +162,37 @@ class Inkling2Sm70Experts(nn.Module):
             self.register_buffer(
                 name, torch.empty(shape, dtype=dtype), persistent=False
             )
+        self.mx13: grouped_gemm.Mxfp8Weight | None = None
+        self.mx2: grouped_gemm.Mxfp8Weight | None = None
+
+    def _apply(self, fn, recurse=True):
+        # The held MXFP8 codes and scales move with the module (.to, .cuda).
+        super()._apply(fn, recurse)
+        for name in ("mx13", "mx2"):
+            held = getattr(self, name)
+            if held is not None:
+                setattr(
+                    self,
+                    name,
+                    grouped_gemm.Mxfp8Weight(
+                        fn(held.codes), fn(held.scale), held.offset
+                    ),
+                )
+        return self
+
+    def expert_weights(self) -> tuple[Any, Any]:
+        """(w13, w2) as the routes read them: tensors in the model dtype, or
+        the ``grouped_gemm.Mxfp8Weight`` pair of a held MXFP8 layer."""
+        if self.mx13 is not None:
+            return self.mx13, self.mx2
+        return self.w13, self.w2
 
     def load_expert_layer(
         self, layer: ExpertLayer, range_check: RangeCheck | None = check_cast_range
     ) -> None:
         """Load `layer` (already sliced to this rank): TurboMind banks for an
-        admitted NVFP4 layer, else the dequantized w13 and w2. `range_check`
+        admitted NVFP4 layer, the codes of a held MXFP8 layer, else the
+        dequantized w13 and w2. `range_check`
         sees every cast to fp16: the dequantized blocks (expert_weights.py)
         or the banks' scales (moe_tm.py)."""
         device = self.gate.weight.device
@@ -172,6 +209,11 @@ class Inkling2Sm70Experts(nn.Module):
                 "Inkling 2 NVFP4 experts stay on the fp16 torch path: %s.",
                 self.tm_rejection,
             )
+        self.mx13 = self.mx2 = None
+        if layer.format == MXFP8 and self.dtype == torch.float16 and mxfp8_enabled():
+            if self._load_mxfp8(layer, device, range_check):
+                return
+            range_check = None  # mxfp8_codes saw every value
         w13, w2 = layer.dequantize(self.dtype, range_check=range_check)
         for name, got in (("w13", w13), ("w2", w2)):
             if got.shape != self.weight_shapes[name]:
@@ -185,6 +227,45 @@ class Inkling2Sm70Experts(nn.Module):
             else:
                 setattr(self, name, got.to(device))
         self.tm_route = None
+
+    def _load_mxfp8(
+        self,
+        layer: ExpertLayer,
+        device: torch.device,
+        range_check: RangeCheck | None,
+    ) -> bool:
+        """Hold `layer` as codes and scales; False when it must be
+        dequantized (a value not exact in fp16)."""
+        codes = layer.mxfp8_codes(self.dtype, range_check=range_check)
+        if codes is None:
+            moe_tm.logger.warning_once(
+                "Inkling 2 MXFP8 experts of layer %d hold values that are not "
+                "exact in fp16; they are dequantized.",
+                layer.layer,
+            )
+            return False
+        held = []
+        for name, got in zip(("w13", "w2"), codes):
+            if got.codes.shape != self.weight_shapes[name]:
+                raise ValueError(
+                    f"Inkling 2: layer {layer.layer} {name} has shape "
+                    f"{tuple(got.codes.shape)}, expected {self.weight_shapes[name]}"
+                )
+            held.append(
+                grouped_gemm.Mxfp8Weight(
+                    got.codes.to(device), got.scale.to(device), got.offset
+                )
+            )
+            empty = torch.empty((0, *self.weight_shapes[name][1:]), dtype=self.dtype)
+            setattr(self, name, empty.to(device))
+        self.mx13, self.mx2 = held
+        self.tm_route = None
+        moe_tm.logger.info_once(
+            "Inkling 2 MXFP8 experts stay 8-bit, decoded in the expert GEMMs "
+            "(%s=0 dequantizes them at load).",
+            MXFP8_SWITCH,
+        )
+        return True
 
     def _load_tm(
         self,
@@ -259,7 +340,7 @@ class Inkling2Sm70Experts(nn.Module):
             return
         if on_grouped(x):
             grouped_gemm.grouped_expert_sum(
-                x, top_k_index, top_k_weights, self.w13, self.w2,
+                x, top_k_index, top_k_weights, *self.expert_weights(),
                 self.gate_cap, self.up_cap, output, act_hook=self.act_quant,
             )  # fmt: skip
             return
@@ -306,15 +387,17 @@ class Inkling2Sm70Experts(nn.Module):
         # torch.bincount syncs on CUDA (min and max); scatter_add_ does not.
         counts = flat.new_zeros(none + 1).scatter_add_(0, flat, torch.ones_like(flat))
         total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        w13, w2 = self.expert_weights()
         start = 0
         for expert, count in enumerate(counts[:none].tolist()):
             if not count:
                 continue
             rows = tokens[start : start + count]
-            gate, up = F.linear(x[rows], self.w13[expert]).chunk(2, dim=-1)
+            gate_up = F.linear(x[rows], grouped_gemm.expert_weights(w13, expert))
+            gate, up = gate_up.chunk(2, dim=-1)
             act = torch_ref.softcapped_swiglu(gate, up, self.gate_cap, self.up_cap)
             act = act_quant.apply(self.act_quant, act)
-            out = F.linear(act, self.w2[expert]).float()
+            out = F.linear(act, grouped_gemm.expert_weights(w2, expert)).float()
             total.index_add_(0, rows, out * weights[start : start + count, None])
             start += count
         output.copy_(total)
@@ -337,8 +420,7 @@ class Inkling2Sm70Experts(nn.Module):
         ids, order = torch.sort(ids, stable=True)
         skip = (ids == none).unsqueeze(1)
         ids = ids.clamp(max=none - 1)
-        w13 = self.w13.index_select(0, ids)
-        w2 = self.w2.index_select(0, ids)
+        w13, w2 = (grouped_gemm.expert_weights(w, ids) for w in self.expert_weights())
         row = x.contiguous()
         gate_up = torch.cat([F.linear(row, w13[slot]) for slot in range(k)])
         gate, up = gate_up.chunk(2, dim=-1)
@@ -387,7 +469,11 @@ class Inkling2Sm70Experts(nn.Module):
         route; the caller checks ``on_fused_routing`` and the route.
         `decode_only` as `expert_sum`'s `rowwise`."""
         gate = self.gate
-        logits = routing.router_logits(x, gate.weight)
+        if on_decode(x, decode_only):
+            # The router GEMV runs inside the route launch (visit_fusion.py).
+            logits = routing.RouterInput(x, gate.weight)
+        else:
+            logits = routing.router_logits(x, gate.weight)
         if is_padding is not None:
             is_padding = is_padding.reshape(-1)
         x = act_quant.apply(self.act_quant, x)
@@ -401,6 +487,6 @@ class Inkling2Sm70Experts(nn.Module):
             logits, gate.bias, self.top_k, gate.route_scale, is_padding, pad_id=-1
         )
         grouped_gemm.routed_expert_sum(
-            x, routed, self.w13, self.w2, self.gate_cap, self.up_cap, output,
+            x, routed, *self.expert_weights(), self.gate_cap, self.up_cap, output,
             act_hook=self.act_quant,
         )  # fmt: skip

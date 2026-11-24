@@ -6,18 +6,20 @@
                        visits, final norm; owns the caches of every visit
       lm_head          Inkling2Sm70LMHead: the unpadded vocabulary rows, or
                        this rank's part of them (weights.py ``head_sharded``)
-      logits_processor Inkling2Sm70LogitsProcessor: head GEMM in the model
-                       dtype, all-gather of a sharded head, cast to fp32,
-                       then the soft cap
+      logits_processor Inkling2Sm70LogitsProcessor: head GEMM (a GEMV of
+                       2 to 8 rows, gemv.py) in the model dtype,
+                       all-gather of a sharded head, cast to fp32, then
+                       the soft cap; greedy tokens of a batch the
+                       V1 sampler hook admits without the logits (greedy.py)
       visual           Inkling2VisionEncoder (vision.py), or None when the
                        image limit per prompt is 0
 
 Weights load through weights.py (parameters), expert_weights.py (experts,
 into each layer's ``mlp``) and the encoder's own loader. Each TP rank builds
 this class and loads its own shards: a slice of the attention heads and of
-the expert intermediate units and, when sharded, of the LM head rows;
-embedding, norms, convs, routers and the vision encoder are whole on every
-rank.
+the expert intermediate units and, when sharded, of the LM head and the
+token embedding rows; norms, convs, routers and the vision encoder are
+whole on every rank.
 
 DSpark draft features (``SupportsEagle3``): with aux layers set, ``forward``
 returns ``(final, [input of each listed visit..., final])``. A visit input
@@ -38,7 +40,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -50,7 +51,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from . import act_quant
+from . import act_quant, gemv, greedy
 from .expert_weights import Inkling2ExpertLoader
 from .fp16_audit import walk_process_weights_after_loading
 from .loop import Inkling2Sm70LoopModel, PartialAudit, VisitDump
@@ -128,8 +129,13 @@ class Inkling2Sm70LMHead(nn.Module):
 def _head_logits(
     lm_head: Any, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None
 ) -> torch.Tensor:
-    """This rank's logits in the model dtype."""
-    logits = F.linear(hidden_states.to(lm_head.weight.dtype), lm_head.weight)
+    """This rank's logits in the model dtype (gemv.py up to 4 rows)."""
+    logits = gemv.linear(
+        hidden_states.to(lm_head.weight.dtype),
+        lm_head.weight,
+        min_rows=gemv.HEAD_MIN_ROWS,
+        max_rows=gemv.HEAD_MAX_ROWS,
+    )
     if embedding_bias is not None:
         logits = logits + embedding_bias
     return logits
@@ -162,6 +168,18 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
                 return None
         return logits.float()
 
+    def get_top_tokens(
+        self,
+        lm_head: Any,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """int64 [rows]: the greedy tokens (greedy.py)."""
+        if not greedy.on_kernels(self, lm_head, hidden_states):
+            return super().get_top_tokens(lm_head, hidden_states, embedding_bias)
+        logits = _head_logits(lm_head, hidden_states, embedding_bias)
+        return greedy.top_tokens(logits, lm_head, self.soft_cap)
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Inkling2MultiModalProcessor,
@@ -171,6 +189,11 @@ class Inkling2Sm70LogitsProcessor(LogitsProcessor):
 class Inkling2LoopSm70ForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsEagle3
 ):
+    @property
+    def supports_sm70_topk_sampler(self) -> bool:
+        """The V1 sampler hook's opt-in (greedy.py)."""
+        return greedy.enabled()
+
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         from vllm.distributed import (

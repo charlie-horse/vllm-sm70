@@ -11,6 +11,9 @@ sum of moe.py, max-abs-rel under 2e-3:
 - captured in a CUDA graph and replayed on new routing (equal to the eager
   route), and eagerly under ``torch.cuda.set_sync_debug_mode("error")``;
 - on the tiny checkpoint's MXFP8 layer through the module;
+- an MXFP8 layer held 8-bit: its decode is exact, its route equals the
+  dequantized layer's within fp16 rounding (torch expert sum bit for bit)
+  and its time per visit is printed beside the fp16 route's;
 - on the real MXFP8 layers 20-23 at both TP2 ranks when
   INKLING2_SM70_CHECKPOINT names the checkpoint directory (skipped
   otherwise).
@@ -120,7 +123,7 @@ def routing(m, seed, *, skew=False, pad=()):
 def route(module, x, indices, weights, out=None):
     out = torch.full_like(x, float("nan")) if out is None else out
     grouped_gemm.grouped_expert_sum(
-        x, indices, weights, module.w13, module.w2, GATE_CAP, UP_CAP, out
+        x, indices, weights, *module.expert_weights(), GATE_CAP, UP_CAP, out
     )
     return out
 
@@ -384,3 +387,110 @@ def test_checkpoint_mxfp8_layers_match_torch_path(monkeypatch, tp_rank):
             assert max_abs_rel(out, ref) < TOL, (index, m)
         del module
         torch.cuda.empty_cache()
+
+
+# --------------------------------------------------------------------------
+# MXFP8 layers held 8-bit (VLLM_SM70_INKLING_MXFP8_EXPERTS)
+# --------------------------------------------------------------------------
+MX_SWITCH = moe.MXFP8_SWITCH
+FINITE = [c for c in range(256) if c & 0x7F != 0x7F]
+
+
+def test_mx_decode_is_exact_on_the_gpu():
+    """Every finite code under exponent bytes 100..246: the dequant kernel
+    equals the torch form bit for bit."""
+    scales = torch.arange(100, 247, dtype=torch.uint8)
+    codes = torch.tensor(FINITE, dtype=torch.uint8).repeat(len(scales), 1)
+    scale = scales[:, None].expand(-1, (codes.shape[1] + 31) // 32)
+    weight = grouped_gemm.Mxfp8Weight(
+        codes[None].cuda(), scale.contiguous()[None].cuda()
+    )
+    got = grouped_gemm.dequantize(weight, kernels=True)
+    assert torch.equal(got, grouped_gemm.dequantize(weight, kernels=False))
+
+
+def _mx_layer(tp_rank):
+    """A random MXFP8 layer at the real shape, one TP2 rank's slice; real
+    layers hold exponent bytes 113..118."""
+    g = torch.Generator().manual_seed(tp_rank)
+    pick = torch.tensor(FINITE, dtype=torch.uint8)
+    parts = {}
+    for name, rows, cols in (
+        ("w13", 2 * INTERMEDIATE, HIDDEN),
+        ("w2", HIDDEN, INTERMEDIATE),
+    ):
+        codes = pick[torch.randint(len(pick), (EXPERTS, rows, cols), generator=g)]
+        scale = torch.randint(113, 119, (EXPERTS, rows, cols // 32), generator=g)
+        parts[name] = (codes.view(torch.float8_e4m3fn), scale.to(torch.uint8))
+    local = INTERMEDIATE // 2
+    first = local * tp_rank
+    (w13, s13), (w2, s2) = parts["w13"], parts["w2"]
+    rows = slice(2 * first, 2 * (first + local))
+    return ew.ExpertLayer(
+        20, ew.MXFP8,
+        ew.PackedExpertWeight("w13", ew.MXFP8, w13[:, rows], s13[:, rows],
+                              (0, HIDDEN), interleaved=True),
+        ew.PackedExpertWeight("w2", ew.MXFP8, w2[:, :, first:first + local], s2,
+                              (first, first + local)),
+    )  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def mx_pair():
+    """(held, dequantized) modules of one random real-shape MXFP8 layer."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires an SM70 GPU")
+    layer = _mx_layer(1)
+    mods = []
+    for value in ("1", "0"):
+        patch = pytest.MonkeyPatch()
+        patch.setenv("VLLM_SM70_INKLING_NVFP4_TM", "0")
+        patch.setenv(MX_SWITCH, value)
+        module = moe.Inkling2Sm70Experts(real_config(), tp_size=2).cuda()
+        module.load_expert_layer(layer)
+        patch.undo()
+        g = torch.Generator().manual_seed(5)
+        module.gate.weight.data.copy_(torch.randn(EXPERTS, HIDDEN, generator=g))
+        mods.append(module)
+    assert mods[0].mx13 is not None and mods[1].mx13 is None
+    yield mods
+    del mods
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("m", SIZES)
+def test_held_layer_equals_dequantized_layer(mx_pair, m, record_property):
+    """Within fp16 rounding (the slot GEMV may sum in another order); the
+    share of bit-equal outputs is recorded."""
+    held, plain = mx_pair
+    x, indices, weights = routing(m, seed=m)
+    got, want = route(held, x, indices, weights), route(plain, x, indices, weights)
+    assert max_abs_rel(got, want) < TOL
+    equal = float((got == want).float().mean())
+    record_property("bit_equal_share", equal)
+    print({"m": m, "bit_equal": equal, "max_abs_rel": max_abs_rel(got, want)})
+    for rowwise in [True, False] if m <= 8 else [False]:
+        assert torch.equal(
+            oracle(held, x, indices, weights, rowwise),
+            oracle(plain, x, indices, weights, rowwise),
+        )
+
+
+def test_held_layer_time_per_visit(mx_pair, record_property):
+    held, plain = mx_pair
+    rows = []
+    for m in SIZES:
+        x, indices, weights = routing(m, seed=m)
+        args = (x, indices, weights, torch.empty_like(x))
+        row = {"m": m}
+        for name, module in (("held", held), ("fp16", plain)):
+
+            def fn(module=module, args=args):
+                route(module, *args)
+
+            row[f"{name}_eager_ms"] = _ms(fn)
+            if m <= max(GRAPH_SIZES):
+                row[f"{name}_graph_ms"] = _graph_ms(fn)
+        rows.append(row)
+        print(row)
+    record_property("mxfp8_time_per_visit", rows)

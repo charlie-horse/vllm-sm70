@@ -56,13 +56,15 @@ def _conv_tile(
     cols,
     col_mask,
     divisor,
+    store,
     WS: tl.constexpr,
     H: tl.constexpr,
     W: tl.constexpr,
     DYNAMIC: tl.constexpr,
 ):
     """fp32 conv of `rows` x `cols`, before the cast to the dtype of x;
-    stores the conv inputs of the tile's real rows with a slot."""
+    stores the conv inputs of the tile's real rows with a slot when the
+    scalar `store` holds."""
     real = rows < num_tokens
     slot = tl.load(slot_ptr + rows, mask=real, other=-1)
     valid = real & (slot >= 0)
@@ -135,7 +137,7 @@ def _conv_tile(
         + (safe_slot % cache_block)[:, None] * stride_cn
         + cache_col[None, :],
         cur,
-        mask=valid[:, None] & col_mask[None, :],
+        mask=tl.where(store, valid, False)[:, None] & col_mask[None, :],
     )
     return y
 
@@ -182,7 +184,7 @@ def _short_conv_kernel(
         x_ptr, stride_x, w_ptr, stride_w0, stride_w1, dyn_ptr, stride_dyn,
         cache_ptr, stride_cb, stride_ch, stride_cn, cache_block, offset,
         pos_ptr, seq_ptr, qstart_ptr, slot_ptr, table_ptr, stride_bt, max_blocks,
-        num_tokens, rows, cols, col_mask, divisor, WS, H, W, DYNAMIC,
+        num_tokens, rows, cols, col_mask, divisor, True, WS, H, W, DYNAMIC,
     )  # fmt: skip
     y = tl.where((rows < num_tokens)[:, None], y, 0.0)
     tl.store(
@@ -194,6 +196,8 @@ def _short_conv_kernel(
 
 @triton.jit
 def _key_value_tile(
+    rows,
+    head,
     x_ptr,
     stride_x,
     w_ptr,
@@ -232,15 +236,13 @@ def _key_value_tile(
     BLOCK_D: tl.constexpr,
     IS_V: tl.constexpr,
 ):
-    rows = tl.program_id(0) * BT + tl.arange(0, BT)
-    head = tl.program_id(1)
     d = tl.arange(0, BLOCK_D)
     col_mask = d < D
     y = _conv_tile(
         x_ptr, stride_x, w_ptr, stride_w0, stride_w1, dyn_ptr, stride_dyn,
         cache_ptr, stride_cb, stride_ch, stride_cn, cache_block, offset,
         pos_ptr, seq_ptr, qstart_ptr, slot_ptr, table_ptr, stride_bt, max_blocks,
-        num_tokens, rows, head * D + d, col_mask, divisor, D, H, W, DYNAMIC,
+        num_tokens, rows, head * D + d, col_mask, divisor, True, D, H, W, DYNAMIC,
     )  # fmt: skip
     # The conv output in the projection dtype, then clip (K) or norm (V).
     y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
@@ -312,9 +314,11 @@ def _key_value_conv_kernel(
 ):
     # Programs (tile, head, 0 | 1): the K | V conv of one KV head; constexprs
     # are passed by name because a tuple splat drops them.
+    rows = tl.program_id(0) * BT + tl.arange(0, BT)
+    head = tl.program_id(1)
     if tl.program_id(2) == 0:
         _key_value_tile(
-            k_ptr, stride_k, wk_ptr, stride_wk0, stride_wk1, dk_ptr, stride_dk,
+            rows, head, k_ptr, stride_k, wk_ptr, stride_wk0, stride_wk1, dk_ptr, stride_dk,
             offset_k,
             cache_ptr, kv_ptr, kv_slot_ptr, pos_ptr, seq_ptr, qstart_ptr, slot_ptr,
             table_ptr, num_tokens, stride_cb, stride_ch, stride_cn, cache_block,
@@ -323,7 +327,7 @@ def _key_value_conv_kernel(
         )  # fmt: skip
     else:
         _key_value_tile(
-            v_ptr, stride_v, wv_ptr, stride_wv0, stride_wv1, dv_ptr, stride_dv,
+            rows, head, v_ptr, stride_v, wv_ptr, stride_wv0, stride_wv1, dv_ptr, stride_dv,
             offset_v,
             cache_ptr, kv_ptr, kv_slot_ptr, pos_ptr, seq_ptr, qstart_ptr, slot_ptr,
             table_ptr, num_tokens, stride_cb, stride_ch, stride_cn, cache_block,

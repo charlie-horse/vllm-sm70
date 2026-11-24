@@ -13,6 +13,10 @@ of the largest logit in fp16, with no inf/NaN, at TP1 and TP2, with
 contexts past the window (the harness frees the blocks before it and
 fills them with NaN).
 
+Rounds that verify no drafts (a context step alone, as the speculator's
+propose with num_speculative_tokens 0) leave the later rounds' drafts and
+logits as in a run that drafted every round.
+
 Also: the weight loader's checks, the fold, f_rnn after rejected tokens,
 and the registered class names. The fp16 TP1 cases run again in a child
 pytest with TRITON_INTERPRET=1, through the Triton kernels.
@@ -304,10 +308,17 @@ def _speculator(model, num_reqs: int, max_tokens: int, dtype: torch.dtype):
 
 
 def run_rounds(
-    tp_size: int, dtype: torch.dtype, seed: int = 0, *, sharded: bool = False
+    tp_size: int,
+    dtype: torch.dtype,
+    seed: int = 0,
+    *,
+    sharded: bool = False,
+    skip: frozenset[int] = frozenset(),
 ):
-    """Per round and request: (ctx_len, anchor, tokens, logits [7, V]) of
-    every rank, and the fp32 features."""
+    """Per drafted round and request: (ctx_len, anchor, tokens, logits
+    [7, V]) of every rank, and the fp32 features. Rounds in `skip` verify no
+    drafts, as the speculator's propose with num_speculative_tokens 0: the
+    context step stores the K/V only and there is no block step."""
     from vllm.forward_context import get_forward_context
 
     checkpoint, target = _checkpoint(seed), _target_weights(seed + 1)
@@ -323,7 +334,7 @@ def run_rounds(
     for index, schedule in enumerate(ROUNDS):
         ctx = {r: harness.requests[r].computed + n for r, n in schedule.items()}
 
-        def store(rank, batch):
+        def store(rank, batch, index=index):
             model, spec = models[rank], specs[rank]
             feats = batch.take({r: f.to(dtype) for r, f in features.items()})
             md = get_forward_context().attn_metadata
@@ -331,6 +342,8 @@ def run_rounds(
             slots = [md[name].slot_mapping for name in names]
             model.precompute_and_store_context_kv(feats, batch.positions, slots)
             spec.hidden_states[: feats.shape[0]] = feats
+            if index in skip:
+                return list(batch.req_ids)
             rejected = torch.zeros(len(batch.req_ids), dtype=torch.int32)
             spec.prepare_context_anchor(
                 len(batch.req_ids), batch.query_start_loc, rejected
@@ -338,6 +351,8 @@ def run_rounds(
             return list(batch.req_ids)
 
         order = harness.step(schedule, store)[0]
+        if index in skip:
+            continue
         f_rows = {r: i for i, r in enumerate(order)}
 
         def block(rank, batch, index=index, f_rows=f_rows):
@@ -412,6 +427,28 @@ def test_the_fp16_draft_tokens_mostly_agree_with_fp32(fp32_run):
         same += int((a[0][0] == b[0][0]).sum())
         total += a[0][0].numel()
     assert same >= 0.9 * total, (same, total)
+
+
+@pytest.mark.parametrize("skip", [frozenset({1, 2}), frozenset({0, 2})])
+def test_rounds_without_drafts_keep_the_draft_in_sync(fp32_run, skip):
+    """A step that verifies no drafts (spec_policy.py) stores the context
+    K/V only; a later drafting round gives the drafts and logits of a run
+    that drafted every round."""
+    if INTERPRETED:
+        pytest.skip("covered by the parent run")
+    got, *_ = run_rounds(1, torch.float32, skip=skip)
+    want = [
+        result
+        for index, result in enumerate(fp32_run[0])
+        if index // len(ROUNDS[0]) not in skip
+    ]
+    assert len(got) == len(want) == len(ROUNDS[0]) * (len(ROUNDS) - len(skip))
+    for (req, ctx, anchor, ranks), (w_req, w_ctx, w_anchor, w_ranks) in zip(
+        got, want, strict=True
+    ):
+        assert (req, ctx, anchor) == (w_req, w_ctx, w_anchor)
+        assert torch.equal(ranks[0][0], w_ranks[0][0])
+        torch.testing.assert_close(ranks[0][1], w_ranks[0][1], atol=1e-6, rtol=0)
 
 
 # --- pieces -------------------------------------------------------------------------

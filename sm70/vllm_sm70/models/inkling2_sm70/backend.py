@@ -21,18 +21,20 @@ padded to the capture size. So an op reads rows [0, n) only and treats the
 model rows after them as padding; inside [0, n) a token with a negative slot
 is padding too. The builders sort decode requests first.
 
-A step that runs as a FULL decode graph is decode-only (``decode_only``):
-it is a uniform decode of q = ``decode_query_len`` tokens per request (q = 1
-without a speculative config; a verify step of 1 + num_speculative_tokens
-with one), its zero-token requests (graph padding) are last, the engine's
-cudagraph_mode has FULL decode graphs and the step's (padded) token count
-is at most ``max_cudagraph_capture_size``, so the runner captures or
-replays it (UP v1/cudagraph_dispatcher.py, v1/worker/gpu/cudagraph_utils.py).
-The builders read this from the engine's config at build time. The ops of
-such a step read no host data and their shapes depend on the token tensors
-and the block-table width alone; an op covers the rows of the slot mapping
-(P), a row with a negative slot is padding, and each row is a query at its
-own position that sees the rows of its request before it. Every other step,
+A step that runs as a FULL decode graph is decode-only (``decode_only``): it
+is a uniform decode of q tokens per request, q one of ``decode_query_lens``
+(q = 1 without a speculative config; a verify step of 1 +
+num_speculative_tokens with one; with a dynamic speculative-decoding
+schedule, 1 + each draft count of the schedule, 1 included), its zero-token
+requests (graph padding) are last, the engine's cudagraph_mode has FULL
+decode graphs and the step's (padded) token count is at most
+``max_cudagraph_capture_size``, so the runner captures or replays it (UP
+v1/cudagraph_dispatcher.py, v1/worker/gpu/cudagraph_utils.py). The builders
+read this from the engine's config at build time. The ops of such a step
+read no host data and their shapes depend on the token tensors and the
+block-table width alone; an op covers the rows of the slot mapping (P), a
+row with a negative slot is padding, and each row is a query at its own
+position that sees the rows of its request before it. Every other step,
 eager decodes included, takes the ops that branch in Python on the batch
 (numpy request lengths, nonzero): they run eagerly or as eager breaks of a
 PIECEWISE graph. The builders declare UNIFORM_SINGLE_TOKEN_DECODE graph
@@ -88,6 +90,7 @@ __all__ = [
     "cache_metadata",
     "decode_graph_enabled",
     "decode_query_len",
+    "decode_query_lens",
     "is_decode_only",
     "replays_decode_graph",
 ]
@@ -123,12 +126,25 @@ def decode_query_len(vllm_config: Any) -> int:
     return 1 + (2 * k if v1_parallel else k)
 
 
-def _uniform_decode(cm: CommonAttentionMetadata, query_len: int) -> bool:
-    """Whether every request of `cm` has `query_len` tokens, but for
-    zero-token requests after them (host data only)."""
-    if query_len == 1:
-        return cm.max_query_len <= 1
-    if cm.max_query_len != query_len or not cm.num_reqs:
+def decode_query_lens(vllm_config: Any) -> tuple[int, ...]:
+    """Every q of a decode step: ``decode_query_len``, and with a dynamic
+    speculative-decoding schedule (spec_policy.py) 1 + each of its draft
+    counts, capped at num_speculative_tokens."""
+    q = decode_query_len(vllm_config)
+    spec = getattr(vllm_config, "speculative_config", None)
+    schedule = getattr(spec, "num_speculative_tokens_per_batch_size", None)
+    if not schedule:
+        return (q,)
+    return tuple(sorted({1 + min(int(n), q - 1) for _, _, n in schedule}))
+
+
+def _uniform_decode(cm: CommonAttentionMetadata, query_lens: tuple[int, ...]) -> bool:
+    """Whether every request of `cm` has q tokens, q one of `query_lens`,
+    but for zero-token requests after them (host data only)."""
+    if cm.max_query_len <= 1:
+        return 1 in query_lens
+    query_len = cm.max_query_len
+    if query_len not in query_lens or not cm.num_reqs:
         return False
     lens = cm.query_start_loc_cpu[: cm.num_reqs + 1].diff()
     real, rest = divmod(int(lens.sum()), query_len)
@@ -144,7 +160,7 @@ def replays_decode_graph(vllm_config: Any, cm: CommonAttentionMetadata) -> bool:
 
     if not decode_graph_enabled(vllm_config):
         return False
-    if not _uniform_decode(cm, decode_query_len(vllm_config)):
+    if not _uniform_decode(cm, decode_query_lens(vllm_config)):
         return False
     compilation = getattr(vllm_config, "compilation_config", None)
     mode = getattr(compilation, "cudagraph_mode", None)

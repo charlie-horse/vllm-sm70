@@ -124,7 +124,9 @@ def _gated_sublayer(cases, tokens: int):
     return run
 
 
-def test_launches_of_a_gated_sublayer(cases):
+@pytest.mark.parametrize("fusion", ["1", "0"], ids=["fused", "unfused"])
+def test_launches_of_a_gated_sublayer(cases, monkeypatch, fusion):
+    monkeypatch.setenv("VLLM_SM70_INKLING_VISIT_FUSION", fusion)
     run = _gated_sublayer(cases, 1)
     run()
     torch.cuda.synchronize()
@@ -134,6 +136,9 @@ def test_launches_of_a_gated_sublayer(cases):
         run()
         torch.cuda.synchronize()
     kernels = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    if fusion == "1":
+        assert kernels == ["_attn_res_row_kernel", "_gate_blend_kernel"], kernels
+        return
     assert len(kernels) == 4, kernels
     assert {"_gate_down_kernel", "_gate_up_kernel"} <= set(kernels), kernels
 

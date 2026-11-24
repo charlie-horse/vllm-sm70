@@ -51,6 +51,8 @@ EFFECTIVE_DEFAULTS = {
         "visit_dump_dir": None,
         "max_image_encoder_tokens": 10817,
         "expert_act_fake_quant": False,
+        "dspark_spec_max_reqs": 1,
+        "dspark_spec_tokens": 7,
     },
 }
 
@@ -175,16 +177,24 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TRITON_NORMS",
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
+        "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
         "VLLM_SM70_INKLING_DSPARK",
+        "VLLM_SM70_INKLING_DSPARK_AUTO",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
         "VLLM_SM70_INKLING_ASYNC_SCHED",
         "VLLM_SM70_INKLING_SHARDED_HEAD",
+        "VLLM_SM70_INKLING_SHARDED_EMBED",
+        "VLLM_SM70_INKLING_MXFP8_EXPERTS",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
+        "VLLM_SM70_INKLING_VISIT_FUSION",
+        "VLLM_SM70_INKLING_SMALL_M_GEMV",
+        "VLLM_SM70_INKLING_NVFP4_GEMV",
         "VLLM_SM70_INKLING_MERGED_PROJ",
+        "VLLM_SM70_INKLING_GREEDY_TOP1",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -452,6 +462,16 @@ def _inkling_triton_decode_attn_off(name):
         assert attention_torch.on_triton(SimpleNamespace(is_cuda=True)) is False
 
 
+def _inkling_split_kv_attn_off(name):
+    """The decode-attention kernel launches unsplit; the split launches' own
+    checks are tests/ops/test_m12_inkling2_triton_decode_attn_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import attention_torch
+
+    assert attention_torch.SPLIT_SWITCH == name
+    assert attention_torch.on_split_kv() is False
+
+
 def _inkling_grouped_moe_off(name):
     """A GPU tensor takes the torch expert sum of inkling2_sm70/moe.py; the
     route's own checks are tests/quant/test_m12_inkling2_grouped_moe_cpu.py."""
@@ -493,6 +513,63 @@ def _inkling_fused_small_ops_off(name):
         assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
 
 
+def _inkling_greedy_top1_off(name):
+    """The Inkling 2 model does not opt in to the V1 sampler hook; the
+    kernels are checked in tests/sampler/test_m12_inkling2_greedy_top1_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import greedy
+
+    assert greedy.SWITCH == name and not greedy.enabled()
+
+
+def _inkling_visit_fusion_off(name):
+    """A decode-only GPU batch keeps the kernels of each op of a layer
+    visit (inkling2_sm70/visit_fusion.py); the fused kernels' own checks are
+    tests/ops/test_m12_inkling2_visit_fusion_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import visit_fusion
+
+    assert visit_fusion.SWITCH == name
+    x = SimpleNamespace(is_cuda=True)
+    with mock.patch.object(visit_fusion._compat, "AVAILABLE", True):
+        assert visit_fusion.on_decode(x, True) is False
+        assert visit_fusion.on_visit(x, True, True) is False
+
+
+def _inkling_small_m_gemv_off(name):
+    """A 4-token fp16 GPU projection keeps cuBLAS (inkling2_sm70/gemv.py);
+    the kernel's own checks are tests/ops/test_m12_inkling2_small_m_gemv_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    import torch
+
+    from vllm_sm70.models.inkling2_sm70 import gemv
+
+    assert gemv.SMALL_M_SWITCH == name
+    x = SimpleNamespace(
+        ndim=2, shape=(4, 64), dtype=torch.float16, is_cuda=True, stride=lambda d: 1
+    )
+    with mock.patch.object(gemv._compat, "AVAILABLE", True):
+        assert gemv.on_small_m(x, x) is False
+
+
+def _inkling_nvfp4_gemv_off(name):
+    """One-row expert slots on the GPU keep the TurboMind stages
+    (inkling2_sm70/gemv.py, moe_tm.py); the kernel's own checks are
+    tests/quant/test_m12_inkling2_nvfp4_gemv_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import gemv
+
+    assert gemv.NVFP4_SWITCH == name
+    with mock.patch.object(gemv._compat, "AVAILABLE", True):
+        assert gemv.on_nvfp4(SimpleNamespace(is_cuda=True)) is False
+
+
 def _inkling_tm_tune_off(name):
     """The Inkling 2 hook writes no TurboMind tuning knob; the knob values are
     checked in tests/models/test_m12_inkling2_tm_tune_cpu.py."""
@@ -515,6 +592,21 @@ def _inkling_dspark_off(name):
     )
     assert name in draft.speculative_rejection(spec, None)
     assert draft.speculator_cls(SimpleNamespace(speculative_config=spec)) is None
+
+
+def _inkling_dspark_auto_off(name):
+    """The Inkling 2 hook sets no speculative-decoding schedule; the schedules
+    it sets are checked in tests/models/test_m12_inkling2_spec_policy_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import spec_policy
+
+    assert spec_policy.SWITCH == name
+    spec = SimpleNamespace(num_speculative_tokens=7)
+    config = SimpleNamespace(
+        speculative_config=spec, scheduler_config=SimpleNamespace(max_num_seqs=8)
+    )
+    assert spec_policy.apply(config, sm70_config(_vc({})).inkling2) is None
+    assert not hasattr(spec, "num_speculative_tokens_per_batch_size")
 
 
 def _inkling_dspark_kernels_off(name):
@@ -588,6 +680,24 @@ def _inkling_sharded_head_off(name):
     from vllm_sm70.models.inkling2_sm70 import weights
 
     assert weights.HEAD_SWITCH == name and not weights.sharded_head_enabled()
+
+
+def _inkling_sharded_embed_off(name):
+    """At TP2 every rank's weight map keeps the whole token embedding; the
+    sharded embedding is in tests/models/test_m12_inkling2_sharded_embed_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import weights
+
+    assert weights.EMBED_SWITCH == name and not weights.sharded_embed_enabled()
+
+
+def _inkling_mxfp8_experts_off(name):
+    """An fp16 MXFP8 layer is dequantized at load; the held layer is in
+    tests/quant/test_m12_inkling2_mxfp8_experts_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import moe
+
+    assert moe.MXFP8_SWITCH == name and not moe.mxfp8_enabled()
 
 
 def _inkling_decode_graph_off(name):
@@ -691,6 +801,8 @@ def _path_off(name):
         _inkling_triton_sconv_off(name)
     elif name == "VLLM_SM70_INKLING_TRITON_DECODE_ATTN":
         _inkling_triton_decode_attn_off(name)
+    elif name == "VLLM_SM70_INKLING_SPLIT_KV_ATTN":
+        _inkling_split_kv_attn_off(name)
     elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
         _inkling_decode_graph_off(name)
     elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
@@ -701,14 +813,28 @@ def _path_off(name):
         _inkling_tm_tune_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK":
         _inkling_dspark_off(name)
+    elif name == "VLLM_SM70_INKLING_DSPARK_AUTO":
+        _inkling_dspark_auto_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK_KERNELS":
         _inkling_dspark_kernels_off(name)
     elif name == "VLLM_SM70_INKLING_ASYNC_SCHED":
         _inkling_async_sched_off(name)
     elif name == "VLLM_SM70_INKLING_SHARDED_HEAD":
         _inkling_sharded_head_off(name)
+    elif name == "VLLM_SM70_INKLING_SHARDED_EMBED":
+        _inkling_sharded_embed_off(name)
+    elif name == "VLLM_SM70_INKLING_MXFP8_EXPERTS":
+        _inkling_mxfp8_experts_off(name)
     elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
         _inkling_fused_small_ops_off(name)
+    elif name == "VLLM_SM70_INKLING_GREEDY_TOP1":
+        _inkling_greedy_top1_off(name)
+    elif name == "VLLM_SM70_INKLING_VISIT_FUSION":
+        _inkling_visit_fusion_off(name)
+    elif name == "VLLM_SM70_INKLING_SMALL_M_GEMV":
+        _inkling_small_m_gemv_off(name)
+    elif name == "VLLM_SM70_INKLING_NVFP4_GEMV":
+        _inkling_nvfp4_gemv_off(name)
     elif name in PENDING:
         _getter_only(name)
     else:
@@ -758,6 +884,8 @@ def test_env_cannot_enable(monkeypatch, value):
             "visit_dump_dir": "/dump",
             "max_image_encoder_tokens": 1601,
             "expert_act_fake_quant": False,
+            "dspark_spec_max_reqs": 4,
+            "dspark_spec_tokens": 5,
         },
     }
     assert sm70_config(_vc(off)).model_dump() == off

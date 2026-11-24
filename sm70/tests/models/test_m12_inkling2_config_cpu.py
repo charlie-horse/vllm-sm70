@@ -174,6 +174,94 @@ def test_hook_takes_a_staged_dspark_draft_only(device, route_log, monkeypatch, s
         icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
 
 
+@pytest.mark.parametrize(
+    ("sm70", "given", "switch", "want_schedule", "want_sizes"),
+    [
+        # Default: steps of 1 request verify 7 drafts, larger ones none.
+        (None, None, None, [(1, 1, 7), (2, 4, 0)], [1, 2, 3, 4, 8]),
+        (
+            {"dspark_spec_max_reqs": 2},
+            None,
+            None,
+            [(1, 2, 7), (3, 4, 0)],
+            [1, 2, 3, 4, 8, 16],
+        ),
+        # Verify steps of 6 tokens; the draft's graph still has 8 per request.
+        (
+            {"dspark_spec_tokens": 5},
+            None,
+            None,
+            [(1, 1, 5), (2, 4, 0)],
+            [1, 2, 3, 4, 6, 8],
+        ),
+        ({"dspark_spec_max_reqs": 4}, None, None, None, 32),
+        (
+            {"dspark_spec_max_reqs": 4, "dspark_spec_tokens": 5},
+            None,
+            None,
+            [(1, 4, 5)],
+            [6, 8, 12, 16, 18, 24, 32],
+        ),
+        (None, None, "0", None, 32),  # the kill switch: every step verifies
+        (
+            None,
+            [(1, 2, 3), (3, 4, 0)],
+            None,
+            [(1, 2, 3), (3, 4, 0)],
+            [1, 2, 3, 4, 8, 16],
+        ),
+    ],
+)
+def test_hook_sets_the_speculation_schedule(
+    device, route_log, monkeypatch, sm70, given, switch, want_schedule, want_sizes
+):
+    """want_sizes: the capture sizes the hook sets, or (no schedule) the
+    largest one alone."""
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    device(7, 0)
+    monkeypatch.setattr(icfg, "tm_tuning_env", lambda *args: {})
+    if switch is None:
+        monkeypatch.delenv("VLLM_SM70_INKLING_DSPARK_AUTO", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_INKLING_DSPARK_AUTO", switch)
+    spec = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=given,
+        draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
+    )
+    cfg = _vllm_config(spec=spec, sm70=None if sm70 is None else {"inkling2": sm70})
+    cfg.use_v2_model_runner = True
+    cfg.scheduler_config.max_num_seqs = 4
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    assert spec.num_speculative_tokens_per_batch_size == want_schedule
+    compilation = cfg.compilation_config
+    if isinstance(want_sizes, int):
+        assert getattr(compilation, "cudagraph_capture_sizes", None) is None
+        assert compilation.max_cudagraph_capture_size == want_sizes
+    else:
+        assert compilation.cudagraph_capture_sizes == want_sizes
+        assert compilation.max_cudagraph_capture_size == want_sizes[-1]
+    logged = [line for line in route_log if "schedule" in line]
+    assert len(logged) == (want_schedule is not None)
+
+
+def test_hook_refuses_more_verified_tokens_than_drafts(device, route_log):
+    from vllm_sm70.models.inkling2_sm70 import draft
+
+    device(7, 0)
+    spec = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
+    )
+    cfg = _vllm_config(spec=spec, sm70={"inkling2": {"dspark_spec_tokens": 8}})
+    cfg.use_v2_model_runner = True
+    with pytest.raises(ValueError, match="dspark_spec_tokens must be 1 to"):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+
+
 @pytest.mark.parametrize("block_size", [None, 32])
 @pytest.mark.parametrize("async_scheduling", [None, False, True])
 @pytest.mark.parametrize("cache_dtype", ["auto", "float16"])
@@ -480,7 +568,10 @@ def test_real_vllm_config_runs_the_hook_before_the_graph_defaults(
     assert config.cache_config.block_size == icfg.KV_BLOCK_SIZE
     # Upstream turns the unset async scheduling on after the hook.
     assert config.scheduler_config.async_scheduling is True
-    assert f"cudagraph_mode {want};" in route_log[0]
+    # The route line, whichever info lines the hook logs before it (the
+    # TurboMind tuning line comes first when a real _sm70_C is importable).
+    routes = [line for line in route_log if "cudagraph_mode" in line]
+    assert routes and f"cudagraph_mode {want};" in routes[0]
     if want == "FULL_DECODE_ONLY":
         compilation = config.compilation_config
         assert compilation.max_cudagraph_capture_size == icfg.DECODE_GRAPH_MAX_BATCH
@@ -602,7 +693,10 @@ def test_inkling2_section_is_config_only():
     does not enter the graph hash."""
     names = [n for n in envs.environment_variables() if "INKLING" in n]
     assert not [n for n in names if "INKLING2" in n or "DUMP" in n]
-    assert all(n in envs._SECTIONS["models"] for n in names)  # route switches
+    # route switches; the TurboMind grouped-prefill knob is read by the C++
+    knobs = {"VLLM_SM70_INKLING_TM_GROUPED_PREFILL"}
+    assert all(n in envs._SECTIONS["models"] for n in names if n not in knobs)
+    assert all(n in envs._SECTIONS["ops"] for n in knobs)
     on = Sm70Config.model_validate({"inkling2": {"visit_dump_dir": "/dump"}})
     assert compute_hash(on) == compute_hash(Sm70Config())
 

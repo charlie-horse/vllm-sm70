@@ -1,4 +1,4 @@
-# TurboMind SM70 GEMM core and ops: provenance (patches K02, K03, K11)
+# TurboMind SM70 GEMM core and ops: provenance (patches K02, K03, K11, M12)
 
 Source: charlie-horse/vLLM at **cf9492a01**. The lmdeploy upstream commit isn't recorded in the fork (see `lmdeploy/NOTICE`). Line counts are `wc -l`. "fork last-touch" is `git log -1 --format=%h -- <fork path>`. Re-verify against a fork checkout with:
 
@@ -684,6 +684,14 @@ capture; with 2 GPUs over gloo, both ranks end with the same cache digest.
 - Elastic EP (`process_local_only`) runs the warmup per process without
   collectives; SM70 MoE refuses EP, so this path is unused.
 
+## M12: Inkling 2 grouped expert prefill (`ops/tm_moe_sm70.cu`, `ops/tm_config.h`)
+
+- **`nvfp4_moe_dense_stage_sm70_out`:** a third exact grouped-prefill shape set, `exact_inkling2_prefill_shape`: more than 64 input rows, 128 experts, and (k 2304, n 1152) or (k 576, n 2304), the W13 and W2 banks of Inkling 2 Mini at TP2 (`vllm_sm70/models/inkling2_sm70/moe_tm.py`). Such a call is one grouped `nvfp4_moe_gemm_sm70_out_impl` launch over all experts instead of the per-expert loop of 128 launches. Its route log key is `logged_nvfp4_inkling2_grouped_prefill`. The Qwen and Flint shape sets are unchanged.
+- **New `sm70_inkling_tm_grouped_prefill_enabled()`** (file-local): false only when `VLLM_SM70_INKLING_TM_GROUPED_PREFILL` is exactly `"0"`. `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=0` also turns the Inkling 2 branch off.
+- **`tm_config.h`:** one more knob, `inkling_tm_grouped_prefill` (`VLLM_SM70_INKLING_TM_GROUPED_PREFILL`), registered in the `ops` section of `vllm_sm70/envs.py`.
+- **Tuning:** none added. The grouped calls run at more than `COMPACT_BATCH_MAX_SLOTS` (640) routed slots with compact groups on, above the NVFP4 MoE tuning limit that the Inkling 2 engine hook sets (at most 512 slots), so they always run `kDefault` and nothing is measured in capture or in eager prefill.
+- **Python mirror:** `vllm_sm70/ops/tm.py` `nvfp4_moe_dense_stage_route()` and `NVFP4_MOE_GROUPED_PREFILL_SHAPES`. `tests/quant/test_m12_inkling2_grouped_prefill_cpu.py` parses the op's shape sets and row cut-offs and keeps the mirror equal to them.
+
 ## Files
 
 | new path | fork path | status | lines | fork lines | fork last-touch | sha256 | fork sha256 |
@@ -803,10 +811,10 @@ capture; with 2 GPUs over gloo, both ranks end with the same cache digest.
 | `sm70/csrc/turbomind/ops/qwen38_prefill_cutlass.cuh` | `csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cuh` | verbatim | 13 | 13 | 58beb3433 | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` |
 | `sm70/csrc/turbomind/ops/sm70_policy.h` | `-` | new | 9 | - | - | `e22e683997b19651e2d31f7bf9597a39e97574aa34348c7a0a0be05d4dec02df` | `-` |
 | `sm70/csrc/turbomind/ops/tm_awq_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 744 | 10913 | 899e9ed33 | `0d179aa7673d8b1a21105012bbb3d1dc3af8285119ed2a7869e11fc30d5bce08` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_config.h` | `csrc/sm70_policy.h` | rewritten | 267 | 315 | c43f5d78c | `a5fb816fb7d5ba9485e7839d85d7e8e0662ea8f7e47cacc665192b3cf63f760a` | `b2c935891ef32cc8c70367fb109c65f574beaff64b193b08565164b0a9e53981` |
+| `sm70/csrc/turbomind/ops/tm_config.h` | `csrc/sm70_policy.h` | rewritten | 269 | 315 | c43f5d78c | `cdc5b8d68f8a2c94f461c73b019b3d23bac84a29d85302af2d9141d2c6c4b5c4` | `b2c935891ef32cc8c70367fb109c65f574beaff64b193b08565164b0a9e53981` |
 | `sm70/csrc/turbomind/ops/tm_f16_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 375 | 10913 | 899e9ed33 | `39219d6437ea5ebd06a5468731caa7e6a5e16496a1e1342de3fa336244c74da5` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_fp8_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 615 | 10913 | 899e9ed33 | `493ed6e2d7c920bb8f6c82d8c8046feb0fb566c4318c6f0b5e9cd5fa1daf790b` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3415 | 10913 | 899e9ed33 | `4517ca77811962b1d332cfabe8681b6d31a1627022ca63bb91a6c29427ca2f63` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3438 | 10913 | 899e9ed33 | `054abb60efa5fabdea6199955552c49ca498524eba858779dbdef8e83340b723` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_nvfp4_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 288 | 10913 | 899e9ed33 | `98028afde445b8ecc1827be9ac32982bbbbf6afc6ae6cb3a269ba9423ec97c0f` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_ops_common_sm70.cuh` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 119 | 10913 | 899e9ed33 | `f00da8f4ef8450a75bbd8cae4d798fa12be683d0e406606410b4db97ccd96bb7` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_registry_sm70.cu` | `csrc/sm70_turbomind/ops/tm_registry_sm70.cu` | verbatim | 38 | 38 | 58beb3433 | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` |

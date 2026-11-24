@@ -193,6 +193,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
             "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE",
             "VLLM_SM70_FP8_SAFE_FAST_SELECTOR",
             "VLLM_SM70_FP8_TUNE_SMALL_SHAPES",
+            # "0": the Inkling 2 NVFP4 expert stages above 64 routed slots
+            # take the per-expert loop (128 launches per stage) instead of
+            # one grouped launch (tm_moe_sm70.cu nvfp4_moe_dense_stage_sm70_out,
+            # mirrored by ops/tm.py nvfp4_moe_dense_stage_route).
+            "VLLM_SM70_INKLING_TM_GROUPED_PREFILL",
             "VLLM_SM70_MXFP4_MOE_GROUPED_M8",
             "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR",
             "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
@@ -358,6 +363,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN": kill_switch(
             "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
         ),
+        # "0": the Inkling 2 decode-attention kernel walks each row's keys in
+        # one program per row and head instead of splitting them over several
+        # programs and merging the partials (split-KV). Env-only (no
+        # Sm70Config field), read per eager call (inkling2_sm70/
+        # attention_torch.py) and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_SPLIT_KV_ATTN": kill_switch(
+            "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
+        ),
         # "0": Inkling 2 decode-only batches take the ops of mixed batches
         # again, the cache backends declare no full-graph support and an
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/
@@ -390,6 +403,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # again and Sm70CudaPlatform.get_speculator_cls (U6) returns None
         # (inkling2_sm70/draft.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_DSPARK": kill_switch("VLLM_SM70_INKLING_DSPARK"),
+        # "0": the Inkling 2 config hook sets no speculative-decoding
+        # schedule, so every decode step of a DSpark engine verifies
+        # num_speculative_tokens drafts. Otherwise steps of more than
+        # sm70.inkling2.dspark_spec_max_reqs requests decode one token per
+        # request (inkling2_sm70/spec_policy.py). Env-only, read once per
+        # engine config.
+        "VLLM_SM70_INKLING_DSPARK_AUTO": kill_switch("VLLM_SM70_INKLING_DSPARK_AUTO"),
         # "0": the Inkling 2 draft (inkling2_sm70/dspark.py) runs the torch
         # forms of its norm, RoPE, block attention, SwiGLU, Markov gate and
         # soft-cap ops instead of the Triton kernels (inkling2_sm70/ops/
@@ -411,6 +431,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SHARDED_HEAD": kill_switch(
             "VLLM_SM70_INKLING_SHARDED_HEAD"
         ),
+        # "0": every TP rank holds the whole Inkling 2 token embedding.
+        # Otherwise, at TP > 1 with a padded vocabulary that splits evenly,
+        # each rank holds its own vocabulary rows, looks up the ids in them
+        # and the ranks all-reduce the rows (inkling2_sm70/weights.py,
+        # loop.py). Env-only, read when the model is built.
+        "VLLM_SM70_INKLING_SHARDED_EMBED": kill_switch(
+            "VLLM_SM70_INKLING_SHARDED_EMBED"
+        ),
+        # "0": the Inkling 2 MXFP8 expert layers are dequantized to the model
+        # dtype at load. Otherwise, in an fp16 model, they stay e4m3 codes
+        # with their per-32 exponent scales and the expert GEMMs decode them
+        # (inkling2_sm70/moe.py, ops/grouped_gemm.py). Env-only, read when a
+        # layer is loaded.
+        "VLLM_SM70_INKLING_MXFP8_EXPERTS": kill_switch(
+            "VLLM_SM70_INKLING_MXFP8_EXPERTS"
+        ),
         # "0": the small torch chains of Inkling 2 decode-only batches (the
         # prologue's q/r clips and relative projection, the attention output
         # gate, the TurboMind SwiGLU, the short convs' padding masks) run on
@@ -421,6 +457,31 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
             "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
         ),
+        # "0": Inkling 2 decode-only batches run one kernel per op of a layer
+        # visit again instead of the merged kernels of inkling2_sm70/
+        # visit_fusion.py (short conv with residual and AttnRes mix, message
+        # gates, prologue, router with route). Env-only (no Sm70Config
+        # field), read per eager call and fixed at capture in a replayed CUDA
+        # graph; other batches and tensors off the GPU never merge.
+        "VLLM_SM70_INKLING_VISIT_FUSION": kill_switch(
+            "VLLM_SM70_INKLING_VISIT_FUSION"
+        ),
+
+
+        # "0": the Inkling 2 dense projections of 1 to 8 tokens (qkvr with
+        # its k/v inputs and packed taps, the attention output projection,
+        # the LM head of 1 to 4 tokens) run on cuBLAS instead of one Triton
+        # GEMV launch each (inkling2_sm70/gemv.py). Env-only (no Sm70Config
+        # field), read per eager call and fixed at capture in a replayed CUDA
+        # graph; tensors off the GPU always take cuBLAS.
+        "VLLM_SM70_INKLING_SMALL_M_GEMV": kill_switch("VLLM_SM70_INKLING_SMALL_M_GEMV"),
+        # "0": the one-row expert slots of the Inkling 2 TurboMind experts
+        # (at most 80 routed slots) run the two TurboMind dense stages and
+        # the SwiGLU kernel instead of the Triton NVFP4 GEMV over the same
+        # banks, W13 with the SwiGLU in its epilogue (inkling2_sm70/gemv.py,
+        # moe_tm.py). Env-only (no Sm70Config field), read per eager call
+        # and fixed at capture in a replayed CUDA graph.
+        "VLLM_SM70_INKLING_NVFP4_GEMV": kill_switch("VLLM_SM70_INKLING_NVFP4_GEMV"),
         # "1": the Inkling 2 projections that share an input are packed into
         # one buffer and run as one GEMM: a global layer's q/k/v/r/gate/sink
         # rows and conv taps, the controllers' gain and forget gates; the q/r
@@ -428,6 +489,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # own buffer and GEMM. Env-only (no Sm70Config field), read when the
         # model is built (inkling2_sm70/weights.py, layers.py).
         "VLLM_SM70_INKLING_MERGED_PROJ": opt_in("VLLM_SM70_INKLING_MERGED_PROJ"),
+        # "0": the Inkling 2 model does not opt in to the V1 hidden-state
+        # sampler, so every batch takes compute_logits (fp16 logit
+        # all-gather) and the upstream Sampler. Otherwise an all-greedy
+        # batch the F12 fast path admits takes the per-shard soft-capped
+        # top-1 kernels and a (value, id) pair all-gather (inkling2_sm70/
+        # greedy.py). Env-only (no Sm70Config field), read on every step.
+        "VLLM_SM70_INKLING_GREEDY_TOP1": kill_switch("VLLM_SM70_INKLING_GREEDY_TOP1"),
     },
     # Kai (K16 top-k candidate sampler). Kill switch only.
     "sampler": {
