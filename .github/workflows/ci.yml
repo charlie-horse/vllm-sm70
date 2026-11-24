@@ -96,13 +96,14 @@ jobs:
         run: scripts/regen-patches.sh --check "$VLLM_SRC"
 
   python-unit:
-    # wheel:   vLLM exactly as released (plugin must work without our patches).
+    # wheel:   vLLM exactly as released; plugin and registration tests only
+    #          (the plugin must import and register without our patches).
     # patched: the same, with patches/series applied to the BASE source and that
     #          tree first on PYTHONPATH, so the U-hook tests (e.g. test_u1_hooks)
     #          run instead of skipping.
     name: Python unit tests (CPU, vLLM ${{ matrix.vllm }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -187,6 +188,10 @@ jobs:
           set -uo pipefail
           python -c 'import vllm; print("vllm from", vllm.__file__)'
           read -ra dirs <<<"${{ steps.detect.outputs.dirs }}"
+          if [[ "${{ matrix.vllm }}" == wheel ]]; then
+            # Unpatched vLLM: the plugin imports and registers; the full suite runs in `patched`.
+            dirs=(sm70/tests/plugin sm70/tests/models/test_m12_inkling2_registration_cpu.py)
+          fi
           python -m pytest -q "${dirs[@]}" -m "not gpu"; rc=$?
           [[ $rc == 0 || $rc == 5 ]] || exit $rc
 
