@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M12 inkling2-sm70-model registration (vllm_sm70/models/inkling2_sm70/).
+"""Tests for inkling2-sm70 model registration (vllm_sm70/models/inkling2_sm70/).
 
 CPU only: registry wiring at faked cc 7.0 vs 8.0, the config classes in
 vLLM's _CONFIG_REGISTRY on both, the vendored configs.py against the sha256

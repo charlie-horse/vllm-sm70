@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K03 GPU accuracy: TurboMind fp16 / FP8-block / NVFP4 GEMM vs torch.matmul.
+"""GPU accuracy: TurboMind fp16 / FP8-block / NVFP4 GEMM vs torch.matmul.
 
 The reference is fp32 torch.matmul on the dequantized weight. The pass bar is
 max|out - ref| / max|ref| < 1e-2 at M in {1, 2, 8, 64, 512}, on Flint (NVFP4)
@@ -59,7 +59,7 @@ def test_nvfp4_gemm_matches_matmul(tm_gpu, n, k, m):
 
 
 def test_nvfp4_prepare_meta_contract(tm_gpu):
-    """Mara's K03 contract: meta = (k_ld = 32 * K, q_ld = N)."""
+    """The prepare meta contract: meta = (k_ld = 32 * K, q_ld = N)."""
     k, n = 5120, 4352
     codes, scales = nvfp4_weight(k, n)
     _, _, meta = tm_gpu.nvfp4_sm70_prepare(codes, scales)

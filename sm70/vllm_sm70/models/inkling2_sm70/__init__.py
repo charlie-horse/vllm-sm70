@@ -1,24 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 inkling2-sm70-model: Inkling 2 (looped, e.g. Inkling 2 Mini) on SM70.
+"""Inkling 2 (looped, e.g. Inkling 2 Mini) on SM70.
 
-What: the model ``Inkling2LoopSm70ForConditionalGeneration`` (model.py,
-  loop.py, layers.py: the text stack on one TP rank), upstream's Inkling 2 config classes vendored unchanged
-  (configs.py, see PROVENANCE.md) and the SM70 subclasses that keep the LM
-  head in the model dtype (sm70_configs.py), the chat renderer mode
-  ``inkling2_sm70`` (renderer.py, inkling2_encoding.py), and the reasoning
-  and tool parsers ``inkling2_sm70`` (parsers.py).
-Why: vLLM v0.33.0 has no ``inkling2`` config type or architecture, and
-  upstream's model asserts bf16 and SM90+ kernels. A separate architecture
-  name keeps upstream's class untouched; serve args select ours with
-  ``--hf-overrides '{"architectures":
-  ["Inkling2LoopSm70ForConditionalGeneration"]}'``.
-Registration: the config classes (``inkling2_dspark``, the DSpark draft's,
-  included) go into vLLM's ``_CONFIG_REGISTRY``, the
-  renderer mode into its tokenizer and renderer registries and the parser
-  names into its reasoning and tool parser managers in every process (a CPU
-  process parses config.json, renders chat and parses output too); the model
-  class and the draft's ``Inkling2DSparkSm70Model`` (draft.py) only when the
-  visible GPUs are all cc 7.0.
+The model ``Inkling2LoopSm70ForConditionalGeneration`` (model.py, loop.py,
+layers.py: the text stack on one TP rank), upstream's Inkling 2 config
+classes vendored unchanged (configs.py, see PROVENANCE.md) and their SM70
+subclasses (sm70_configs.py), the renderer mode and the reasoning and tool
+parsers ``inkling2_sm70`` (renderer.py, inkling2_encoding.py, parsers.py).
+Serve args select the model with ``--hf-overrides '{"architectures":
+["Inkling2LoopSm70ForConditionalGeneration"]}'``.
+The config classes (``inkling2_dspark`` included), the renderer mode and the
+parser names register in every process; the model class and the draft's
+``Inkling2DSparkSm70Model`` (draft.py) only when the visible GPUs are all
+cc 7.0.
 """
 
 from __future__ import annotations
@@ -119,7 +112,7 @@ def register() -> bool:
     Idempotent. The config classes, the renderer mode and the parser names
     register first, on any device. The model class is skipped (returns
     False) when the visible GPUs aren't all cc 7.0. Raises
-    when they are but ``_sm70_C`` is missing (K01 fail-fast), and when the
+    when they are but ``_sm70_C`` is missing (fail fast), and when the
     registry didn't take the entry. It marks itself done only after every
     step succeeded, so a retry runs it again. The lazy "<module>:<class>"
     form keeps model and CUDA imports out of plugin load

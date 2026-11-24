@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Qwen Phase 2 matrix on c4130 (2x V100-32GB, TP2, --dtype half, TRITON_ATTN).
-#
+# Qwen serving matrix (TP2, --dtype half, TRITON_ATTN).
 #   qwen_matrix.sh ROW      ROW = 1 | 2 | 3 | 4 | all | 2-noemu | 4-noemu | summary
-#
 #   1  Qwen3.6-35B-A3B-FP8                          no spec decode
 #   2  Qwen3.6-35B-A3B-FP8 + Qwen3.6-35B-A3B-DFlash2  dflash, k=7, probabilistic
 #   3  Qwen3.8-27B-FP8                              no spec decode
 #   4  Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2          dflash, k=7, probabilistic
-#   2-noemu / 4-noemu: row 2 / 4 with VLLM_SM70_DFLASH2_EMULATION=0 (M7 A/B;
-#      recorded as INFO, never gated, not part of `all`).
-#
+#   2-noemu / 4-noemu: row 2 / 4 with VLLM_SM70_DFLASH2_EMULATION=0 (INFO only,
+#      never gated, not part of `all`).
 # Each row: vllm serve on 127.0.0.1:8100 -> /health -> probe.py -> results.json
-# + server.log in $OUT/rowN/ -> server killed (trap on EXIT). Never touches
-# systemd, the vllm service, /etc/nixos or activeModel.
-#
+# + server.log in $OUT/rowN/ -> server killed. Never touches systemd or /etc/nixos.
 # Env: VLLM_BIN, VLLM_PY (required), QWEN_STAGE, OUT, MAX_MODEL_LEN (32768),
 #      HEALTH_TIMEOUT (seconds, 1500), GPU_MEM_UTIL (0.85).
 # Exit: 0 all gated rows of this run PASS, 1 a row FAILed, 2 refused to start.
@@ -29,7 +24,7 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1500}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 SERVED_NAME=qwen
 
-usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ $# -eq 1 ]] || usage
 ROW_ARG="$1"
 

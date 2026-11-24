@@ -1,29 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 merged visit kernels (inkling2_sm70/ops/visit.py, the
-RouterInput route of ops/routing.py) and the route of visit_fusion.py, on
-CPU.
+"""Inkling 2 merged visit kernels (inkling2_sm70/ops/visit.py, the
+RouterInput route of ops/routing.py) and the route of visit_fusion.py.
 
-- the kill switch VLLM_SM70_INKLING_VISIT_FUSION and the route choice:
-  decode-only batches only, tensors off the GPU, only "0" turns it off;
-- through Triton's interpreter, each against the launches it merges:
-  - the router GEMV inside ``route`` against ``router_logits`` then
-    ``route``, with and without dispatch and padding rows, the rows copied
-    from the dispatch input; the ticket counter back at 0;
-  - ``gate_blend`` against ``gate_down``, ``gate_up`` and
-    ``blend_rms_norm``, one and three streams, a broadcast state;
-  - the MLP input mix of a pending attention conv and the attention input
-    mix of a pending layer output (``Pending`` through
-    ``norms.sublayer_inputs``, with and without a base, normed and with
-    message gates) against ``short_conv`` and the unmerged mix, on the paged
-    caches of tests/ops/_inkling2_sconv.py: same outputs, same caches;
-  - a pending layer output run alone (``conv_residual``) against
-    ``short_conv`` and ``residual_add``;
-  - the merged prologue against ``query_rel`` and ``key_value_conv``
-    (``_inkling2_sconv.run`` on decode and verify steps).
-
+- the kill switch VLLM_SM70_INKLING_VISIT_FUSION and the route choice;
+- through Triton's interpreter, against the launches each kernel merges:
+  the router GEMV inside ``route``; ``gate_blend`` against ``gate_down``,
+  ``gate_up`` and ``blend_rms_norm``; the pending conv + mix of
+  ``norms.sublayer_inputs`` against ``short_conv`` and the unmerged mix on
+  paged caches; ``conv_residual``; the merged prologue against
+  ``query_rel`` and ``key_value_conv``.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite). The AOT compile check is
-test_m12_inkling2_triton_sm70_compile_cpu.py; the model-level check is
+(test_interpreted_suite). AOT compile check:
+test_m12_inkling2_triton_sm70_compile_cpu.py; model-level check:
 tests/models/test_m12_inkling2_visit_fusion_model_cpu.py.
 """
 

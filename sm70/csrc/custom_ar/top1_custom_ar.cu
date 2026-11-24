@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// F12 custom-AR exchange: the greedy top-1 (value, token id) pair reduction
+// Custom-AR exchange: the greedy top-1 (value, token id) pair reduction
 // over upstream's custom all-reduce buffers instead of an NCCL all-gather.
-//
-// Ported from fork cf9492a: kernel csrc/custom_all_reduce.cuh:1720-1750
-// (cross_device_top1_argmax<ngpus>), host :3072-3106
-// (CustomAllreduce::top1_argmax) and csrc/custom_all_reduce.cu:1449-1475
-// (top1_argmax), schema csrc/torch_bindings.cpp:1762-1765. See PROVENANCE.md
-// for what changed (staged exchange as K17's R5 fix, no graph buffers).
+// Source: PROVENANCE.md.
 //
 // Every rank writes its [rows, 2] FP32 pairs into its own staging buffer
 // (upstream's eager buffer, IPC-registered at init: buffers_), meets the
@@ -32,11 +27,11 @@
 
 namespace vllm_sm70::custom_ar {
 
-// One CTA, one thread per row (fork: <<<1, 128>>>, numel <= 256).
+// One CTA, one thread per row.
 constexpr int kTop1Threads = 128;
 constexpr int kTop1MaxRows = kTop1Threads;
 
-// Tie rule (fork cross_device_top1_argmax): match a full-vocabulary argmax.
+// Tie rule: match a full-vocabulary argmax.
 // NaNs precede finite values, and the first original vocabulary id wins among
 // NaNs or equal values. Ranks own increasing vocabulary ranges, so this is
 // also the lowest rank, as torch.argmax over the all-gathered pairs.
@@ -171,8 +166,6 @@ void custom_ar_top1_argmax(int64_t fa_handle, const torch::Tensor& pair,
 }  // namespace vllm_sm70::custom_ar
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:1762-1765 custom_ar.def("top1_argmax"),
-  // same arguments with the output marked as an alias.
   m.def(
       "custom_ar_top1_argmax(int fa, Tensor pair, Tensor(a!) output, "
       "int reg_buffer, int reg_buffer_sz_bytes) -> ()");

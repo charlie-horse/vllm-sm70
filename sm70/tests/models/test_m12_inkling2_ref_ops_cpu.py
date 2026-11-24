@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 torch reference ops (ops/torch_ref.py).
+"""Tests for the Inkling 2 torch reference ops (ops/torch_ref.py).
 
 CPU fp32, without the Hugging Face Inkling 2 classes: every op recorded in
 fixtures/inkling2_tiny/ops.safetensors is recomputed from its recorded inputs

@@ -7,7 +7,7 @@ import pathlib
 import re
 
 CSRC = pathlib.Path(__file__).resolve().parents[2] / "csrc"
-# K01's own registry (abi_version) is not a TurboMind op.
+# The ABI registry (abi_version) is not a TurboMind op.
 SKIP_FILES = {"torch_bindings_sm70.cpp"}
 
 _BLOCK = re.compile(r"TORCH_LIBRARY(?:_FRAGMENT)?\(\s*(\w+)\s*,\s*\w+\s*\)\s*\{")

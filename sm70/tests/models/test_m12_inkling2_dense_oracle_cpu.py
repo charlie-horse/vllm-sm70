@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 dense stateless oracle (inkling2_ref.py).
+"""Tests for the Inkling 2 dense stateless oracle (inkling2_ref.py).
 
 CPU fp32, without the Hugging Face Inkling 2 classes: the oracle runs the tiny
 checkpoint (fixtures/inkling2_tiny/) and is compared with what the reference

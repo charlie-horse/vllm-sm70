@@ -2,24 +2,16 @@
 """Inkling 2 NVFP4 expert slots as a Triton GEMV over the TurboMind banks
 (sm_70: no tl.dot, libdevice exp and tanh, fp32 FMA).
 
-    nvfp4_slot_gemv   out[s] = rows[s] @ W[expert[s]] for one-row slots,
-                      W13 optionally with the soft-capped SwiGLU in its
-                      epilogue
-
-The banks are moe_tm.py's, read in place: codes int32 [E, K, N / 8] and
-fp16 scales [E, K / 16, N] as ``tm.nvfp4_sm70_prepare`` writes them with
-k_ld = 32 * K and q_ld = N. Codes are words [N / 32, K / 8, 32]: word
-(t, j, c) holds the eight e2m1 codes of column 32 t + c at K rows 8 j +
-``NIBBLE_K`` (nibble p, low bits first). A code's fp16 bit pattern placed
-as sign | e1 e0 m << 9 is its value times 2^-14; the 2^14 applies to the
-fp32 sum.
-
-One program covers one tile of 32 output columns of one slot over all of K
-(with the SwiGLU: a gate tile and the matching up tile), so every code byte
-of a slot's expert is read once. Products and sums run in fp32;
-a W13 output rounds to fp16 before the SwiGLU, as the TurboMind stage
-output does, and the SwiGLU's fp32 result rounds once (ops/activation.py).
-Expert ids are clamped to 0..E-1, as moe_tm.py clamps padding slots.
+``nvfp4_slot_gemv``: out[s] = rows[s] @ W[expert[s]] for one-row slots, W13
+optionally with the soft-capped SwiGLU in its epilogue. The banks are
+moe_tm.py's, read in place: codes int32 [E, K, N / 8] and fp16 scales
+[E, K / 16, N] with k_ld = 32 * K and q_ld = N. Word (t, j, c) of the codes
+[N / 32, K / 8, 32] holds the eight e2m1 codes of column 32 t + c at K rows
+8 j + ``NIBBLE_K`` (nibble p, low bits first). A code placed as fp16 bits
+sign | e1 e0 m << 9 is its value times 2^-14; the 2^14 applies to the fp32
+sum. One program covers 32 output columns of one slot over all of K, so every
+code byte is read once. A W13 output rounds to fp16 before the SwiGLU, as the
+TurboMind stage does. Expert ids are clamped to 0..E-1.
 """
 
 from __future__ import annotations

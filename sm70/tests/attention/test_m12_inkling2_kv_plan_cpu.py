@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: KV planning for Inkling 2 Mini's 96 cache layers at TP2.
+"""CPU checks: KV planning for Inkling 2 Mini's 96 cache layers at TP2.
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). The specs
+Needs upstream vLLM's Python importable (skipped otherwise). The specs
 come from the model's cache owners (models/inkling2_sm70/cache.py) built for
 the vendored config.json (48 fp16 attention passes, 48 conv-state passes
 with the hidden streams replicated per rank) and are fed to upstream's
 planner.
 Covers the group plan, page sizes, the scheduler and hash blocks, and the
-per-request admission caps at the batched-token budgets the port serves.
+per-request admission caps at the batched-token budgets the model serves.
 """
 
 from __future__ import annotations
@@ -276,8 +276,8 @@ def _capacity(batched_tokens: int, batches: int, num_blocks: int, model_len: int
 @pytest.mark.parametrize(
     "batched_tokens, num_blocks, sync, async_",
     [
-        # Pool blocks inferred from the measured sizes (perf P7, 8K model
-        # length); the pool is the same with one or two batches in flight.
+        # Pool blocks at an 8K model length; the pool is the same with one
+        # or two batches in flight.
         (512, 31_692, (202_670, 1281), (121_944, 2129)),
         (2048, 31_608, (67_694, 3825), (35_878, 7217)),
     ],

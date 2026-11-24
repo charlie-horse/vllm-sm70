@@ -1,65 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine-config hook for Inkling2LoopSm70ForConditionalGeneration.
 
-``vllm_sm70.models.inkling2_sm70.register()`` installs it as
-``MODELS_CONFIG_MAP[ARCH]`` (a dict insert). UP calls it from
-``VllmConfig.try_verify_and_update_config`` (UP config/vllm.py:1539).
-
-* Refuses anything other than fp16 on cc 7.0, prompt embeddings
-  (upstream models/inkling2/nvidia/model.py:556-559) and a speculative
-  config other than method dspark with a staged ``inkling2_dspark`` draft
-  (draft.py ``speculative_rejection``).
-* Attention: the model owns its attention layers and KV caches, so no layer
-  goes through the platform's backend selection (Flash-V100 or TRITON_ATTN).
-  ``attention_config.backend`` stays unset and an explicit
-  ``--attention-backend`` is refused.
-* KV plan: block size ``KV_BLOCK_SIZE`` (set when unset), the KV cache in
-  the model dtype, no pipeline parallelism.
-* Async scheduling stays upstream's choice (on when unset and the executor
-  supports it). With it on, two batches are in flight, so the conv and
-  sliding-window admission caps count 2 x ``max_num_batched_tokens``
-  in-flight tokens (UP config/vllm.py ``max_in_flight_tokens``). With
-  VLLM_SM70_INKLING_ASYNC_SCHED=0 an unset value becomes off and
-  ``--async-scheduling`` is refused.
-* Speculative decoding: sets the batch-size schedule of
-  ``spec_policy.apply`` (``sm70.inkling2.dspark_spec_max_reqs`` and
-  ``dspark_spec_tokens``) unless ``--speculative-config`` holds one.
-* CUDA graphs: an unset ``cudagraph_mode`` becomes FULL_DECODE_ONLY:
-  decode-only batches (one token per request, or 1 + num_speculative_tokens
-  in a verify step: q = backend.py ``decode_query_len``; each q of
-  ``decode_query_lens`` with a schedule) replay a FULL graph and every
-  other batch runs eagerly. A mode with FULL decode graphs sets
-  ``max_cudagraph_capture_size`` q x min(``DECODE_GRAPH_MAX_BATCH``,
-  max_num_seqs) tokens when neither it nor the capture sizes are set (with
-  a schedule: the capture sizes q x n of each tier's steps of n requests,
-  and the draft's block x n of each drafting step), and refuses set sizes
-  above q x ``DECODE_GRAPH_MAX_BATCH``. The ops of a
-  decode-only batch read
-  device metadata only (backend.py); those of other batches branch on the
-  batch on the host, so a mode whose mixed batches are FULL (FULL) is
-  refused. PIECEWISE (and the mixed part of FULL_AND_PIECEWISE) captures
-  the model's ops as eager breaks (UP compilation/breakable_cudagraph.py
-  ``eager_break_during_capture``), and only with
-  ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``; without it an explicit mode with
-  PIECEWISE logs a warning. With ``VLLM_SM70_INKLING_DECODE_GRAPH=0`` or a
-  visit dump no FULL mode is accepted and an unset mode becomes PIECEWISE
-  with the breakable variable, NONE without it. UP applies its default,
-  FULL_AND_PIECEWISE, after this hook and only to an unset mode (UP
-  config/vllm.py ``_apply_optimization_level_defaults``).
-* Copies ``sm70.inkling2.max_image_encoder_tokens`` onto the model's
-  ``hf_config``, where the image processor reads it (processing.py).
-* TurboMind tuning (``tm_tuning_env``): with FULL decode graphs, the
-  TurboMind expert route on and its ops loaded, and none of
-  ``TM_TUNE_KNOBS`` set, writes them into the environment of the workers
-  spawned after this: small-shape tuning on, the NVFP4 MoE limit at the
-  decode graph cap times top-k routed slots, the NVFP4 dense limit 0. The
-  knobs are process-wide and read once (csrc/turbomind/ops/tm_config.h);
-  an Inkling 2 engine holds no other NVFP4 TurboMind layer. Each capture
-  size runs once eagerly before its capture (UP gpu_model_runner.py
-  ``_warmup_and_capture``), which measures its stage shapes; capture never
-  measures (gemm_runtime.cpp ``select_moe_dispatch_policy_impl``) and reuses
-  them. VLLM_SM70_INKLING_TM_TUNE=0 leaves the knobs alone.
-* Logs the routes once per process.
+* Refuses anything but fp16 on cc 7.0, prompt embeddings, pipeline
+  parallelism, an explicit ``--attention-backend`` (the model owns its
+  attention) and a speculative config other than a staged dspark draft.
+* Sets block size ``KV_BLOCK_SIZE`` and the KV cache in the model dtype.
+* Async scheduling keeps two batches in flight, so the admission caps count
+  2 x ``max_num_batched_tokens``; VLLM_SM70_INKLING_ASYNC_SCHED=0 turns it off.
+* Sets the DSpark batch-size schedule (spec_policy.py).
+* CUDA graphs: an unset mode becomes FULL_DECODE_ONLY; FULL mixed batches are
+  refused; capture sizes are capped at q x ``DECODE_GRAPH_MAX_BATCH``.
+* Copies ``max_image_encoder_tokens`` onto ``hf_config`` and, unless they are
+  set or VLLM_SM70_INKLING_TM_TUNE=0, sets the TurboMind tuning knobs for
+  the workers (``tm_tuning_env``). Logs the routes once per process.
 """
 
 import os

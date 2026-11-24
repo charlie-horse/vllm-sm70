@@ -1,25 +1,17 @@
 # Kernels on upstream's CustomAllreduce: source list for _sm70_C.
-#   tp2_ar_fused_add_rms_norm.cu  TP2 all-reduce + add + RMSNorm (C6, K17)
-#   top1_custom_ar.cu             greedy top-1 pair exchange (F12,
-#                                 VLLM_SM70_TOP1_CUSTOM_AR)
-# Both include custom_ar_common.cuh (ABI pins, staged start barrier).
+#   tp2_ar_fused_add_rms_norm.cu  TP2 all-reduce + add + RMSNorm
+#   top1_custom_ar.cu             greedy top-1 exchange (VLLM_SM70_TOP1_CUSTOM_AR)
+# Both include custom_ar_common.cuh. Appends to SM70_CUDA_SRCS only when
+# CUDA and sm_70 were found.
 #
-# sm70/CMakeLists.txt does `include(csrc/custom_ar/sources.cmake)` when this
-# file exists. Same contract as the other areas: append to SM70_CUDA_SRCS
-# only when CUDA and sm_70 were found.
+# The kernels read upstream vLLM's CustomAllreduce (a handle from vLLM's
+# _C_custom_ar), so they must be built against the exact csrc headers vLLM was
+# built from: $ENV{VLLM_SM70_VLLM_CSRC_DIR} (set in nix/sm70-ext.nix), on
+# the include path of these sources only. Without it the area is skipped and
+# both ops are absent (the fusion stays off, greedy top-1 uses all-gather).
 #
-# The kernel reads upstream vLLM's CustomAllreduce (a handle from vLLM's
-# _C_custom_ar), so it must be built against the exact csrc headers vLLM was
-# built from: $ENV{VLLM_SM70_VLLM_CSRC_DIR}, the patched tree's csrc/ (Nix
-# sets it in nix/sm70-ext.nix). That directory goes on the include path of
-# these sources only, so upstream headers can never shadow ours elsewhere.
-# Without it the area is skipped with a message; the Python side then finds
-# no _sm70_C::tp2_all_reduce_fused_add_rms_norm (the fusion stays off) and
-# no _sm70_C::custom_ar_top1_argmax (greedy top-1 keeps the all-gather).
-#
-# nvcc flags: -O3 and the -U__CUDA_NO_HALF*__ flags (undo torch's defines;
-# _f16Vec and packed_assign_add use the half operators), as upstream vLLM
-# does in cmake/utils.cmake. No --use_fast_math: rsqrtf and the FP32 sums
+# nvcc flags: -O3 and -U__CUDA_NO_HALF*__ (the half operators are used), as
+# upstream's cmake/utils.cmake. No --use_fast_math: rsqrtf and the FP32 sums
 # must round exactly as upstream's fused_add_rms_norm kernel does.
 
 set(_VLLM_SM70_CUSTOM_AR_ROOT "${CMAKE_CURRENT_LIST_DIR}")

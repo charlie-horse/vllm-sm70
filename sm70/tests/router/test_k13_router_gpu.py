@@ -2,16 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused SM70 E256/K6 sigmoid router against the generic FP32 route (GPU).
 
-Ported from fork cf9492a tests/kernels/moe/test_sm70_flint_router.py
-(192 lines, 3629e29f6). The generic route is what the MoE runner runs for
-this layer: F.linear with the FP32 gate on FP32-cast hidden states, then
-topk_sigmoid (renormalized). The fused kernel only sums the logits in another
-FP32 order, so ids must match except at genuine near-ties, and weights must
-agree to FP32 rounding.
+The generic route is what the MoE runner runs for this layer: F.linear with
+the FP32 gate on FP32-cast hidden states, then topk_sigmoid (renormalized).
+The fused kernel only sums the logits in another FP32 order, so ids must
+match except at genuine near-ties, and weights must agree to FP32 rounding.
 
-New here: the descending-capture regression (risk R4, the C4 pattern):
-graphs captured largest batch first on a fresh stream and a poisoned shared
-pool, the smallest replayed first, with the workspace admitted eagerly.
+Also the descending-capture case: graphs captured largest batch first on a
+fresh stream and a poisoned shared pool, the smallest replayed first, with
+the workspace admitted eagerly.
 """
 
 from __future__ import annotations
@@ -217,8 +215,8 @@ def _poison_pool(pool, stream, device):
 
 @torch.inference_mode()
 def test_descending_capture_regression(router_gpu, monkeypatch):
-    """Black box (R4): admission through the U3 provider, capture 2 then 1
-    on a fresh stream and a poisoned shared pool with no eager route call,
+    """Black box: admission through the router provider hook, capture 2 then
+    1 on a fresh stream and a poisoned shared pool with no eager route call,
     then replay 1 before 2. A workspace or counter created lazily under
     capture would come from the poisoned pool (or only be zeroed by the
     first graph) and corrupt the batch-1 graph."""
@@ -227,8 +225,8 @@ def test_descending_capture_regression(router_gpu, monkeypatch):
     w = gate_weight(r, 314)
     runner = make_runner(gate=make_gate(device=device))
     runner.gate.weight.data = w
-    # Warmup (U1 kernel_warmup / first eager forward): the only place the
-    # workspace is created. Then U3 asks the provider on every forward.
+    # Warmup (kernel_warmup / first eager forward): the only place the
+    # workspace is created. Then the hook asks the provider on every forward.
     state = r.flint_router_provider(runner)
     assert isinstance(state, r.FlintFusedRouter)
     counter_ptr, logits_ptr = state.counter.data_ptr(), state.logits.data_ptr()
@@ -241,7 +239,7 @@ def test_descending_capture_regression(router_gpu, monkeypatch):
     for batch in (2, 1):  # descending, as vLLM captures
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=pool, stream=stream):
-            route = r.flint_router_provider(runner)  # as U3 does per forward
+            route = r.flint_router_provider(runner)  # as the hook does per forward
             outs[batch] = route.try_route(x[:batch])
         assert outs[batch] is not None
         graphs[batch] = g

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 vendored Triton norm kernels on an SM70 GPU.
+"""Inkling 2 vendored Triton norm kernels on an SM70 GPU.
 
 Each kernel of inkling2_sm70/ops/norm.py, attn_res.py and loop.py, compiled
 for sm_70, on fp16 inputs at the checkpoint's hidden size against the torch

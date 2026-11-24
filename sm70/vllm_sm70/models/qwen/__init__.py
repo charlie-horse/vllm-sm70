@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.6 / 3.8 on SM70 (Mara).
+"""Qwen3.6 / 3.8 on SM70.
 
-M7 dflash2-fp16-range: ``dflash_sm70`` points the DFlash2 draft architecture
+``dflash_sm70`` points the DFlash2 draft architecture
 at a subclass that runs the BF16-trained draft in FP16 with BF16 range.
 Kill-switch: VLLM_SM70_DFLASH2_EMULATION=0.
 """

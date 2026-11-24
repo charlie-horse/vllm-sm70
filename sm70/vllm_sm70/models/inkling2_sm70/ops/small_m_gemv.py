@@ -2,19 +2,15 @@
 """Inkling 2 dense projections of at most ``MAX_ROWS`` tokens as one Triton
 GEMV (sm_70: no tl.dot, fp32 FMA).
 
-    segment_gemv   out [M, N] = x_s [M, K] @ weight[rows of s]^T for each
-                   row segment s of `weight` [N, K], in one launch
-
-A segment is a run of weight rows that reads one input: segments
-alternate over the inputs as (x0) or (x0, x1, x2) or (x0, x1, x2, x1, x2),
-the row layout of a gated or global layer's ``attn.qkvr.weight`` (query
-rows, k, v) with the key and value tap rows packed after it. Each program
-covers ``BLOCK_N`` rows of one segment over all of K and all M rows, so
-every weight byte is read once. Products and sums run in fp32 and round
-once to the dtype of `out`.
-
-The grid is static for static M and shapes, nothing is read back to the
-host and nothing is allocated, so a call captures in a CUDA graph.
+``segment_gemv``: out [M, N] = x_s [M, K] @ weight[rows of s]^T for each row
+segment s of `weight` [N, K], in one launch. Segments alternate over the
+inputs as (x0) or (x0, x1, x2) or (x0, x1, x2, x1, x2): the row layout of a
+gated or global layer's ``attn.qkvr.weight`` (query rows, k, v) with the key
+and value tap rows packed after it. Each program covers ``BLOCK_N`` rows of
+one segment over all of K and M, so every weight byte is read once. Products
+and sums run in fp32 and round once to the dtype of `out`. The grid is static
+for static M and shapes, nothing is read back or allocated, so a call
+captures in a CUDA graph.
 """
 
 from __future__ import annotations

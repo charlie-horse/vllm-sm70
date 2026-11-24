@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Flint TP2 expert banks and references for the K12 GPU tests.
+"""Flint TP2 expert banks and references for the Flint MoE GPU tests.
 
-Ported from fork cf9492a tests/kernels/moe/test_sm70_nvfp4_contract_flint.py
-(`_dequantize` :1038, `_flint_expert_weights` :1048, `_reference_moe` :1073,
-`_flint_routing` :1157, `_relative_error` :1173, and `_dirty_graph_pool` from
-tests/kernels/attention/test_sm70_flash_v100_sinks_decode.py:738). The banks
-are prepared here with tm.nvfp4_sm70_prepare exactly as
-vllm_sm70/quant/nvfp4_moe.py (M4) does at load, instead of through the
-fork's ModelOptNvFp4SM70MoEMethod.
+The banks are prepared with tm.nvfp4_sm70_prepare exactly as
+vllm_sm70/quant/nvfp4_moe.py does at load.
 """
 
 from __future__ import annotations
@@ -33,7 +28,7 @@ def dequantize(codes, block_scales, row_scales):
 
 
 def flint_expert_weights(device, seed: int, w2_global: float = 0.04):
-    """Random ModelOpt NVFP4 Flint TP2 experts (fork :1048-1070)."""
+    """Random ModelOpt NVFP4 Flint TP2 experts."""
     gen = torch.Generator(device=device).manual_seed(seed)
 
     def block_scales(rows, groups):
@@ -89,7 +84,7 @@ class Banks:
 
 
 def prepare_banks(tm, raw) -> Banks:
-    """Stacked TurboMind banks, as M4 process_weights_after_loading builds them."""
+    """Stacked TurboMind banks, as nvfp4_moe builds them at load."""
     out = {}
     for stage, split in (("w13", INTER), ("w2", None)):
         ws, ss, meta = [], [], None
@@ -116,7 +111,7 @@ def prepare_banks(tm, raw) -> Banks:
 
 
 def routing(tokens: int, gen: torch.Generator, device):
-    """Flint sigmoid top-6 with renormalize (fork :1157-1162)."""
+    """Flint sigmoid top-6 with renormalize."""
     x = torch.randn(tokens, HIDDEN, generator=gen).half().to(device)
     logits = torch.randn(tokens, EXPERTS, generator=gen).to(device)
     scores, ids = torch.sigmoid(logits).topk(TOP_K, dim=-1)
@@ -125,7 +120,7 @@ def routing(tokens: int, gen: torch.Generator, device):
 
 
 def reference_moe(x, weights, ids, raw):
-    """FP32 oracle on the dequantized checkpoint (fork :1073-1091)."""
+    """FP32 oracle on the dequantized checkpoint."""
     out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     for expert in ids.unique().tolist():
         if not 0 <= expert < EXPERTS:
@@ -149,9 +144,8 @@ def reference_moe(x, weights, ids, raw):
 
 def turbomind_moe(tm, banks: Banks, x, weights, ids):
     """Per-slot TurboMind dense GEMMs over the same banks, with the decode's
-    FP16 boundaries (gate/up, SiLU*up, each routed output). Replaces the
-    fork's TurboMind-route comparison (:1215-1220): same rounding points,
-    another K order, and an independent reader of the bank layout."""
+    FP16 boundaries (gate/up, SiLU*up, each routed output): same rounding
+    points, another K order, and an independent reader of the bank layout."""
     out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     gate_up = torch.empty(1, 2 * INTER, dtype=torch.float16, device=x.device)
     routed = torch.empty(1, HIDDEN, dtype=torch.float16, device=x.device)
@@ -192,7 +186,7 @@ def dirty_graph_pool(device, pool, stream):
 
     Tensors allocated in a throwaway capture on the pool are filled by one
     replay and then freed, so later captures on the pool reuse poisoned
-    memory instead of whatever cudaMalloc returned (fork sinks test :738).
+    memory instead of whatever cudaMalloc returned.
     """
     numel = 64 << 20  # 256 MiB of int32
     poison = torch.cuda.CUDAGraph()

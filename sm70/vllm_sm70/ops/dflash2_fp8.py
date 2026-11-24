@@ -1,34 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""M9a: channel-FP8 QPN8 route for the DFlash2 draft's M8 projections.
+"""Channel-FP8 QPN8 route for the DFlash2 draft's projections.
 
-What: the DFlash2 draft decoder runs 8 query rows per drafting request
-  (k=7 plus the anchor), so a batch of 1-4 requests is M = 8, 16, 24 or 32.
-  For those M this route quantizes each flagged draft projection once after
-  load to E4M3 with one FP32 scale per output channel, packs it with K09's
-  ``fp8_qpn8_prepare_sm70`` and runs K09's ``fp8_qpn8_gemm_sm70_out``
-  (channel scales, M <= 32). Any other M uses the original FP16 weight
-  (``torch.mm``). The FP8 copy replaces K18's FP16 M8 packing for that layer,
-  as in the fork ("The FP8 layout replaces the FP16 M8 packing").
-How it hooks in: patch U1, through K18. ``ops.dflash2.dflash2_unquantized_gemm``
-  (what ``Sm70CudaPlatform.get_unquantized_gemm`` returns) tries
-  :func:`apply_dflash2_fp8_m8` first, then K18's FP16 M8 kernel, then
-  ``F.linear``. M7's DFlash2 decoder-layer subclass flags the projections
-  (``FP8_MARK_ATTR``) only when the DFlash2 verifier resolves on
-  (``Sm70Config.dflash2_verifier``) and k == 7. No upstream line.
-Switch: ``VLLM_SM70_DFLASH2_VERIFIER=0`` (M1) -> nothing is flagged, and K18's
-  FP16 M8 path (or F.linear) runs. The route also needs K18's U1 dispatcher,
-  which is on by default for the same Qwen3.8 contract; so
-  ``VLLM_SM70_DFLASH2_FP16=0`` turns this route off too. E3 (2026-11-09,
-  TP2) measured it -0.9 ms/step over K18 alone; the fork never ran it at TP2.
+The DFlash2 draft decoder runs 8 query rows per drafting request (k=7 plus
+the anchor), so 1-4 requests give M = 8, 16, 24 or 32. For those M this
+route quantizes each flagged projection once after load to E4M3 with one
+FP32 scale per output channel, packs it with ``fp8_qpn8_prepare_sm70`` and
+runs ``fp8_qpn8_gemm_sm70_out`` (channel scales, M <= 32). Any other M uses
+the FP16 weight (``torch.mm``). The FP8 copy replaces the FP16 M8 packing
+for that layer. Split-K is derived from K so one split serves M = 8..32.
 
-Ported from fork cf9492a
-vllm/model_executor/layers/quantization/sm70_dflash2_fp8.py (133 lines)
-and its call sites vllm/model_executor/layers/linear.py:344-352, :396-403,
-vllm/model_executor/models/qwen3_dflash2.py:278-297. Changes: the fork's
-TP4-only (N, K) -> split table and its TP==4 condition are dropped; split-K is
-derived from K so the same split serves M = 8..32 (K09's M=17..32 channel
-kernels need split 12 or 16 with two accumulator chains).
+``ops.dflash2.dflash2_unquantized_gemm`` tries :func:`apply_dflash2_fp8_m8`
+first. The DFlash2 decoder-layer subclass flags projections
+(``FP8_MARK_ATTR``) only when the DFlash2 verifier resolves on and k == 7.
+``VLLM_SM70_DFLASH2_VERIFIER=0`` or ``VLLM_SM70_DFLASH2_FP16=0`` turns it off.
 """
 
 from __future__ import annotations
@@ -50,7 +35,7 @@ ROUTE_ATTR = "_sm70_dflash2_fp8_route"
 ROWS_PER_REQUEST = 8
 MAX_ROWS = 32
 E4M3_MAX = 448.0
-# Smallest scale kept: the fork's clamp (2**-24, the FP16 subnormal floor).
+# Smallest scale kept: 2**-24, the FP16 subnormal floor.
 MIN_SCALE = 2.0**-24
 # M=17..32 channel kernels admit only these (fp8_qpn8_sm70.cu TORCH_CHECKs).
 ACCUMULATOR_CHAINS = 2
@@ -60,12 +45,11 @@ OPS = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out")
 
 
 def draft_fp8_wanted(vllm_config) -> bool:
-    """Should M7's draft decoder layer flag its projections for this route?
+    """Should the draft decoder layer flag its projections for this route?
 
-    Yes when the DFlash2 verifier resolves on (M1 ``dflash2_verifier``:
-    "auto" = the fork contract, which already requires k == 7; "on" forces
-    it, so k == 7 is checked again here as in FORK qwen3_dflash2.py:295-297)
-    and ``VLLM_SM70_DFLASH2_VERIFIER`` is not 0. Only getattr on vllm_config.
+    Yes when the DFlash2 verifier resolves on (``Sm70Config.dflash2_verifier``;
+    "on" skips the contract, so k == 7 is checked again here) and
+    ``VLLM_SM70_DFLASH2_VERIFIER`` is not 0. Only getattr on vllm_config.
     """
     from vllm_sm70.config import (
         dflash2_verifier_enabled,
@@ -87,7 +71,7 @@ def draft_fp8_wanted(vllm_config) -> bool:
 
 
 def fp8_rows(rows: int) -> bool:
-    """M this route serves: 8, 16, 24, 32 (FORK sm70_dflash2_fp8.py:31-32)."""
+    """M this route serves: 8, 16, 24, 32."""
     return 0 < rows <= MAX_ROWS and rows % ROWS_PER_REQUEST == 0
 
 
@@ -98,9 +82,9 @@ def ops_available() -> bool:
 def split_for(k: int) -> int | None:
     """The split-K serving every M in 8..32 for a channel-scaled [N, K], or None.
 
-    K09's M=17..32 channel kernels require split 12 or 16 with two
+    The QPN8 M=17..32 channel kernels require split 12 or 16 with two
     accumulator chains, the fast decoder and no prefetch; split 16 is
-    preferred (fork: "The M=17..32 kernels take split 12 or 16").
+    preferred.
     """
     if k <= 0 or k % 16:
         return None
@@ -114,7 +98,7 @@ def split_for(k: int) -> int | None:
 def channel_fp8_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """[N, K] fp16 -> (E4M3 [N, K], FP32 scales [N, 1]).
 
-    FORK sm70_dflash2_fp8.py:94-100: scale = amax/448 per output channel; an
+    scale = amax/448 per output channel; an
     all-zero channel takes scale 1 (exact zero codes); scales are clamped to
     2**-24, the smallest the QPN8 channel-scale storage keeps.
     """
@@ -218,7 +202,7 @@ def _dispatch_impl(
     scales: torch.Tensor,
     split_k: int,
 ) -> torch.Tensor:
-    # FORK sm70_dflash2_fp8.py:35-52. The M decision stays inside the opaque
+    # The M decision stays inside the opaque
     # op, so a compiled graph traced for a dynamic M keeps the decode route.
     output = x.new_empty((x.shape[0], weight.shape[0]))
     if fp8_rows(x.shape[0]):
@@ -250,7 +234,6 @@ def apply_dflash2_fp8_m8(
     layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor | None:
     """The route's output, or None when this call goes to the next route."""
-    # FORK sm70_dflash2_fp8.py:111-133
     route = getattr(layer, ROUTE_ATTR, None)  # decided once, at prepare time
     if route is None:
         return None

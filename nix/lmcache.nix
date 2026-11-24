@@ -3,8 +3,8 @@
 #
 # Usable on its own, but normally driven by ./module.nix, which enables it
 # when the active model has `lmcache = true`, sets the chunk size and runs it
-# as the vllm user (CUDA IPC needs the same user). The unit names keep the
-# `vllm-` prefix they had when this was part of the vllm module.
+# as the vllm user (CUDA IPC needs the same user). The unit names carry the
+# `vllm-` prefix.
 { inputs }:
 {
   config,

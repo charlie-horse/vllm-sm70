@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K11 CPU checks: the NVFP4 M<=2 GEMV shape set and its launch table.
+"""CPU checks: the NVFP4 M<=2 GEMV shape set and its launch table.
 
-What:
 - The kernel's launch table (VLLM_TM_GEMV_TABLE in
   csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu) equals
-  vllm_sm70.ops.tm.NVFP4_TM_GEMV_SHAPES and M3's MODELOPT_NVFP4_GEMV_SHAPES.
-  An admitted shape the kernel can't run would silently fall back to
-  TurboMind; one the kernel runs but M3 never admits is dead code.
+  vllm_sm70.ops.tm.NVFP4_TM_GEMV_SHAPES and the linear layer's
+  MODELOPT_NVFP4_GEMV_SHAPES. An admitted shape the kernel can't run would
+  silently fall back to TurboMind; one the kernel runs but the layer never
+  admits is dead code.
 - Every table entry passes the kernel's own validity rule
   (tm_gemv_config_valid), so no admitted Flint TP2 shape falls back.
 - The Python mirror of the op's shape gate agrees with the table.
-- The op schema matches M3's call
+- The op schema matches the layer's call
   (tm.nvfp4_tm_gemv_dispatch_sm70_out(out, x, w, s, 16, k_ld, q_ld, shift)).
-Op-level parts of fork tests/quantization/test_sm70_modelopt_nvfp4_gemv.py
-(0c9f3ee73): the Flint/non-Flint shape sets. The layer-admission parts are
-M3's (tests/quant/test_m3_nvfp4_linear.py).
+Layer admission is tested in tests/quant/test_m3_nvfp4_linear.py.
 """
 
 from __future__ import annotations
@@ -92,8 +90,8 @@ def test_python_mirror_matches_table():
         assert not tm.nvfp4_tm_gemv_takes_gemv(1, k, n, 32, 32 * k, n)
         assert not tm.nvfp4_tm_gemv_takes_gemv(1, k, n, 16, 0, n)
         assert not tm.nvfp4_tm_gemv_takes_gemv(1, k, n, 16, 32 * k, 0)
-    # fork test_other_model_shapes_are_not_admitted: Qwen TP2, transposed
-    # Flint, and near misses all keep TurboMind.
+    # Other model shapes are not admitted: Qwen TP2, transposed Flint, and
+    # near misses all keep TurboMind.
     for k, n in ((5120, 8704), (4096, 6144), (2560, 2048), (2048, 4096), (1024, 2048)):
         assert not tm.nvfp4_tm_gemv_takes_gemv(1, k, n, 16, 32 * k, n)
 

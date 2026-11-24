@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Lossless FP16-source compact target selection; no precision conversion.
-//
-// K18: ported from fork cf9492a csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu
-// (see PROVENANCE.md). Only change: the ops register in _sm70_C, not _C.
+// Source: PROVENANCE.md.
 #include <torch/all.h>
 #include <torch/library.h>
 #include <ATen/cuda/CUDAContext.h>

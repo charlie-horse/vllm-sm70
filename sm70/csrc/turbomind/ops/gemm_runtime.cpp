@@ -169,7 +169,7 @@ struct TurboMindRuntime {
     }
   }
 
-  // _sm70_C::tm_runtime_close (K03). Waits for every device that owns
+  // _sm70_C::tm_runtime_close. Waits for every device that owns
   // TurboMind state, then frees it all: stream workspaces (barriers,
   // partials, tensormaps, flags), the per-device Gemm objects with their
   // dispatch caches and tuning results, the prepared fp16 weight cache, and
@@ -226,7 +226,7 @@ struct TurboMindRuntime {
   }
 };
 
-// One process-wide owner (the fork kept one per engine runtime object).
+// One process-wide owner.
 TurboMindRuntime& runtime() {
   static TurboMindRuntime state;
   return state;
@@ -301,7 +301,7 @@ bool fp8_grouped_bmm_decode_enabled() {
 bool awq_reuse_imported_cache_enabled() {
   // An imported plan is produced by the coordinated warmup on rank 0.  Keep
   // it as the default source of truth on the other TP ranks; an explicit 0
-  // remains available for cache-debugging and old standalone warmups.
+  // remains available for cache debugging and standalone warmups.
   return vllm::sm70::policy_atoi(
              vllm::sm70::PolicyField::awq_reuse_imported_cache, 1) != 0;
 }
@@ -877,8 +877,7 @@ int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
   return gemm.Export(ofs);
 }
 
-// K03: cache import/export (fork csrc/torch_bindings.cpp:1155,1161, minus
-// `str? native_policy`) and the runtime shutdown op.
+// Cache import/export and the runtime shutdown op.
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
   m.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   m.def("sm70_gemm_export_cache(Tensor device_hint, str path) -> int");

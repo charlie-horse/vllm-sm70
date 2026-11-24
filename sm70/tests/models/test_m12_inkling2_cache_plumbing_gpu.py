@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 GPU spike (marked gpu): the cache-plumbing stub (inkling2_stub.py) on
+"""GPU check (marked gpu): the cache-plumbing stub (inkling2_stub.py) on
 a real engine at TP2.
 
 Needs two cc 7.0 GPUs with about ``INKLING2_STUB_KV_BYTES`` (default 4 GiB)

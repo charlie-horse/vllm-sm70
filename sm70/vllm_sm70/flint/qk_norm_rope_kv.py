@@ -2,28 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused per-head q/k RMSNorm, NeoX RoPE and paged FP16 KV write for SM70.
 
-Port of FORK vllm/models/flint/qk_norm_rope_kv.py (cf9492a); see
-PROVENANCE.md next to this file.
-
-The unfused route runs three or four kernels per attention layer: the q and
-k RMSNorms, the RoPE (sliding layers only) and the KV cache write. At one or
-two decode tokens each of them is launch bound, so this kernel does all of
-it in one launch, one program per (token, head).
-
-Numerics follow the unfused route: the norm reduces in FP32 and rounds
-``x * rsqrt(mean(x^2) + eps) * w`` to FP16 once, and RoPE reads the rounded
-normalized values, computes ``x1 * cos - x2 * sin`` and ``x2 * cos + x1 * sin``
-in FP32 and rounds once. The cache receives the same FP16 keys the attention
-gets, and V is copied unchanged. The cache layout and the padding rule
-(slots below zero are skipped, tokens past ``slot_mapping`` are not written)
-are those of upstream ``TritonAttentionImpl.do_kv_cache_update``: the
-per-layer cache is logical ``(blocks, Hkv, page, 2 * D)`` (physical LBNHC on
-Flash-V100 and TRITON_ATTN), viewed as K and V ``(blocks, page, Hkv, D)``
-with explicit strides.
-
+One launch, one program per (token, head), replaces the q and k RMSNorms,
+the RoPE (sliding layers only) and the KV cache write, which are launch
+bound at one or two decode tokens. Numerics follow the unfused route: the
+norm reduces in FP32 and rounds to FP16 once; RoPE reads the rounded values,
+computes in FP32 and rounds once. The cache gets the same FP16 keys the
+attention gets; V is copied unchanged. Cache layout and padding rule
+(negative slots skipped, tokens past ``slot_mapping`` not written) are those
+of upstream ``TritonAttentionImpl.do_kv_cache_update``: logical
+``(blocks, Hkv, page, 2 * D)``, viewed as K and V ``(blocks, page, Hkv, D)``
+with explicit strides. Source: PROVENANCE.md next to this file.
 Kill switch: VLLM_SM70_FLINT_QK_ROPE_KV=0 (Sm70Config.flint_qk_rope_kv),
-read by the model when it decides the route (``fused_route_rejection``).
-"""
+read by the model when it decides the route (``fused_route_rejection``)."""
 
 from __future__ import annotations
 
@@ -42,9 +32,7 @@ OP_NAME = QK_ROPE_KV_OP_NAME
 SPLITTING_OP = QK_ROPE_KV_SPLITTING_OP
 
 HEAD_DIM = 128
-# RoPE tables the kernel reads (it widens either to FP32). The fork built the
-# table in the model dtype; upstream Flint builds it in FP32
-# (UP models/flint/model.py:283-291).
+# RoPE tables the kernel reads (it widens either to FP32).
 COS_SIN_DTYPES = (torch.float16, torch.float32)
 # Unquantized FP16 KV. "float16" is the explicit spelling of "auto" for an
 # FP16 model.
@@ -312,7 +300,7 @@ def _direct_cache_views(
         return None
     if kv_cache.shape[1] != num_kv_heads or kv_cache.shape[-1] != 2 * head_dim:
         return None
-    # As in TritonAttentionImpl.do_kv_cache_update (UP triton_attn.py:828):
+    # As in TritonAttentionImpl.do_kv_cache_update:
     # (B, H, N, 2D) -> (B, N, H, 2D) -> K, V each (B, N, H, D).
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     if (
@@ -398,9 +386,8 @@ def attention_after_fused_write(
     """``attn(q, k, v)`` without the KV-cache write, for a layer whose cache
     the op above has already written.
 
-    Replaces FORK ``Attention.forward(..., kv_cache_updated=True)``
-    (FORK attention.py:535,583,604), which upstream does not have. Mirrors UP
-    Attention.forward (UP attention.py:490-581) for an unquantized KV cache:
+    Upstream Attention.forward has no "KV already written" mode; this mirrors
+    it for an unquantized KV cache:
     no query quant, no unified_kv_cache_update. q/k are the op's q_out/k_out,
     so the attention is ordered after the op by data dependency.
     """

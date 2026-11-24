@@ -1,20 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M5 flint-sm70-model: Flint (RecursiveSI/flint, ModelOpt W4A16 NVFP4) on SM70.
+"""Flint (RecursiveSI/flint, ModelOpt W4A16 NVFP4) on SM70.
 
-What: ``FlintSm70ForCausalLM`` (model.py), a port of the fork's Flint model
-  (FORK cf9492a vllm/models/flint/) on upstream v0.33.0 layers, with FP16
-  rescaling (fp16_rescale.py) and the engine-config hook (config.py). The
-  fused q/k norm + RoPE + KV write is K15's (vllm_sm70/flint/
-  qk_norm_rope_kv.py, #54), which the model calls. It reuses upstream's
-  ``vllm.models.flint.configs.FlintConfig``.
-Why: upstream's FlintForCausalLM asserts bf16 + FlashInfer (UP 4ba787e
-  models/flint/model.py:318, 321), and V100 has neither. A separate
-  architecture name keeps upstream's class untouched; the c4130 serve args
-  select ours with
-  ``--hf-overrides '{"architectures": ["FlintSm70ForCausalLM"]}'``.
-Kill-switch: VLLM_SM70_FLINT_QK_ROPE_KV=0 turns off the fused op only
-  (unfused norms + RoPE + upstream Attention.forward). The model itself is
-  opt-in through --hf-overrides.
+``FlintSm70ForCausalLM`` (model.py) runs on upstream v0.33.0 layers, with FP16
+rescaling (fp16_rescale.py), the engine-config hook (config.py) and the fused
+q/k norm + RoPE + KV write of vllm_sm70/flint/qk_norm_rope_kv.py. It reuses
+upstream's ``vllm.models.flint.configs.FlintConfig``.
+Upstream's FlintForCausalLM asserts bf16 + FlashInfer, and Volta has neither.
+A separate architecture name keeps upstream's class untouched; serve args
+select ours with ``--hf-overrides '{"architectures": ["FlintSm70ForCausalLM"]}'``.
+VLLM_SM70_FLINT_QK_ROPE_KV=0 turns off the fused op only (unfused norms +
+RoPE + upstream Attention.forward).
 """
 
 from __future__ import annotations
@@ -39,7 +34,7 @@ def register() -> bool:
     """Register ``FlintSm70ForCausalLM`` and its config hook. Idempotent.
 
     Skips (returns False) when the visible GPUs aren't all cc 7.0. Raises when
-    they are but ``_sm70_C`` is missing (K01 fail-fast), and when the registry
+    they are but ``_sm70_C`` is missing (fail fast), and when the registry
     or MODELS_CONFIG_MAP didn't take the entry. It marks itself done only
     after every step succeeded, so a retry runs it again. The lazy
     "<module>:<class>" form keeps model and CUDA imports out of plugin load

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 paged short-conv kernels (inkling2_sm70/ops/paged_conv.py)
+"""Inkling 2 paged short-conv kernels (inkling2_sm70/ops/paged_conv.py)
 on an SM70 GPU.
 
 The scenarios of test_m12_inkling2_triton_sconv_cpu.py (_inkling2_sconv.py),

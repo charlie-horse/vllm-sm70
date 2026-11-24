@@ -1,23 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashQLA SM70 GDN kernels (K08): wrappers, fakes and the prefill route.
+"""FlashQLA SM70 GDN kernels: wrappers, fakes and the prefill route.
 
-Ported from fork cf9492a:
-- flash_qla/ops/gated_delta_rule/chunk/sm70/fused_fwd.py
-  (chunk_gated_delta_rule_fwd_sm70_vlk_varlen, :269-322;
-  gdn_decode_mixed_qkv_global_state_sm70, :325-417)
-- vllm/model_executor/layers/fla/ops/sm70/gdn_prefill.py
-  (flashqla_sm70_chunk_gated_delta_rule, non-TileLang branch)
-- vllm/model_executor/layers/fla/ops/sm70/gdn_decode.py
-  (flashqla_decode_rejection / flashqla_decode)
-The pybind11 extension, its loader/JIT fallback, the native policy object,
-the TileLang branch (K10) and the profiler are gone; the ops live in
-torch.ops._sm70_C (sm70/csrc/gdn/gdn_forward.cu).
+The ops live in torch.ops._sm70_C (sm70/csrc/gdn/gdn_forward.cu).
 
 Routes:
 - Prefill: `register_chunk_gated_delta_rule()` installs an out-of-tree
-  `ChunkGatedDeltaRule` (CustomOp.register_oot, UP custom_op.py:234) whose
-  forward runs the FlashQLA varlen kernel on SM70. Kill switch
+  `ChunkGatedDeltaRule` (CustomOp.register_oot) whose forward runs the
+  FlashQLA varlen kernel on SM70. Kill switch
   VLLM_SM70_GDN_FLASHQLA_PREFILL=0, read when the op is constructed.
 - Non-spec decode: `flashqla_decode(...)`, called by the GDN layer subclass
   (gdn/layer.py) from `_forward_core_decode_non_spec`. Kill switch
@@ -71,7 +61,7 @@ def _op(name: str):
 # ---------------------------------------------------------------------------
 
 
-# fork gdn_forward.cu gdn_forward_vlk_varlen (pybind, returned [out, state])
+# gdn_forward.cu gdn_forward_vlk_varlen
 def gdn_forward_vlk_varlen_out(
     output: torch.Tensor,
     final_state: torch.Tensor,
@@ -119,7 +109,7 @@ if has_op("gdn_forward_vlk_varlen_out"):
         return None
 
 
-# fork gdn_forward.cu gdn_decode_mixed_qkv_global_state
+# gdn_forward.cu gdn_decode_mixed_qkv_global_state
 def gdn_decode_mixed_qkv_global_state(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -164,7 +154,7 @@ if has_op("gdn_decode_mixed_qkv_global_state"):
         return None
 
 
-# fork gdn_forward.cu resolve_column_groups_per_block
+# gdn_forward.cu resolve_column_groups_per_block
 def gdn_resolve_column_groups_per_block(tokens: int, q_heads: int, v_heads: int) -> int:
     """Columns of V per thread subgroup the kernels pick for this shape."""
     return int(_op("gdn_resolve_column_groups_per_block")(tokens, q_heads, v_heads))
@@ -236,11 +226,9 @@ def flashqla_chunk_gated_delta_rule(
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """FlashQLA varlen chunked GDN prefill, same contract as upstream FLA
-    `chunk_gated_delta_rule` (UP third_party/flash_linear_attention/ops/
-    chunk.py:138): q/k [1, T, H, K], v [1, T, Hv, V], g (log space) and
+    `chunk_gated_delta_rule`: q/k [1, T, H, K], v [1, T, Hv, V], g (log space) and
     beta [1, T, Hv], initial_state [N, Hv, V, K]. Returns (o [1, T, Hv, V],
     final_state [N, Hv, V, K] float32 or None).
-    Fork: fla/ops/sm70/gdn_prefill.py flashqla_sm70_chunk_gated_delta_rule.
     """
     if use_qk_l2norm_in_kernel:
         from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
@@ -301,9 +289,7 @@ def decode_rejection(
     state_indices: torch.Tensor,
     out: torch.Tensor,
 ) -> str | None:
-    """Why the FlashQLA decode cannot take these tensors, or None.
-    Fork: fla/ops/sm70/gdn_decode.py flashqla_decode_rejection + the checks of
-    fused_fwd.py gdn_decode_mixed_qkv_global_state_sm70."""
+    """Why the FlashQLA decode cannot take these tensors, or None."""
     if not has_op("gdn_decode_mixed_qkv_global_state"):
         return "op_missing"
     if not mixed_qkv.is_cuda or not _is_sm70(mixed_qkv.device):

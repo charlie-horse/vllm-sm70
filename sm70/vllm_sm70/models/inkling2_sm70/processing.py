@@ -2,23 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling 2 image preprocessing and vLLM multimodal processing on SM70.
 
-Port of upstream vllm/models/inkling2/processing.py (see PROVENANCE.md).
-Differences: pixels are fp16, the cell size comes from the checkpoint's
-``vision_config``, and the prompt-update target follows the renderer:
+Port of upstream vllm/models/inkling2/processing.py (see PROVENANCE.md): fp16
+pixels, the cell size from ``vision_config``, a prompt target per renderer:
 
 - ``inkling2_sm70`` tokenizer mode: the renderer emits one
   ``<|content_image|>`` per image; it becomes the marker followed by
   ``rows * cols`` copies of ``IMAGE_PAD_ID``.
-- any other mode (the checkpoint's Jinja template): the template emits
-  ``<|content_image|><|unused_200054|>`` for typed image parts, so only the
-  pad is replaced, by ``rows * cols`` pads. Typed parts need
-  ``--chat-template-content-format openai``. A prompt whose pad count
-  differs from its image count is rejected.
-
-Only the pad positions receive vision embeddings.
-
-An image with more image tokens than ``Inkling2ProcessingInfo.max_image_tokens``
-is rejected with a ValueError; nothing is resized.
+- any other mode (the checkpoint's Jinja template, which needs
+  ``--chat-template-content-format openai``): the template emits
+  ``<|content_image|><|unused_200054|>``; only the pad is replaced, by
+  ``rows * cols`` pads. A pad count other than the image count is rejected.
+Only the pad positions receive vision embeddings. An image over
+``Inkling2ProcessingInfo.max_image_tokens`` raises ValueError; nothing is resized.
 """
 
 from __future__ import annotations

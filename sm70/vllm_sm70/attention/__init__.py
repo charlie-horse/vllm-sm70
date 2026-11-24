@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 attention backends (Flash-V100, K05-K07).
+"""SM70 attention backends (Flash-V100).
 
 register() points AttentionBackendEnum.CUSTOM at the Flash-V100 backend.
 Selection happens in Sm70CudaPlatform.get_attn_backend_cls (select_backend
@@ -57,7 +57,7 @@ def flash_v100_rejection(
     """Why Flash-V100 is not chosen for this layer, or None to choose it.
 
     (a) no backend selected explicitly, (b) kill switch not "0", (c) head
-    size 128/256, (d) fp16, (e) the K05 ops are in the loaded _sm70_C; then
+    size 128/256, (d) fp16, (e) the Flash-V100 ops are in the loaded _sm70_C; then
     the backend's own validate_configuration (KV dtype, MLA, sparse, ...).
     """
     if selected_backend is not None:

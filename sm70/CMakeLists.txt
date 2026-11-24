@@ -9,7 +9,7 @@
 cmake_minimum_required(VERSION 3.26)
 project(vllm_sm70 LANGUAGES CXX)
 
-# torch 2.14 headers need C++20 (as UP CMakeLists.txt:16-19).
+# torch 2.14 headers need C++20 (as in upstream vLLM's CMakeLists.txt).
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
@@ -98,48 +98,48 @@ if(VLLM_SM70_CUTLASS_DIR)
     "${VLLM_SM70_CUTLASS_DIR}/tools/util/include")
 endif()
 
-# Hook for K02 (TurboMind GEMM core). The file appends to the lists above.
+# Hook for TurboMind GEMM core. The file appends to the lists above.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/turbomind/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/turbomind/sources.cmake")
 endif()
 
-# Hook for K08 (FlashQLA GDN prefill/decode). Same contract as above.
+# Hook for FlashQLA GDN prefill/decode. Same contract as above.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gdn/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/gdn/sources.cmake")
 endif()
 
-# Hook for K05 (Flash-V100 attention, lean subset). Same contract.
+# Hook for Flash-V100 attention, lean subset. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")
 endif()
 
-# Hook for K13 (Flint fused router). Same contract.
+# Hook for Flint fused router. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/router/sources.cmake")
 endif()
 
-# Hook for K16 (Flint top-k candidate sampler). Same contract.
+# Hook for Flint top-k candidate sampler. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/sampler/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/sampler/sources.cmake")
 endif()
 
-# Hook for K17 (TP2 all-reduce + RMSNorm). Same contract; needs
+# Hook for TP2 all-reduce + RMSNorm. Same contract; needs
 # $ENV{VLLM_SM70_VLLM_CSRC_DIR} (vLLM's csrc headers) for its one source.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/custom_ar/sources.cmake")
 endif()
 
-# Hook for K09 (QPN8 block-FP8 decode GEMV). Same contract.
+# Hook for QPN8 block-FP8 decode GEMV. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/qpn8/sources.cmake")
 endif()
 
-# Hook for K18 (DFlash2 draft FP16 M<=8 GEMM). Same contract.
+# Hook for DFlash2 draft FP16 M<=8 GEMM. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/dflash2/sources.cmake")
 endif()
 
-# Hook for K12 (Flint NVFP4 MoE M<=2 QPN decode). Same contract.
+# Hook for Flint NVFP4 MoE M<=2 QPN decode. Same contract.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flint_moe/sources.cmake")
 endif()
@@ -147,7 +147,7 @@ endif()
 if(SM70_CUDA_SRCS AND NOT (SM70_HAS_CUDA AND SM70_ARCHS))
   message(FATAL_ERROR "vllm_sm70: CUDA sources listed but no CUDA/sm_70 toolchain")
 endif()
-# APPEND (K05): area files may set their own per-file nvcc options first.
+# APPEND: area files may set their own per-file nvcc options first.
 foreach(_src IN LISTS SM70_CUDA_SRCS)
   set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "${SM70_CUDA_GENCODE}")
 endforeach()

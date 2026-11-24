@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sm70CudaPlatform: upstream CudaPlatform plus the SM70 hooks.
 
-Imported only via `vllm_sm70.platform.Sm70CudaPlatform`, i.e. once vLLM
-resolves our platform plugin. Importing this module needs vLLM's compiled
-`_C_stable_libtorch` (UP platforms/cuda.py:23).
+Imported only via `vllm_sm70.platform.Sm70CudaPlatform`, once vLLM
+resolves our platform plugin. Importing it needs vLLM's compiled
+`_C_stable_libtorch`.
 
-The area imports (quant etc.) are not done at module import: this module is
-imported *during* `current_platform` resolution (UP platforms/__init__.py:
-300-317, before `_current_platform` is assigned), and the area modules import
-vLLM modules that read `current_platform` at import time (e.g. UP
-model_executor/layers/quantization/__init__.py:11). Doing it here would
-re-enter resolution and create a second platform instance. Instead the areas
-are imported from the first post-resolution hook: `import_kernels()` (run on
-`import vllm._custom_ops`, UP _custom_ops.py:21) or `check_and_update_config()`.
+The area modules (quant etc.) are not imported at module import: this module
+is imported during `current_platform` resolution, and the areas import vLLM
+modules that read `current_platform` at import time, which would create a
+second platform instance. They are imported from the first hook after
+resolution: `import_kernels()` (run on `import vllm._custom_ops`) or
+`check_and_update_config()`.
 """
 
 from __future__ import annotations
@@ -59,8 +57,8 @@ def _enforce_strict() -> None:
 
     Called only from Sm70CudaPlatform hooks, i.e. only when the sm70 platform
     is active (every visible GPU is cc 7.0). vLLM swallows exceptions raised
-    from a general plugin's register() (UP plugins/__init__.py:66-71), so
-    the raise has to happen here. VLLM_SM70_PLUGIN_STRICT=0 downgrades it.
+    from a general plugin's register(), so the raise has to happen here.
+    VLLM_SM70_PLUGIN_STRICT=0 downgrades it.
     """
     failed = vllm_sm70.failed_areas()
     if not failed:
@@ -79,7 +77,7 @@ _shutdown_registered = False
 
 
 def _tm_runtime_close() -> None:
-    """Sync and release the process-wide TurboMind runtime (Quinn K02 N1)."""
+    """Sync and release the process-wide TurboMind runtime."""
     try:
         import torch
 
@@ -113,9 +111,9 @@ class Sm70CudaPlatform(CudaPlatform):
         attn_selector_config: Any,
         num_heads: int | None = None,
     ) -> str:
-        # K06: Flash-V100 (AttentionBackendEnum.CUSTOM) for fp16 decoder
-        # layers with head size 128/256 when no backend was chosen and the
-        # K05 ops are built; otherwise upstream (TRITON_ATTN on SM70).
+        # Flash-V100 (AttentionBackendEnum.CUSTOM) for fp16 decoder layers
+        # with head size 128/256 when no backend was chosen and the
+        # Flash-V100 ops are built; otherwise upstream (TRITON_ATTN on SM70).
         from vllm_sm70 import attention
 
         reason = attention.flash_v100_rejection(selected_backend, attn_selector_config)
@@ -137,10 +135,10 @@ class Sm70CudaPlatform(CudaPlatform):
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
-        # T8/T9: the fork's SM70 CUDA graph capture sizes and graph-memory
-        # profiling (vllm_sm70/graph_policy.py). Runs before upstream's
-        # _set_cudagraph_sizes (UP config/vllm.py:1825 vs :2013); explicit
-        # user sizes win. Off with VLLM_SM70_GRAPH_CAPTURE_SIZES=0 /
+        # SM70 CUDA graph capture sizes and graph-memory profiling
+        # (vllm_sm70/graph_policy.py). Runs before upstream's
+        # _set_cudagraph_sizes; explicit user sizes win. Off with
+        # VLLM_SM70_GRAPH_CAPTURE_SIZES=0 /
         # VLLM_SM70_GRAPH_MEMORY_POLICY=0.
         super().apply_config_platform_defaults(vllm_config)
         from vllm_sm70 import graph_policy
@@ -162,9 +160,9 @@ class Sm70CudaPlatform(CudaPlatform):
         from vllm_sm70.passes import install_composite_pass
 
         install_composite_pass(vllm_config.compilation_config)
-        # K15: split the fused Flint q/k-norm + RoPE + KV-write op out of the
-        # compiled graph next to unified_kv_cache_update (FORK
-        # config/compilation.py:1172-1174). Off with VLLM_SM70_FLINT_QK_ROPE_KV=0.
+        # Split the fused Flint q/k-norm + RoPE + KV-write op out of the
+        # compiled graph next to unified_kv_cache_update. Off with
+        # VLLM_SM70_FLINT_QK_ROPE_KV=0.
         from vllm_sm70.config import sm70_config
         from vllm_sm70.flint import install_splitting_op
 
@@ -173,24 +171,24 @@ class Sm70CudaPlatform(CudaPlatform):
             enabled=sm70_config(vllm_config).flint_qk_rope_kv,
         )
 
-    # U1 hooks (patches/0001): None keeps upstream behaviour.
+    # Hooks from patches/0002: None keeps upstream behaviour.
     @classmethod
     def get_unquantized_gemm(
         cls, linear_backend: str = "auto"
     ) -> Callable[..., Any] | None:
-        # K18: DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
-        # other layer and M falls through to F.linear (UP
-        # default_unquantized_gemm). None (upstream dispatch) unless the
-        # engine is the qualified Qwen3.8 DFlash2 contract, the ops are built
-        # and VLLM_SM70_DFLASH2_FP16 is not "0". Cached per engine: UP calls
-        # this per forward for lm_head and the router gate.
+        # DFlash2 draft layers with M<=8 run the _sm70_C M8 kernel; every
+        # other layer and M falls through to F.linear. None (upstream
+        # dispatch) unless the engine is the qualified Qwen3.8 DFlash2
+        # contract, the ops are built and VLLM_SM70_DFLASH2_FP16 is not "0".
+        # Cached per engine: vLLM calls this per forward for lm_head and the
+        # router gate.
         from vllm_sm70.ops import dflash2
 
         return dflash2.select_unquantized_gemm(linear_backend)
 
     @classmethod
     def kernel_warmup(cls, worker: Any) -> None:
-        # U1 (patches/0002): after model load and the compile warmup, before
+        # patches/0002: after model load and the compile warmup, before
         # capture_model. Three steps, always in this order and none skipped
         # because an earlier one had nothing to do; each has its own kill
         # switch. A step whose module is not in this build is skipped.
@@ -200,7 +198,7 @@ class Sm70CudaPlatform(CudaPlatform):
             from vllm_sm70 import warmup
 
             warmup.run(worker)
-        # (2) K13 (R4): admit the fused router and allocate its per-layer
+        # (2) Admit the fused router and allocate its per-layer
         #     workspace. A worker without get_model skips only this step.
         #     A failure raises, as in (3): one rank admitting the fused
         #     router while another fell back would diverge. Off with
@@ -217,10 +215,10 @@ class Sm70CudaPlatform(CudaPlatform):
                     "VLLM_SM70_FLINT_FUSED_ROUTER=0 to use the upstream gate "
                     "and select_experts"
                 ) from e
-        # (3) K16 / F12: bind the V1 hidden-state sampler and create its
-        #     device counter here, never lazily during capture (R4).
+        # (3) Bind the V1 hidden-state sampler and create its device
+        #     counter here, never lazily during capture.
         #     A failure raises: if one TP rank silently fell back to upstream
-        #     sampling while the other used K16, their collectives would no
+        #     sampling while the other did not, their collectives would no
         #     longer match and the engine would hang.
         #     VLLM_SM70_FLINT_SAMPLER=0 VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 is
         #     the way to run without it.
@@ -237,14 +235,14 @@ class Sm70CudaPlatform(CudaPlatform):
                 ) from e
         return None
 
-    # U4 hook (patches/0005), read once in the V1 GPUModelRunner.__init__.
+    # Hook from patches/0005, read once in the V1 GPUModelRunner.__init__.
     @classmethod
     def get_hidden_state_sampler(cls) -> Any:
-        # K16: TP-local exact top-k (k <= 20) sampling, and F12: vocab-
-        # parallel top-1 for all-greedy batches, for models that opt in
-        # (vllm_sm70/sample_v1.py). VLLM_SM70_FLINT_SAMPLER=0 turns K16 off,
-        # VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 (or Sm70Config, read in
-        # prepare) turns F12 off; with both off there is no hook (upstream).
+        # TP-local exact top-k (k <= 20) sampling and vocab-parallel top-1
+        # for all-greedy batches, for models that opt in (sample_v1.py).
+        # VLLM_SM70_FLINT_SAMPLER=0 turns top-k off,
+        # VLLM_SM70_GREEDY_TOKEN_FASTPATH=0 (or Sm70Config, read in prepare)
+        # turns top-1 off; with both off there is no hook (upstream).
         if not _hidden_state_sampler_enabled():
             return None
         from vllm_sm70 import envs
@@ -255,7 +253,7 @@ class Sm70CudaPlatform(CudaPlatform):
             greedy=bool(envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH),
         )
 
-    # U6 hook (patches/0006), asked once by the V2 runner's init_speculator:
+    # Hook from patches/0006, asked once by the V2 runner's init_speculator:
     # the Inkling 2 DSpark draft's speculator, None for every other config
     # or with VLLM_SM70_INKLING_DSPARK=0 (models/inkling2_sm70/draft.py).
     @classmethod
@@ -264,7 +262,7 @@ class Sm70CudaPlatform(CudaPlatform):
 
         return draft.speculator_cls(vllm_config)
 
-    # U3 hook (patches/0004, PR #43): asked on every MoE forward that holds
+    # Hook from patches/0004: asked on every MoE forward that holds
     # the gate; the provider caches its route per layer (vllm_sm70/router.py).
     @classmethod
     def get_moe_router_provider(cls) -> Callable[..., Any] | None:
@@ -272,14 +270,12 @@ class Sm70CudaPlatform(CudaPlatform):
 
         return router.provider()
 
-    # K17: upstream's own per-op IR priority hook (UP platforms/interface.py:
-    # 1452, CudaPlatform's override platforms/cuda.py:712-734, merged into
-    # KernelConfig.ir_op_priority at config/kernel.py:461-478; a user-set
-    # priority stays first). Under Inductor upstream picks ["native"], whose
-    # fused_add_rms_norm keeps the residual sum in FP32 before rounding
-    # (UP ir/ops/layernorm.py:44-62). On SM70 pin the C kernel (FP16
+    # Upstream's per-op IR priority hook (merged into
+    # KernelConfig.ir_op_priority; a user-set priority stays first). Under
+    # Inductor upstream picks ["native"], whose fused_add_rms_norm keeps the
+    # residual sum in FP32 before rounding. On SM70 pin the C kernel (FP16
     # residual, __hadd2), so the unfused graph, the kill-switched path and
-    # the fused TP2 all-reduce + RMSNorm collective (K17) share one rounding.
+    # the fused TP2 all-reduce + RMSNorm collective share one rounding.
     # "native" stays as the fallback for args vllm_c does not support (a
     # weight dtype other than the input's, variance_size).
     SM70_FUSED_ADD_RMS_NORM_PRIORITY = ("vllm_c", "native")
@@ -289,9 +285,9 @@ class Sm70CudaPlatform(CudaPlatform):
         import dataclasses
 
         priority = super().get_default_ir_op_priority(vllm_config)
-        # Flint only (K17 admission): there the fused AR kernel keeps the
-        # residual in fp16, so the unfused path (switch off) must too. Other
-        # models keep upstream's priority (fork parity).
+        # Flint only (where the AR + RMSNorm fusion admits): there the fused
+        # AR kernel keeps the residual in fp16, so the unfused path (switch
+        # off) must too. Other models keep upstream's priority.
         reason = _k17_rejection(vllm_config)
         if reason is not None:
             _log_pin_once(
@@ -318,7 +314,7 @@ def _flint_sampler_enabled() -> bool:
 
 
 def _hidden_state_sampler_enabled() -> bool:
-    """K16 or the F12 greedy fast path is on (env kill switches only)."""
+    """The top-k sampler or the greedy fast path is on (env kill switches only)."""
     from vllm_sm70 import envs
 
     return bool(envs.VLLM_SM70_FLINT_SAMPLER or envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH)
@@ -348,7 +344,7 @@ def _log_pin_once(fmt: str, *args: Any) -> None:
 
 
 def _k17_rejection(vllm_config: Any) -> str | None:
-    """K17's rejection() for this engine config: None when it admits."""
+    """The AR + RMSNorm fusion's rejection() for this engine config: None when it admits."""
     if getattr(vllm_config, "model_config", None) is None:
         return "no model config yet"
     try:
@@ -362,5 +358,5 @@ def _k17_rejection(vllm_config: Any) -> str | None:
 
 
 def _k17_admits(vllm_config: Any) -> bool:
-    """True when K17's rejection() is None for this engine config."""
+    """True when the AR + RMSNorm fusion's rejection() is None for this engine config."""
     return _k17_rejection(vllm_config) is None

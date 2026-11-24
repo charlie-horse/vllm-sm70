@@ -1,42 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 routed experts in torch, with every expert held in the model dtype.
 
-One module per layer, mounted as ``mlp``: the fp32 router (``gate.weight``,
-``gate.bias``) and the dequantized expert weights of one TP rank
-(``expert_weights.ExpertLayer.dequantize``). ``forward`` is one eager-break op
-that writes this rank's partial expert sum into a caller buffer. At TP > 1
-each rank holds a contiguous slice of the intermediate units, so the caller
-sums the partials of all ranks with one all-reduce.
-
-Rounding follows the reference: routing in fp32, both GEMMs in the model
-dtype, the SwiGLU soft caps in fp32, the routing weight applied after W2 and
-the sum over a token's experts in fp32, rounded once to the model dtype.
-
-The NVFP4 layers that ``moe_tm.rejection`` admits run on the TurboMind
-dense stage instead (moe_tm.py) and hold no fp16 expert weights;
-``VLLM_SM70_INKLING_NVFP4_TM=0`` keeps every layer here.
-
-Switch: in an fp16 model an MXFP8 layer whose values are all exact in fp16
-keeps its e4m3 codes and exponent scales (``grouped_gemm.Mxfp8Weight``,
-half the bytes) and every route decodes them, to the same values, unless
-VLLM_SM70_INKLING_MXFP8_EXPERTS=0, which dequantizes it at load. Read when
-a layer is loaded.
-
-Switch: the layers held in the model dtype take ``ops/grouped_gemm.py``
-(no host sync at any batch size, one Triton GEMV launch per projection for
-the slots outside the per-expert capacity) unless
-VLLM_SM70_INKLING_GROUPED_MOE=0, which sends them back to the torch expert
-sum below. Tensors off the GPU take the torch expert sum, except in
-Triton's interpreter. The switch is read on every eager call; a replayed
-CUDA graph keeps the route it was captured with.
-
-Switch: a batch of at most ``routing.MAX_SLOTS`` routed slots on the
-TurboMind or the grouped route is routed by ops/routing.py (router GEMV,
-then top-k, weights, slot sort and row gather in one launch, the weighted
-sum in another) unless VLLM_SM70_INKLING_FUSED_ROUTING=0, which keeps the
-torch router and the torch sort of those routes. Read and fixed as above.
-On a decode-only batch the router GEMV runs inside the route launch
-(visit_fusion.py).
+One module per layer, mounted as ``mlp``: the fp32 router and this rank's
+dequantized experts. ``forward`` is one eager-break op that writes this rank's
+partial expert sum into a caller buffer. Rounding as the reference: routing,
+SwiGLU caps and the weighted sum in fp32, GEMMs in the model dtype.
+Switches, read on every eager call (a replayed graph keeps its route):
+VLLM_SM70_INKLING_NVFP4_TM=0 keeps NVFP4 layers off TurboMind (moe_tm.py);
+VLLM_SM70_INKLING_GROUPED_MOE=0 sends model-dtype layers from
+ops/grouped_gemm.py back to the torch sum; VLLM_SM70_INKLING_FUSED_ROUTING=0
+keeps the torch router and sort instead of ops/routing.py for batches of at
+most ``routing.MAX_SLOTS`` slots. VLLM_SM70_INKLING_MXFP8_EXPERTS=0, read at
+load, dequantizes MXFP8 layers instead of keeping their e4m3 codes.
 """
 
 from __future__ import annotations

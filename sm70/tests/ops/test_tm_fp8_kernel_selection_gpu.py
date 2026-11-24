@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel-level FP8 route checks (the C++ side of fork test_sm70_fp8_kernel_selection).
+"""Kernel-level FP8 route checks: the C++ routing inside the ops.
 
-The fork test (tests/quantization/test_sm70_fp8_kernel_selection.py,
-c9d825d5c) is about Python kernel selection and KernelConfig, which is
-Mara's M-side work. What K03 owns is the C++ routing inside the ops:
-- the pre-scaled block-FP8 entry points accept only their exact shapes
-  (fork awq_sm70_gemm.cu:4288-4300);
+- the pre-scaled block-FP8 entry points accept only their exact shapes;
 - fp8_gemm_sm70_prefill_dispatch_out below min_prefill_m is the plain
   TurboMind GEMM, bit for bit, and above it is the dequantize + dense GEMM
   path (CUTLASS for Qwen3.8 8K prefill, else torch.mm);

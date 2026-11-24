@@ -3,9 +3,7 @@
 // The M8 execution layout follows the in-tree QPN8 kernels, derived from
 // dnv2003/v100-skinny (MIT). See LICENSE.v100-skinny for the retained notice.
 // Weights stay FP16; the independent K partitions accumulate in FP32.
-//
-// K18: ported from fork cf9492a csrc/sm70_turbomind/ops/dflash2_fp16_m8_sm70.cu
-// (see PROVENANCE.md). Ops register in the _sm70_C namespace.
+// Source: PROVENANCE.md.
 #include <torch/all.h>
 #include <torch/library.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -83,7 +81,7 @@ __global__ void dflash2_fp16_m8_kernel(half* __restrict__ output,
   }
 }
 
-// K18: the kernel loads input rows and packed weights as uint4.
+// The kernel loads input rows and packed weights as uint4.
 bool aligned16(const torch::Tensor& t) {
   return reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 16 == 0;
 }
@@ -107,7 +105,7 @@ void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK((tile == 16 || tile == 32) && (warps == 8 || warps == 16));
   TORCH_CHECK(n % tile == 0 && k % (16 * warps * (tile == 16 ? 2 : 1)) == 0);
   TORCH_CHECK(packed.numel() == static_cast<int64_t>(n) * k);
-  // K18: the fork assumed 16-byte aligned base pointers; check it.
+  // The kernel needs 16-byte aligned base pointers.
   TORCH_CHECK(aligned16(input) && aligned16(packed),
               "DFlash2 FP16 M8: input and packed must be 16-byte aligned");
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
@@ -148,7 +146,7 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
               output.size(0) == input.size(0) &&
               output.size(1) == weight.size(0));
   const int64_t m = input.size(0);
-  // K18: misaligned views (e.g. a row slice) keep the matrix product.
+  // Misaligned views (e.g. a row slice) keep the matrix product.
   const bool aligned = aligned16(input) && aligned16(packed);
   if (m == 8 && aligned) {
     sm70_dflash2_fp16_m8_out(output, input, packed, tile, warps);
@@ -156,7 +154,7 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
   }
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   if (m >= 1 && m < 8 && aligned) {
-    // K18 (new): M 1..7 runs the M8 kernel on zero-padded rows. Each output
+    // M 1..7 runs the M8 kernel on zero-padded rows. Each output
     // row depends only on its own input row and the reduction order is fixed,
     // so rows [0, m) are bitwise those of an M8 call on the padded input.
     auto padded_in = at::zeros({8, input.size(1)}, input.options());

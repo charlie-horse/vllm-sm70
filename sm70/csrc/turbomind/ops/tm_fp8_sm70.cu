@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// TurboMind FP8 (E4M3, block-128) dense GEMM: prepare, dequant, GEMM, prefill dispatch (K03).
-// Moved verbatim from fork cf9492a csrc/sm70_turbomind/ops/awq_sm70_gemm.cu;
-// see ../PROVENANCE.md for the fork line range of every function.
+// TurboMind FP8 (E4M3, block-128) dense GEMM: prepare, dequant, GEMM, prefill dispatch.
+// Source: ../PROVENANCE.md.
 #include "tm_ops_common_sm70.cuh"
 
 #include <torch/library.h>
@@ -558,45 +557,37 @@ void fp8_gemm_sm70_out_meta(torch::Tensor out, torch::Tensor _in_feats,
 }
 
 // ---------------------------------------------------------------------------
-// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// Op registration.
 // ---------------------------------------------------------------------------
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:630
   m.def(
       "fp8_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, int "
       "group_size, bool interleave_gated_silu) -> Tensor[]");
-  // fork csrc/torch_bindings.cpp:638
   m.def(
       "fp8_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:705
   m.def(
       "fp8_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_kernel, Tensor _scaling_factors, int group_size, int k_ld, int "
       "q_ld, bool gated_silu, bool preserve_default_partition=False) -> "
       "()");
-  // fork csrc/torch_bindings.cpp:829
   m.def(
       "fp8_gemm_sm70_prefill_prescaled_out(Tensor(a!) out, Tensor "
       "_in_feats, Tensor _kernel, Tensor _prescaled_factors, int "
       "group_size, int k_ld, int q_ld) -> ()");
-  // fork csrc/torch_bindings.cpp:838
   m.def(
       "fp8_gemm_sm70_prescaled_m1_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _prescaled_factors, int group_size, int "
       "k_ld, int q_ld) -> ()");
-  // fork csrc/torch_bindings.cpp:932
   m.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, int "
       "dense_weight_ptr, Tensor _in_feats, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size, int k_ld, int q_ld, bool "
       "gated_silu, int min_prefill_m) -> ()");
-  // fork csrc/torch_bindings.cpp:991
   m.def(
       "fp8_gemm_sm70_out_auto(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_kernel, Tensor _scaling_factors) -> ()");
-  // fork csrc/torch_bindings.cpp:998
   m.def(
       "fp8_gemm_sm70_out_meta(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_kernel, Tensor _scaling_factors, Tensor _meta, bool gated_silu) "

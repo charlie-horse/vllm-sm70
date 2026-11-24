@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: load-time checks.
 
-* ``Fp16Audit`` checks every cast to fp16 (a bf16 or fp32 checkpoint tensor,
-  a dequantized expert block). A value above the fp16 range raises with the
-  tensor name (as flint_sm70/fp16_rescale.py ``check_fp16_range``). So does a
-  nonzero value that rounds to zero and is larger than ``FLUSH_RELATIVE``
-  times the tensor's largest |w|, and a nonzero tensor whose largest |w| is
-  below the smallest normal fp16 value: the tensor lies below the fp16 range
-  and would be held in subnormals. Other values that round to zero, and
-  subnormal results, are counted; a tensor with more than
-  ``SUBNORMAL_WARN_SHARE`` of its values subnormal is logged with its name.
+* ``Fp16Audit`` checks every cast to fp16. A value above the fp16 range
+  raises with the tensor name. So does a nonzero value that rounds to zero
+  and exceeds ``FLUSH_RELATIVE`` times the tensor's largest |w|, and a
+  nonzero tensor whose largest |w| is below the smallest normal fp16 value.
+  Other values that round to zero, and subnormals, are counted; a tensor
+  with more than ``SUBNORMAL_WARN_SHARE`` subnormal values is logged.
 * ``check_hard_coded_config`` refuses a config whose values differ from the
   ones the model code is written for.
 * ``walk_process_weights_after_loading`` runs the post-load hook of every
-  submodule. vLLM itself calls only attention layers and the top-level model
-  (UP model_executor/model_loader/utils.py ``process_weights_after_loading``).
+  submodule; vLLM itself calls only attention layers and the top model.
 """
 
 from __future__ import annotations

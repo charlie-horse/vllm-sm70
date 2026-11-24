@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K06 CPU checks for the Flash-V100 attention backend (no GPU).
+"""CPU checks for the Flash-V100 attention backend (no GPU).
 
-Needs upstream v0.33.0's Python source importable (installed vllm, or the
+Needs upstream vLLM's Python source importable (installed vllm, or the
 source tree on PYTHONPATH); skipped otherwise. No compiled vLLM extension:
 `vllm._C_stable_libtorch` is stubbed when absent, as in tests/plugin.
 
@@ -9,7 +9,7 @@ Covers: CUSTOM registration, backend class flags and validate_configuration,
 get_supported_kernel_block_sizes(spec), the platform selection rules (a)-(e)
 and the kill switch, the LBNHC split, the metadata builder on fake
 CommonAttentionMetadata, and the impl forward routed onto CPU stand-ins of
-the K05 ops (_fv100_cpu_ops.py) against the SDPA reference.
+the Flash-V100 ops (_fv100_cpu_ops.py) against the SDPA reference.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def test_builder_flags(monkeypatch):
     assert FlashAttnV100MetadataBuilder.supports_draft_decode_metadata_update is False
     spec = SimpleNamespace(num_speculative_tokens=7, parallel_drafting=False)
     spec_cfg = SimpleNamespace(speculative_config=spec)
-    # K07: verify batches are capture-safe; the spec kill switch restores K06.
+    # Verify batches are capture-safe unless the spec kill switch is off.
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
     assert FlashAttnV100MetadataBuilder.get_cudagraph_support(spec_cfg, None) is (
         AttentionCGSupport.UNIFORM_BATCH
@@ -394,7 +394,7 @@ def cpu_ops(monkeypatch):
 
     from vllm_sm70.ops import fv100
 
-    # Two-launch ops whatever the build has (K14's fused route: see
+    # Two-launch ops whatever the build has (the fused route: see
     # test_fv100_fused_decode_cpu.py).
     monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     ops = CpuOps()
@@ -560,8 +560,8 @@ def test_forward_checks_kv_views_once(builder, cpu_ops, monkeypatch):
 
 def test_get_name_resolves_in_backend_enum(backend_cls):
     """Every upstream Attention layer does AttentionBackendEnum[get_name()]
-    (UP attention.py:433); a name that is not an enum member crashes worker
-    init (Bea, c4130, Flint FV100 serve)."""
+    (UP attention.py:433); a name that is not an enum member fails worker
+    init."""
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     from vllm_sm70 import attention

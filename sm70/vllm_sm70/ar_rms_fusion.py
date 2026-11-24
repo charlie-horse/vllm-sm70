@@ -1,43 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K17 (C6): TP2 all-reduce + fused_add_rms_norm as one collective.
+"""TP2 all-reduce + fused_add_rms_norm as one collective.
 
-Ported from fork cf9492a (commits 45896b591, 9f175fc6e, 2eb8f3b0a):
-
-* ``Tp2AllReduceFusedAddRMSNormPattern`` <- fork compilation/passes/fusion/
-  allreduce_rms_fusion.py (pattern, extra checks, unfused-boundary counter,
-  pass admission ``tp2_add_rms_rejection``). Here it is one entry of the
-  composite pass (vllm_sm70.passes), on upstream ``BasePattern`` and
-  ``vllm.ir.ops.fused_add_rms_norm``.
-* ``torch.ops.vllm_sm70.tp2_all_reduce_fused_add_rms_norm`` <- fork
-  parallel_state.py op + GroupCoordinator/CudaCommunicator/CustomAllreduce
-  methods. The fork extended vLLM's communicator; here the op reads
-  upstream's ``CustomAllreduce`` (``device_communicator.ca_comm``) and calls
-  ``_sm70_C::tp2_all_reduce_fused_add_rms_norm`` with its handle. No vLLM
-  source is patched.
-
-Interface (fixed; tests pin it):
-  torch.ops.vllm_sm70.tp2_all_reduce_fused_add_rms_norm(
-      tensor, tensor_b: Tensor | None, residual, weight,
-      epsilon: float, scale: float, group_name: str) -> (normalized, residual)
-  torch.ops._sm70_C.tp2_all_reduce_fused_add_rms_norm(
-      fa: int, inp, inp_b: Tensor | None, residual, weight,
-      normalized_out (a!), residual_out (b!), reg_buffer: int,
-      reg_buffer_sz_bytes: int, epsilon: float, scale: float) -> ()
-
-Admitted models: Flint only (FlintSm70ForCausalLM or FlintForCausalLM), as in the
-fork, where only FlintModelConfig requested the pass (fork models/config.py:
-341-372, MODELS_CONFIG_MAP["FlintForCausalLM"] :1052). Other hidden-2048
-models (e.g. GemmaRMSNorm-style fp32 weight + 1) are never matched.
-
-Admitted shapes (fused kernel): TP2, PP1, FP16, hidden 2048, 1-16 rows,
-contiguous and 16-byte aligned operands, scale 1 or a positive power of two.
-Anything else at runtime (prefill rows, a disabled or absent custom
+``Tp2AllReduceFusedAddRMSNormPattern`` is one entry of the composite pass
+(vllm_sm70.passes). It rewrites to ``torch.ops.vllm_sm70.
+tp2_all_reduce_fused_add_rms_norm``, which reads upstream's
+``CustomAllreduce`` (``device_communicator.ca_comm``) and calls
+``_sm70_C::tp2_all_reduce_fused_add_rms_norm`` with its handle. Tests pin
+both op signatures.
+Admitted models: Flint only. Admitted shapes: TP2, PP1, FP16, hidden 2048,
+1-16 rows, contiguous 16-byte aligned operands, scale 1 or a positive power
+of two. Anything else at runtime (prefill rows, a disabled or absent custom
 all-reduce) runs the unfused ops, with the same result.
 
-Kill switch: VLLM_SM70_FLINT_AR_RMSNORM=0 (read in register(), so the
-composite pass's uuid changes with it).
-"""
+VLLM_SM70_FLINT_AR_RMSNORM is read in register(), so the composite pass's
+uuid changes with it."""
 
 from __future__ import annotations
 
@@ -66,9 +43,7 @@ KILL_SWITCH = "VLLM_SM70_FLINT_AR_RMSNORM"
 HIDDEN_SIZE = 2048
 MAX_ROWS = 16
 
-# The fork keyed the request on the Flint architecture (MODELS_CONFIG_MAP).
-# Production serves M5's FlintSm70ForCausalLM (via --hf-overrides), which
-# model_config.architecture then reports; upstream's class is kept too.
+# The SM70 Flint class (selected via --hf-overrides) and upstream's class.
 FLINT_ARCHITECTURES = ("FlintSm70ForCausalLM", "FlintForCausalLM")
 
 # Attributes of upstream's CustomAllreduce the fused path reads.
@@ -114,9 +89,7 @@ def operands_admitted(
 ) -> bool:
     """FP16 [1-16, 2048] operands, contiguous and 16-byte aligned, one device.
 
-    fork CollectiveCapabilities.fused_add_rms_norm_tp2 (collective_provider.py,
-    45896b591) minus the communicator part; the C++ host function checks the
-    same again.
+    The C++ host function checks the same again.
     """
     if inp.dim() != 2:
         return False
@@ -144,7 +117,7 @@ def communicator_admitted(ca: Any) -> bool:
     if ca.disabled or ca.world_size != 2 or not ca._ptr:
         return False
     # Real IPC peers, not the multi-node fallback that repeats the local
-    # buffer (UP custom_all_reduce.py:309-311).
+    # buffer.
     ptrs = ca.buffer_ptrs
     return len(ptrs) == 2 and ptrs[0] != ptrs[1]
 

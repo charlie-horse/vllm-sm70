@@ -1,26 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K12 GPU: Flint NVFP4 MoE M<=2 two-kernel decode on Flint TP2 shapes.
+"""GPU: Flint NVFP4 MoE M<=2 two-kernel decode on Flint TP2 shapes.
 
-Port of the two-kernel GPU decode cases of fork cf9492a
-tests/kernels/moe/test_sm70_nvfp4_contract_flint.py:
-  * test_flint_decode_qpn_matches_reference_and_turbomind (:1183)
-  * test_flint_decode_qpn_skips_invalid_routes (:1223)
-  * test_flint_decode_qpn_cuda_graph_replay (:1242)
-Dropped: the persistent single-launch cases (:1296-1447; the op is not
-ported) and test_flint_decode_qpn_kill_switch_keeps_turbomind (:1276; the
-switch acts at load, covered on CPU in test_k12_flint_moe_cpu.py, and the
-TurboMind fallback route is M4's, tested in tests/quant/test_m4_nvfp4_moe.py).
-
-New for R4 and the shape audit:
-  * test_descending_capture_regression: the C4 `--max-num-seqs 20` pattern
-    (fork test_decode_sinks_descending_capture_regression, sinks test :763)
-    applied to the split-K counters: graphs captured M=2 then M=1 on a
-    poisoned shared pool with no eager call first, M=1 replayed first.
+  * The decode matches the FP32 reference and TurboMind, skips invalid
+    routes, and replays in a CUDA graph.
+  * test_descending_capture_regression: graphs captured M=2 then M=1 on a
+    poisoned shared pool with no eager call first, M=1 replayed first, so
+    split-K counters created lazily under capture would show.
   * test_shared_workspace_two_layers_in_one_graph.
   * test_admitted_shape_set / test_guards_reject_other_shapes: the C++
     guards admit exactly Flint TP2 at M in {1, 2} and refuse TP1/TP4 banks,
     M=3, top-8 and misaligned input.
-
+The kill switch acts at load and is tested on CPU in test_k12_flint_moe_cpu.py.
 Run from the repo root against the built package:
     pytest -m gpu sm70/tests/flint_moe
 """
@@ -194,13 +184,13 @@ def test_decode_cuda_graph_replay(flint_gpu):
 
 
 def test_descending_capture_regression(flint_gpu):
-    """Black box (R4): graphs captured largest first, smallest replayed first.
+    """Black box: graphs captured largest first, smallest replayed first.
 
     Captures M=2 then M=1 on a fresh stream and a shared, poisoned graph pool
     with no eager decode call, then replays M=1 for several routings before
     M=2 ever replays, then M=2, then M=1 again. A workspace created or zeroed
     lazily inside the first capture would leave the M=1 graph on garbage
-    counters (the fork's C4 `--max-num-seqs 20` gibberish).
+    counters.
     """
     device, flint_moe, _ = flint_gpu
     raw, banks, plan = _layer(flint_gpu)
@@ -261,7 +251,7 @@ def test_descending_capture_regression(flint_gpu):
 
 def test_shared_workspace_two_layers_in_one_graph(flint_gpu):
     """Two layers in one stream share one workspace (counters re-arm per
-    launch), as M4 may do; replays match per-layer eager results."""
+    launch); replays match per-layer eager results."""
     device, flint_moe, _ = flint_gpu
     _, banks_a, plan_a = _layer(flint_gpu)
     _, banks_b, plan_b = _layer(flint_gpu, w2_global=7.0)
@@ -326,8 +316,8 @@ def _raw_bank(device, inter, hidden=HIDDEN, experts=EXPERTS):
     ],
 )
 def test_guards_reject_other_shapes(flint_gpu, case, inter, tokens, top_k):
-    """The C++ guards refuse every shape but Flint TP2 (the TP4-only op
-    lesson): a wrong shape must fail loudly, never run out of bounds."""
+    """The C++ guards refuse every shape but Flint TP2: a wrong shape must
+    fail loudly, never run out of bounds."""
     device, flint_moe, _ = flint_gpu
     w13_w, w13_s, w2_w, w2_s = _raw_bank(device, inter)
     ws = flint_moe.allocate_workspace(device)

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K15 CPU checks of the fused q/k RMSNorm + RoPE + FP16 KV write.
+"""CPU checks of the fused q/k RMSNorm + RoPE + FP16 KV write.
 
 The kernel runs through Triton's interpreter (fixture ``interp``), so this
-checks the numerics and the KV-cache addressing on upstream v0.33.0's cache
-layout without a GPU:
+checks numerics and KV-cache addressing on upstream's layout without a GPU:
 - against a float reference of the unfused route (norm, then NeoX RoPE), at
   the Flint TP2 (Hq 16 / Hkv 2) and TP1 (32 / 4) shapes, head dim 128;
 - bit-identical cache bytes to upstream's own writer
@@ -12,8 +11,6 @@ layout without a GPU:
   with physical LBNHC (Flash-V100 and TRITON_ATTN) or LBHNC;
 - the op's routing: direct write for TritonAttentionImpl and
   FlashAttnV100Impl (inherited writer), the backend's writer otherwise.
-
-The fork's GPU version of these checks is test_k15_qk_norm_rope_kv_gpu.py.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite); in the parent they show as skipped.
 """
@@ -34,7 +31,7 @@ EPS = 1e-6
 K_FILL = 13.0
 V_FILL = 17.0
 MAX_POS = 4096
-# Flint: 32 query heads, 4 KV heads. TP2 is the shipped config.
+# Flint: 32 query heads, 4 KV heads; TP2 splits them 16 / 2.
 SHAPES = [
     pytest.param(16, 2, id="flint-tp2-hq16-hkv2"),
     pytest.param(32, 4, id="flint-tp1-hq32-hkv4"),
@@ -134,7 +131,7 @@ def _reference(qkv, qw, kw, positions, cos_sin, hq, hkv):
 
 def _assert_fp16_close(actual, expected):
     # Same formula; only the FP32 reduction order differs. One FP16 ulp, and
-    # nearly every element exact (FORK test_sm70_flint_qk_norm_rope_kv.py:76).
+    # nearly every element exact.
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=2e-3)
     exact = (actual == expected).float().mean().item()
     assert exact > 0.97, exact

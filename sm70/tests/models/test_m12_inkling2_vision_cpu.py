@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 vision encoder (inkling2_sm70/vision.py).
+"""Tests for the Inkling 2 vision encoder (inkling2_sm70/vision.py).
 
 CPU fp32 against the image features recorded in fixtures/inkling2_tiny (two
 non-square images). The comparison with a live Hugging Face tower, which adds

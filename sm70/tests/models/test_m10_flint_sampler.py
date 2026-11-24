@@ -1,46 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M10: FlintSm70 opts into the K16 top-k candidate sampler.
-
-The sampler half of M10. The router half (K13, no model declaration) is
-#86's sm70/tests/models/test_m10_flint_router.py. K16 replaces the fork's
-per-model sampler hooks (fork cf9492a vllm/models/flint/model.py:570-577,
-:605-614); M10 sets ``supports_sm70_topk_sampler = True`` on the Flint model,
-the opt-in K16's U4 hook (vllm_sm70/sample_v1.py) checks.
-
-CPU: the M5 model declares the opt-in and passes K16's model gate; the
-  Flint TP2 LM head passes K16's rank-uniform LM-head admission; only
-  VLLM_SM70_FLINT_SAMPLER=0 makes the platform getter return None, and then
-  kernel_warmup does not prepare the sampler.
-GPU (``-m gpu``), what K16's contract says is exact, and nothing more
-  (Quinn: no exact-token gate between arms that differ numerically):
-  K16 samples top-k <= 20 from the same FP16 LM-head logits as upstream,
-  restricted to the only tokens upstream can return (FORK
-  v1/sample/ops/sm70_topk_candidates.py docstring; vllm_sm70/sample.py).
-  So inside ONE engine with K16 on, a top_k=1 request (K16 samples it) gives
-  the greedy request's tokens (upstream samples it: K16 rejects temperature
-  0 as ``sampling_mode``; the greedy request asks logprobs=2 for the
-  near-tie rule below).
-  The "off" engine (VLLM_SM70_FLINT_SAMPLER=0) only shows K16 absent; its
-  greedy tokens next to the "on" engine's are printed, not gated: two engine
-  instances are not bitwise equal on every build (M5 T4c).
-  Seeded top-k 20 / top-p 0.95 on vs off stays xfail until K16's RNG parity
-  and engine-instance determinism are verified (see ``seeded_parity_unverified``).
-  These K16 engines run with the F12 greedy fast path off
-  (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0), so greedy requests take upstream.
-GPU, F12 (G5/G6): inside ONE engine with the greedy fast path on, a greedy
-  request (F12: vocab-parallel top-1) gives the tokens of the same greedy
-  request with logprobs=2 (F12 rejects logprobs, so compute_logits + the
-  upstream Sampler take it). F12's contract is the first maximal index, as
-  upstream's argmax.
-Near-tie rule (G1, G3, G5, G6): the two requests run as separate batches, and
-  the engine's decode is not batch-invariant on this stack (the G2/G4 xfail),
-  so their logits can differ by noise. A request may diverge only at its
-  first differing token, only to the reference's (logprobs=2 request's) #2
-  token, and only if the reference's #1 - #2 logprob gap is <= NEAR_TIE_NATS;
-  the rest of that request is not compared. Anything else fails.
-
-K16 is a V1-runner hook (patches/0005, U4); the Flint wrapper sets
-VLLM_USE_V2_MODEL_RUNNER=0 (roadmap D2) and so do these tests.
+"""FlintSm70 opts into the top-k candidate sampler (vllm_sm70/sample.py).
+CPU: the model sets ``supports_sm70_topk_sampler`` and passes the sampler's
+  model gate; the Flint TP2 LM head passes its rank-uniform admission; only
+  VLLM_SM70_FLINT_SAMPLER=0 makes the platform getter return None.
+GPU (``-m gpu``) checks only what is exact, inside ONE engine: with the
+  sampler on, top_k=1 (sampled by it) gives the greedy request's tokens
+  (greedy goes to upstream); with the greedy fast path on (G5/G6), greedy
+  gives the tokens of greedy with logprobs (upstream). Off-engine tokens are
+  printed, not gated; seeded top-k/top-p on vs off is xfail
+  (``seeded_parity_unverified``).
+Near-tie rule: a request may diverge only once, to the reference's
+  (logprobs=2) #2 token, when its #1 - #2 gap is <= NEAR_TIE_NATS; the rest is
+  not compared. The sampler is a V1-runner hook: tests set
+  VLLM_USE_V2_MODEL_RUNNER=0.
 """
 
 from __future__ import annotations
@@ -74,7 +46,7 @@ GREEDY_LOGPROBS_REJECT_LOG = "SM70 greedy top-1 fast path rejected: logprobs"
 # --------------------------------------------------------------------------
 @pytest.fixture
 def platform_cls(monkeypatch):
-    """Sm70CudaPlatform on a CPU host (as the K16 CPU tests import it)."""
+    """Sm70CudaPlatform on a CPU host (as the sampler CPU tests import it)."""
     import importlib
     import types
 
@@ -93,7 +65,7 @@ def platform_cls(monkeypatch):
 
 @pytest.fixture
 def tp(monkeypatch):
-    """A stand-in TP group, so M5 layers can be built without torch.distributed."""
+    """A stand-in TP group, so Flint layers can be built without torch.distributed."""
     import vllm.distributed.parallel_state as ps
 
     def _set(world_size=1, rank=0):
@@ -126,7 +98,7 @@ def test_model_declares_the_sampler_opt_in():
 
 
 def test_sampler_passes_the_model_gate_on_flint(vllm_config):
-    """K16's model gate: the opt-in, lm_head and logits_processor. A step that
+    """The sampler's model gate: the opt-in, lm_head and logits_processor. A step that
     passes it gets the next rejection (spec decode here), not "model"."""
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm_sm70.models.flint_sm70 import model as m
@@ -152,8 +124,8 @@ def test_sampler_passes_the_model_gate_on_flint(vllm_config):
 
 
 def test_k16_admits_the_flint_tp2_lm_head(tp, vllm_config):
-    """M5's LM head and logits processor, at Flint's vocabulary on TP2 rank 1
-    (the last shard), pass K16's rank-uniform LM-head admission in FP16."""
+    """Flint's LM head and logits processor, at Flint's vocabulary on TP2
+    rank 1 (the last shard), pass the sampler's rank-uniform LM-head admission in FP16."""
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
     from vllm.models.flint.configs import FlintConfig
@@ -164,7 +136,7 @@ def test_k16_admits_the_flint_tp2_lm_head(tp, vllm_config):
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.float16)
     try:
-        with torch.device("meta"):  # as M5 builds them (model.py __init__)
+        with torch.device("meta"):  # as the model builds them (model.py __init__)
             lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
     finally:
         torch.set_default_dtype(default)
@@ -188,8 +160,8 @@ def test_k16_admits_the_flint_tp2_lm_head(tp, vllm_config):
 def test_sampler_kill_switch_only_zero(platform_cls, monkeypatch, raw, on):
     from vllm_sm70.sample_v1 import Sm70HiddenStateSampler
 
-    # The same hook carries the F12 greedy fast path; turn it off so the
-    # getter answers for K16 alone (F12: tests/sampler/
+    # The same hook carries the greedy fast path; turn it off so the getter
+    # answers for the sampler alone (fast path: tests/sampler/
     # test_f12_greedy_fastpath_cpu.py).
     monkeypatch.setenv(GREEDY_SWITCH, "0")
     monkeypatch.delenv(SAMPLER_SWITCH, raising=False)
@@ -204,13 +176,13 @@ def test_sampler_kill_switch_only_zero(platform_cls, monkeypatch, raw, on):
 def test_kernel_warmup_prepares_the_sampler_only_when_on(
     platform_cls, monkeypatch, sampler_off
 ):
-    """kernel_warmup's step (3) (U1, before capture) binds the sampler via
+    """kernel_warmup's step (3) (before capture) binds the sampler via
     sample_v1.prepare_worker; with VLLM_SM70_FLINT_SAMPLER=0 it does not.
-    Steps (1) and (2) are covered by tests/plugin/test_kernel_warmup_order.py
-    and #86; here (1) is stubbed and (2) skipped (no get_model)."""
+    Here step (1) is stubbed and (2) skipped (no get_model); the order is
+    covered by tests/plugin/test_kernel_warmup_order.py."""
     from vllm_sm70 import sample_v1, warmup
 
-    monkeypatch.setenv(GREEDY_SWITCH, "0")  # K16 alone (see above)
+    monkeypatch.setenv(GREEDY_SWITCH, "0")  # the sampler alone (see above)
     if sampler_off:
         monkeypatch.setenv(SAMPLER_SWITCH, "0")
     else:
@@ -246,7 +218,7 @@ PROMPTS = [
     "1, 1, 2, 3, 5, 8,",
 ]
 TINY_IDS = [[1, 2, 3, 4, 5], [7, 8, 9]]
-V1_RUNNER = {"VLLM_USE_V2_MODEL_RUNNER": "0"}  # U4/K16 are V1-only (D2)
+V1_RUNNER = {"VLLM_USE_V2_MODEL_RUNNER": "0"}  # the sampler hook is V1-only
 
 
 def _gpus_used_mib():
@@ -260,7 +232,7 @@ def _gpus_used_mib():
 
 
 def _shutdown(llm, settle_mib=2048, timeout_s=120):
-    """Release an LLM's GPUs before the next one starts (as #36's T-tests):
+    """Release an LLM's GPUs before the next one starts (as in test_m5_flint_sm70.py):
     stop the engine core, drop the object, tear down the process groups,
     then wait for the memory to come back."""
     from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -283,7 +255,7 @@ def _shutdown(llm, settle_mib=2048, timeout_s=120):
 
 
 def _tiny_flint_dir(tmp_path):
-    """#36's tiny random Flint (hidden 2048, E256/K6, vocab 512)."""
+    """A tiny random Flint (hidden 2048, E256/K6, vocab 512)."""
     from vllm.models.flint.configs import FlintConfig
 
     cfg = FlintConfig(
@@ -337,7 +309,7 @@ def _ckpt_llm():
         hf_overrides=ARCH_OVERRIDE,
         max_model_len=8192,
         gpu_memory_utilization=0.85,
-        max_num_seqs=2,  # K16 admits batches of 1-2 rows
+        max_num_seqs=2,  # the sampler admits batches of 1-2 rows
         enable_prefix_caching=False,  # the 2nd request must prefill in full
         seed=0,
     )
@@ -415,10 +387,8 @@ def _tokens_and_logprobs(completion):
 
 
 # Largest reference #1 - #2 logprob gap (nats) at which a candidate may take
-# the reference's #2 token. Below the fork's eager_vs_graphs decode set-mean
-# anchor (~0.024 nats: T4d's 1.5x limit is 0.0363, docs/checks.md#gpu-gate),
-# i.e. under the per-token noise two kernel schedules of the same model show,
-# and about one FP16 ulp of a logit in [16, 32) (1/64).
+# the reference's #2 token: below the per-token noise two kernel schedules
+# of the same model show, about one FP16 ulp of a logit in [16, 32) (1/64).
 NEAR_TIE_NATS = 0.02
 
 
@@ -482,16 +452,17 @@ def test_near_tie_check():
 
 
 def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
-    """K16's exact contract inside one engine, plus K16 absent when killed.
+    """The sampler's exact contract inside one engine, plus its absence when
+    killed.
 
-    "on" engine: greedy (upstream, K16 rejects sampling_mode) then top_k=1 at
-    temperature 1 (K16 samples), same prompts, same batch shapes, prefix
+    "on" engine: greedy (upstream; the sampler rejects sampling_mode) then
+    top_k=1 at temperature 1 (the sampler samples), same prompts, same batch shapes, prefix
     caching off so both prefill the same rows: identical tokens up to the
     near-tie rule (greedy carries logprobs=2 as its reference). "off"
-    engine: K16 never engaged; its greedy is printed next to the "on"
-    engine's greedy, not gated (engine-instance noise, M5 T4c)."""
+    engine: the sampler never engaged; its greedy is printed next to the
+    "on" engine's greedy, not gated (engine-instance noise)."""
     reqs = [(prompts, _greedy_logprobs_params(n)), (prompts, _top1_params(n))]
-    no_f12 = {**V1_RUNNER, GREEDY_SWITCH: "0"}  # greedy -> upstream, not F12
+    no_f12 = {**V1_RUNNER, GREEDY_SWITCH: "0"}  # greedy -> upstream, not the fast path
     on, on_logs = _run(
         make_llm, {**no_f12, SAMPLER_SWITCH: None}, reqs, monkeypatch, capfd
     )
@@ -515,14 +486,15 @@ def _sampler_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
 
 
 def _greedy_fastpath_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
-    """F12's exact contract inside one engine, plus F12 absent when killed.
+    """The greedy fast path's exact contract inside one engine, plus its
+    absence when killed.
 
-    "on" engine (defaults): greedy (F12) then greedy with logprobs=1
-    (upstream: F12 rejects logprobs; logprobs=2 is the near-tie reference),
-    same prompts and batch shapes, prefix caching off: identical tokens up
-    to the near-tie rule. "off" engine
-    (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0): F12 never engaged; its greedy is
-    printed next to the "on" engine's, not gated (M5 T4c)."""
+    "on" engine (defaults): greedy (fast path) then greedy with logprobs
+    (upstream: the fast path rejects logprobs; logprobs=2 is the near-tie
+    reference), same prompts and batch shapes, prefix caching off: identical
+    tokens up to the near-tie rule. "off" engine
+    (VLLM_SM70_GREEDY_TOKEN_FASTPATH=0): the fast path never engaged; its
+    greedy is printed next to the "on" engine's, not gated."""
     reqs = [(prompts, _greedy_params(n)), (prompts, _greedy_logprobs_params(n))]
     on, on_logs = _run(
         make_llm, {**V1_RUNNER, GREEDY_SWITCH: None}, reqs, monkeypatch, capfd
@@ -547,19 +519,16 @@ def _greedy_fastpath_exact(make_llm, prompts, n, monkeypatch, capfd, *, tp):
 
 
 class NotEngagedError(Exception):
-    """K16 did not run (or ran while killed): a real failure, not covered by
+    """The sampler did not run (or ran while killed): a real failure, not covered by
     ``seeded_parity_unverified``."""
 
 
 # The seeded on-vs-off comparison spans two engine instances, so it holds only
-# if (a) K16 draws upstream's FP32 exponentials from the same Philox state and
-# advances the generator by the same offset, verified on GPU by
-# sm70/tests/sampler/test_k16_topk_candidates_sampler_gpu.py::
-# test_request_generator_matches_reference (a seeded request generator) and
-# ::test_same_token_as_reference, and (b) the two engines produce bitwise
-# equal logits, verified by M5's T4c (eager vs eager, two instances, tuning
-# off). Until both pass on the stack under test only the token equality may
-# fail (AssertionError); a NotEngagedError still fails and an XPASS shows.
+# if (a) the sampler draws upstream's FP32 exponentials from the same Philox
+# state and offset (sm70/tests/sampler/test_k16_topk_candidates_sampler_gpu.py)
+# and (b) the two engines give bitwise equal logits (T4c in
+# test_m5_flint_sm70.py). Only the token equality may fail (AssertionError);
+# a NotEngagedError still fails and an XPASS shows.
 seeded_parity_unverified = pytest.mark.xfail(
     strict=False,
     raises=AssertionError,
@@ -590,8 +559,8 @@ def _sampler_seeded_on_off(make_llm, prompt, n, monkeypatch, capfd):
 @pytest.mark.gpu
 @one_gpu
 def test_g1_tiny_sampler_top1_equals_greedy(tmp_path, monkeypatch, capfd):
-    """G1 (1 GPU): tiny Flint TP1, V1 runner, CUDA graphs: in the K16 engine,
-    top_k=1 (K16) gives upstream greedy's tokens; K16 absent when killed."""
+    """G1 (1 GPU): tiny Flint TP1, V1 runner, CUDA graphs: in the sampler
+    engine, top_k=1 gives upstream greedy's tokens; absent when killed."""
     path = _tiny_flint_dir(tmp_path)
     _sampler_exact(
         lambda: _tiny_llm(path), _tiny_prompts(), 16, monkeypatch, capfd, tp=1
@@ -602,7 +571,7 @@ def test_g1_tiny_sampler_top1_equals_greedy(tmp_path, monkeypatch, capfd):
 @one_gpu
 @seeded_parity_unverified
 def test_g2_tiny_sampler_seeded_on_off(tmp_path, monkeypatch, capfd):
-    """G2 (1 GPU): one seeded top-k 20 / top-p 0.95 request, K16 on vs off."""
+    """G2 (1 GPU): one seeded top-k 20 / top-p 0.95 request, sampler on vs off."""
     path = _tiny_flint_dir(tmp_path)
     prompt = _tiny_prompts()[0]
     _sampler_seeded_on_off(lambda: _tiny_llm(path), prompt, 32, monkeypatch, capfd)
@@ -613,7 +582,7 @@ def test_g2_tiny_sampler_seeded_on_off(tmp_path, monkeypatch, capfd):
 @needs_ckpt
 def test_g3_ckpt_tp2_sampler_top1_equals_greedy(monkeypatch, capfd):
     """G3 (2 GPUs): checkpoint TP2, V1 runner, CUDA graphs: as G1, with the
-    K16 lines once on each rank."""
+    sampler lines once on each rank."""
     _sampler_exact(_ckpt_llm, PROMPTS, 64, monkeypatch, capfd, tp=2)
 
 
@@ -623,15 +592,15 @@ def test_g3_ckpt_tp2_sampler_top1_equals_greedy(monkeypatch, capfd):
 @seeded_parity_unverified
 def test_g4_ckpt_tp2_sampler_seeded_on_off(monkeypatch, capfd):
     """G4 (2 GPUs): checkpoint TP2: one seeded top-k 20 / top-p 0.95 request,
-    K16 on vs off."""
+    sampler on vs off."""
     _sampler_seeded_on_off(_ckpt_llm, PROMPTS[1], 64, monkeypatch, capfd)
 
 
 @pytest.mark.gpu
 @one_gpu
 def test_g5_tiny_greedy_fastpath_equals_upstream(tmp_path, monkeypatch, capfd):
-    """G5 (1 GPU): tiny Flint TP1, V1 runner, CUDA graphs: in one engine, F12
-    greedy gives upstream greedy's tokens; F12 absent when killed."""
+    """G5 (1 GPU): tiny Flint TP1, V1 runner, CUDA graphs: in one engine, the
+    greedy fast path gives upstream greedy's tokens; absent when killed."""
     path = _tiny_flint_dir(tmp_path)
     _greedy_fastpath_exact(
         lambda: _tiny_llm(path), _tiny_prompts(), 16, monkeypatch, capfd, tp=1
@@ -642,6 +611,6 @@ def test_g5_tiny_greedy_fastpath_equals_upstream(tmp_path, monkeypatch, capfd):
 @two_gpus
 @needs_ckpt
 def test_g6_ckpt_tp2_greedy_fastpath_equals_upstream(monkeypatch, capfd):
-    """G6 (2 GPUs): checkpoint TP2: as G5, with the F12 lines once on each
+    """G6 (2 GPUs): checkpoint TP2: as G5, with the fast-path lines once on each
     rank (the pair all-gather runs across both GPUs)."""
     _greedy_fastpath_exact(_ckpt_llm, PROMPTS, 64, monkeypatch, capfd, tp=2)

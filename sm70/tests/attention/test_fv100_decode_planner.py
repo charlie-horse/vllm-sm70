@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K06: decode planner (trimmed port) and decode dispatch wiring.
+"""Decode planner and decode dispatch wiring.
 
-Planner: port of fork cf9492a tests/kernels/attention/
-test_sm70_flash_v100_decode_planner.py, trimmed to the lean subset: the
-partition-size defaults, the static (CUDA-graph) plan with its workspace
-envelope, the fp16 XQA workspace dtype, and the stale active-partition GPU
-case (D128 here; D64 is not built). Dropped: XQA batch-context routing and
-the E4M3/E5M2 cases (not compiled in K05).
+Planner: the partition-size defaults, the static (CUDA-graph) plan with its
+workspace envelope, the fp16 XQA workspace dtype, and the stale
+active-partition GPU case (D128; D64 is not built). XQA batch-context
+routing and E4M3/E5M2 KV are not built and not tested.
 
-Dispatch: the non-fused CPU cases of fork test_sm70_flash_v100_sinks_decode.py
-(:1444-1591) restated for vllm_sm70.attention.flash_v100.dispatch: a sink
-layer passes its sinks and window to the paged decode, a sink-free layer
-does not, and XQA never takes a sink layer.
+Dispatch (vllm_sm70.attention.flash_v100.dispatch): a sink layer passes its
+sinks and window to the paged decode, a sink-free layer does not, and XQA
+never takes a sink layer.
 """
 
 from __future__ import annotations
@@ -166,8 +163,8 @@ class _Rec:
 
 @pytest.fixture
 def rec(fv100, monkeypatch):
-    # K06 routing on the two-launch ops whatever the build has; the K14
-    # fused route is tested in test_fv100_fused_decode_cpu.py.
+    # Routing on the two-launch ops whatever the build has; the fused route
+    # is tested in test_fv100_fused_decode_cpu.py.
     monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     r = _Rec()
     monkeypatch.setattr(fv100, "_op", r)
@@ -223,7 +220,7 @@ def test_capture_launches_the_max_model_len_envelope(rec):
     assert eager[12] * eager[11] < 4096
 
 
-# ------------------------------------------- B1: small captured batches
+# ------------------------------------------------ small captured batches
 
 SMALL = "VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION"
 
@@ -275,7 +272,7 @@ def test_small_batch_kill_switch(rec, monkeypatch):
 
 
 def test_eager_decode_is_unchanged(rec, monkeypatch):
-    # Eager plans from the live max_seq_len (4096 -> 256) with or without B1.
+    # Eager plans from the live max_seq_len (4096 -> 256) whatever SMALL says.
     for value in ("0", "1"):
         monkeypatch.setenv(SMALL, value)
         partition, launched = _run_qwen38(rec, 8, capture=False)

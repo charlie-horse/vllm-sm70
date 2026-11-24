@@ -2,56 +2,17 @@
 """Inkling 2 on SM70: the backends of the model-owned caches.
 
 The model runs attention and the short convs itself, so neither backend has
-an attention impl. Each one only names the builder that turns the runner's
-per-batch ``CommonAttentionMetadata`` into the metadata the model's ops read:
-
-    Inkling2AttentionBackend -> Inkling2AttentionMetadata  (K/V caches)
-    Inkling2SconvBackend     -> Inkling2SconvMetadata      (conv-state caches)
-
-The runner stores one metadata object per cache owner under the owner's
-forward-context name; ``cache_metadata(owner)`` reads it back.
-
-``num_actual_tokens`` is n, the scheduled tokens of the batch:
-``query_start_loc_cpu[num_reqs]``, not the runner's
-``CommonAttentionMetadata.num_actual_tokens``, which is the padded count in a
-FULL graph (UP v1/worker/gpu_model_runner.py ``_build_attention_metadata``).
-Token tensors have P >= n rows. The runner gives P = n except in a FULL
-graph, where P is the padded batch, while the model's tensors are always
-padded to the capture size. So an op reads rows [0, n) only and treats the
-model rows after them as padding; inside [0, n) a token with a negative slot
-is padding too. The builders sort decode requests first.
-
-A step that runs as a FULL decode graph is decode-only (``decode_only``): it
-is a uniform decode of q tokens per request, q one of ``decode_query_lens``
-(q = 1 without a speculative config; a verify step of 1 +
-num_speculative_tokens with one; with a dynamic speculative-decoding
-schedule, 1 + each draft count of the schedule, 1 included), its zero-token
-requests (graph padding) are last, the engine's cudagraph_mode has FULL
-decode graphs and the step's (padded) token count is at most
-``max_cudagraph_capture_size``, so the runner captures or replays it (UP
-v1/cudagraph_dispatcher.py, v1/worker/gpu/cudagraph_utils.py). The builders
-read this from the engine's config at build time. The ops of such a step
-read no host data and their shapes depend on the token tensors and the
-block-table width alone; an op covers the rows of the slot mapping (P), a
-row with a negative slot is padding, and each row is a query at its own
-position that sees the rows of its request before it. Every other step,
-eager decodes included, takes the ops that branch in Python on the batch
-(numpy request lengths, nonzero): they run eagerly or as eager breaks of a
-PIECEWISE graph. The builders declare UNIFORM_SINGLE_TOKEN_DECODE graph
-support, UNIFORM_BATCH with a speculative config, and order requests of up
-to q tokens first. VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit dump,
-marks no step decode-only and declares no graph support.
-
-On the V2 runner a step builds once per (builder class, spec) and fills the
-token index once: the other groups of that step reuse the first build
-through ``update_block_table``, as the V1 runner does itself (UP
-v1/worker/gpu_model_runner.py ``_build_attention_metadata``); V2 reuses only
-Mamba builds (UP v1/worker/gpu/attn_utils.py ``build_attn_metadata``). A step is the set of
-builds that share the runner's ``query_start_loc_cpu``, ``seq_lens`` and
-``positions`` tensors.
-
-Cache views are logical (blocks, heads, tokens, width) in every layout; the
-backends declare LBNHC, the layout Flash-V100 uses.
+an impl; each names the builder of its metadata (Inkling2AttentionMetadata,
+Inkling2SconvMetadata), stored per cache owner (``cache_metadata(owner)``).
+``num_actual_tokens`` is n = ``query_start_loc_cpu[num_reqs]``, not the
+runner's padded count. Token tensors have P >= n rows: ops read rows [0, n),
+and a row with a negative slot is padding. Builders sort decodes first.
+A step is decode-only (``decode_only``) when it runs as a FULL decode graph:
+q tokens per request (q in ``decode_query_lens``), zero-token requests last.
+Its ops read no host data and their shapes depend on the token tensors and
+block-table width alone. VLLM_SM70_INKLING_DECODE_GRAPH=0, or a per-visit
+dump, marks no step decode-only. On the V2 runner a step builds once per
+(builder class, spec). The backends declare the LBNHC layout.
 """
 
 from __future__ import annotations

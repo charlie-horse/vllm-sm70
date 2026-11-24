@@ -1,33 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 DSpark draft (``mtp.safetensors``) on SM70, in fp16.
 
-    Inkling2DSparkSm70Model   registered as ``Inkling2DSparkSm70Model``
-      model.layers[i]         3 dense layers: block attention over context
-                              K/V built from target features, SwiGLU MLP
-      model.markov_head       recurrent (rnn_hidden) correction of the logits
-      lm_head                 the target's, shared by load_dspark_model
-
-The port of upstream's ``Inkling2DSparkModel`` (vLLM c32251b
-models/inkling2/nvidia/dspark.py) without flashinfer, FlashAttention or
-the MNNVL all-reduce. Differences:
-
-* fp16 weights and GEMMs; the residual stream is fp32 (upstream: bf16).
-  Weights outside the fp16 range refuse the load.
-* TP splits attention heads and the MLP like upstream (6 all-reduces per
-  draft step), so a rank's draft K/V page equals the target's.
-* Each layer owns an ``Inkling2AttentionCache``; a local layer's window is
-  ``sliding_window_size + 1`` so the KV manager keeps the
-  ``sliding_window_size`` positions before the block that it reads.
-* The Markov head's rnn_proj runs in fp32; the fold of hidden_out into the
-  LM head is fp64, stored in the model dtype. Logits are fp32.
-* A TP-sharded target LM head (weights.py ``head_sharded``): each rank folds
-  its vocabulary rows and the ranks all-gather the fold once at load; the
-  base logits are all-gathered in the model dtype each draft step. Every
-  rank then holds the logits of the whole vocabulary.
-
-Kernels (ops/dspark.py) run on CUDA tensors and in Triton's interpreter;
-other tensors, or ``VLLM_SM70_INKLING_DSPARK_KERNELS=0``, take their torch
-forms.
+``Inkling2DSparkSm70Model``: 3 dense layers (block attention over context K/V
+built from target features, SwiGLU MLP), a recurrent Markov head that
+corrects the logits, and the target's LM head (shared by load_dspark_model).
+Differences from upstream's ``Inkling2DSparkModel`` (see PROVENANCE.md):
+fp16 weights and GEMMs with an fp32 residual stream (out-of-range weights
+refuse the load); no flashinfer, FlashAttention or MNNVL all-reduce. Each
+layer owns an ``Inkling2AttentionCache``; a local layer's window is
+``sliding_window_size + 1``. The Markov head's rnn_proj runs in fp32; its
+fold into the LM head is fp64, stored in the model dtype. Logits are fp32.
+With a TP-sharded target LM head the ranks all-gather the fold once at load
+and the base logits each draft step. Kernels (ops/dspark.py) run on CUDA
+tensors and in Triton's interpreter unless VLLM_SM70_INKLING_DSPARK_KERNELS=0.
 """
 
 from __future__ import annotations

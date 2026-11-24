@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K08 CPU checks for the FlashQLA GDN ops (no GPU, no built _sm70_C).
+"""CPU checks for the FlashQLA GDN ops (no GPU, no built _sm70_C).
 
 What: the GDN schemas in sm70/csrc/gdn are prefixed `gdn_`, mutate only
   `Tensor(a!)`/`Tensor(b!)` outputs and have CUDA impls; every tensor op has

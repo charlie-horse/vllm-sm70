@@ -1,55 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""``glm47_sm70``: the fork's GLM-4.7 reasoning parser, for Flint on vLLM v0.33.0.
+"""``glm47_sm70``: a GLM-4.7 reasoning parser that works with Flint.
 
-Ported verbatim (logic) from fork cf9492a ``vllm/reasoning/glm47_reasoning_parser.py``
-(``Glm47ReasoningParser``, registered there as "glm47").
+Use: ``--reasoning-parser-plugin vllm_sm70.reasoning --reasoning-parser
+glm47_sm70`` (``vllm_sm70.models.register()`` also imports this module).
+Flint's chat template stops at ``<|assistant|>`` with no thinking switch,
+so the model opens ``<think>`` itself. The parser handles both layouts:
 
-Why: upstream v0.33.0 maps "glm47" to the ParserEngine adapter
-(``vllm/parser/glm47_moe.py``). For a request with
-``chat_template_kwargs.enable_thinking=False`` it turns reasoning extraction
-off (glm47_moe.py:257-261, :284). Flint's chat template stops at
-``<|assistant|>`` and has no thinking switch, so Flint reasons anyway and
-upstream streams ``<think>...</think>`` verbatim as content. The fork's parser
-sees from the template that the model opens ``<think>`` itself and keeps
-extraction on (c4130 Nov 8 logs: same request, fork reasoning vs ours content).
-
-Use (0 upstream lines): ``--reasoning-parser-plugin vllm_sm70.reasoning
---reasoning-parser glm47_sm70``. The plugin also imports this module from
-``vllm_sm70.models.register()``. ``--reasoning-parser glm47`` restores
-upstream behaviour.
-
-Difference from the fork file: ``adjust_request`` sets
-``skip_special_tokens=False``, as upstream's glm47 does, so ``<think>`` and
-``</think>`` reach the parser as text when they are special tokens.
-
-Fork docstring:
-
-Reasoning parser for the GLM-4.7 ``<think>``/``<tool_call>`` output format.
-
-It follows the upstream ``glm47`` parser, and also supports chat templates
-whose generation prompt stops at ``<|assistant|>``:
-
-* If the generation prompt opens ``<think>`` (GLM-4.7), the output starts
-  inside the reasoning block. Text up to ``</think>`` is reasoning.
-  ``enable_thinking=False`` or ``thinking=False`` turns extraction off,
-  because the template then closes the block in the prompt.
-* If the generation prompt stops at ``<|assistant|>``, the model opens
-  ``<think>`` itself when it chooses to reason. Output with no ``<think>``
-  is the answer and is returned as content. The output alone shows whether
-  the model reasoned, so the thinking switches are not needed.
-
-With both layouts:
-
-* ``</think>`` and ``<tool_call>`` end reasoning. ``<tool_call>`` and the
-  rest of the output become content for the tool parser.
-* A stray ``</think>`` is dropped, and trailing whitespace is trimmed from
-  the reasoning.
-* ``is_reasoning_end`` ignores markers from earlier turns of the prompt.
-
-If the tokenizer has no chat template, the parser treats the output as
-starting inside reasoning, like upstream.
-"""
+* Generation prompt opens ``<think>`` (GLM-4.7): output starts inside the
+  reasoning block; ``enable_thinking=False`` / ``thinking=False`` turn
+  extraction off. No chat template: treated the same way.
+* Generation prompt stops at ``<|assistant|>``: output with no ``<think>``
+  is content.
+``</think>`` and ``<tool_call>`` end reasoning; ``<tool_call>`` onward is
+content. A stray ``</think>`` is dropped and trailing whitespace trimmed.
+``adjust_request`` sets ``skip_special_tokens=False`` so markers reach it."""
 
 from collections.abc import Container, Iterable, Sequence
 from typing import TYPE_CHECKING

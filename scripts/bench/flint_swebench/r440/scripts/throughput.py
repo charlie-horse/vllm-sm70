@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """Throughput + paired comparison of a run against a baseline (same ids).
 
-Usage::
+    throughput.py --run runs/slice50_s20 [--baseline runs] [--ids FILE]
+                  [--attempt 1] [--json]
 
-    .venv/bin/python -I scripts/throughput.py --run runs/slice50_s20 \\
-        [--baseline runs] [--ids slice50_ids.txt] [--attempt 1] [--json]
-
-Per run (all done instances of attA in that run dir):
-  wall          first run.log timestamp -> last done_ marker mtime
-  agg tok/s     sum completion tokens / wall
-  stream tok/s  sum completion tokens / sum agent_s (per-sequence speed)
-  median agent_s per task
-Paired (ids in --ids, scored = done and not infra in both runs): pass@1 of
-each run, discordant counts b (baseline only) / c (run only), McNemar exact
-two-sided p = min(1, 2 * P[X <= min(b, c)]), X ~ Binom(b + c, 1/2).
+Per run (done instances of attA): wall (first run.log timestamp -> last
+done_ marker), agg tok/s (completion tokens / wall), stream tok/s
+(completion tokens / sum agent_s), median agent_s.
+Paired (ids scored in both runs): pass@1 of each, discordant counts b / c,
+McNemar exact two-sided p = min(1, 2 * P[X <= min(b, c)]), X ~ Binom(b+c, 1/2).
 Classification comes from analyze.py (same directory or ../../scripts).
 """
 

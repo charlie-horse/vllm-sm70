@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M3 nvfp4-dense-turbomind (vllm_sm70/quant/nvfp4_linear.py).
+"""Tests for the NVFP4 dense TurboMind layer (vllm_sm70/quant/nvfp4_linear.py).
 
-CPU tests mock ``vllm_sm70.ops.tm`` with pure-torch references:
-  prepare packs 8 E2M1 codes per int32 along N and returns meta =
-  (32*K, N), the layout the fork's GEMV admission checks (FORK cf9492a
-  sm70_turbomind.py:621-622). gemm/gemv dequantize (E2M1 x fp16 combined
-  scale) and matmul in fp32.
-What the CPU tests can't show, and the ``gpu`` tests below cover: Kai's
-  real TurboMind tile layout and k_ld/q_ld values, the GEMV's 2^shift
-  prescale numerics, FP16 accumulation error, and CUDA-graph capture.
+CPU tests mock ``vllm_sm70.ops.tm`` with pure-torch references: prepare
+  packs 8 E2M1 codes per int32 along N and returns meta = (32*K, N), the
+  layout the GEMV admission checks. gemm/gemv dequantize (E2M1 x fp16
+  combined scale) and matmul in fp32.
+The ``gpu`` tests cover what the CPU tests can't show: the real TurboMind
+  tile layout and k_ld/q_ld values, the GEMV's 2^shift prescale numerics,
+  FP16 accumulation error, and CUDA-graph capture.
 """
 
 import importlib
@@ -45,7 +44,7 @@ FLINT_QUANT_CFG = {
 
 
 # --------------------------------------------------------------------------
-# Mock of Kai's vllm_sm70.ops.tm
+# Mock of vllm_sm70.ops.tm
 # --------------------------------------------------------------------------
 def _pack_n8(codes: torch.Tensor) -> torch.Tensor:
     k, n = codes.shape
@@ -69,8 +68,7 @@ def make_mock_tm(gemv: bool = True):
     tm = types.ModuleType("vllm_sm70.ops.tm")
     tm.calls = []
 
-    # Exact Kai contract (FORK torch_bindings.cpp:654-660, 948-961;
-    # vllm/_sm70/linear.py:350, 1763, 1805): no global_scale argument anywhere.
+    # The op contract: no global_scale argument anywhere.
     def nvfp4_sm70_prepare(qweight, scales, group_size=16, interleave_gated_silu=False):
         assert qweight.dtype == torch.uint8 and scales.dtype == torch.float16
         tm.calls.append(("prepare", qweight, scales, group_size, interleave_gated_silu))
@@ -87,8 +85,7 @@ def make_mock_tm(gemv: bool = True):
         out, x, w, s, group_size, k_ld, q_ld, scale_shift=14
     ):
         shift = scale_shift
-        # The real op runs its GEMV for M <= 2 and TurboMind above (FORK
-        # sm70_provider.py:42).
+        # The real op runs its GEMV for M <= 2 and TurboMind above.
         tm.calls.append(
             ("gemv" if x.shape[0] <= 2 else "dispatch_gemm", x.shape[0], shift)
         )
@@ -140,8 +137,8 @@ class _FakeCuda(Platform):
 
 @pytest.fixture
 def device(monkeypatch):
-    """device(major, minor, ops=True): fake the current device and K01's
-    readiness inputs (same scheme as test_m2_quant_gates.py)."""
+    """device(major, minor, ops=True): fake the current device and the
+    platform's readiness inputs (same scheme as test_m2_quant_gates.py)."""
 
     def _set(major: int, minor: int, ops: bool = True):
         cls = type("Dev", (_FakeCuda,), {})
@@ -217,7 +214,7 @@ def _reference(x, packed, block, gscale, fp16_scale: bool):
     scale = block.float() * gscale
     if (
         fp16_scale
-    ):  # TurboMind folds block*global into FP16 (FORK sm70_turbomind.py:508-515)
+    ):  # TurboMind folds block*global into FP16
         scale = scale.half().float()
     w = E2M1[codes] * scale.repeat_interleave(16, dim=1)
     return x.float() @ w.t()
@@ -282,9 +279,9 @@ def test_process_weights_calls_prepare(nvl, mock_tm):
 
 
 def test_global_scale_folded_once(nvl, mock_tm):
-    """The fp16 scales handed to prepare already include weight_scale_2
-    (FORK sm70_turbomind.py:506-513), and nothing applies it again: scaling the
-    global scale by 4 scales the scales by exactly 4 and the output by 4."""
+    """The fp16 scales handed to prepare already include weight_scale_2, and
+    nothing applies it again: scaling the global scale by 4 scales the scales
+    by exactly 4 and the output by 4."""
     tm = mock_tm()
     packed, block, g = _random_nvfp4(512, 256, seed=3, global_scale=2.0**-10)
     x = torch.randn(2, 256).half()
@@ -363,12 +360,11 @@ def test_non_flint_shape_uses_gemm(nvl, mock_tm):
 
 @pytest.mark.parametrize("has_gemv", [False, True])
 def test_gemv_decision_with_real_c4130_meta(nvl, monkeypatch, has_gemv):
-    """Reproduces the c4130 f31b6aa decision for the Flint TP2 "o" shape
-    (K=N=2048, in MODELOPT_NVFP4_GEMV_SHAPES, FORK sm70_turbomind.py:569-579)
-    with the meta Kai's real nvfp4_sm70_prepare returned there: k_ld=65536
-    (=32*K) and q_ld=2048 (=N), with fp16 scales and the default config. Every
-    admission check passes except the op probe, so the GEMV is selected only
-    when K11's nvfp4_tm_gemv_dispatch_sm70_out is registered."""
+    """The GEMV decision for the Flint TP2 "o" shape (K=N=2048, in
+    MODELOPT_NVFP4_GEMV_SHAPES) with the meta the real nvfp4_sm70_prepare
+    returns: k_ld=65536 (=32*K) and q_ld=2048 (=N), with fp16 scales and the
+    default config. Every admission check passes except the op probe, so the
+    GEMV is selected only when nvfp4_tm_gemv_dispatch_sm70_out is registered."""
     monkeypatch.delenv("VLLM_SM70_MODELOPT_NVFP4_GEMV", raising=False)
     k = n = 2048
     state = nvl.SM70TurboMindLinearState(
@@ -443,11 +439,11 @@ def test_online_fp8_on_sm70_is_refused_by_upstream(
     device, restore_registries, monkeypatch, tmp_path
 ):
     """Online ``--quantization fp8`` (checkpoint without a quant config) on
-    SM70, with M2 + M3 installed. Upstream rewrites it to
-    OnlineQuantizationConfig (UP 4ba787e weight_utils.py:355-363), whose min
-    capability is 75 (online/base.py:209-212). It therefore never reaches
-    Sm70Fp8Config's gate, and VllmConfig refuses cc 7.0 (config/vllm.py:926-936).
-    Nothing picks a kernel silently."""
+    SM70, with the SM70 quant configs installed. Upstream rewrites it to
+    OnlineQuantizationConfig (weight_utils.py:355-363), whose min capability
+    is 75 (online/base.py:209-212). It therefore never reaches
+    Sm70Fp8Config's gate, and VllmConfig refuses cc 7.0 (config/vllm.py:
+    926-936). Nothing picks a kernel silently."""
     from types import SimpleNamespace
 
     from vllm.config.vllm import VllmConfig
@@ -460,7 +456,7 @@ def test_online_fp8_on_sm70_is_refused_by_upstream(
     device(7, 0)
     configs = _reload_configs(monkeypatch)
     assert configs.REGISTERED and configs.M3_INSTALLED
-    assert configs.Sm70Fp8Config.get_min_capability() == 70  # M2 gate is open
+    assert configs.Sm70Fp8Config.get_min_capability() == 70  # the SM70 gate is open
     model_config = SimpleNamespace(
         quantization="fp8",
         quantization_config=None,
@@ -483,7 +479,7 @@ def test_online_fp8_on_sm70_is_refused_by_upstream(
 
 def test_fp8_config_refuses_online_construction():
     """The other route, an Fp8Config built for a non-fp8 checkpoint, raises
-    in upstream's constructor (UP 4ba787e fp8.py:106-112)."""
+    in upstream's constructor (fp8.py:106-112)."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     with pytest.raises(ValueError, match="no longer supports online"):
@@ -521,7 +517,7 @@ def test_hook_installs_on_sm70(device, restore_registries, monkeypatch, nvl):
     device(7, 0)
     configs = _reload_configs(monkeypatch)
     assert configs.M3_INSTALLED and nvl.builder_installed()
-    configs.register()  # includes the M3 D4 check
+    configs.register()  # includes the NVFP4 linear builder check
     method = up_modelopt.build_linear_method(_quant_config(), "W4A16_NVFP4", "x")
     assert type(method) is nvl.ModelOptNvFp4Sm70LinearMethod
     up_modelopt.LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] = lambda c, p: None
@@ -572,7 +568,7 @@ def test_builder_chains_existing(device, restore_registries, nvl):
 
 
 # --------------------------------------------------------------------------
-# GPU tests (c4130 only): real Kai ops via vllm_sm70.ops.tm
+# GPU tests (SM70): real ops via vllm_sm70.ops.tm
 # --------------------------------------------------------------------------
 def _gpu_ready() -> bool:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -599,11 +595,11 @@ def _has_k11_gemv() -> bool:
     return tm.has_op("nvfp4_tm_gemv_dispatch_sm70_out")
 
 
-# The GEMV op is K11's (sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu,
-# PROVENANCE.md "K11"). These tests also carry @needs_sm70, so they only run
-# on an SM70 GPU with vllm_sm70.ops importable; there, a missing op means the
-# build is wrong (admission would silently fall back to the GEMM), so the
-# test fails instead of skipping.
+# The GEMV op is sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu. These tests
+# also carry @needs_sm70, so they only run on an SM70 GPU with
+# vllm_sm70.ops importable; there, a missing op means the build is wrong
+# (admission would silently fall back to the GEMM), so the test fails
+# instead of skipping.
 @pytest.fixture
 def _k11_gemv_op():
     if not _has_k11_gemv():
@@ -616,7 +612,7 @@ def _k11_gemv_op():
 needs_k11_gemv = pytest.mark.usefixtures("_k11_gemv_op")
 
 
-# Flint TP2 per-rank (K, N), FORK sm70_turbomind.py:567-579
+# Flint TP2 per-rank (K, N)
 FLINT_SHAPES = [
     (2048, 2560),
     (2048, 2048),
@@ -675,11 +671,9 @@ def test_gpu_gemv_equals_gemm(nvl, monkeypatch, k, n, m):
 
 
 def _check_strided_rows(nvl, monkeypatch, gemv: bool) -> None:
-    """Port of FORK cf9492a tests/kernels/quantization/
-    test_sm70_nvfp4_tm_gemv.py:157-165. A row-strided (non-contiguous) M=2
-    activation on the Flint "o" shape (K=N=2048, one of the six admitted
-    shapes, FORK sm70_turbomind.py:569-579) must give exactly the result of
-    its contiguous copy. flatten_linear_input passes 2-D views through
+    """A row-strided (non-contiguous) M=2 activation on the Flint "o" shape
+    (K=N=2048, one of the six admitted shapes) must give exactly the result
+    of its contiguous copy. flatten_linear_input passes 2-D views through
     unchanged, so the op sees the row stride."""
     method, layer, _ = _gpu_prepared(nvl, 2048, 2048, 1, monkeypatch, gemv=gemv)
     assert (2048, 2048) in nvl.MODELOPT_NVFP4_GEMV_SHAPES
@@ -705,8 +699,7 @@ def test_strided_activation_rows_gemm(nvl, monkeypatch):
 @needs_k11_gemv
 @torch.inference_mode()
 def test_strided_activation_rows(nvl, monkeypatch):
-    """Strided rows on the M<=2 GEMV. Skips without K11's op, as the fork's
-    test did (FORK test_sm70_nvfp4_tm_gemv.py:29-37, ``_requires_gemv``)."""
+    """Strided rows on the M<=2 GEMV. Skips without the GEMV op."""
     _check_strided_rows(nvl, monkeypatch, gemv=True)
 
 

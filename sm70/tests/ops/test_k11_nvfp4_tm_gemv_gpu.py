@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K11 GPU: the Flint NVFP4 M<=2 GEMV on the TurboMind operands.
+"""GPU: the Flint NVFP4 M<=2 GEMV on the TurboMind operands.
 
-Ported from fork cf9492a tests/kernels/quantization/test_sm70_nvfp4_tm_gemv.py
-(0c9f3ee73). The fork prepared ModelOpt layers through its sm70_turbomind
-provider. This port calls the ops directly (tm.nvfp4_sm70_prepare +
-tm.nvfp4_tm_gemv_dispatch_sm70_out), with operands built the way M3 builds
-them: global scale folded into the fp16 scales, one e2m1 code per byte.
-The layer-level path is M3's GPU test. The reference dequantizes the codes
-with the effective fp16 scales TurboMind uses: fp16(e4m3 * global).
+Calls the ops directly (tm.nvfp4_sm70_prepare +
+tm.nvfp4_tm_gemv_dispatch_sm70_out), with operands built the way the NVFP4
+linear layer builds them: global scale folded into the fp16 scales, one e2m1
+code per byte. The layer-level path has its own GPU test. The reference
+dequantizes the codes with the effective fp16 scales TurboMind uses:
+fp16(e4m3 * global).
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ _FP16_MAX = 65504.0
 
 
 def _scale_shift(scales):
-    # Same rule as M3's _tm_gemv_scale_shift (fork sm70_turbomind.py:583-594).
+    # Same rule as the NVFP4 linear layer's _tm_gemv_scale_shift.
     peak = float(scales.abs().amax())
     shift = 14
     while shift > 0 and peak * 2.0**shift > _FP16_MAX:

@@ -1,22 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Construct upstream's `Attention` layer with Flash-V100 selected (CPU only).
 
-Regression for the c4130 Flint FV100 serve crash: upstream v0.33.0's
-`Attention.__init__` does `AttentionBackendEnum[attn_backend.get_name()]`
-(UP model_executor/layers/attention/attention.py:433) after building the
-impl, so a backend whose get_name() is not an enum member passes every
-backend-level test and still kills every worker at model init.
-
-This builds real `Attention` layers inside `set_current_vllm_config` with
-`attn_backend=None`, so the backend comes from upstream's real selector
-(`get_attn_backend` -> `current_platform.get_attn_backend_cls`) running
-Sm70CudaPlatform's routing. Mocked, and only these: the platform's device
-queries (capability 7.0, device name; no NVML/CUDA on CPU), and
-`vllm_sm70.attention._ops_available` (no compiled _sm70_C). The enum
-lookup, the impl constructor (FlashAttnV100Impl -> TritonAttentionImpl with
-the SM70 KV-dtype checks) and the static_forward_context registration are
-upstream's and ours, unpatched.
-
+Upstream's `Attention.__init__` does
+`AttentionBackendEnum[attn_backend.get_name()]` (UP attention.py:433) after
+building the impl, so a backend whose get_name() is not an enum member fails
+model init. These tests build real `Attention` layers inside
+`set_current_vllm_config` with `attn_backend=None`, so upstream's selector
+runs Sm70CudaPlatform's routing. Only the platform's device queries
+(capability 7.0, device name) and `vllm_sm70.attention._ops_available` are
+mocked; the enum lookup, the impl constructor and the static_forward_context
+registration run unpatched.
 Shapes: Flint per rank (16 q / 2 kv heads, head 128, fp16, fp32 learned
 sinks, sliding window 513 and full attention) and a Qwen-like layer (head
 256, no sinks).
@@ -103,7 +96,7 @@ def _build_layer(*, num_heads, num_kv_heads, head_size, window, sinks, prefix):
     vllm_config = VllmConfig()
     old_dtype = torch.get_default_dtype()
     # Models are built under the activation dtype (UP attention.py: dtype =
-    # torch.get_default_dtype()); the c4130 stack runs --dtype half.
+    # torch.get_default_dtype()); Volta has no bf16, so that is fp16.
     torch.set_default_dtype(torch.float16)
     try:
         with set_current_vllm_config(vllm_config):
@@ -157,7 +150,7 @@ def test_attention_layer_resolves_to_flash_v100(
 
     # Chosen by the real selector + Sm70CudaPlatform routing, not passed in.
     assert layer.attn_backend is FlashAttnV100Backend
-    # The line that crashed every serve (UP attention.py:433).
+    # The enum lookup of Attention.__init__ (UP attention.py:433).
     assert layer.backend is AttentionBackendEnum.CUSTOM
     assert type(layer.impl) is FlashAttnV100Impl
     assert layer.impl._fv100_reason is None  # FV100 kernels, not Triton fallback

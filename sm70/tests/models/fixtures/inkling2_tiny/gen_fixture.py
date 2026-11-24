@@ -3,9 +3,14 @@
 
 Runs the Hugging Face reference classes (transformers at TRANSFORMERS_COMMIT,
 CPU fp32) on a tiny random checkpoint written in the released checkpoint's
-names and layouts, and saves what the port is compared with. It needs that
+names and layouts, and saves what the plugin is compared with. It needs that
 transformers tree first on PYTHONPATH; the tests that read the fixtures do
-not. Usage and file list: PROVENANCE.md.
+not. Run from the repo root:
+
+    PYTHONPATH=<transformers>/src python \\
+        sm70/tests/models/fixtures/inkling2_tiny/gen_fixture.py [--check]
+
+``--check`` regenerates in a temporary directory and compares (see check()).
 """
 
 from __future__ import annotations

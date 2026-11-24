@@ -1,32 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """TurboMind pre-capture warmup, TP-coordinated (Sm70CudaPlatform.kernel_warmup).
 
-What: before CUDA graph capture, run every TurboMind GEMM shape a decode step
-  can hit (dense NVFP4/FP8 and NVFP4/FP8 MoE, at every capture size, the
-  spec-decode verify M and the eager-only decode sizes) once, so that each is
-  tuned; tune on one TP rank and give every rank that rank's dispatch cache.
-Why: TurboMind picks a launch spec per shape. In eager, a shape's first call
-  is kMeasure, a timed autotune whose pick can change run to run and between
-  TP ranks; under capture an untuned shape gets kDefault
-  (csrc/turbomind/ops/gemm_runtime.cpp:441-475, MoE :537-560). Different
-  split-K or kernel means different bits, so graph replay diverged from
-  eager and rank 0 from rank 1. After this, capture reuses the tuned spec
-  (kReuse) and both ranks hold the same specs.
-How: plan.py (shapes and M values), kinds.py (one call per shape and M),
-  coord.py (source rank tunes, cache broadcast, all ranks import and replay),
-  cache.py (cache bytes; VLLM_SM70_GEMM_LUT_EXPORT_PATH writes a LUT and
-  VLLM_SM70_GEMM_LUT_PATH imports one on every rank, so the calls it covers
-  are not measured and their specs are the same on every start).
-  Called from upstream's kernel_warmup via U1 (patches/0002), after the
-  compile warmup and before capture_model (UP v1/worker/gpu_worker.py:982-994).
-Kill-switch: VLLM_SM70_TM_PRECAPTURE_WARMUP=0 skips all of it (main's
-  behaviour before this). Every TP rank must see the same value: the switch
-  is read before the first collective.
-
-ported from FORK cf9492a vllm/model_executor/warmup/awq_sm70_warmup.py:
-1229-1336 (``sm70_awq_warmup``); provenance in
-sm70/csrc/turbomind/PROVENANCE.md, "Pre-capture warmup".
-"""
+Before CUDA graph capture, run every TurboMind GEMM shape a decode step can
+hit once, so each is tuned; tune on one TP rank and give every rank that
+rank's dispatch cache. TurboMind picks a launch spec per shape: in eager a
+shape's first call is a timed autotune (kMeasure) whose pick can differ per
+run and per rank, and under capture an untuned shape gets kDefault.
+Different specs give different bits. After this, capture reuses the tuned
+spec (kReuse) and all ranks hold the same specs.
+Modules: plan.py (shapes and M values), kinds.py (one call per shape and
+M), coord.py (source rank tunes, cache broadcast, all ranks import and
+replay), cache.py (cache bytes and the optional LUT file).
+Called from the kernel_warmup hook (patches/0002) before capture_model.
+VLLM_SM70_TM_PRECAPTURE_WARMUP=0 skips it; every TP rank must see the same
+value, since it is read before the first collective."""
 
 from __future__ import annotations
 
@@ -43,7 +30,7 @@ KILL_SWITCH = "VLLM_SM70_TM_PRECAPTURE_WARMUP"
 CACHE_PATH = "VLLM_SM70_GEMM_LUT_PATH"
 EXPORT_PATH = "VLLM_SM70_GEMM_LUT_EXPORT_PATH"
 STRICT = "VLLM_SM70_GEMM_LUT_STRICT"
-# Ops whose presence means the build has TurboMind (K03).
+# Ops whose presence means the build has TurboMind.
 REQUIRED_OPS = ("sm70_gemm_import_cache", "sm70_gemm_export_cache")
 
 
@@ -121,8 +108,8 @@ def run(worker: Any, *, group: Any = "tp", executor: Any = None) -> Result | Non
         return None
     if group == "tp":
         par = getattr(vllm_config, "parallel_config", None)
-        # Elastic EP re-warms one process at a time (UP elastic_execute.py:698,
-        # process_local_only): no collectives there. SM70 MoE refuses EP anyway.
+        # Elastic EP re-warms one process at a time (process_local_only): no
+        # collectives there. SM70 MoE refuses EP anyway.
         group = None if getattr(par, "enable_elastic_ep", False) else tp_group()
 
     device = (
@@ -305,7 +292,7 @@ def _export_lut(
     ident: dict[str, Any] | None = None,
 ) -> str:
     """Write the source rank's whole dispatch cache for a later run's
-    VLLM_SM70_GEMM_LUT_PATH (fork _save_lut_cache, atomic here). Returns the
+    VLLM_SM70_GEMM_LUT_PATH (written atomically). Returns the
     summary fragment; failures are a WARNING, never fatal."""
     from vllm_sm70.warmup import cache
 

@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K05 GPU: D256 paged prefill over long prefixes and every kept D256 route.
+"""GPU: D256 paged prefill over long prefixes and every kept D256 route.
 
-Port of fork cf9492a tests/kernels/attention/test_sm70_flash_v100_splitkv_n.py.
-The fork test exercised the external FA2 split-D/split-KV operators
-(torch.ops._vllm_fa2_C.sm70_d256_splitd_*), which K05 does not carry
-(Tier B drops the zhinianqin FA2 stack). Its shapes, a short chunk over a
-very long prefix (Q64 over KV 70016, Q512 over KV 33024) at Hq6/Hkv1/D256,
-now run through the lean Flash-V100 paged prefill, checked against an fp32
-reference instead of against the unsplit dense operator.
+The first test runs a short chunk over a very long prefix (Q64 over KV
+70016, Q512 over KV 33024) at Hq6/Hkv1/D256 through the Flash-V100 paged
+prefill and checks it against an fp32 reference.
 
-The second test pins each D256 route the lean build keeps (launcher in
+The second test pins each D256 route the build keeps (launcher in
 fused_mha_forward_paged.cu): BM32 phase (M >= 32, page % 16 == 0, no
 window), low-SMEM contiguous (page 16), low-SMEM stride-268 with the
 software pipeline (page 784), low-SMEM generic (other pages, or any page

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K16 top-k candidate sampler tests.
+"""Fixtures for the top-k candidate sampler tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C with the K16 ops. Run them from the repo root with the
+vllm_sm70._sm70_C with the sampler ops. Run them from the repo root with the
 built package first on PYTHONPATH:
 
     pytest -m gpu sm70/tests/sampler
@@ -22,8 +22,8 @@ def sampler_gpu():
     counter prepared (as kernel_warmup does before capture), else skip.
 
     Like tm_gpu (tests/ops/conftest.py): with an SM70 GPU present, a missing
-    or K16-less _sm70_C is a broken build or a wrong PYTHONPATH, so the test
-    fails instead of skipping and the nightly run cannot pass on stubs.
+    _sm70_C or one without the sampler ops is a broken build or a wrong
+    PYTHONPATH, so the test fails instead of skipping and cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

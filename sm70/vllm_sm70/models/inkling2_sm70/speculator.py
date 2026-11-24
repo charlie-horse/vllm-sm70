@@ -5,7 +5,7 @@ The port of upstream's ``Inkling2DSparkSpeculator`` (vLLM c32251b
 models/inkling2/speculator.py) onto the v0.33.0 DSpark speculator. It stores
 the raw target features (each draft layer mixes them itself) and runs the
 recurrent Markov head step by step. Draft logits are fp32 for greedy and
-probabilistic drafts alike; Sm70CudaPlatform.get_speculator_cls (U6)
+probabilistic drafts alike; Sm70CudaPlatform.get_speculator_cls
 returns this class (draft.py). A step that verifies no drafts runs the
 inherited propose with num_speculative_tokens 0, which stores the context
 K/V only; f_rnn is recomputed at the next drafting step.

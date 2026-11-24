@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Decode/prefill dispatch onto the K05 Flash-V100 ops (K06).
-
-Takes the place of the fork's decode/prefill executors
-(flash_v100/{decode,prefill,dense_prefill,routing}.py, ~5.9K lines) for the
-lean subset:
+"""Decode/prefill dispatch onto the Flash-V100 ops.
 
   decode   D256, no sinks, no window, GQA 4/6/8 -> tensor-core XQA
            otherwise (Flint D128 GQA8 sinks/window, other GQA) -> paged
@@ -14,33 +10,11 @@ lean subset:
 
 CUDA graphs: a captured decode replays for any sequence length, so under
 capture the launch grid covers max_model_len (the "workspace envelope");
-eager decode launches only what the batch's max_seq_len needs.
-
-B1 (small captured batches): the envelope alone would pick 1024-token
-partitions whenever max_model_len >= 32768 (ops/fv100.py
-_select_default_decode_partition_size), where eager decode at the same
-context uses 256. A captured XQA decode of at most SMALL_BATCH_ROWS rows
-then runs a few long partitions on a mostly idle GPU. Bea's microbench
-(one Qwen3.8 TP2 layer, 2 kv heads, page 832, envelope 32768; us per
-layer-step, partition 1024 -> 256):
-
-  context   1 row          8 verify rows (one DFlash2 request)
-  1K        208 -> 52      211 -> 54
-  4K        261 -> 70      258 -> 239
-  16K       265 -> 151     1005 -> 778
-  32K       280 -> 291     1761 -> 1549
-  64K       555 -> 533     3278 -> 3079     (envelope 150000)
-  128K      1104 -> 1009   6533 -> 6094     (envelope 150000)
-
-At 32K context a single row is 4% slower with 256 (280 vs 291; 280 vs
-292 at envelope 150000); everywhere else 256 is as fast or faster, so
-these captures pass partition 256. Envelope 150000 costs the same as
-32768 (empty partitions exit at once). The 256-partition workspace is its
-own cache entry sized for <= SMALL_BATCH_ROWS rows: 12.5 MB at a 32K
-envelope, 100 MB above 131072 (12 q heads). Kill switch
-VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0
-(read at capture; only "0" acts) keeps the envelope's default.
-"""
+eager decode launches only what the batch's max_seq_len needs. A captured
+XQA decode of at most SMALL_BATCH_ROWS rows uses 256-token partitions
+instead of the envelope's default (1024 when max_model_len >= 32768), so
+small batches use more of the GPU. That workspace is its own cache entry.
+Kill switch: VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION=0 (read at capture)."""
 
 from __future__ import annotations
 
@@ -64,14 +38,14 @@ _verify_logged = False
 
 
 def verify_kernel_enabled() -> bool:
-    """B2 kill switch: only "0" acts (K07's XQA expansion runs instead)."""
+    """Verify-kernel kill switch: only "0" acts (the XQA expansion runs instead)."""
     return os.environ.get(VERIFY_SWITCH) != "0"
 
 
 def use_verify_kernel(
     query: torch.Tensor, key_cache: torch.Tensor, metadata: FlashAttnV100Metadata
 ) -> bool:
-    """B2 takes a K07 verify batch whose requests all have 8 tokens, up to
+    """The verify kernel takes a verify batch whose requests all have 8 tokens, up to
     the rows whose workspace fits fv100.VERIFY_WORKSPACE_BUDGET at this
     max_model_len. The switch is read here on every call, so a CUDA graph
     keeps the route it was captured with."""
@@ -140,7 +114,7 @@ def use_xqa(
     window: tuple[int, int],
     sinks: torch.Tensor | None,
 ) -> bool:
-    """fork routing.py:133-135 plus decode.py:776-790 (XQA has no sink term)."""
+    """Whether the layer can take the XQA decode (XQA has no sink term)."""
     return (
         sinks is None
         and window == FULL_WINDOW
@@ -169,7 +143,7 @@ def run_decode(
     """Decode rows [0, decode_rows), one query token each (row i <-> token i).
 
     Without spec decode a row is a request (padding rows of a captured batch
-    have zero tokens and sit at the end). With the K07 verify expansion a
+    have zero tokens and sit at the end). With the verify expansion a
     row is a verify token, with its own visible length and block-table row
     (metadata.decode_seq_lens / decode_block_table, persistent buffers).
     """
@@ -269,9 +243,7 @@ def run_prefill(
 
 
 # ---------------------------------------------------------------------------
-# K14 (C4): one-launch sink decode. Ported from fork cf9492a
-# vllm/v1/attention/backends/flash_v100/impl.py:49-70 (capture summary) and
-# :894-920, :942-948 (_prepare_fused_sink_decode and its call in forward).
+# One-launch sink decode.
 # ---------------------------------------------------------------------------
 
 # A sink-layer forward ran under capture since the last eager one.
@@ -298,7 +270,7 @@ def _log_sink_capture_summary() -> None:
 
 def init_fused_decode(impl) -> None:
     """At layer construction: mark sink layers the one-launch kernel takes and
-    allocate the device's counters right away (R4: eager, before any capture).
+    allocate the device's counters right away (eager, before any capture).
 
     vLLM v0.33.0's profile run has no attention metadata and the decode
     graphs are captured largest batch first, so the layer's first eager

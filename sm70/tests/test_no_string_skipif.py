@@ -3,7 +3,7 @@
 
 A string condition is evaluated in the decorated function's globals. Under
 @torch.inference_mode() those are torch's, so a helper defined in the test
-module raises NameError at setup (#34, and again in the M3 K11 gate).
+module raises NameError at setup.
 """
 
 import ast

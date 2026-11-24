@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M1 sm70-config: Sm70Config defaults, parsing, kill switches, hash.
+"""Sm70Config defaults, parsing, kill switches, hash.
 
 CPU only. Pure pydantic: vllm is never imported, except by the VLLM_SM70_QUANT
-path check (M2 registration is skipped), which is skipped when vLLM's Python
+path check (quant registration is skipped), which is skipped when vLLM's Python
 source is not importable.
 
-The kill switches use K01's ``vllm_sm70.envs.kill_switch``: only "0" acts,
+The kill switches use ``vllm_sm70.envs.kill_switch``: only "0" acts,
 and the environment can never turn a feature on.
 """
 
@@ -56,7 +56,7 @@ EFFECTIVE_DEFAULTS = {
     },
 }
 
-# Our sections of K01's registry.
+# Our sections of the envs registry.
 REGISTERED = {**envs._SECTIONS["quant"], **envs._SECTIONS["models"]}
 # Route switches (envs.route_switch): "0" and "1" force a route, any other
 # value keeps the default one.
@@ -68,17 +68,16 @@ OURS = {
     name: get for name, get in REGISTERED.items() if name not in ROUTE | OPT_IN
 }
 
-# Sm70Config fields whose kill switch is registered in Kai's "sampler"
-# section (F12 greedy top-1 on the U4 hook). Not graph fields: sampling runs
+# Sm70Config fields whose kill switch is registered in the "sampler"
+# section (greedy top-1 on the V1 sampler hook). Not graph fields: sampling runs
 # eagerly, outside the compiled graph. The path check is
 # tests/sampler/test_f12_greedy_fastpath_cpu.py.
 SAMPLER_FIELD_SWITCHES = {"VLLM_SM70_GREEDY_TOKEN_FASTPATH": "greedy_token_fastpath"}
-# "inkling2" is the M12 debug section: no kill switch, read eagerly.
+# "inkling2" is the Inkling 2 debug section: no kill switch, read eagerly.
 NON_GRAPH_FIELDS = set(SAMPLER_FIELD_SWITCHES.values()) | {"inkling2"}
 
-# Switches that are registered but whose path has not landed yet. Each must
-# name the patch that wires it, and the no-dead-switch test fails as soon
-# as the name is consumed, so that this entry gets removed.
+# Registered switches that no plugin code reads. Each must name the patch
+# that wires it; the no-dead-switch test fails once the name is read.
 PENDING: dict[str, str] = {}
 
 
@@ -132,11 +131,11 @@ def test_kernel_config_fallback():
 def test_unknown_key_rejected():
     with pytest.raises(Exception, match="extra|Extra"):
         sm70_config(_vc({"skinny_moe": False}))
-    for bad in ("cutlass", "marlin"):  # Route-M dropped for v1
+    for bad in ("cutlass", "marlin"):  # not accepted backends
         with pytest.raises(Exception):
             sm70_config(_vc({"quant_backend": bad}))
     with pytest.raises(Exception, match="extra|Extra"):
-        sm70_config(_vc({"flint_fusions": False}))  # old name
+        sm70_config(_vc({"flint_fusions": False}))  # not a field
 
 
 def test_frozen():
@@ -207,7 +206,7 @@ def test_registered_names_are_exactly_ours():
     assert set(SAMPLER_FIELD_SWITCHES) <= set(envs._SECTIONS["sampler"])
     for name, field in SAMPLER_FIELD_SWITCHES.items():
         assert KILL_SWITCHES[name] == (field, False)
-    for name in (  # M10 and Kai own these; they must not be ours
+    for name in (  # other sections own these; they must not be ours
         "VLLM_SM70_FLINT_FUSED_ROUTER",
         "VLLM_SM70_FLINT_SAMPLER",
         "VLLM_SM70_FLINT_ATTN_FUSED_DECODE",
@@ -226,7 +225,7 @@ def _field_off(name):
 
 
 def _nvfp4_gemv_not_selected():
-    """M3 path: with the switch at "0", the SM70 W4A16 linear method reads
+    """With the switch at "0", the SM70 W4A16 linear method reads
     nvfp4_gemv=False and does not admit a Flint-shape layer to the GEMV, even
     though the shape, layout and op all qualify (vllm_sm70/quant/nvfp4_linear.py)."""
     pytest.importorskip("vllm")  # the GEMV path check builds a real vllm layer
@@ -268,7 +267,7 @@ def _fp8_refuses(name):
 
 
 def _fp8_not_routed():
-    """M6 path: even on a ready SM70 host, no SM70 FP8 method is routed."""
+    """Even on a ready SM70 host, no SM70 FP8 method is routed."""
     pytest.importorskip("vllm")
     from unittest import mock
 
@@ -329,7 +328,7 @@ def _dflash2_emulation_off(name):
 
 
 def _fp8_moe_compact_off():
-    """M6: M==1 takes the decomposed single-token plan, not the compact op."""
+    """FP8 MoE: M==1 takes the decomposed single-token plan, not the compact op."""
     pytest.importorskip("vllm.envs")
     from vllm_sm70.quant import fp8_moe
 
@@ -339,7 +338,7 @@ def _fp8_moe_compact_off():
 
 
 def _fp8_moe_decode_off():
-    """M6: the Qwen FP8 single-token MoE route is off (batched only)."""
+    """The Qwen FP8 single-token MoE route is off (batched only)."""
     pytest.importorskip("vllm.envs")
     from vllm_sm70.quant import fp8_moe
 
@@ -348,7 +347,7 @@ def _fp8_moe_decode_off():
 
 
 def _flint_moe_decode_off():
-    """M4: the M<=2 decode fast path is not admitted (dense stage only)."""
+    """NVFP4 MoE: the M<=2 decode fast path is not admitted (dense stage only)."""
     pytest.importorskip("vllm.envs")
     from vllm_sm70.quant import nvfp4_moe
 
@@ -357,24 +356,24 @@ def _flint_moe_decode_off():
 
 
 def _flint_moe_compact_off():
-    """M4: compact slot groups are off (per-expert offsets for every M); the
+    """NVFP4 MoE: compact slot groups are off (per-expert offsets for every M); the
     route-level check is in sm70/tests/quant/test_m4_nvfp4_moe.py."""
     pytest.importorskip("vllm.envs")
     from vllm_sm70.quant import nvfp4_moe
 
     assert not nvfp4_moe.compact_policy_enabled(_vc({}))
     assert not nvfp4_moe.compact_policy_enabled(_vc({"flint_moe_compact": True}))
-    assert nvfp4_moe.decode_policy_enabled(_vc({}))  # K12 is untouched
+    assert nvfp4_moe.decode_policy_enabled(_vc({}))  # the decode kernel is untouched
 
 
 def _getter_only(name):
-    # TODO: replace with a path test in the patch named in PENDING.
+    # For PENDING switches: checks the getter only.
     assert getattr(envs, name) is False
 
 
 def _flint_qk_rope_kv_off():
-    """M5 path: with the switch at "0", FlintSm70Attention's fused-route
-    admission (K15, vllm_sm70/flint/qk_norm_rope_kv.py) refuses an
+    """With the switch at "0", FlintSm70Attention's fused-route
+    admission (vllm_sm70/flint/qk_norm_rope_kv.py) refuses an
     otherwise eligible layer, so the layer runs the unfused q/k norm + RoPE
     and upstream's Attention.forward."""
     import torch
@@ -404,7 +403,7 @@ def _flint_qk_rope_kv_off():
 
 
 def _inkling_nvfp4_tm_off(name):
-    """M12 "0": no Inkling 2 shape is admitted to the TurboMind dense stage;
+    """With "0", no Inkling 2 shape is admitted to the TurboMind dense stage;
     the route-level check is in sm70/tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
     pytest.importorskip("vllm.envs")
     import torch
@@ -580,8 +579,8 @@ def _inkling_tm_tune_off(name):
 
 
 def _inkling_dspark_off(name):
-    """The Inkling 2 hook refuses a staged DSpark draft and the U6 hook has
-    no speculator; the accepted case is in
+    """The Inkling 2 hook refuses a staged DSpark draft and the speculator
+    hook has none; the accepted case is in
     tests/models/test_m12_inkling2_draft_cpu.py."""
     pytest.importorskip("vllm")
     from vllm_sm70.models.inkling2_sm70 import draft
@@ -718,7 +717,7 @@ def _inkling_decode_graph_off(name):
 
 
 def _inkling_merged_proj(name, on):
-    """Models built now pack their projections only when on; the packed and
+    """Models pack their projections only when on; the packed and
     unpacked models are compared in test_m12_inkling2_merged_proj_cpu.py."""
     pytest.importorskip("vllm")
     from vllm_sm70.models.inkling2_sm70 import weights
@@ -942,7 +941,7 @@ def test_hash_changes_for_every_graph_field():
         "fp8_moe_decode": False,
         "fp8_moe_compact_decode": False,
         "nvfp4_gemv": False,
-        "shared_moe_overlap": True,  # the fork hashes it too
+        "shared_moe_overlap": True,  # part of the hash
     }
     assert set(flips) == set(GRAPH_FIELDS)
     assert set(GRAPH_FIELDS) == set(Sm70Config.model_fields) - NON_GRAPH_FIELDS
@@ -1016,7 +1015,7 @@ def test_auto_resolution_rules():
 
 
 def test_fp8_moe_stage_constants_match_fork_resolution():
-    """FORK cf9492a Sm70MoEFormatConfig.resolve (vllm/config/sm70_moe.py
+    """Fork cf9492a Sm70MoEFormatConfig.resolve (vllm/config/sm70_moe.py
     :319-452) with the unit's env (nothing set)."""
     from vllm_sm70.config import CONSTANTS
 

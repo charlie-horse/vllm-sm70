@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: the Inkling 2 cache backends and their metadata builders
+"""CPU checks: the Inkling 2 cache backends and their metadata builders
 (models/inkling2_sm70/backend.py).
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). The batch is
+Needs upstream vLLM's Python importable (skipped otherwise). The batch is
 two decode requests and one chunked-prefill request; every expected value is
 written out by hand. Owners are built for the vendored Inkling 2 Mini
 config.json at TP2 in fp16, block size 32 (conv blocks hold 4 tokens).

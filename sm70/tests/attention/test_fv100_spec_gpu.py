@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K07 GPU: Flash-V100 spec-decode verify (smallq -> XQA) and DFlash drafts.
+"""GPU: Flash-V100 spec-decode verify (smallq -> XQA) and DFlash drafts.
 
-Ports (fork cf9492a):
-* tests/kernels/attention/test_sm70_flash_v100_mtp_smallq_exactness.py:
-  the token-wise decode expansion equals the causal paged prefill (now for
-  both the scalar and the XQA decode).
-* tests/kernels/attention/test_sm70_dflash_batched_prefill.py: a batched
-  non-causal draft step through the backend matches serial per-request
-  prefill, and a CUDA graph replays it after each step's metadata rebuild
-  (v0.33 rebuilds metadata eagerly every step; fp16 only, pages 16/832/1648).
-* tests/kernels/attention/test_sm70_flash_v100_prefix_decode_rows.py: in a
-  mixed batch the verify rows taken by the decode route match the prefill
-  route (kill switch off), and the chunk row is bit-identical either way.
-* tests/v1/spec_decode/test_dflash2.py (attention parts): causal verify and
-  non-causal draft attention against upstream TRITON_ATTN.
-Plus: verify output vs TRITON_ATTN on the same inputs (max |diff| < 2e-2,
-D256, GQA 6/8, 8 query rows, fp16 KV), eager and graph-replayed.
+* The token-wise decode expansion equals the causal paged prefill, for both
+  the scalar and the XQA decode.
+* A batched non-causal draft step through the backend matches serial
+  per-request prefill, and a CUDA graph replays it after each step's
+  metadata rebuild (fp16, pages 16/832/1648).
+* In a mixed batch the verify rows taken by the decode route match the
+  prefill route (kill switch off), and the chunk row is bit-identical.
+* Causal verify and non-causal draft attention against upstream TRITON_ATTN.
+* Verify output vs TRITON_ATTN on the same inputs (max |diff| < 2e-2,
+  D256, GQA 6/8, 8 query rows, fp16 KV), eager and graph-replayed.
 """
 
 from __future__ import annotations
@@ -139,7 +134,7 @@ def _q(n, heads, d, device, seed):
     return torch.randn(n, heads[0], d, generator=gen).to(device, torch.float16)
 
 
-# ----------------------------------------------- smallq exactness (port)
+# ---------------------------------------------------------- smallq exactness
 
 
 @pytest.mark.parametrize("query_len", [5, L, 16])
@@ -181,7 +176,7 @@ def test_smallq_decode_matches_causal_prefill(fv100_gpu, query_len, heads, decod
     torch.testing.assert_close(smallq, prefill, atol=1.5e-2, rtol=1e-2)
 
 
-# ------------------------------- A1: one-launch expansion == torch expansion
+# ------------------------------------ one-launch expansion == torch expansion
 
 
 @pytest.mark.parametrize("width", [3, 129, 300])
@@ -270,8 +265,9 @@ def test_smallq_kernel_rewrites_the_same_buffers(fv100_gpu, monkeypatch):
 
 # ----------------------------------------- verify vs TRITON_ATTN (+ graph)
 
-# B2's switch. B2 takes 8-token verify by default; the two K07 tests below
-# set it to "0" (K07 stays the fallback), B1's test runs both.
+# The verify kernel's switch. The verify kernel takes 8-token verify by
+# default; the two XQA-expansion tests below set it to "0", the small-batch
+# test runs both.
 VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
 
 
@@ -342,8 +338,8 @@ def test_verify_graph_replays_after_rebuild(fv100_gpu, monkeypatch, heads):
         assert diff < MAX_ABS, (step, diff)
 
 
-# B1 envelopes: (max_model_len, capture lengths, replay steps). The 150000
-# envelope replays contexts above 32K (40000, 100000).
+# Small-batch envelopes: (max_model_len, capture lengths, replay steps). The
+# 150000 envelope replays contexts above 32K (40000, 100000).
 B1_CASES = {
     "env32k": (32768, 4096, ([1000, 4096], [5000, 300])),
     "env150k": (150000, 40000, ([40000, 100000], [100000, 2000])),
@@ -362,12 +358,12 @@ B1_CASES = {
 def test_small_batch_graph_at_long_envelopes(
     fv100_gpu, monkeypatch, case, query_len, b2, batch, small
 ):
-    """B1: a captured XQA decode of <= 16 rows (verify rows of one or two
+    """A captured XQA decode of <= 16 rows (verify rows of one or two
     requests, or single-token rows) at a 32K or 150K envelope (256-token
-    partitions; 1024 with the switch off) replays to TRITON_ATTN's output,
-    including contexts above 32K. Verify rows take the B2 kernel by default
-    (128-token partitions, whatever B1's switch says) and K07's XQA
-    expansion with VERIFY=0."""
+    partitions; 1024 with the small-batch switch off) replays to
+    TRITON_ATTN's output, including contexts above 32K. Verify rows take the
+    verify kernel by default (128-token partitions, whatever the small-batch
+    switch says) and the XQA expansion with VERIFY=0."""
     device, fv100 = fv100_gpu
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_SMALL_BATCH_PARTITION", small)
     monkeypatch.setenv(VERIFY, b2)
@@ -414,7 +410,7 @@ def test_small_batch_graph_at_long_envelopes(
         assert diff < MAX_ABS, (step, lens[:batch], diff)
 
 
-# ------------------------- B2: verify kernel (KV read once per request)
+# ----------------------------- verify kernel (KV read once per request)
 
 # Lengths around the 128-key partition and 32-key tile edges, and long ones.
 B2_LENS = [8, 31, 127, 128, 129, 161, 300, 4096, 4097, 40000]
@@ -433,7 +429,7 @@ def _verify_forward(ours_b, ours, layer, q, kv, cm, out):
 def test_verify_kernel_matches_triton_and_k07(
     fv100_gpu, monkeypatch, heads, block_size, batch
 ):
-    """Eager: the verify kernel against TRITON_ATTN and against K07's XQA
+    """Eager: the verify kernel against TRITON_ATTN and against the XQA
     expansion (switch off), over lengths at partition and tile edges."""
     device, fv100 = fv100_gpu
     d, capacity = 256, 65536
@@ -633,7 +629,7 @@ def test_prefix_decode_rows_match_prefill_route(fv100_gpu, monkeypatch, block_si
     assert diff < 1.5e-2, diff
 
 
-# ------------------------------------------ DFlash non-causal draft (port)
+# ------------------------------------------------- DFlash non-causal draft
 
 
 @pytest.mark.parametrize("block", [16, 832, 1648])

@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// B2: Flash-V100 DFlash2 verify attention, KV read once per verify step.
+// Flash-V100 DFlash2 verify attention, KV read once per verify step.
 //
-// No fork counterpart (new for vllm-sm70). K07 verifies a DFlash2 step by
-// expanding its 8 query tokens into 8 decode rows that the XQA kernel runs
-// one by one, so every token streams the request's whole KV. Bea's
-// microbench (one Qwen3.8 TP2 layer, 2 kv heads, D256) measured the 8 rows of
-// one request at 4K context at 239-258 us, against 70 us for a single row.
-//
-// This kernel takes the same expanded rows (K07's decode_seq_lens and
-// decode_block_table, query rows token-major: row = request * 8 + token) and
-// runs one CTA per (request, kv head, 128-key partition). The CTA holds all
-// 8 tokens x G query heads of that kv head (R = 8 * G = 48 or 64 rows) and
-// reads each K and V tile once:
-//
+// A DFlash2 verify step is 8 query tokens expanded into 8 decode rows
+// (decode_seq_lens and decode_block_table, query rows token-major:
+// row = request * 8 + token). This kernel runs one CTA per (request, kv head,
+// 128-key partition). The CTA holds all 8 tokens x G query heads of that kv
+// head (R = 8 * G = 48 or 64 rows) and reads each K and V tile once.
+
 //   1. Q rows -> shared memory (R x 256 fp16).
 //   2. For each 32-key tile: gather K through the block table, then
 //      S[R, 32] = Q K^T with WMMA m16n16k16 (fp32 accumulate).
@@ -24,7 +18,7 @@
 //      (tmp_out [rows, Hq, partitions, 256], max_logits / exp_sums
 //      [rows, Hq, partitions]); a row with no visible key in the partition
 //      writes nothing (the reducer never reads that partition).
-//
+
 // A second kernel reduces the partitions of each (row, head) exactly like
 // the XQA reducer (flash_decode_paged.cu flash_attention_decode_reduce_kernel
 // with a fixed partition size and no sinks).
@@ -176,7 +170,7 @@ __global__ void __launch_bounds__(kThreads, 1) verify_partition_kernel(
   float* sSum = sMax + kRows;
   int* sLimit = reinterpret_cast<int*>(sSum + kRows);
 
-  // All 8 rows of a request share one block-table row (K07 copies it).
+  // All 8 rows of a request share one block-table row.
   const int* bt = block_table + static_cast<int64_t>(row0) * bt_stride;
 
   // 1. Q: row r = token * G + g <- q[row0 + token, kv_head * G + g, :].

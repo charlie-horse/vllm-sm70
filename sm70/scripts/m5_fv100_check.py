@@ -1,27 +1,18 @@
 #!/usr/bin/env python3
 """Flint attention check: Flash-V100 (sinks) against TRITON_ATTN, batched.
 
-Kai's GPU check 3 for the M5 Flash-V100 default (Nov 6): greedy outputs on
-the M5 prompts at batch sizes 2/3/4/8/20, every batch run twice, on the
-default backend (Flash-V100) and with VLLM_SM70_FLASH_V100=0 (TRITON_ATTN).
-
+Greedy outputs on the Flint gate prompts at batch sizes 2/3/4/8/20, each
+batch run twice, on Flash-V100 and with VLLM_SM70_FLASH_V100=0 (TRITON_ATTN).
   gen      --model M [--hf-overrides J] --backend fv100|triton --out F.json
-           one engine (graphs mode, TP2, max_num_seqs 20); per batch size N,
-           N requests cycling through the prompts, run twice.
+           one engine (graphs mode, TP2, max_num_seqs 20)
   compare  FV100.json TRITON.json
-
-What counts. Flint's greedy tokens flip on last-bit differences (MoE top-6
-of 256 routing), so two valid backends may diverge after a shared prefix.
-compare prints each request's common prefix for eyeballing and FAILs only on:
-  * a run-to-run difference inside one engine (same batch, same backend;
-    with tuning off this must be zero, and on Flash-V100 it points at the
-    K14 fused decode's counters);
-  * a degenerate Flash-V100 output (empty, or the last 32 tokens use fewer
-    than 4 distinct ids) where Triton's output for that request is not;
-  * a Flash-V100 output that diverges from Triton at token 0.
-Read the printed texts as well: gibberish that is not repetitive is a FAIL.
-
-Tuning is off (as in every M5 tool) unless M5_ALLOW_TUNING=1.
+Greedy tokens flip on last-bit differences (MoE top-6 of 256 routing), so
+backends may diverge after a shared prefix. compare prints each common
+prefix and FAILs only on: a run-to-run difference inside one engine; a
+degenerate Flash-V100 output (empty, or < 4 distinct ids in the last 32)
+where Triton's is not; a Flash-V100 output that diverges at token 0.
+Gibberish that is not repetitive is also a FAIL: read the printed texts.
+Tuning is off unless M5_ALLOW_TUNING=1.
 """
 import argparse
 import json
@@ -100,9 +91,9 @@ def cmd_compare(a) -> int:
             r0, r1 = data["batches"][n][0], data["batches"][n][1]
             for i, (x, y) in enumerate(zip(r0, r1)):
                 if x["token_ids"] != y["token_ids"]:
-                    # Tuning off (#77 default) makes one engine deterministic;
-                    # a Flash-V100-only diff points at the K14 fused decode's
-                    # counters, not the MoE (Kai).
+                    # Tuning off makes one engine deterministic; a
+                    # Flash-V100-only diff points at the fused decode's
+                    # counters, not the MoE.
                     hint = " (K14 fused decode counters?)" if name == "fv100" else ""
                     fails.append(f"{name} batch {n} req {i}: run 1 != run 2 "
                                  f"at token {_common(x['token_ids'], y['token_ids'])}"

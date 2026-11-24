@@ -2,20 +2,16 @@
 """Inkling 2 decode kernels for the small torch chains of a layer visit
 (sm_70: no tl.dot, libdevice exp and log, no tanh.approx).
 
-    query_rel      the q and r clips of the attention prologue, tau of a
-                   global layer, r @ rel_proj and the zeroing of padding
-                   rows, in one launch           prologue.query_states and
-                                                 attention_prologue
-    gate           attn_output * sigmoid(gate) with padding rows zeroed, in
-                   one launch                    attention_torch.
-                                                 gate_and_project
+    query_rel   the q and r clips of the attention prologue, tau of a global
+                layer, r @ rel_proj and zeroed padding rows, in one launch
+                (prologue.query_states and attention_prologue)
+    gate        attn_output * sigmoid(gate) with padding rows zeroed, in one
+                launch (attention_torch.gate_and_project)
 
-Math and rounding as the torch ops, which stay the reference: products,
-norms and sums in fp32; a clip rounds to the dtype of its input before tau
-multiplies it, and the clipped r is rounded before the projection, whose
-sums run in fp32 and round once to the output dtype. A row is padding when
-it is at or after `num_tokens` or its slot is negative; its outputs are
-zero. Metadata is read on the device only.
+Math and rounding as the torch ops, the reference: products, norms and sums
+in fp32; a clip rounds to its input dtype before tau multiplies it, and the
+clipped r rounds before the projection. A row is padding when it is at or
+after `num_tokens` or its slot is negative; its outputs are zero.
 """
 
 from __future__ import annotations

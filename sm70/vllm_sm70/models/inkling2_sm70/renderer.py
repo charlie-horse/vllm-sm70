@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""M12 inkling2-sm70-renderer: native Inkling 2 chat rendering to token ids.
+"""Native Inkling 2 chat rendering to token ids.
 
 What: renderer mode ``inkling2_sm70`` (``--tokenizer-mode inkling2_sm70``).
   Chat messages render straight to token ids through inkling2_encoding.py;

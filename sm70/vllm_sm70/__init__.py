@@ -5,8 +5,8 @@ Entry points (see nix-entry_points.txt):
   vllm.general_plugins  sm70 = vllm_sm70:register
   vllm.platform_plugins sm70 = vllm_sm70.platform:activate
 
-No heavy imports at module level: vLLM swallows plugin import errors
-(UP plugins/__init__.py:66-71), and the platform plugin is imported while
+No heavy imports at module level: vLLM swallows plugin import errors,
+and the platform plugin is imported while
 `vllm.platforms.current_platform` is still being resolved.
 """
 
@@ -56,8 +56,7 @@ def retry_failed_areas() -> None:
 def register() -> None:
     """vllm.general_plugins entry point. Idempotent, safe without _sm70_C.
 
-    vLLM calls this in every process (UP plugins/__init__.py:77-90), possibly
-    more than once.
+    vLLM calls this in every process, possibly more than once.
     """
     global _registered
     if _registered:

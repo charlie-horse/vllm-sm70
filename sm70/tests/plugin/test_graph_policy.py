@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""T8/T9: SM70 CUDA graph capture sizes and graph-memory policy (CPU).
-
-The size tables are the fork's (FORK vllm/platforms/runtime_defaults.py:
-22-33, 200-251); the expected lists below were computed from those
-functions at cf9492a.
-"""
+"""SM70 CUDA graph capture sizes and graph-memory policy (CPU)."""
 
 import os
 from types import SimpleNamespace
@@ -45,7 +40,7 @@ def _clean_env(monkeypatch):
         (3, [1, 2, 3]),
         (4, [1, 2, 4]),
         (8, [1, 2, 4, 8]),
-        (20, [1, 2, 4, 8, 16, 20]),  # Flint prod (host max-num-seqs 20)
+        (20, [1, 2, 4, 8, 16, 20]),  # Flint (max-num-seqs 20)
         (32, [1, 2, 4, 8, 16, 32]),
         (64, [1, 2, 4, 8, 16, 32]),  # capped at B32
         (256, [1, 2, 4, 8, 16, 32]),
@@ -208,7 +203,7 @@ def test_dynamic_speculative_decoding_kept():
     assert gp.sizes_rejection(cfg) == "dynamic speculative decoding"
 
 
-# ---- T9 memory policy -------------------------------------------------------
+# ---- memory policy -----------------------------------------------------------
 
 
 def test_memory_estimate_off_on_v1():
@@ -304,7 +299,7 @@ def _upstream_sizes(cfg):
 
 @requires_vllm
 def test_upstream_default_differs_for_flint_prod(stub_stable_libtorch):
-    # What vllm-sm70 ran before T8: up to 2 x max_num_seqs, step 8, plus 20.
+    # Upstream's default: up to 2 x max_num_seqs, step 8, plus 20.
     assert _upstream_sizes(_cfg(max_num_seqs=20)) == (
         [1, 2, 4, 8, 16, 20, 24, 32, 40],
         40,

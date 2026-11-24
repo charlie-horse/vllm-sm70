@@ -1,4 +1,4 @@
-# vllm-sm70: upstream vLLM for V100 (sm_70)
+# vllm-sm70: upstream vLLM for Volta (sm_70)
 
 A Nix flake that builds a pinned upstream vLLM release for Volta, with an
 out-of-tree plugin (`sm70/`) and a series of upstream-file patches
@@ -7,12 +7,12 @@ this file. How everything works: [docs/README.md](docs/README.md).
 
 ## Access
 
-- Host access (Tailscale in a cloud session, SSH, sudo) follows the flake
+- Host access (SSH, sudo) follows the flake
   repo's [CLAUDE.md](https://github.com/charlie-horse/flake/blob/main/CLAUDE.md#access).
-- SSH to the hosts and GPU runs on c4130 only when the user has allowed it
-  for the task.
+- SSH to the hosts and GPU runs only when the user has allowed it for the
+  task.
 - Never put IPs, tailnet names, passwords or tokens in code, logs, docs or a
-  PR. Host names (c4130, r440) are fine.
+  PR.
 
 ## Changes
 
@@ -29,10 +29,13 @@ this file. How everything works: [docs/README.md](docs/README.md).
    what the code declares (pins, hashes, options, defaults, kill switches,
    model entries, versions): read it from the source. Docs hold only what the
    code can't say: procedures, and rules whose breach the code can't prevent.
+   Docs cover only the code in this repository, plus the minimum hardware
+   detail needed to understand or use it. Name hosts or environments only
+   where a procedure strictly needs it.
 2. **Docs say how things work now.** No history, dates of past events,
    rationale ("why"), measurements of past runs, plans, decisions, open
-   questions, owners or status notes. Present tense, terse. A constraint you
-   must follow is written as a rule.
+   questions, owners or status notes. Present tense. A constraint you must
+   follow is written as a rule.
 3. **Tasks live in the project, not in git.** No TODO/FIXME/XXX, follow-ups
    or "later" notes in code or docs.
 4. **Where docs live.** Prose goes in `docs/`; [docs/README.md](docs/README.md)
@@ -42,7 +45,12 @@ this file. How everything works: [docs/README.md](docs/README.md).
    license and changes from that source.
 5. **One home per topic.** Edit a topic in its doc and link to it elsewhere.
    A new topic gets a row in docs/README.md.
-6. **Code comments stay short and local.** At most 15 contiguous comment
-   lines; longer prose goes to the doc, with a one-line pointer in the code.
+6. **Text in code follows these rules too.** Comments, docstrings, patch
+   headers and `PROVENANCE.md` files obey rules 1-3 and 8. A comment block
+   or docstring is at most 15 lines; longer prose goes to a doc, with a
+   one-line pointer in the code. No docs embedded in code or patches.
 7. **Docs change in the same PR as the code.** Moving or renaming a doc or
    heading fixes every link to it.
+8. **Plain language, low complexity.** Write so a layperson new to GPUs and
+   vLLM can follow: short sentences, plain words, each term of art defined
+   on first use. Keep each doc as short as it can be while still usable.

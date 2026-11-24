@@ -1,24 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M1 sm70-config: the typed SM70 policy for the plugin.
+"""The typed SM70 kernel policy for the plugin.
 
-What: ``Sm70Config``, a frozen pydantic model with 13 kernel-policy fields
-  and the ``inkling2`` section (extra keys are rejected), and
-  ``sm70_config(vllm_config)``. The helper reads
-  ``additional_config["sm70"]`` (or ``kernel_config.sm70``), applies the
-  kill-only env switches from ``vllm_sm70.envs``, and caches the result per
-  vllm_config. ``compute_hash()`` covers only the graph-affecting fields.
-  ``CONSTANTS`` holds the tuned values that were env knobs in the fork.
-Why: the 1Cat fork (charlie-horse/vLLM cf9492a) resolved about 300 env knobs
-  on the Flint / Qwen FP8 / DFlash2 paths through LegacyInputs, PolicyDefaults
-  and native ABI tuples. Defaults here are the *effective* values the c4130
-  service ran with: fork defaults, plus the cc=7.0 platform overrides in
-  vllm/platforms/runtime_defaults.py, with no VLLM_SM70_* env on the unit
-  (FORK nix/module.nix:198-207, :329; HOST hosts/c4130/vllm/default.nix).
-Kill-switch: VLLM_SM70_<THING>=0, registered in the "quant" and "models"
-  sections of vllm_sm70/envs.py (VLLM_SM70_GREEDY_TOKEN_FASTPATH: in
-  "sampler") (K01 ``kill_switch``; only "0" acts) and read
-  here only as ``vllm_sm70.envs.<NAME>``. It can only turn a field off.
-  Configuration is the only way to turn something on.
+``Sm70Config`` is a frozen pydantic model (extra keys are rejected).
+``sm70_config(vllm_config)`` reads ``additional_config["sm70"]`` (or
+``kernel_config.sm70``), applies the kill switches from ``vllm_sm70.envs``
+and caches the result per vllm_config. A kill switch can only turn a field
+off; configuration is the only way to turn something on.
+``compute_hash()`` covers only the graph-affecting fields. ``CONSTANTS``
+holds fixed tuning values that are not configurable.
 
 This package imports nothing from vllm (only pydantic and vllm_sm70.envs).
 """
@@ -54,9 +43,8 @@ class Inkling2Config(BaseModel):
     """Largest vision-encoder sequence of one image: merge * merge patches
     per image token plus the class token (10817 is 2704 image tokens, e.g.
     2080 x 2080 pixels, for Inkling 2 Mini). A larger image is rejected, and
-    the profiling image has this size. Evidence: on a V100 the encoder's
-    attention takes 0.02 GiB at 10817 on the memory-efficient kernel, the
-    largest sequence measured. The encoder runs eagerly: not a graph field."""
+    the profiling image has this size. The encoder runs eagerly: not a
+    graph field."""
 
     expert_act_fake_quant: bool = False
     """Numerics emulation: fake-quantize (fp32) each expert GEMM's input and
@@ -80,69 +68,47 @@ class Inkling2Config(BaseModel):
 
 
 class Sm70Config(BaseModel):
-    """SM70 (Volta) kernel policy. Defaults are the effective cf9492a values."""
+    """SM70 (Volta) kernel policy."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     quant_backend: QuantBackend = "auto"
     """Provider for SM70 quantized linear and MoE layers. "auto" resolves to
-    TurboMind on every c4130 path. Evidence: fork SM70_QUANT_BACKEND default
-    'auto' (FORK envs.py:3276); fork SM70_FP8_TURBOMIND=1 (envs.py:8485) and
-    fork SM70_NVFP4_TURBOMIND=1 (envs.py:8546); use_turbomind returns
-    turbomind for "auto" when enabled (config/kernel.py:232-234). No override
-    applies. Route-M (Marlin) is dropped for v1, so "marlin" is not accepted.
-    Kill: VLLM_SM70_FP8_TURBOMIND=0 makes the SM70 FP8 path refuse with a
-    clear error (see require_fp8_turbomind). There is no SM70 fallback:
-    upstream FP8 refuses capability 70."""
+    TurboMind; there is no Marlin route. VLLM_SM70_FP8_TURBOMIND=0 makes the
+    SM70 FP8 path refuse with an error (see require_fp8_turbomind); there is
+    no SM70 fallback, since upstream FP8 refuses capability 70."""
 
     nvfp4_gemv: bool = True
-    """Flint NVFP4 W4A16 dense GEMV for M<=2 rows, limited to the six TP2
-    (K, N) shapes in sm70_turbomind.py:569-579. Larger M uses the TurboMind
-    GEMM. Evidence: fork SM70_MODELOPT_NVFP4_GEMV=1 (envs.py:8669), loader
-    alias kernel.py:62. No override applies.
+    """Flint NVFP4 W4A16 dense GEMV for M<=2 rows, limited to a fixed set
+    of TP2 (K, N) shapes. Larger M uses the TurboMind GEMM.
     Kill: VLLM_SM70_MODELOPT_NVFP4_GEMV=0."""
 
     flint_moe_qpn_decode: bool = True
     """Flint NVFP4 routed-expert decode for M<=2 tokens at TP2: two kernels,
     W13 with fused SwiGLU, then W2 with the reduce. Gates: the layer contract
     must be in _DECODE_QPN_CONTRACTS, the native ops must be present, and the
-    scales must be finite (nvfp4_sm70_moe.py:230-290). M>2 uses the TurboMind
-    grouped route; with --kernel-config.sm70_skinny_moe false, TurboMind also
-    handles M>2. The single-launch persistent variant stays off
-    (fork SM70_FLINT_MOE_PERSISTENT=0, envs.py:5100).
-    Evidence: fork SM70_FLINT_MOE_QPN_DECODE=1 (envs.py:5079;
-    sm70_moe.py:472). No override applies.
+    scales must be finite. M>2 uses the TurboMind grouped route.
     Kill: VLLM_SM70_FLINT_MOE_QPN_DECODE=0."""
 
     flint_moe_compact: bool = True
     """Flint NVFP4 routed experts when the dense-stage route serves a call
-    with M*top_k <= 80 routed slots (M 3..13 at top-6, plus M<=2 when K12
-    does not take it): each slot is its own one-row group, so each stage is
-    one compact grouped TurboMind launch. Without it, M*top_k in 18..64 runs
-    TurboMind's per-expert loop (256 launches per stage). Evidence: fork
-    _use_compact_grouped / _prepare_compact_slot_groups, always on and not
-    switched (nvfp4_sm70_moe.py:88, 570-618, 718-721, 1619-1636). No
-    override applies. Kill: VLLM_SM70_FLINT_MOE_COMPACT=0 (a new name: the
-    fork has no switch for this route)."""
+    with M*top_k <= 80 routed slots (M 3..13 at top-6, plus M<=2 when the
+    QPN decode does not take it): each slot is its own one-row group, so each
+    stage is one compact grouped TurboMind launch. Without it, M*top_k in
+    18..64 runs TurboMind's per-expert loop.
+    Kill: VLLM_SM70_FLINT_MOE_COMPACT=0."""
 
     fp8_moe_decode: bool = True
-    """Qwen FP8 MoE single-token decode route: the legacy compact
-    active-expert decode (fork SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=1),
-    the indexed W2 (fork SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH=1),
-    and the weighted native reduce (fork SM70_MOE_SINGLE_TOKEN_UNPERMUTE_
-    FASTPATH=1, envs.py:9262, resolves single_token_reduce to "weighted",
-    sm70_moe.py:393-397; consumer fp8_sm70_moe.py:54). W13 stays dense and permute stays generic.
-    Applies when M==1. Larger M uses the batched FP8 MoE GEMM
-    (fork SM70_FP8_MOE_BATCHED_GEMM=1, envs.py:8857). Evidence: alias tables
-    in sm70_moe.py:16-71. No override applies.
+    """Qwen FP8 MoE single-token decode route: the compact active-expert
+    decode, the indexed W2 and the weighted native reduce. W13 stays dense
+    and permute stays generic. Applies when M==1. Larger M uses the batched
+    FP8 MoE GEMM.
     Kill: VLLM_SM70_FP8_MOE_DECODE=0."""
 
     fp8_moe_compact_decode: bool = True
-    """Within the fp8_moe_decode route (M==1): the fork's legacy compact op,
-    one fused ``fp8_moe_single_token_sm70_out`` launch with exact_layout
-    (FORK fp8_sm70_moe.py:547-554; frozen as CONSTANTS FP8_MOE_LEGACY_COMPACT,
-    FP8_MOE_COMPACT_EXACT_LAYOUT, FP8_MOE_COMPACT_NATIVE_UNPERMUTE and
-    FP8_MOE_COMPACT_DECOMPOSED below). Off: the decomposed single-token plan
+    """Within the fp8_moe_decode route (M==1): the compact op, one fused
+    ``fp8_moe_single_token_sm70_out`` launch with exact_layout (see the
+    FP8_MOE_*COMPACT* CONSTANTS below). Off: the decomposed single-token plan
     (active-expert W13, SiLU*up, indexed W2, unpermute). It has no effect
     when fp8_moe_decode is off (batched only).
     Kill: VLLM_SM70_FP8_MOE_COMPACT_DECODE=0."""
@@ -150,70 +116,40 @@ class Sm70Config(BaseModel):
     flint_qk_rope_kv: bool = True
     """Flint fused q/k RMSNorm + RoPE + FP16 paged KV-cache write (one kernel).
     Gates: SM70, FP16 default dtype, FP16 KV (kv_cache_dtype auto), and the
-    fused_route_rejection shape checks (FORK models/flint/model.py:312-330).
-    Evidence: fork SM70_FLINT_QK_ROPE_KV=1 (envs.py:8622) ->
-    KernelConfig.sm70_flint_qk_rope_kv (kernel.py:766-781). No override
-    applies. v1 gates only this fusion; the Flint router, sampler, TP2
-    AR+RMSNorm and sink-fused decode (all on at cf9492a) come later with
-    their own switches. Kill: VLLM_SM70_FLINT_QK_ROPE_KV=0."""
+    fused_route_rejection shape checks. The Flint router, sampler, TP2
+    AR+RMSNorm and sink-fused decode have their own switches.
+    Kill: VLLM_SM70_FLINT_QK_ROPE_KV=0."""
 
     fp8_qpn8: bool | None = None
-    """The fork's sm70_native "qpn8" selector (kernel_config.sm70_fp8.qpn8,
-    FORK config/kernel.py:398), NOT block QPN8 (see fp8_block_qpn8). Reserved
-    for the sm70_native qpn8 selector (M9/verifier); M8 does not read it.
-    None (auto) means on only when the DFlash2 verifier contract qualifies
-    and quantization == "fp8" (platforms/runtime_defaults.py:497-513;
-    SM70_DFLASH2_VERIFIER_DEFAULTS sm70_dflash2.py:27). Effective values:
-    Qwen3.8-27B True, Qwen3.6-35B-A3B False. Plain default 0 (envs.py:3880).
+    """The sm70_native "qpn8" selector for the DFlash2 verifier, not block
+    QPN8 (see fp8_block_qpn8, which does not read it). None (auto) means on
+    only when the DFlash2 verifier contract qualifies and quantization ==
+    "fp8" (fp8_qpn8_enabled).
     Kill: VLLM_SM70_FP8_QPN8=0."""
 
     fp8_block_qpn8: bool = True
-    """M8 block QPN8: weight-only FP8 decode GEMV for block-128 dense
-    linears (K09). Evidence: FORK cf9492a kernel_config.sm70_fp8.block_qpn8
-    = True (config/kernel.py:386); QPN8Fp8BlockScaledMMLinearKernel is first
-    in _POSSIBLE_FP8_BLOCK_KERNELS for CUDA (kernels/linear/__init__.py:344)
-    and its can_implement (kernels/linear/qpn/fp8_block.py:160-195) gates
-    only on this flag, fp16 in/out, static 128x128 block weights, rank 2,
-    N,K % 128 and the native ops. So it is on for both Qwen3.6-35B-A3B and
-    Qwen3.8-27B. No override
-    applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0.
-
+    """Block QPN8: weight-only FP8 decode GEMV for block-128 dense linears
+    (fp16 in/out, static 128x128 block weights, N and K multiples of 128).
     The flag alone does not admit a layer; fp8_block_qpn8_turbomind_copy
-    does. At the c4130 prod settings (max_num_seqs 4, DFlash2 k=7, so 32
-    rows) the default copy policy admits neither Qwen model while K09's
-    block-scaled max M is 8: both stay on M6 TurboMind (signed-off
-    deviation, PR #65)."""
+    decides. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0."""
 
     fp8_block_qpn8_turbomind_copy: bool | None = None
     """Block QPN8 vs a second, TurboMind-packed weight copy. rows =
-    max_num_seqs * (num_speculative_tokens + 1); max_m = K09's
+    max_num_seqs * (num_speculative_tokens + 1); max_m =
     qpn8_max_m(block_scaled=True): 8, or 32 with VLLM_SM70_FP8_QPN8_M32=1.
-    None (default, safe): admit block QPN8 with no copy iff rows <= max_m;
-    otherwise do NOT admit it (plain M6, one copy). True: admit and keep the
-    TurboMind copy for rows above max_m (two copies; bench/explicit only).
-    False: admit with no copy; rows above max_m use K09's dense fallback.
-    None deliberately differs from the fork's auto, which kept the copy
-    when rows > 8 (FORK config/kernel.py:388 block_qpn8_volta_turbomind_prefill,
-    kernels/linear/qpn/fp8_block.py:204-213): the default must not double
-    the dense FP8 weights on 32 GB V100s (~+12 GiB per GPU on Qwen3.8-27B
-    at TP2). True reproduces the fork's two-copy behaviour. No kill switch
-    (a policy, not a feature)."""
+    None (default): admit block QPN8 with no copy iff rows <= max_m;
+    otherwise do not admit it (TurboMind only, one copy). True: admit and
+    keep the TurboMind copy for rows above max_m (two copies of the dense
+    FP8 weights). False: admit with no copy; rows above max_m use the
+    QPN8 dense fallback. No kill switch (a policy, not a feature)."""
 
     dflash2_verifier: VerifierMode = "auto"
-    """The DFlash2 verifier bundle: 17 fork SM70_DFLASH2_* flags plus FP8_QPN8
-    (sm70_dflash2.py:20-39). "auto" turns it on iff
-    sm70_dflash2_verifier_qualified holds (models/config.py:1087-1134): arch
-    Qwen3_5*ForCausalLM/ConditionalGeneration, fp16, hidden 5120, heads 24/4,
-    head_dim 256, method dflash, k=7, draft selector_top_k 16, PP1.
-    Effective values: Qwen3.8 on, Qwen3.6 off (MoE arch), Flint n/a.
+    """The DFlash2 verifier bundle (CONSTANTS["DFLASH2_VERIFIER_FLAGS"]
+    plus fp8_qpn8). "auto" turns it on iff dflash2_verifier_qualified holds.
     Kill: VLLM_SM70_DFLASH2_VERIFIER=0."""
 
     shared_moe_overlap: bool = False
-    """Qwen3-Next/3.5-MoE shared-expert stream overlap. Effectively OFF:
-    VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP default 0 (envs.py:13347), and
-    qwen3_next.py:245-249 disables the stream unless it is requested. Only
-    the Qwen4Exp FP16 lane forces it on (model_executor/models/
-    runtime_defaults.py:110-111), which does not apply on c4130.
+    """Qwen3-Next/3.5-MoE shared-expert stream overlap. Off by default.
     Kill: VLLM_SM70_SHARED_MOE_OVERLAP=0."""
 
     greedy_token_fastpath: bool = True
@@ -225,12 +161,8 @@ class Sm70Config(BaseModel):
     opt in (``supports_sm70_topk_sampler``), on SM70, without spec decode,
     structured output, logprobs, penalties, allowed/bad words, thinking
     budget or active non-argmax-invariant logits processors
-    (vllm_sm70/sample_greedy.py, on the U4 hook). Evidence: fork
-    VLLM_SM70_GREEDY_TOKEN_FASTPATH=1 (envs.py:7033) ->
-    kernel_config.layer_execution.greedy_token_fastpath; runner gate
-    gpu_model_runner.py:7646-7695, call :7845-7862; Flint get_top_tokens
-    models/flint/model.py:571-604. No override applies. Not a graph field:
-    sampling runs outside the compiled graph.
+    (vllm_sm70/sample_greedy.py). Not a graph field: sampling runs outside
+    the compiled graph.
     Kill: VLLM_SM70_GREEDY_TOKEN_FASTPATH=0."""
 
     inkling2: Inkling2Config = Inkling2Config()
@@ -253,10 +185,7 @@ GRAPH_FIELDS: tuple[str, ...] = (
     "nvfp4_gemv",
     "shared_moe_overlap",
 )
-"""Fields that change the compiled graph. shared_moe_overlap is included
-because the fork always hashes it: all layer aliases pre-Ampere, this one
-alone elsewhere (policy_defaults.py:275-277).
-Keep nvfp4_gemv in until it is tested. greedy_token_fastpath is not one:
+"""Fields that change the compiled graph. greedy_token_fastpath is not one:
 sampling runs eagerly, outside the compiled graph. Nor is inkling2 (read eagerly)."""
 
 # Kill switch name -> (field, value forced when engaged). VLLM_SM70_FP8_TURBOMIND,
@@ -279,8 +208,8 @@ KILL_SWITCHES: dict[str, tuple[str, Any]] = {
 def apply_kill_switches(cfg: Sm70Config) -> Sm70Config:
     """Return cfg with every engaged kill switch applied (it can only disable).
 
-    Reads each switch as ``vllm_sm70.envs.<NAME>`` (K01 getter: True means
-    enabled, so only "0" acts).
+    Reads each switch as ``vllm_sm70.envs.<NAME>`` (True means enabled, so
+    only "0" acts).
     """
     updates = {
         field: value
@@ -369,7 +298,7 @@ def compute_hash(config: Any) -> str:
 
 
 def fp8_qpn8_enabled(cfg: Sm70Config, *, verifier_qualified: bool) -> bool:
-    """Resolve fp8_qpn8=None (auto) the way cf9492a did (runtime_defaults.py:508-513)."""
+    """Resolve fp8_qpn8=None (auto): on iff the DFlash2 verifier is on."""
     if cfg.fp8_qpn8 is not None:
         return cfg.fp8_qpn8
     return dflash2_verifier_enabled(cfg, verifier_qualified=verifier_qualified)
@@ -384,13 +313,11 @@ def dflash2_verifier_enabled(cfg: Sm70Config, *, verifier_qualified: bool) -> bo
 def dflash2_verifier_qualified(
     model_config: Any, speculative_config: Any, parallel_config: Any
 ) -> bool:
-    """The fork's DFlash2 verifier contract (FORK models/config.py:1087-1134,
-    sm70_dflash2_verifier_qualified): Qwen3_5 arch, fp16, hidden 5120, 24/4
+    """The DFlash2 verifier contract: Qwen3_5 arch, fp16, hidden 5120, 24/4
     heads x 256, method dflash with k=7, draft selector_top_k 16, PP1, no
-    DBO/ubatching. Target quantization and TP are not part of it (fork
-    docstring). Only getattr on the three configs, so no vllm import.
-    Reserved for the sm70_native qpn8 selector / DFlash2 verifier (M9);
-    M8's block QPN8 does not use it."""
+    DBO/ubatching. Target quantization and TP are not part of it. Only
+    getattr on the three configs, so no vllm import. Block QPN8 does not
+    use it."""
     if model_config is None or speculative_config is None or parallel_config is None:
         return False
     import torch
@@ -421,29 +348,26 @@ def dflash2_verifier_qualified(
 
 
 # --------------------------------------------------------------------------
-# Frozen constants: the effective cf9492a values of the knobs that are no
-# longer configurable. "override" marks values the cc=7.0 platform defaults
-# changed from the plain envs.py default.
+# Fixed values of knobs that are not configurable.
 # --------------------------------------------------------------------------
 CONSTANTS: dict[str, Any] = {
-    # Dense GEMM / native TurboMind tuning (F16_DENSE_MAX_M, FP8/NVFP4_DENSE_
-    # TUNE_MAX_M=64, BATCH_GEMM_LAYOUTS=1, QPN8 tile choices, workspace bytes,
-    # ...) is owned by the ops: csrc/turbomind/ops/tm_config.h (K02/K03).
-    # FP8 MoE stage modes (sm70_moe.py:16-71)
-    "FP8_MOE_BATCHED_GEMM": True,  # envs.py:8857
+    # Dense GEMM / native TurboMind tuning is owned by the ops:
+    # csrc/turbomind/ops/tm_config.h.
+    # FP8 MoE stage modes
+    "FP8_MOE_BATCHED_GEMM": True,
     "FP8_MOE_W13_PER_EXPERT": False,
     "FP8_MOE_W2_PER_EXPERT": False,
     "FP8_MOE_PERMUTE_WITH_SCRATCH": True,
-    # Resolved as in Sm70MoEFormatConfig.resolve (sm70_moe.py:319-452).
-    "FP8_MOE_LEGACY_COMPACT": True,  # envs.py:9136 (default "1")
-    "FP8_MOE_COMPACT_EXACT_LAYOUT": True,  # unset -> "1", sm70_moe.py:344-349
-    "FP8_MOE_COMPACT_NATIVE_UNPERMUTE": False,  # unset -> "0", same lines
-    "FP8_MOE_COMPACT_DECOMPOSED": False,  # unset -> "0", same lines
-    "MOE_SINGLE_TOKEN_W13": ("dense",),  # compact/indexed W13 aliases all 0, :370-379
-    "MOE_SINGLE_TOKEN_W2": "indexed",  # fork FP8 INDEXED_W2 alias =1, :380-391
-    "MOE_SINGLE_TOKEN_REDUCE": "weighted",  # UNPERMUTE_FASTPATH=1, :393-397
-    "MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": False,  # envs.py:9247
-    # NVFP4 MoE routes (sm70_moe.py:454); the Qwen3.8 ones are exact-TP4 contracts
+    # FP8 MoE single-token compact route
+    "FP8_MOE_LEGACY_COMPACT": True,
+    "FP8_MOE_COMPACT_EXACT_LAYOUT": True,
+    "FP8_MOE_COMPACT_NATIVE_UNPERMUTE": False,
+    "FP8_MOE_COMPACT_DECOMPOSED": False,
+    "MOE_SINGLE_TOKEN_W13": ("dense",),
+    "MOE_SINGLE_TOKEN_W2": "indexed",
+    "MOE_SINGLE_TOKEN_REDUCE": "weighted",
+    "MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": False,
+    # NVFP4 MoE routes; the Qwen3.8 ones are exact-TP4 contracts
     "NVFP4_MOE_GROUPED_PREFILL": True,
     "NVFP4_MOE_FAST_PREFILL": True,
     "NVFP4_MOE_FUSED_SWIGLU_PREFILL": True,
@@ -455,12 +379,10 @@ CONSTANTS: dict[str, Any] = {
     "NVFP4_MOE_GROUPED_DECODE": False,
     "NVFP4_MOE_RAW_SCALE": False,
     "NVFP4_MOE_GROUPED_EXPERT_ROWS": False,
-    "FLINT_MOE_PERSISTENT": False,  # envs.py:5100
-    # Effective at cf9492a but wired later (router and sampler: M10).
-    # Attention sink decode and AR+RMSNorm are Kai's (K14/K17).
-    "CF9492A_FLINT_FUSED_ROUTER": True,  # envs.py:5400; M<=2, E256/K6, no DP/EP
-    "CF9492A_FLINT_SAMPLER": True,  # envs.py:8749; <=2 rows, random, top_k<=20
-    # DFlash2 (sm70_dflash2.py:93, :144)
+    "FLINT_MOE_PERSISTENT": False,
+    "CF9492A_FLINT_FUSED_ROUTER": True,  # M<=2, E256/K6, no DP/EP
+    "CF9492A_FLINT_SAMPLER": True,  # <=2 rows, random, top_k<=20
+    # DFlash2 draft proposal
     "DFLASH2_PROPOSAL_TEMPERATURE_SCALE": 1.0,  # GLM5-only overrides do not apply
     "DFLASH2_PROPOSAL_TOP_P": 1.0,
     "DFLASH2_LOOKUP": {

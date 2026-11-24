@@ -1,30 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M10a: FlintSm70 takes the K13 fused decode router.
-
-The router-only split of #66 (M10 router + sampler). K13 needs no model
-declaration: U3's platform getter (``Sm70CudaPlatform.get_moe_router_provider``,
-PR #43) admits each MoE runner by structure (``vllm_sm70.router._rejection``).
-It replaces the provider the fork binds per model (fork cf9492a
-vllm/models/flint/model.py:227-229).
-
-CPU: the gate M5's FlintSm70SparseMoeBlock builds, with the router M5's
-  FusedMoEFactory arguments produce, passes K13's admission; so does the real
-  MoERunner M5's block builds through UP's FusedMoEFactory on a mocked SM70
-  CUDA platform; the kill switch ("0" only) makes the platform getter return
-  None, and kernel_warmup then decides no route.
-GPU (``-m gpu``), VLLM_SM70_FLINT_FUSED_ROUTER on vs off:
-  G1  tiny random Flint (TP1, router-shaped: hidden 2048, E256/K6): K13 is
-      admitted on its one MoE layer and generation completes; greedy tokens
-      are reported, not gated.
-  G2  checkpoint at TP2 (FLINT_SM70_CHECKPOINT; both V100s, ``vllm``
-      stopped): K13 admitted on all 47 MoE layers per rank, and the
-      teacher-forced decode logprobs (M5 harness, sm70/scripts/
-      m5_teacher_forced.py) of "on" vs "off" stay within 1.5x the fork's
-      eager_vs_graphs anchor (FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE).
-  Not exact greedy tokens (Quinn, #86): K13 changes only the FP32 summation
-  order of the router logits, which flips MoE top-6 near-ties, so free-running
-  token equality is not a correctness signal; the envelope is.
-  Skipped without SM70 GPUs.
+"""FlintSm70 takes the fused decode router (vllm_sm70/router.py).
+The router needs no model declaration: the platform getter
+(``Sm70CudaPlatform.get_moe_router_provider``) admits each MoE runner by
+structure (``vllm_sm70.router._rejection``).
+CPU: the Flint MoE block's gate and router, and the real MoERunner built
+  through UP's FusedMoEFactory on a mocked SM70 platform, pass admission; the
+  kill switch ("0" only) makes the getter return None and kernel_warmup
+  decides no route.
+GPU (``-m gpu``), VLLM_SM70_FLINT_FUSED_ROUTER on vs off: G1 tiny random
+  Flint (TP1, E256/K6): admitted on its one MoE layer, greedy tokens reported
+  only. G2 checkpoint at TP2: admitted on all 47 MoE layers per rank, and
+  teacher-forced decode logprobs within 1.5x the fork's eager_vs_graphs
+  anchor. Greedy tokens are not gated: the router changes the FP32 summation
+  order, which flips MoE top-6 near-ties. Skipped without SM70 GPUs.
 """
 
 from __future__ import annotations
@@ -50,9 +38,9 @@ from vllm_sm70.models import flint_sm70
 
 ROUTER_SWITCH = "VLLM_SM70_FLINT_FUSED_ROUTER"
 
-# Log line (vllm_sm70/router.py admit_flint_fused_router) that shows K13 ran.
+# Log line (vllm_sm70/router.py admit_flint_fused_router) that shows the router ran.
 ROUTER_ON_LOG = "vllm_sm70: fused E256/K6 sigmoid router enabled"
-# K13 prepare_model (router.py, from kernel_warmup before capture), once per
+# prepare_model (router.py, from kernel_warmup before capture), once per
 # rank. The layer count is the strong check: fewer than the model's MoE
 # layers means a partial non-admission (per-layer reasons are DEBUG only).
 ROUTER_ADMITTED_LOG = re.compile(r"vllm_sm70: fused router admitted on (\d+) layers")
@@ -64,7 +52,7 @@ CKPT_MOE_LAYERS = 47  # checkpoint: 49 layers, 47 with MoE (mlp.gate.weight)
 # --------------------------------------------------------------------------
 @pytest.fixture
 def platform_cls(monkeypatch):
-    """Sm70CudaPlatform on a CPU host (as the K13 CPU tests import it)."""
+    """Sm70CudaPlatform on a CPU host (as the router CPU tests import it)."""
     import importlib
     import types
 
@@ -94,7 +82,7 @@ def router_mod(monkeypatch):
 
 @pytest.fixture
 def tp(monkeypatch):
-    """A stand-in TP group, so M5 layers can be built without torch.distributed."""
+    """A stand-in TP group, so Flint layers can be built without torch.distributed."""
     import vllm.distributed.parallel_state as ps
 
     def _set(world_size=1, rank=0):
@@ -106,7 +94,7 @@ def tp(monkeypatch):
 
 
 def _m5_moe_block(monkeypatch, config):
-    """M5's FlintSm70SparseMoeBlock with the real GateLinear; the experts and
+    """FlintSm70SparseMoeBlock with the real GateLinear; the experts and
     shared expert are stubbed and the FusedMoEFactory arguments recorded."""
     from vllm_sm70.models.flint_sm70 import model as m
 
@@ -124,7 +112,7 @@ def _m5_moe_block(monkeypatch, config):
 
 
 def _router_for(monkeypatch, kw):
-    """The router UP's factory builds on CUDA from M5's FusedMoEFactory args."""
+    """The router UP's factory builds on CUDA from the block's FusedMoEFactory args."""
     from vllm.model_executor.layers.fused_moe.router import router_factory
 
     monkeypatch.setattr(router_factory.current_platform, "is_cpu", lambda: False)
@@ -139,8 +127,8 @@ def _router_for(monkeypatch, kw):
 
 
 def test_k13_admits_the_m5_gate(monkeypatch, tp, router_mod):
-    """The gate M5 builds is FP32 [256, 2048] with FP32 output, and K13's
-    admission accepts it together with the router M5's arguments produce.
+    """The Flint gate is FP32 [256, 2048] with FP32 output, and the router's
+    admission accepts it together with the router its arguments produce.
     The runner's other fields are written out here; the next test takes them
     from the real MoERunner instead."""
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
@@ -209,17 +197,17 @@ def parallel_groups(monkeypatch):
 
 
 def test_k13_admits_the_m5_moe_runner_on_sm70(monkeypatch, parallel_groups, router_mod):
-    """M5's FlintSm70SparseMoeBlock built unmodified through UP's
-    FusedMoEFactory -> MoERunner, on a mocked SM70 CUDA platform: K13's
+    """FlintSm70SparseMoeBlock built unmodified through UP's
+    FusedMoEFactory -> MoERunner, on a mocked SM70 CUDA platform:
     _rejection() returns None for the runner it builds (gate, router,
     _fse_fuse_gate, routed_input_transform, enable_dbo, moe_config as UP
     sets them); prepare_model() admits it from the block's module tree, and
     the route passes try_route's own checks on an FP16 [2, 2048] input.
 
     Stubbed: the routed-expert quant method is a Sm70MoEMethodBase without
-    weights (on the checkpoint it is M4's ModelOptNvFp4Sm70MoEMethod, which
+    weights (on the checkpoint it is ModelOptNvFp4Sm70MoEMethod, which
     inherits is_monolithic/topk_indices_dtype from that base, checked below),
-    the TP1 process groups, U3's presence, the device check (weights are on
+    the TP1 process groups, the platform-getter patch's presence, the device check (weights are on
     the CPU) and the op.
     """
     import vllm.platforms
@@ -234,7 +222,7 @@ def test_k13_admits_the_m5_moe_runner_on_sm70(monkeypatch, parallel_groups, rout
     from vllm_sm70.models.flint_sm70 import model as m
     from vllm_sm70.quant.nvfp4_moe import ModelOptNvFp4Sm70MoEMethod
 
-    # M4's method keeps the base's runner-facing answers (no override).
+    # ModelOptNvFp4Sm70MoEMethod keeps the base's runner-facing answers (no override).
     for name in ("is_monolithic", "topk_indices_dtype"):
         assert getattr(ModelOptNvFp4Sm70MoEMethod, name) is getattr(
             Sm70MoEMethodBase, name
@@ -280,8 +268,9 @@ def test_k13_admits_the_m5_moe_runner_on_sm70(monkeypatch, parallel_groups, rout
         router_mod, "_flint_route_op", lambda: lambda *a: calls.append(a)
     )
     assert router_mod._rejection(runner) is None
-    # kernel_warmup's prepare_model finds the runner in M5's module tree
-    # (U3 itself is a patch the CPU venv lacks, hence _u3_present).
+    # kernel_warmup's prepare_model finds the runner in the block's module
+    # tree (the platform-getter patch is absent in the CPU venv, hence
+    # _u3_present).
     monkeypatch.setattr(router_mod, "_u3_present", lambda: True)
     assert router_mod.prepare_model(block) == 1
     route = router_mod.flint_router_provider(runner)  # the decision cached
@@ -316,7 +305,7 @@ def test_router_kill_switch_only_zero(platform_cls, router_mod, monkeypatch, raw
 def test_kernel_warmup_decides_routes_only_when_on(
     platform_cls, router_mod, monkeypatch, router_off
 ):
-    """kernel_warmup (U1, before capture) decides the routes through
+    """kernel_warmup (before capture) decides the routes through
     prepare_model; with the kill switch it decides none."""
     if router_off:
         monkeypatch.setenv(ROUTER_SWITCH, "0")
@@ -371,7 +360,7 @@ def _gpus_used_mib():
 
 
 def _shutdown(llm, settle_mib=2048, timeout_s=120):
-    """Release an LLM's GPUs before the next one starts (as #36's T-tests):
+    """Release an LLM's GPUs before the next one starts (as in test_m5_flint_sm70.py):
     stop the engine core, drop the object, tear down the process groups,
     then wait for the memory to come back."""
     from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -394,7 +383,7 @@ def _shutdown(llm, settle_mib=2048, timeout_s=120):
 
 
 def _tiny_flint_dir(tmp_path):
-    """#36's tiny random Flint, router-shaped so K13 admits it: hidden 2048,
+    """A tiny random Flint, router-shaped so the router admits it: hidden 2048,
     256 experts, sigmoid renormalized top-6. One MoE layer (layer 1)."""
     from vllm.models.flint.configs import FlintConfig
 
@@ -448,7 +437,7 @@ def _ckpt_llm():
         hf_overrides=ARCH_OVERRIDE,
         max_model_len=8192,
         gpu_memory_utilization=0.85,
-        max_num_seqs=2,  # decode at M <= 2, the size K13 routes
+        max_num_seqs=2,  # decode at M <= 2, the size the router takes
         seed=0,
     )
 
@@ -513,7 +502,7 @@ def _router_on_off(make_llm, prompts, n, monkeypatch, capfd, *, moe_layers, tp):
 
 @functools.cache
 def _m5_tests():
-    """M5's test module (T4 harness helpers: sequence sets, fork envelope,
+    """test_m5_flint_sm70.py (T4 harness helpers: sequence sets, fork envelope,
     scoring LLM, per-set gate), loaded by path under a private name."""
     path = pathlib.Path(__file__).with_name("test_m5_flint_sm70.py")
     spec = importlib.util.spec_from_file_location("_m5_t4_harness", path)
@@ -525,7 +514,7 @@ def _m5_tests():
 @pytest.mark.gpu
 @one_gpu
 def test_g1_tiny_router_admitted(tmp_path, monkeypatch, capfd):
-    """G1 (1 GPU, #66's G1): tiny Flint TP1, CUDA graphs: K13 admitted with
+    """G1 (1 GPU): tiny Flint TP1, CUDA graphs: the router admitted with
     the switch on, absent with VLLM_SM70_FLINT_FUSED_ROUTER=0; greedy tokens
     reported only (no fork envelope for random weights)."""
     path = _tiny_flint_dir(tmp_path)
@@ -555,13 +544,13 @@ T4_READY = bool(
     reason="set FLINT_SM70_T4_SEQS_DIR and FLINT_SM70_T4_ENVELOPE (fork calibration)",
 )
 def test_g2_ckpt_tp2_router_on_off_within_envelope(monkeypatch, capfd):
-    """G2 (2 GPUs, #66's G4): checkpoint TP2, CUDA graphs, K13 on vs off.
+    """G2 (2 GPUs): checkpoint TP2, CUDA graphs, router on vs off.
 
-    Gate 1: K13 admitted on all 47 MoE layers on each rank, and absent off.
-    Gate 2 (Quinn, #86): teacher-forced decode (forced sequences, real decode
+    Gate 1: admitted on all 47 MoE layers on each rank, and absent off.
+    Gate 2: teacher-forced decode (forced sequences, real decode
     steps under graph replay, max_num_seqs 1) of "on" vs "off" within 1.5x
     the fork's eager_vs_graphs anchor per set (mean and max), the same gate
-    as M5's T4a. Both arms run graphs mode with tuning off (the harness
+    as T4a in test_m5_flint_sm70.py. Both arms run graphs mode with tuning off (the harness
     default)."""
     m5 = _m5_tests()
     tf = m5._tf_module()

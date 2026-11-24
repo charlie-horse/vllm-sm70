@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 merged projections on an SM70 GPU.
+"""Inkling 2 merged projections on an SM70 GPU.
 
 The tiny checkpoint (fixtures/inkling2_tiny) in fp16 at TP1 on the GPU,
 built with the packs (``VLLM_SM70_INKLING_MERGED_PROJ=1``) and without

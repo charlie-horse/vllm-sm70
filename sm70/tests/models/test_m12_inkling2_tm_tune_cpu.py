@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 TurboMind tuning defaults of the engine-config hook
+"""Inkling 2 TurboMind tuning defaults of the engine-config hook
 (inkling2_sm70/config.py ``tm_tuning_env``), on CPU.
 
 - with FULL decode graphs, the TurboMind expert route on and its ops

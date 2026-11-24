@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 decode kernels that merge adjacent launches of a layer visit
-(sm_70: no tl.dot, no PDL, libdevice tanh). The route is visit.py's.
+(sm_70: no tl.dot, no PDL, libdevice tanh). The route is visit_fusion.py's.
 
-    conv_mix        a short conv (sconv.py), the residual stream it feeds
-                    and the AttnRes mix of the next sublayer input, with or
-                    without its RMS norm; one program per (query, token)
-                    convolves the token's whole row, the first one stores
+    conv_mix        a short conv, the residual it feeds and the next AttnRes mix
     conv_residual   a short conv and the residual add after it
-    prologue        small_ops.query_rel and paged_conv.key_value_conv:
-                    programs (token, query head), then (token, K/V head)
-    gate_blend      fused.gate_down, fused.gate_up and loop.blend_rms_norm
-                    of the message gates, in one launch (tickets.py)
+    prologue        small_ops.query_rel and paged_conv.key_value_conv
+    gate_blend      fused.gate_down, fused.gate_up and loop.blend_rms_norm of
+                    the message gates, in one launch (tickets.py)
 
-Math and rounding as the kernels they merge, which stay the reference: the
-conv output rounds to the dtype of its input before it is summed; the
-residual sums ((base + update) + conv) in fp32 and rounds once; the mixes
-are those of attn_res.py's row kernel. gate_blend sums each row's squares
-per block of outputs, then over the blocks in order.
+Math and rounding as the kernels they merge, the reference: the conv output
+rounds to its input dtype before it is summed; the residual sums
+((base + update) + conv) in fp32 and rounds once; the mixes are those of
+attn_res.py's row kernel. gate_blend sums each row's squares per block of
+outputs, then over the blocks in order.
 """
 
 from __future__ import annotations

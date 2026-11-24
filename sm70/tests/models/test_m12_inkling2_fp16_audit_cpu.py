@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 load-time checks (fp16_audit.py) and their use
+"""Tests for the Inkling 2 load-time checks (fp16_audit.py) and their use
 by the weight loader (weights.py).
 
 CPU. The tiny checkpoint is loaded in fp16 with one injected value; the

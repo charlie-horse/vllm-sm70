@@ -1,21 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 Triton norm kernels (the vendored inkling2_sm70/ops/norm.py,
-attn_res.py, loop.py and the gate and residual kernels of ops/fused.py) and
-their route (inkling2_sm70/norms.py), on CPU.
+"""Inkling 2 Triton norm kernels (vendored ops/norm.py, attn_res.py, loop.py,
+and the gate and residual kernels of ops/fused.py) and their route
+(inkling2_sm70/norms.py), on CPU.
 
 - provenance: each vendored file, with its stored patch reverse-applied, is
   the upstream file of the recorded sha256;
 - the sources hold nothing sm_70 rejects or runs slowly: PDL only behind
   USE_GDC, no tanh.approx, no tl.dot, no bfloat16, no SM100/SM120 import;
-- the switch VLLM_SM70_INKLING_TRITON_NORMS and the route choice: the
-  kernels on decode-only batches by default, none with "0", all with "1";
-- the kernels through Triton's interpreter against the torch reference ops,
-  in fp32 within 1e-5 and in fp16 within 2e-3, and the route built on them
-  against the torch route.
+- the switch VLLM_SM70_INKLING_TRITON_NORMS and the route choice;
+- the kernels through Triton's interpreter against the torch reference ops
+  (fp32 within 1e-5, fp16 within 2e-3), and the route against the torch one.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite); in the parent they show as skipped. The GPU
-version is test_m12_inkling2_triton_norms_gpu.py.
+(test_interpreted_suite). GPU version: test_m12_inkling2_triton_norms_gpu.py.
 """
 
 from __future__ import annotations

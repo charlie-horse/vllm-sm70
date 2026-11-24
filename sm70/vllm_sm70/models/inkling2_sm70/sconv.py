@@ -1,39 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: short convs over the paged conv-state cache, in torch.
 
-The conv-state cache of a layer visit ([blocks, heads, tokens, head_size],
-``Inkling2ConvState``) holds the conv input of each stream at every absolute
-position. One call convolves the tokens of a batch and stores their inputs:
-
-    tap `lag` tokens back of batch row t, at position p of its request:
-      zero           when p - lag < 0 or the row has no slot (padding)
-      x[t - lag]     when row t - lag belongs to the same request
-      cache[p - lag] otherwise, through the request's block table
-
+The conv-state cache ([blocks, heads, tokens, head_size], ``Inkling2ConvState``)
+holds each stream's conv input at every position. Tap `lag` of batch row t at
+position p: zero when p - lag < 0 or the row has no slot; x[t - lag] when that
+row is of the same request; else cache[p - lag] via the block table.
     static   y = (sum_k w[c, k] * tap[K - 1 - k] + x) / sqrt(K + 1)
-    dynamic  y = (sum_l (w[l, c] + dyn[t, head(c), l]) * tap[l] + x)
-                 / sqrt(2 K + 1)
-
-The sums run in fp32; `y` is rounded to the dtype of `x`. Taps are read
-before the batch is stored. Tap rule as upstream's Triton kernels
-(UP models/inkling2/nvidia/ops/sconv.py ``_tap_sum``). A tap that is zero by
-the rule is selected, not multiplied, so a non-finite value of another
-request stays out of the sum.
-
-Shapes: T batch tokens (padded), C = heads * stream width channels, K taps.
-The metadata covers the first n = ``num_actual_tokens`` tokens (backend.py);
-the ops read those rows of `x` and return zero rows after them. In a
-decode-only batch n is the length of the slot mapping instead, a static
-shape, and the ops read and write the cache without a host sync: the taps
-are gathered for every row and selected, and a row with a negative slot
-writes the null-block slot 0 back unchanged. ``short_conv`` zeroes the
-output rows of padding there, unless its caller's input is zero in them.
-
-Switch: ``short_conv`` and the prologue's K/V convs run one Triton kernel per
-call (ops/paged_conv.py) unless VLLM_SM70_INKLING_TRITON_SCONV=0. Tensors off
-the GPU take the torch ops below, except in Triton's interpreter. The switch
-and ``on_triton`` are read on every eager call; a replayed CUDA graph keeps
-the route it was captured with.
+    dynamic  y = (sum_l (w[l, c] + dyn[t, head(c), l]) * tap[l] + x) / sqrt(2 K + 1)
+Sums run in fp32; `y` rounds to the dtype of `x`. Taps are read before the
+batch is stored; a zero tap is selected, not multiplied. The metadata covers
+the first n = ``num_actual_tokens`` rows (in a decode-only batch, the slot
+mapping's length, without a host sync: a negative slot writes null-block slot
+0 back unchanged). ``short_conv`` and the K/V convs run ops/paged_conv.py
+unless VLLM_SM70_INKLING_TRITON_SCONV=0 (read on every eager call).
 """
 
 from __future__ import annotations

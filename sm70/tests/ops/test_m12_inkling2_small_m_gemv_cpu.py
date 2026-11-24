@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 small-batch dense GEMV (inkling2_sm70/ops/small_m_gemv.py)
+"""Inkling 2 small-batch dense GEMV (inkling2_sm70/ops/small_m_gemv.py)
 and its route (inkling2_sm70/gemv.py), on CPU.
 
 - the kill switch VLLM_SM70_INKLING_SMALL_M_GEMV and the route choice: 1 to
   8 fp16 rows with unit K stride, 1 to 4 rows for the LM head, tensors off
   the GPU on cuBLAS's torch ops, only "0" turns it off;
-- through Triton's interpreter, each against the torch op it replaces:
-  - ``segment_gemv`` with one input and with three inputs over 3 and 5 row
-    segments, strided inputs and output, at small sizes and the Inkling 2
-    Mini TP2 shapes (gated qkvr with its k and v inputs, wo);
-  - prologue.py ``project_qkvr`` (local and gated) and ``project_packed``
-    (with and without the conv taps) against their F.linear forms;
-  - the output projection of attention_torch.py and the LM head of
-    model.py.
+- through Triton's interpreter, against the torch ops they replace:
+  ``segment_gemv`` (one and three inputs, strided, Inkling 2 Mini TP2
+  shapes), prologue.py ``project_qkvr`` and ``project_packed``, the output
+  projection of attention_torch.py and the LM head of model.py.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite). The AOT compile check is

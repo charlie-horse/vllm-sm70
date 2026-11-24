@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K15 CPU checks: fused q/k norm + RoPE + KV-write admission, kill switch
+"""CPU checks: fused q/k norm + RoPE + KV-write admission, kill switch
 and the splitting-op hook.
 
-Port of FORK tests/models/flint/test_qk_norm_rope_kv_admission.py (117).
-Changes: the kill switch resolves through Sm70Config (the fork used
-KernelConfig.sm70_flint_qk_rope_kv), the splitting op is installed by the
-platform hook instead of CompilationConfig itself, an FP32 RoPE table is
-admitted (upstream Flint builds it in FP32), and kv_cache_dtype "float16" is
-admitted next to "auto".
+The kill switch resolves through Sm70Config, the splitting op is installed
+by the platform hook, an FP32 RoPE table is admitted (upstream Flint builds
+it in FP32), and kv_cache_dtype "float16" is admitted next to "auto".
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 DSpark feature capture (port-plan X1), on CPU.
+"""Inkling 2 DSpark feature capture, on CPU.
 
 The tiny checkpoint (fixtures/inkling2_tiny) gets the Inkling 2 Mini
 ``mtp_config`` at its own hidden size; the draft config comes from

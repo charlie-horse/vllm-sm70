@@ -1,24 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M6 qwen-fp8-turbomind (vllm_sm70/quant/fp8_linear.py, fp8_moe.py).
+"""Tests for the Qwen FP8 TurboMind layers (vllm_sm70/quant/fp8_linear.py,
+fp8_moe.py).
 
-What: the CPU tests mock Kai's ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` /
-  ``_C`` with pure-torch versions of the same signatures. They check:
-  - parameter parity with UP Fp8LinearMethod / Fp8MoEMethod create_weights
-    for block [128, 128];
-  - fp8_sm70_prepare arguments;
-  - apply vs an independent block-FP8 dequant reference for M in {1, 2, 64}
-    (dense, and MoE at top-k 8, on both the batched and single-token routes);
-  - the VLLM_SM70_FP8_TURBOMIND and VLLM_SM70_FP8_MOE_DECODE kill switches;
-  - routing at cc 7.0 vs 8.0, skipped layers and the TP gate;
-  - a weight-memory budget for both Qwen models at TP2.
-  The single-token op mocks assume the semantics in FORK cf9492a
-  single_token.py:19-151 (the W13 op builds the slot order itself); they are
-  unverified against the CUDA source.
-  GPU (``-m gpu``, one V100, _sm70_C and vLLM's _C/_moe_C), for Bea on c4130:
+CPU tests mock ``vllm_sm70.ops.tm`` and UP's ``_moe_C`` / ``_C`` with
+  pure-torch versions of the same signatures. They check parameter parity
+  with UP Fp8LinearMethod / Fp8MoEMethod create_weights for block [128, 128];
+  fp8_sm70_prepare arguments; apply vs an independent block-FP8 dequant
+  reference for M in {1, 2, 64} (dense, and MoE at top-k 8 on the batched
+  and single-token routes); the VLLM_SM70_FP8_TURBOMIND and
+  VLLM_SM70_FP8_MOE_DECODE kill switches; routing at cc 7.0 vs 8.0, skipped
+  layers and the TP gate; a weight-memory budget for both Qwen models at
+  TP2. The single-token op mocks assume the W13 op builds the slot order.
+GPU (``-m gpu``, _sm70_C and vLLM's _C/_moe_C):
     python -m pytest -q -p no:cacheprovider sm70/tests/quant/test_m6_qwen_fp8.py -m gpu
-Why: M6 serves both Qwen FP8 checkpoints. A wrong scale layout or route is
-  silent garbage, not a crash.
-Kill-switch: VLLM_SM70_FP8_TURBOMIND, VLLM_SM70_FP8_MOE_DECODE (below and in M1).
 """
 
 import sys
@@ -127,7 +121,7 @@ def make_mock_tm(single_token=True, compact=True):
             # rest: compact_input, gate_up, intermediate, sorted_output,
             # sorted_weights, 4 dst ptr rows, expert_offsets, inv, sorted ids,
             # broadcast idx, w2 raw weight/scale, w13_k, w13_n, w2_k, w2_n,
-            # group, hidden, 5 flags, exact_per_route (K03 tm.py signature).
+            # group, hidden, 5 flags, exact_per_route (tm.py signature).
             assert len(rest) == 27
             dims, flags = rest[15:21], rest[21:]
             tm.calls.append(("compact", dims, flags))
@@ -348,9 +342,8 @@ def test_dense_rejects_non_block_and_bf16(mods):
 # MoE
 # --------------------------------------------------------------------------
 def _moe_config(hidden=None, inter=None, experts=None, top_k=None, tp=1):
-    # Resolve defaults at call time. Default arguments bound to the module
-    # constants at definition time (H, I, E, K) are what made the GPU test
-    # build a 256-hidden layer while generating 2048-hidden weights.
+    # Resolve defaults at call time: default arguments would bind the module
+    # constants (H, I, E, K) at definition time.
     hidden = H if hidden is None else hidden
     inter = I if inter is None else inter
     experts = E if experts is None else experts
@@ -617,7 +610,7 @@ def test_moe_tp_gate(mods, device, monkeypatch, tp):
 # --------------------------------------------------------------------------
 # Memory budget (TP2, per GPU)
 # --------------------------------------------------------------------------
-# Dims verified against config.json at the pinned revisions (2026-11-05):
+# Dims from config.json at the pinned revisions:
 # Qwen/Qwen3.6-35B-A3B-FP8 @95a723d0 (text_config: hidden 2048, 40 layers,
 # 256 experts x moe_inter 512, shared 512, heads 16/2, head_dim 256, linear
 # heads k16/v32 x 128, vocab 248320) and Qwen/Qwen3.8-27B-FP8 @017b9c7a
@@ -687,8 +680,8 @@ def test_fp8_weights_fit_v100_at_tp2(cfg):
     per_gpu = _per_gpu_weight_bytes(cfg)
     total_params_b = per_gpu * 2 / 1e9
     assert 20 < total_params_b < 40  # sanity: ~27B/~35B params, mostly 1 B each
-    # 32 GiB V100, 0.91 utilization, minus ~2.2 GiB LMCache context: weights
-    # must leave room for KV; require < 70% of the 32 GiB.
+    # Weights must leave room for KV and runtime memory on a 32 GiB device;
+    # require < 70% of it.
     assert per_gpu < 0.7 * 32 * 2**30, f"{per_gpu / 2**30:.1f} GiB per GPU"
 
 
@@ -737,7 +730,7 @@ def test_moe_qwen36_tp2_real_shapes_cpu(mods, monkeypatch, route):
 
 
 # --------------------------------------------------------------------------
-# GPU (Bea, c4130)
+# GPU
 # --------------------------------------------------------------------------
 def _gpu_dense(n_parts, k):
     import vllm_sm70.quant.fp8_linear as lin

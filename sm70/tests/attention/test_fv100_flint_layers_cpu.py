@@ -4,22 +4,14 @@
 Flint per TP2 rank: 16 query / 2 KV heads, head size 128, fp32 sinks [16]
 on every layer; `sliding_attention` layers have sliding_window=513 (the
 query token plus 512 keys, so the impl's window is (512, 0)) and
-`full_attention` layers none (FORK models/flint/configs.py:40-74; M5
-model.py:304-319). For each layer type this checks the route an engine
-with AttentionBackendEnum.CUSTOM relies on:
-
-* admission: no Triton fallback reason, K14 fused decode marked;
-* eager mixed batch: decode rows -> fv100_decode_paged_sinks_fused (with
-  the device counters), prefill groups -> fv100_prefill_paged_sinks, the
-  window and sinks passed through, output equal to the SDPA reference;
-* CUDA-graph capture: decode launches the max_model_len envelope on the
-  fused op with counters prepared before capture, never allocates under
-  capture, and without counters takes the two-launch op (no fail-closed);
-* sliding layers: pages wholly before the window may be upstream's
-  null block (all-zero KV) after the sliding-window manager frees them;
-  the result must not change.
-
-Also the capability flag `fv100.supports_sinks()` on fake op sets.
+`full_attention` layers none. For each layer type this checks admission (no
+Triton fallback, fused decode marked), the eager mixed-batch routes (fused
+sink decode with device counters, sink prefill, window and sinks passed
+through, output equal to the SDPA reference), CUDA-graph capture (the
+max_model_len envelope, counters prepared before capture, no allocation
+under capture, the two-launch op without counters), and that sliding pages
+wholly before the window may be upstream's all-zero null block without
+changing the result. Also the capability flag `fv100.supports_sinks()`.
 """
 
 from __future__ import annotations
@@ -33,7 +25,7 @@ torch = pytest.importorskip("torch")
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-# K06 helpers/fixtures: builder, LBNHC cache, CommonAttentionMetadata,
+# Backend test helpers: builder, LBNHC cache, CommonAttentionMetadata,
 # reference check, stable-libtorch stub (also gates on vLLM being importable).
 from test_fv100_backend_cpu import (  # noqa: E402,F401
     _common_metadata,
@@ -86,7 +78,7 @@ def test_supports_sinks_needs_both_sink_ops(monkeypatch, ops, expected):
 
 
 def test_supports_sinks_with_stub_schemas():
-    """Against the real registry: the K05 schemas defined in a Python
+    """Against the real registry: the Flash-V100 schemas defined in a Python
     torch.library (as test_fv100_ops_cpu does) make the flag true."""
     sys.path.insert(0, str(HERE.parent / "ops"))
     from _schemas import sm70_schemas
@@ -118,7 +110,7 @@ pytestmark_vllm = pytest.mark.skipif(
 
 @pytest.fixture
 def flint_ops(monkeypatch):
-    """CpuOps stand-ins, every K05 op plus the K14 fused op 'built'."""
+    """CpuOps stand-ins, every Flash-V100 op plus the fused op 'built'."""
     from _fv100_cpu_ops import CpuOps
 
     from vllm_sm70.attention.flash_v100 import dispatch

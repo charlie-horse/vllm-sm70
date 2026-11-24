@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 """Teacher-forced comparison of a served model against a reference.
 
-A run file is {"cases": [{"id", "prompt_ids", "output_ids", "positions"}]}.
-"positions" has one entry per output token: {"top": [[token id, logprob],
-...]} with the most likely token first and at least the top 2. A reference
-run comes from the HF model or from another served configuration.
-
-  capture   Send prompt_ids + output_ids of every case to /v1/completions
-            with prompt_logprobs and write a run file.
-  compare   REF CAND run files: per-position top-1 agreement, the logprob
-            delta of the reference top-1, and every flip classified by the
-            reference top-1/top-2 gap (near tie below --gap-max).
-  states    REF CAND .npz files of per-visit states: relative L2 per visit,
-            naming the first visit above --tol.
-
-compare and states exit 1 on failure.
-
-Usage:
+A run file is {"cases": [{"id", "prompt_ids", "output_ids", "positions"}]};
+each position is {"top": [[token id, logprob], ...]}, most likely first, at
+least 2 entries. A reference run comes from HF or another served config.
+  capture   send each case to /v1/completions with prompt_logprobs, write a run
+  compare   REF CAND runs: top-1 agreement, logprob delta of the reference
+            top-1, flips classified by the reference top-1/top-2 gap
+  states    REF CAND .npz per-visit states: relative L2, first visit > --tol
+compare and states exit 1 on failure. Usage:
   teacher_forced.py capture --base-url URL --model NAME --cases hf.json --out a.json
-  teacher_forced.py compare hf.json a.json      # served vs HF
-  teacher_forced.py compare a.json b.json       # cold vs cached, TP1 vs TP2, ...
+  teacher_forced.py compare hf.json a.json
   teacher_forced.py states hf.npz port.npz --tol 1e-2
 """
 

@@ -12,7 +12,6 @@ For every row:
 It also fails if a file under sm70/csrc/turbomind (or another listed path)
 has no row.
 
-Usage:
   sm70/tools/check_turbomind_provenance.py [--fork /path/to/fork@cf9492a]
 Exit status: 0 = all good, 1 = mismatch, 2 = usage/parse error.
 """

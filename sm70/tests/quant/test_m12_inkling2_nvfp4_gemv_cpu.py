@@ -1,25 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 NVFP4 expert GEMV (inkling2_sm70/ops/nvfp4_gemv.py) and its
+"""Inkling 2 NVFP4 expert GEMV (inkling2_sm70/ops/nvfp4_gemv.py) and its
 route in moe_tm.py, on CPU.
 
 ``vllm_sm70.ops.tm`` is a pure-torch stand-in whose prepare packs the codes
 in the TurboMind layout the kernel reads (words [N / 32, K / 8, 32], nibble
 p at K row NIBBLE_K[p]) and whose dense stage dequantizes that layout.
-
-- the kill switch VLLM_SM70_INKLING_NVFP4_GEMV and the route choice: the
-  real extension's banks with k_ld = 32 K and q_ld = N, compact one-row
-  slots only, tensors off the GPU on TurboMind outside the interpreter;
-- through Triton's interpreter:
-  - ``nvfp4_slot_gemv`` for W2 and for W13 with the soft-capped SwiGLU,
-    against an fp32 dequant, at small sizes and the Inkling 2 Mini TP2 bank
-    shapes, out-of-range expert ids clamped;
-  - ``Nvfp4TmExperts.expert_sum`` and ``routed_expert_sum`` on the GEMV
-    route against the TurboMind stage route (no stage call on the GEMV
-    route), with an activation hook, and the stage route above the compact
-    bound and with the switch off.
+Covered: the kill switch VLLM_SM70_INKLING_NVFP4_GEMV and the route choice;
+through Triton's interpreter ``nvfp4_slot_gemv`` (W2, and W13 with the
+soft-capped SwiGLU) against an fp32 dequant, and ``expert_sum`` /
+``routed_expert_sum`` on the GEMV route against the TurboMind stage route.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite). The AOT compile check is
+(test_interpreted_suite). AOT compile check:
 tests/ops/test_m12_inkling2_triton_sm70_compile_cpu.py.
 """
 

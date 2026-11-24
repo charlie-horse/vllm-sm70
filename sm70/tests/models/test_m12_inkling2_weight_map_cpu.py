@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 non-expert weight loader (weights.py).
+"""Tests for the Inkling 2 non-expert weight loader (weights.py).
 
 CPU, without the Hugging Face Inkling 2 classes: the tiny checkpoint in
 released names is loaded at TP1 and at both ranks of TP2 and compared with the

@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
-"""Compare ported code against the fork, function by function.
+"""Compare ported code against its source tree (--fork), entity by entity.
 
-    scripts/verify-port.py --port sm70/csrc/foo.cu --fork ../vLLM/csrc/foo.cu
-    scripts/verify-port.py --port sm70/ --fork ../vLLM/csrc ../vLLM/vllm/sm70
-    scripts/verify-port.py --diff pr.diff --port-root . --fork ../vLLM
+    scripts/verify-port.py --port sm70/csrc/foo.cu --fork ../src/csrc/foo.cu
+    scripts/verify-port.py --diff pr.diff --port-root . --fork ../src
 
-Python files are split with `ast` (top-level functions, classes, methods,
-module constants). C++/CUDA files are split with a comment-aware brace
-matcher (functions, kernels, methods, structs/classes, #define macros,
-top-level constexpr/const values).
+Python is split with `ast`; C++/CUDA with a comment-aware brace matcher.
+The source side is first rewritten with the rules in scripts/verify-port.toml,
+then both sides are normalized (comments, whitespace). Each entity is
+IDENTICAL, CHANGED (diff plus NUMERIC/LAUNCH/FP16/CONTROL flags), MOVED,
+NEW (port only) or DROPPED (source only); NEW/DROPPED get "(expected)" when
+they match expected_new/expected_dropped.
 
-Before comparison the fork text is rewritten with the rules in
-scripts/verify-port.toml (the expected renames), then both sides have
-comments and whitespace normalized. Each entity is reported as:
-
-  IDENTICAL  same body after normalization
-  CHANGED    body differs; a unified diff follows, with heuristic flags
-             (NUMERIC, LAUNCH, FP16, CONTROL) to steer review
-  MOVED      same body under a different name or file
-  NEW        in the port only (NEW(expected) if it matches expected_new)
-  DROPPED    in the fork only (DROPPED(expected) if it matches expected_dropped)
-
-Exit status: 0 normally; with --strict, 1 if anything is CHANGED, NEW or
-DROPPED without an "expected" tag.
+Exit status: 0; with --strict, 1 if anything is CHANGED, NEW or DROPPED
+without an "expected" tag.
 """
 from __future__ import annotations
 
@@ -647,7 +637,7 @@ def _trivial_record(e: Entity) -> bool:
     """A class whose body, without its methods, is only a header (and pass).
 
     Such bodies match each other by shape alone, so pairing them as MOVED
-    would be noise (seen on PR M5: FlintSm70SparseMoeBlock "was" FlintAttention).
+    would be noise.
     """
     if e.kind != "class":
         return False

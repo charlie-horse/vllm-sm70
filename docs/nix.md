@@ -1,10 +1,14 @@
-# Nix: using the flake from a host and operating the modules
+# Nix: using the flake and its modules
 
-Outputs: `flake.nix`. Options and built-in models: `nix/module.nix`
-(`services.vllm-sm70`) and `nix/lmcache.nix` (`services.lmcache-sm70`).
-Run host commands as admin with sudo.
+The build is a [Nix flake](https://nixos.org): a file (`flake.nix`) that says
+exactly what to build and from which pinned sources. Its outputs are the
+vLLM package and two **NixOS modules**, settings blocks a NixOS machine
+imports to run vLLM (`services.vllm-sm70`, in `nix/module.nix`) and its
+**LMCache** server (a cache that keeps already-computed prompt data so
+repeated text is not recomputed; `services.lmcache-sm70`, in
+`nix/lmcache.nix`). Those files list every option and built-in model.
 
-## Add the flake to a host
+## Use the flake in a NixOS configuration
 
 ```nix
 # flake.nix
@@ -66,8 +70,7 @@ Serve rules:
   `VLLM_SM70_INKLING_DECODE_GRAPH=0` or a `visit_dump_dir`, no mode with FULL
   graphs is accepted. Capture sizes above q × `DECODE_GRAPH_MAX_BATCH` tokens
   are refused (q = 1, or 1 + `num_speculative_tokens`).
-  The full rule set is the docstring of
-  `sm70/vllm_sm70/models/inkling2_sm70/config.py`.
+  The checks are in `sm70/vllm_sm70/models/inkling2_sm70/config.py`.
 - With `VLLM_SM70_INKLING_ASYNC_SCHED=0`, don't pass `--async-scheduling`.
 - `sm70.inkling2` fields are set only through `--additional-config`
   (`'{"sm70":{"inkling2":{...}}}'`); they have no env variable.

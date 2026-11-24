@@ -1,63 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M3 nvfp4-dense-turbomind: ModelOpt W4A16_NVFP4 dense linear on SM70.
+"""ModelOpt W4A16_NVFP4 dense linear on SM70 (TurboMind W4A16).
 
-What: ``ModelOptNvFp4Sm70LinearMethod``, plus a ``LINEAR_METHOD_BUILDERS
-  ["W4A16_NVFP4"]`` builder (UP 4ba787e modelopt.py:2763-2790) that returns it
-  only when ``vllm_sm70.platform.is_sm70_ready()`` (K01). On any other
-  device the builder falls through to upstream's own ``resolve()`` +
-  ``ModelOptLinearMethod`` (modelopt.py:2710-2760 and :2777-2790), so
-  non-SM70 behaviour is unchanged.
-Why: upstream's W4A16 path selects its kernel through ``init_nvfp4_linear_
-  kernel(use_a16=True)`` (kernels/linear/__init__.py:1191). On cc 7.0 the
-  ``auto`` branch forces Marlin (:1236-1245), which needs SM75+, so it raises.
-  The builder seam is the documented escape hatch (modelopt.py:2763-2774), so
-  this needs no UP edit and no kernel-selector change.
-  Parameters are created by upstream's own ``KNvfp4Static`` scheme and
-  ``_DROP_INPUT_SCALE`` format (modelopt.py:2018-2096, :2532-2557). Names,
-  dtypes, shapes, parameter classes and the NaN sentinel are therefore
-  identical to what UP's W4A16 loader produces. Only kernel selection,
-  post-load preparation and apply differ.
-Kill-switch: ``Sm70Config.nvfp4_gemv`` / ``VLLM_SM70_MODELOPT_NVFP4_GEMV=0``
-  turns off the M<=2 GEMV only; TurboMind GEMM then serves every M.
-  ``VLLM_SM70_QUANT=0`` (M2) disables the whole plugin route, including this
-  builder.
-
-Kernels: Kai's ops, reached only through ``vllm_sm70.ops.tm`` and never
-``torch.ops._sm70_C`` directly. Contract assumed here (unverified until Kai
-lands ``vllm_sm70.ops``):
-
-    tm.nvfp4_sm70_prepare(qweight u8 [K,N], scales f16 [K/16,N],
-                          group_size=16, interleave_gated_silu=False)
-        -> [tm_weight i32 [K,N/8], tm_scales f16 [K/16,N], meta i64[2]=(k_ld,q_ld)]
-    tm.nvfp4_gemm_sm70_out(out, x, tm_weight, tm_scales, group_size, k_ld,
-                          q_ld, gated_silu=False) -> None (mutates out)
-    tm.nvfp4_tm_gemv_dispatch_sm70_out(out, x, tm_weight, tm_scales,
-                          group_size, k_ld, q_ld, scale_shift=14) -> None
-    tm.has_op(name) -> bool        (checks torch.ops._sm70_C)
-
-K01 (main a17c3b0) ships ``vllm_sm70/ops/__init__.py`` with only the area
-``register()`` hook; ``vllm_sm70.ops.tm`` arrives with K03. Until then
-``has_tm_op`` returns False, and process_weights_after_loading raises a clear
-error instead of picking another kernel. The CPU tests mock the module.
-
-Kai confirmed this against FORK cf9492a csrc/torch_bindings.cpp:654-660,
-948-961 and vllm/_sm70/linear.py:350, 1763, 1805, minus the ``native_policy``
-tuple. No op takes a global scale: the caller folds weight_scale_2 into the
-fp16 scales once, before prepare (``format_nvfp4_scales``). The GEMV is
-feature-detected: without K11's op, the GEMM serves every M.
-
-Not M3: online ``--quantization fp8``. It never reaches M2's Sm70Fp8Config
-gate. For a checkpoint without a quantization config, upstream's
-``get_quant_config`` rewrites "fp8" to ``OnlineQuantizationConfig``
-(fp8_per_tensor) (UP 4ba787e model_loader/weight_utils.py:355-363). That
-config's ``get_min_capability()`` is 75 (quantization/online/base.py:209-212),
-so ``VllmConfig._get_quantization_config`` refuses cc 7.0 with "Minimum
-capability: 75. Current capability: 70" (config/vllm.py:926-936). Building
-``Fp8Config`` directly with a non-fp8 checkpoint raises too (fp8.py:106-112).
-There is no SM70 online-FP8 linear, and nothing picks a kernel silently.
-tests/quant/test_m3_nvfp4_linear.py pins this; an SM70 online-FP8 path would
-be a new node with its own gate.
-"""
+``ModelOptNvFp4Sm70LinearMethod``, plus a ``LINEAR_METHOD_BUILDERS
+["W4A16_NVFP4"]`` builder that returns it only when
+``vllm_sm70.platform.is_sm70_ready()``; on any other device the builder
+falls through to upstream's ``ModelOptLinearMethod``. Upstream's W4A16
+path picks Marlin on cc 7.0, which needs SM75+. Parameters come from
+upstream's own ``KNvfp4Static`` scheme, so names, dtypes, shapes and the
+NaN sentinel match upstream's loader; only kernel selection, post-load
+preparation and apply differ. Ops are reached only through
+``vllm_sm70.ops.tm``. No op takes a global scale: ``format_nvfp4_scales``
+folds weight_scale_2 into the fp16 scales before prepare.
+Kill: VLLM_SM70_MODELOPT_NVFP4_GEMV=0 drops the M<=2 GEMV;
+VLLM_SM70_QUANT=0 drops the whole route. Online ``--quantization fp8`` has
+no SM70 path: upstream refuses it on cc 7.0 (tests/quant/test_m3_nvfp4_linear.py)."""
 
 from __future__ import annotations
 
@@ -82,7 +38,7 @@ logger = init_logger("vllm.sm70.quant.nvfp4")
 
 ALGO = "W4A16_NVFP4"
 NVFP4_GROUP_SIZE = 16
-# SM70 packed NVFP4 GEMM needs complete 32-column tiles (FORK sm70_turbomind.py:26-30).
+# SM70 packed NVFP4 GEMM needs complete 32-column tiles.
 NVFP4_OUTPUT_ALIGNMENT = 32
 STATE_ATTR = "_sm70_turbomind_linear"
 GEMM_OP = "nvfp4_gemm_sm70_out"
@@ -91,8 +47,7 @@ PREPARE_OP = "nvfp4_sm70_prepare"
 
 # Per-rank (K, N) of the Flint ModelOpt W4A16 dense layers at TP2: qkv, o,
 # shared-expert gate/up and down, dense-MLP gate/up and down. The GEMV launch
-# table in K11's kernel is tuned for exactly these.
-# ported from FORK sm70_turbomind.py:567-579
+# table in the GEMV kernel is tuned for exactly these.
 MODELOPT_NVFP4_GEMV_SHAPES = frozenset(
     {
         (2048, 2560),
@@ -103,21 +58,20 @@ MODELOPT_NVFP4_GEMV_SHAPES = frozenset(
         (3072, 2048),
     }
 )
-_FP16_MAX = 65504.0  # FORK sm70_turbomind.py:580
+_FP16_MAX = 65504.0
 
 
 # --------------------------------------------------------------------------
-# Kai's op surface
+# TurboMind op surface
 # --------------------------------------------------------------------------
 def _tm():
-    """Kai's TurboMind op wrappers (import is lazy: the module may not exist yet)."""
+    """TurboMind op wrappers (imported lazily)."""
     from vllm_sm70.ops import tm  # type: ignore[import-not-found]
 
     return tm
 
 
 def has_tm_op(name: str) -> bool:
-    # ported from FORK sm70_turbomind.py:597-598 (has_tm_gemv_op), generalized
     try:
         tm = _tm()
     except ImportError:
@@ -135,11 +89,7 @@ def has_tm_op(name: str) -> bool:
 class SM70TurboMindLinearState:
     """Prepared TurboMind operands of one linear.
 
-    ported from FORK sm70_turbomind.py:36-73. NVFP4 only: the uint4/fp8/mxfp4/
-    QPN op kinds, the gated-SiLU and prescaled variants, and ``native_ops``
-    (NativeBindings, Kai's boundary) are dropped. ``refresh_provider`` and
-    FORK sm70_provider.py:106-166 (``bind_prepared_provider``) collapse into
-    ``provider``: "gemm" or "tm_gemv".
+    NVFP4 only. ``provider`` is "gemm" or "tm_gemv".
     """
 
     weight: torch.Tensor
@@ -158,7 +108,6 @@ class SM70TurboMindLinearState:
 
 
 def has_prepared_linear(layer: torch.nn.Module) -> bool:
-    # ported from FORK sm70_turbomind.py:383-384
     return getattr(layer, STATE_ATTR, None) is not None
 
 
@@ -171,7 +120,6 @@ def _store_state(
     output_size: int,
     padded_output_size: int = 0,
 ) -> SM70TurboMindLinearState:
-    # ported from FORK sm70_turbomind.py:346-380 (nvfp4 op_kind only)
     state = SM70TurboMindLinearState(
         weight=weight,
         scales=scales,
@@ -189,7 +137,6 @@ def _store_state(
 # Unpack / format
 # --------------------------------------------------------------------------
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
-    # ported from FORK sm70_turbomind.py:294-305
     if x.dtype == torch.int32:
         count = 8
     elif x.dtype == torch.uint8:
@@ -206,8 +153,6 @@ def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
 def unpack_fp4_weight(weight_packed: torch.Tensor) -> torch.Tensor:
     """[N, K/2] u8 (low nibble = even k) -> [K, N] u8 E2M1 codes.
 
-    ported from FORK sm70_turbomind.py:331-339 (``unpack_mxfp4_weight``; the
-    fork uses it for NVFP4 as well, :507).
     """
     if weight_packed.dim() > 2:
         weight_packed = torch.flatten(weight_packed, start_dim=-2)
@@ -221,9 +166,8 @@ def format_nvfp4_scales(
 ) -> torch.Tensor:
     """[N, K/16] E4M3 block scales x FP32 global -> [K/16, N] FP16.
 
-    ported from FORK sm70_turbomind.py:508-515. ModelOpt stores the global
-    scale as amax / (6 * 448), and TurboMind combines block * global (FORK
-    modelopt.py:1129-1135), so there is no reciprocal.
+    ModelOpt stores the global scale as amax / (6 * 448), and TurboMind
+    combines block * global, so there is no reciprocal.
     """
     return (
         (weight_scale.t().to(torch.float32) * weight_global_scale.to(torch.float32))
@@ -235,8 +179,7 @@ def format_nvfp4_scales(
 def _pad_output(
     qweight: torch.Tensor, scales: torch.Tensor, output_size: int
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    # ported from FORK sm70_turbomind.py:516-536 (gated-SiLU check dropped:
-    # M3 never interleaves)
+    # No gated-SiLU interleave here.
     padded = (
         (output_size + NVFP4_OUTPUT_ALIGNMENT - 1) // NVFP4_OUTPUT_ALIGNMENT
     ) * NVFP4_OUTPUT_ALIGNMENT
@@ -252,16 +195,14 @@ def _pad_output(
 def prepare_nvfp4_linear(layer: torch.nn.Module) -> SM70TurboMindLinearState:
     """Repack a loaded ModelOpt NVFP4 linear into TurboMind operands.
 
-    ported from FORK sm70_turbomind.py:493-564 (interleave_gated_silu=False
-    and prescale_for_batch=False, which is how the ModelOpt W4A16 path calls
-    it: FORK modelopt.py:1142, :1588). Expects ``layer.weight`` [N, K/2] u8,
+    No gated-SiLU interleave and no prescale. Expects ``layer.weight`` [N, K/2] u8,
     ``layer.weight_scale`` [N, K/16] E4M3 and ``layer.weight_global_scale``
     (scalar FP32), all produced by upstream's ``KNvfp4Static.process``.
     """
     if not has_tm_op(PREPARE_OP) or not has_tm_op(GEMM_OP):
         raise RuntimeError(
             "SM70 ModelOpt NVFP4 needs vllm_sm70.ops.tm with "
-            f"{PREPARE_OP} and {GEMM_OP} (Kai's TurboMind extension)."
+            f"{PREPARE_OP} and {GEMM_OP} (the TurboMind extension)."
         )
     tm = _tm()
     qweight = unpack_fp4_weight(layer.weight.data)
@@ -294,8 +235,6 @@ def _tm_gemv_scale_shift(scales: torch.Tensor) -> int:
     The GEMV multiplies each FP16 scale by 2^shift and each E2M1 code (an FP16
     pattern worth code * 2^-14) by that, then applies 2^(14 - shift) in FP32.
     With shift 14 every weight equals TurboMind's fp16(code * scale).
-
-    ported from FORK sm70_turbomind.py:583-594
     """
     peak = float(scales.abs().amax())
     shift = 14
@@ -314,10 +253,8 @@ def admit_modelopt_nvfp4_gemv(
     operator keeps TurboMind for M > 2, so CUDA graphs and torch.compile see a
     single opaque call either way.
 
-    ported from FORK sm70_turbomind.py:601-631. The fork's gated/prescaled/
-    scale-code exclusions are always true here. ``enabled`` replaces
-    ``format_option("nvfp4", "modelopt_gemv")`` (FORK :99-132, :624), and the
-    exact-SM70 tensor check (FORK :198-201) is the builder's job.
+    ``enabled`` is Sm70Config.nvfp4_gemv; the SM70 device check is the
+    builder's job.
     """
     k = int(state.weight.shape[0])
     n = int(state.weight.shape[1]) * 8
@@ -341,10 +278,7 @@ def admit_modelopt_nvfp4_gemv(
 # Apply
 # --------------------------------------------------------------------------
 def flatten_linear_input(x: torch.Tensor, features: int | None = None) -> torch.Tensor:
-    """Keep existing matrix views; flatten only additional batch dimensions.
-
-    ported from FORK vllm/model_executor/kernels/linear_io.py:9-15
-    """
+    """Keep existing matrix views; flatten only additional batch dimensions."""
     features = x.shape[-1] if features is None else features
     if x.ndim == 2 and features != 0 and x.shape[-1] == features:
         return x
@@ -354,7 +288,6 @@ def flatten_linear_input(x: torch.Tensor, features: int | None = None) -> torch.
 def restore_linear_output(
     output: torch.Tensor, x: torch.Tensor, features: int | None = None
 ) -> torch.Tensor:
-    # ported from FORK vllm/model_executor/kernels/linear_io.py:18-24
     features = output.shape[-1] if features is None else features
     if x.ndim == 2 and output.shape == (x.shape[0], features):
         return output
@@ -362,7 +295,6 @@ def restore_linear_output(
 
 
 def _run(state: SM70TurboMindLinearState, x: torch.Tensor, out: torch.Tensor) -> None:
-    # ported from FORK sm70_provider.py:24-53 (_gemm non-gated, _tm_gemv)
     tm = _tm()
     args = (
         out,
@@ -385,14 +317,10 @@ def apply_prepared_linear(
 ) -> torch.Tensor:
     """Flatten, dispatch, crop the alignment padding, add bias, reshape.
 
-    ported from FORK sm70_turbomind.py:911-920 + sm70_provider.py:169-203
-    (non-gated, non-interleaved branch)
-
     Raises:
         TypeError: ``x`` is not float16. The TurboMind W4A16 kernels on SM70
             take FP16 activations only (V100 has no BF16; serve with
-            ``--dtype half``). The fork raised the same check as a
-            RuntimeError (FORK sm70_provider.py:175-181).
+            ``--dtype half``).
     """
     state: SM70TurboMindLinearState = getattr(layer, STATE_ATTR)
     if x.dtype != torch.float16:
@@ -419,11 +347,9 @@ def apply_prepared_linear(
 class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
     """ModelOpt W4A16_NVFP4 dense linear on SM70 (TurboMind W4A16).
 
-    Lifecycle mirrors UP ``ModelOptLinearMethod`` (modelopt.py:2560-2708) for
+    Lifecycle mirrors upstream ``ModelOptLinearMethod`` for
     ``resolve("W4A16_NVFP4")`` = (kNvfp4Static, no activation,
-    _DROP_INPUT_SCALE) (:2754-2758), with the kernel replaced. FORK
-    equivalent: ``ModelOptNvFp4W4A16LinearMethod`` (FORK modelopt.py:1453-1601)
-    + ``_try_prepare_sm70_modelopt_nvfp4`` (:1126-1167).
+    _DROP_INPUT_SCALE), with the kernel replaced.
     """
 
     # Pre-processed (repacked) weights would bypass the TurboMind repack.
@@ -455,8 +381,8 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        # Same as UP ModelOptLinearMethod.create_weights (modelopt.py:2612-2641)
-        # up to, but excluding, select_linear_kernel (:2634), which would pick
+        # Same as upstream ModelOptLinearMethod.create_weights up to, but
+        # excluding, select_linear_kernel, which would pick
         # Marlin and fail on cc 7.0.
         del input_size, output_size
         weight_loader = extra_weight_attrs.get("weight_loader")
@@ -472,7 +398,7 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
         self.fmt.extra_weights(layer, shapes, self.ctx, weight_loader)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # UP lifecycle (modelopt.py:2643-2661): NaN sentinel check, global
+        # Upstream lifecycle: NaN sentinel check, global
         # scale -> weight_global_scale, input_scale dropped.
         self.wkey.process(layer, up_modelopt.WEIGHT)
         self.fmt.post_process(layer)
@@ -495,7 +421,7 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
             "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
             "(weight-only; activations remain half)."
         )
-        # Free the checkpoint layout (ported from FORK modelopt.py:1158-1166).
+        # Free the checkpoint layout.
         layer.weight = Parameter(
             torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
             requires_grad=False,
@@ -520,13 +446,13 @@ class ModelOptNvFp4Sm70LinearMethod(LinearMethodBase):
 
 
 # --------------------------------------------------------------------------
-# Builder (UP modelopt.py:2763-2790)
+# Builder
 # --------------------------------------------------------------------------
 _upstream_builder: Callable[..., LinearMethodBase] | None = None
 
 
 def _fallthrough(config: Any, prefix: str) -> LinearMethodBase:
-    """Exactly what UP build_linear_method does with no builder registered."""
+    """Exactly what upstream build_linear_method does with no builder registered."""
     if _upstream_builder is not None:
         return _upstream_builder(config, prefix)
     spec, ctx, format_scheme = up_modelopt.resolve(ALGO, config, prefix)
@@ -534,8 +460,8 @@ def _fallthrough(config: Any, prefix: str) -> LinearMethodBase:
 
 
 def build_w4a16_nvfp4(config: Any, prefix: str) -> LinearMethodBase:
-    # K01 readiness (all visible GPUs cc 7.0 and _sm70_C loaded), looked up on
-    # the module so tests can patch it, as M2 does.
+    # Readiness (all visible GPUs cc 7.0 and _sm70_C loaded), looked up on
+    # the module so tests can patch it.
     from vllm_sm70 import platform as sm70_platform
 
     if sm70_platform.is_sm70_ready():

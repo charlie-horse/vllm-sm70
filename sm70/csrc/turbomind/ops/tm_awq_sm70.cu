@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// TurboMind AWQ/int4 dense GEMM (K04). Compiled only with VLLM_SM70_TM_AWQ.
-// Moved verbatim from fork cf9492a csrc/sm70_turbomind/ops/awq_sm70_gemm.cu;
-// see ../PROVENANCE.md for the fork line range of every function.
+// TurboMind AWQ/int4 dense GEMM. Compiled only with VLLM_SM70_TM_AWQ.
+// Source: ../PROVENANCE.md.
 #include "tm_ops_common_sm70.cuh"
 
 #include <torch/library.h>
@@ -700,33 +699,27 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
 #endif  // VLLM_SM70_TM_AWQ
 
 // ---------------------------------------------------------------------------
-// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// Op registration.
 // ---------------------------------------------------------------------------
 
 #ifdef VLLM_SM70_TM_AWQ
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:599
   m.def(
       "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor "
       "_zeros, int group_size, bool interleave_gated_silu) -> Tensor[]");
-  // fork csrc/torch_bindings.cpp:608
   m.def(
       "awq_sm70_prepare_compact(Tensor _kernel, Tensor _scaling_factors, "
       "Tensor _zeros, int group_size, bool interleave_gated_silu) -> "
       "Tensor[]");
-  // fork csrc/torch_bindings.cpp:616
   m.def(
       "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:623
   m.def(
       "uint4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor"
       " _zeros, int group_size, bool interleave_gated_silu) -> Tensor[]");
-  // fork csrc/torch_bindings.cpp:675
   m.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
-  // fork csrc/torch_bindings.cpp:689
   m.def(
       "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor "
       "_kernel, Tensor _scaling_factors, int group_size, int k_ld, int "

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 fused-MoE methods and router (K03, K12, K13)."""
+"""SM70 fused-MoE methods and router."""
 
 _registered = False
 
@@ -12,4 +12,4 @@ def register() -> None:
     _registered = True
     from vllm_sm70 import router
 
-    router.register()  # K13: flint_route fake (provider binds via the platform)
+    router.register()  # flint_route fake (provider binds via the platform)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 greedy top-1 (inkling2_sm70/greedy.py, ops/top1.py), on CPU.
+"""Inkling 2 greedy top-1 (inkling2_sm70/greedy.py, ops/top1.py), on CPU.
 
 - the kill switch VLLM_SM70_INKLING_GREEDY_TOP1 and the model's opt-in to
   the V1 sampler hook; the top-k candidate route refuses the soft cap;

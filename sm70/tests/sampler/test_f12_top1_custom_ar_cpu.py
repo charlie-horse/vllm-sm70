@@ -1,24 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""F12 custom-AR pair exchange (VLLM_SM70_TOP1_CUSTOM_AR): CPU checks.
+"""Custom-AR pair exchange (VLLM_SM70_TOP1_CUSTOM_AR): CPU checks.
 
-* Switch: registered in the "sampler" section next to
-  VLLM_SM70_GREEDY_TOKEN_FASTPATH, opt-in: default off (fork: on), only "1"
-  acts.
-* Admission (``custom_ar_reject_reason``): every reason, from rank-uniform
-  inputs only.
-* Dispatch (``greedy_tokens``): admitted -> the kernel, and never the
-  all-gather; switch unset or 0, TP1, CPU, no or disabled custom all-reduce, missing
-  kernel, too many rows -> upstream ``get_top_tokens`` (the all-gather);
-  a failing kernel -> the all-gather with a warning.
-* Identity: the pair ``local_pair`` builds is bitwise the one upstream
-  ``get_top_tokens`` all-gathers, and the kernel's tie rule (mirrored here
-  from csrc/custom_ar/top1_custom_ar.cu) picks the token upstream's
-  all-gather reduction picks, on ties across ranks, NaN and -inf.
-* Source pins: the kernel's launch shape and world sizes match the Python
-  limits; the CMake list builds it.
-
-No GPU and no _sm70_C: the kernel is a Python stand-in that exchanges the
-ranks' pairs, and the custom all-reduce is a namespace.
+* Switch: in the "sampler" section next to VLLM_SM70_GREEDY_TOKEN_FASTPATH,
+  opt-in: default off, only "1" acts.
+* Admission (``custom_ar_reject_reason``): every reason, rank-uniform inputs.
+* Dispatch (``greedy_tokens``): admitted -> the kernel, never the
+  all-gather; switch off, TP1, CPU, no or disabled custom all-reduce,
+  missing kernel, too many rows -> upstream ``get_top_tokens``; a failing
+  kernel -> the all-gather with a warning.
+* Identity: ``local_pair`` builds the pair upstream all-gathers, and the
+  kernel's tie rule (mirrored from csrc/custom_ar/top1_custom_ar.cu) picks
+  upstream's token on ties across ranks, NaN and -inf.
+* Source pins: launch shape and world sizes match the Python limits.
+No GPU and no _sm70_C: the kernel is a Python stand-in.
 """
 
 from __future__ import annotations

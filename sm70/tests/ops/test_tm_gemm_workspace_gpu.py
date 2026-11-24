@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded TurboMind scratch, cache export/import and tm_runtime_close.
 
-Port of fork cf9492a tests/kernels/quantization/test_sm70_gemm_workspace.py
-(419c1b414). The fork test ran GGUF formats under two engine-owned native
-runtimes, each with its own KernelConfig.sm70_turbomind_workspace_bytes. Here
-the runtime is per process, so the two budgets run one after the other,
-separated by `_sm70_C::tm_runtime_close` (new in K03). NVFP4 and FP8 replace
-GGUF.
+The runtime is per process, so the two workspace budgets run one after the
+other, separated by `_sm70_C::tm_runtime_close`. Weights are NVFP4 and FP8.
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ from _ref import (  # noqa: E402
 pytestmark = pytest.mark.gpu
 
 MiB = 1024**2
-# Barriers + tensormaps + flags per stream workspace (fork test, same layout).
+# Barriers + tensormaps + flags per stream workspace.
 FIXED_BYTES = 2 * MiB + 4
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""F12 on a V100: greedy identity of the vocab-parallel top-1.
+"""GPU: greedy identity of the vocab-parallel top-1.
 
 The fake 2-rank split of test_f12_greedy_fastpath_cpu.py, on CUDA: real
 ParallelLMHead shards in FP16, the real LogitsProcessor (its LM-head GEMM is
@@ -7,8 +7,7 @@ whatever the platform dispatches, the same call on both sides), and a
 stand-in pair all-gather. Each rank's token must equal ``argmax`` over the
 gathered FP32 logits (upstream ``Sampler.greedy_sample`` on CUDA) bit for
 bit, including CUDA's ``max``/``argmax`` tie order. Engine-level greedy
-identity (F12 vs upstream inside one Flint engine) is
-tests/models/test_m10_flint_sampler.py G5/G6.
+identity is tests/models/test_m10_flint_sampler.py.
 
     pytest -m gpu sm70/tests/sampler/test_f12_greedy_fastpath_gpu.py
 """
@@ -61,7 +60,7 @@ def _identity(monkeypatch, vllm_env, weight, hidden, tp_size=2):
 @pytest.mark.parametrize("seed", range(4))
 def test_flint_tp2_greedy_identity(monkeypatch, vllm_env, cuda_sm70, rows, seed):
     """Flint's vocabulary and hidden size at TP2, FP16, decode batch sizes up
-    to the prod max-num-seqs."""
+    to max-num-seqs."""
     g = torch.Generator(device=cuda_sm70).manual_seed(seed)
     weight = (
         torch.randn(FLINT_VOCAB, 2048, generator=g, device=cuda_sm70) * 0.02

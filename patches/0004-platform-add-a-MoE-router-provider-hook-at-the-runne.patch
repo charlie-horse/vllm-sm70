@@ -8,7 +8,7 @@ What: Adds Platform.get_moe_router_provider() (default None). When the
   route's try_route(hidden_states) can return (topk_weights, topk_ids),
   which skip the gate GEMM and select_experts. None keeps upstream.
 Why: Out-of-tree platforms (the vllm-sm70 plugin) need one Volta kernel
-  for gate GEMM + top-k (Flint fused router, K13); the gate runs at
+  for gate GEMM + top-k (Flint fused router); the gate runs at
   vllm/model_executor/layers/fused_moe/runner/moe_runner.py:907 and
   expert selection at :630, so both need the precomputed route.
 Upstream-files: vllm/platforms/interface.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py

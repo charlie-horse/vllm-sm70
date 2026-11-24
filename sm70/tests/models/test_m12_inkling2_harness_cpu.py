@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Self-test of the M12 Inkling 2 CPU engine harness (inkling2_harness.py).
+"""Self-test of the Inkling 2 CPU engine harness (inkling2_harness.py).
 
 Needs upstream v0.33.0's Python importable (skipped otherwise). A toy module
 writes a code of (token, position, visit, head, column) into every cache and
