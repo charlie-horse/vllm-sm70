@@ -89,9 +89,10 @@ def device(monkeypatch):
 @pytest.fixture
 def load(monkeypatch):
     """Import quant_config fresh under the given VLLM_SM70_QUANT, then put
-    upstream's registry back."""
+    upstream's registry and vllm_sm70.quant.configs' classes back."""
     saved = dict(me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
     saved_names = list(me_quant.QUANTIZATION_METHODS)
+    configs_state = dict(vars(sm70_quant_configs))
 
     def _load(quant_env: str | None = None):
         if quant_env is None:
@@ -109,6 +110,7 @@ def load(monkeypatch):
     me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.clear()
     me_quant._CUSTOMIZED_METHOD_TO_QUANT_CONFIG.update(saved)
     me_quant.QUANTIZATION_METHODS[:] = saved_names
+    vars(sm70_quant_configs).update(configs_state)
     # Leave the registry naming the module's current class for later tests.
     _load()
 
