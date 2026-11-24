@@ -1,6 +1,6 @@
 # Flint on SWE-bench Verified (mini-swe-agent)
 
-Harness used for `docs/benchmarks/flint_swebench_verified.md`.
+Harness that runs Flint on SWE-bench Verified.
 
 - mini-swe-agent 2.4.6, official `config/benchmarks/swebench.yaml`, overlaid by
   `flint.yaml` (endpoint, sampling, no network in task container, 5 h timeout).

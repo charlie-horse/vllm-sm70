@@ -638,24 +638,13 @@ Re-export after a change to the build, model, TP size, capture sizes or tuning
 knobs (a build, GPU or knob change is refused on import, see above). A table whose kernels are missing from the build drops those records on
 import ("No kernel found"); those calls then fall back as uncovered.
 
-### Nix (fork parity T2/G3)
+### Nix
 
-`services.vllm-sm70.turbomind` in `nix/module.nix` reaches the production mode
-without a code change: `tuneSmallShapes` sets
-`VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1`, and `gemmLutPath`,
-`gemmLutExportPath` and `gemmLutStrict` set the three LUT variables below
-(AWQ stays 0, as on the fork). The export steps for c4130 are in
-`nix/README.md`, "TurboMind small-shape tuning and the GEMM LUT".
-
-**Default: off (unchanged from #77).** No tuned+LUT T4c pass and no tok/s A/B
-(tuned+LUT vs off) is recorded: #78 added the 4K A/B to the Nov 7 checklist,
-and `docs/m5-calibration-nov7.md` ran every gate with tuning off. The default
-flips only after, on c4130, (1) a LUT export, (2) T4c with tuning on, the LUT
-and `VLLM_SM70_GEMM_LUT_STRICT=1` passes (two fresh starts, 0 calls measured,
-bitwise equal), and (3) decode tok/s at n = 1/4/8/20 is no worse than tuning
-off. Then the host sets `tuneSmallShapes = true` and `gemmLutPath`. T8 (SM70
-CUDA graph capture sizes, `vllm_sm70/graph_policy.py`) changes the capture
-sizes, so export the LUT on a build that has it.
+`services.vllm-sm70.turbomind` in `nix/module.nix` sets these knobs:
+`tuneSmallShapes` sets `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1`, and
+`gemmLutPath`, `gemmLutExportPath` and `gemmLutStrict` set the three LUT
+variables below (AWQ stays 0). Exporting and using the LUT:
+[docs/nix.md](../../../docs/nix.md).
 
 ### Env
 

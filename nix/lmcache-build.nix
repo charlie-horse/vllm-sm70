@@ -8,7 +8,7 @@
 #   $out/lmcache-0.5.6.dist-info/    METADATA (version 0.5.6, which vLLM reads)
 #                                    and entry_points.txt (`lmcache` & co.)
 #
-# Patches: ./patches/lmcache (Theo's list), applied with --fuzz=0.
+# Patches: ./patches/lmcache (list in default.nix), applied with --fuzz=0.
 # Runtime deps not in vLLM's set are the `lmcache` group in ./pyenv. Five
 # locked versions are above LMCache's declared caps (numpy, protobuf,
 # opentelemetry-api, prometheus_client, opentelemetry-exporter-prometheus;

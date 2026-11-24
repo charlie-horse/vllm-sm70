@@ -11,7 +11,7 @@
 #
 # Required env: VLLM_PY (venv python with pytest), FLINT_SM70_CHECKPOINT,
 # FLINT_SM70_GOLDEN (T5), and for the teacher-forced gates (T4a/T4c/T4d/T4e/T7,
-# from m5_teacher_forced.py, see docs/m5-calibration-nov7.md):
+# from m5_teacher_forced.py, see docs/checks.md#gpu-gate):
 #   FLINT_SM70_T4_SEQS_DIR      setK.json, >= 3 prompt sets (gen, on ours)
 #   FLINT_SM70_T4_ENVELOPE      the fork's envelope JSON (envelope; built on or
 #                               after Nov 7, with over_1_0 and eager_vs_graphsonly)

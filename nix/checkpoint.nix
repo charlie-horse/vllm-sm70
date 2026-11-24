@@ -11,7 +11,7 @@
 # fork's converter is copied to sm70/tools/flint/ (from cf9492a) but is not
 # wired into a derivation (its env needs gguf, which .#vllm lacks). requireFile only
 # substitutes; if the path is in no store or cache, the build fails with the
-# message below. Rebuild procedure: nix/README.md, "Flint checkpoint".
+# message below. Recovery procedure: docs/nix.md, "Flint checkpoint store path".
 #
 # Change checkpointHash only together with a new checkpoint format; then update
 # expectedOutPath too.
@@ -35,8 +35,8 @@ let
       sm70/tools/flint/convert_gguf.py (from charlie-horse/vLLM cf9492a;
       inputs and env: sm70/tools/flint/PROVENANCE.md), and add it:
         nix-store --add-fixed --recursive sha256 <dir>
-      where <dir> is named flint-nvfp4-modelopt. Steps: nix/README.md,
-      "Flint checkpoint".
+      where <dir> is named flint-nvfp4-modelopt. Steps: docs/nix.md,
+      "Flint checkpoint store path".
     '';
   };
 in
