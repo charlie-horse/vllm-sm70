@@ -2,7 +2,7 @@
 
 Hosts consume this flake as `github:charlie-horse/vllm-sm70/latest`, never
 `main`. The host flake re-locks its inputs, so whatever `latest` points at
-reaches c4130 on its next switch.
+reaches the serving host on its next switch.
 
 ## Moving `latest`
 

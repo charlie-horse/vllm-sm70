@@ -1,11 +1,11 @@
-# Checks on hardware and GPU testing on c4130
+# GPU checks
 
-Every command runs on c4130 as admin, from a checkout of this repo at the
-commit under test, inside `tmux`. Commands marked sudo run with sudo.
+Every command runs on the serving host, from a checkout of this repo at
+the commit under test, inside `tmux`. Commands marked sudo run with sudo.
 
-## GPU runs on c4130
+## GPU runs on the serving host
 
-- Production vLLM serves on both GPUs all the time. A GPU run stops it first
+- Production vLLM serves on the GPUs all the time. A GPU run stops it first
   and restores it at the end, also after a failure:
   ```sh
   sudo systemctl stop vllm vllm-lmcache
@@ -26,13 +26,13 @@ commit under test, inside `tmux`. Commands marked sudo run with sudo.
 ## Candidate build
 
 `$OUT` is the outPath of `.#vllm`, `$GT` that of `.#gpu-tests` (the same
-python plus pytest), both built from the commit under test. Build on r440;
-c4130 fetches them from r440's binary cache.
+python plus pytest), both built from the commit under test, on a build host
+whose binary cache the serving host uses.
 
 ```sh
-# r440, checkout at the commit
+# build host, checkout at the commit
 nix build .#vllm .#gpu-tests --no-link --print-out-paths
-# c4130
+# serving host
 nix-store --realise $OUT --add-root ~/vsm70/result-vllm --indirect
 nix-store --realise $GT --add-root ~/vsm70/result-gpu-tests --indirect
 cd /var/tmp && CUDA_VISIBLE_DEVICES= $OUT/bin/python -c "import torch, vllm, vllm._C_stable_libtorch, vllm._moe_C_stable_libtorch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list(), vllm.__version__)"
@@ -87,7 +87,7 @@ count, even if only docs changed in between. Everything runs on `$OUT` and
    - [Quality probe](#quality-probe): PASS.
    - [LMCache reuse](#lmcache-reuse): both parts pass.
 7. Stop the candidate units and restore production
-   ([GPU runs on c4130](#gpu-runs-on-c4130)).
+   ([GPU runs on the serving host](#gpu-runs-on-the-serving-host)).
 
 Keep every log of the run with the commit and `$OUT`.
 
@@ -285,7 +285,7 @@ vs cold (fresh server or a unique prefix) or prefix-cached vs prefix-cached.
 A cold send may diverge from cached sends on near-tie tokens.
 
 For a teacher-forced comparison of two served configurations (cold vs
-cached, TP1 vs TP2, served vs HF), use `scripts/checks/greedy/teacher_forced.py`
+cached, two TP sizes, served vs HF), use `scripts/checks/greedy/teacher_forced.py`
 (`capture`, then `compare REF CAND`; exits 1 on failure).
 
 ## Quality probe
@@ -376,7 +376,7 @@ python3 scripts/check6-lmcache-reaper.py start     # right after the restart
 python3 scripts/check6-lmcache-reaper.py finish    # any time later; waits out the rest
 ```
 
-If the LMCache journal is not readable as admin, the run ends INCOMPLETE and
+If the LMCache journal is not readable as the running user, the run ends INCOMPLETE and
 prints the `journalctl` command with its `--since` time. Save the journal
 (sudo) and re-judge:
 
@@ -395,7 +395,7 @@ Output: PASS/FAIL/INVALID per criterion on stdout, the JSON summary in
 PASS, all of:
 1. No `Reaped GPU instance` line in `journalctl -u vllm-lmcache` since the
    vllm start (`pinged=False` or `True`).
-2. `/status` `registered_gpu_ids` lists both GPUs after the wait and after
+2. `/status` `registered_gpu_ids` lists every GPU after the wait and after
    the requests.
 3. Request 2 gets an external hit: `vllm:external_prefix_cache_hits` grows
    across it and `usage.prompt_tokens_details.cached_tokens` is above 0.
@@ -411,7 +411,7 @@ patch, all three criteria FAIL.
 ## Qwen matrix, M7 and M8
 
 Scripts: `sm70/scripts/qwen_phase2/`. They start their own `vllm serve` on
-`127.0.0.1:8100` with TP2, write under `$OUT`, and never touch systemd or
+`127.0.0.1:8100`, write under `$OUT`, and never touch systemd or
 the `vllm` unit. Production stopped first.
 
 ```sh

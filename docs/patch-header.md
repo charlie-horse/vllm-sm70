@@ -16,7 +16,7 @@ call into `vllm_sm70`, so a rebase onto a new vLLM release only carries them.
 <area>(<scope>): <imperative summary, under 72 chars>
 
 What: <one or two sentences on what the change does>
-Why: <what Volta / CUDA 12.6 / V100 TP2 needs; link the upstream line or issue>
+Why: <what Volta / CUDA 12.6 needs; link the upstream line or issue>
 Upstream-files: <comma-separated upstream paths touched, or "none (sm70/ only)">
 Kill-switch: <VLLM_SM70_<THING>=0, or "none (build-time)", or "hook returns None -> upstream">
 Tests: <test that proves it, e.g. sm70/tests/plugin/test_u1_hooks.py or "build only">

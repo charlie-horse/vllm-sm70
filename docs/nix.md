@@ -2,7 +2,7 @@
 
 Outputs: `flake.nix`. Options and built-in models: `nix/module.nix`
 (`services.vllm-sm70`) and `nix/lmcache.nix` (`services.lmcache-sm70`).
-Run host commands as admin with sudo.
+Commands marked sudo run with sudo.
 
 ## Add the flake to a host
 

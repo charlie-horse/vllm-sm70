@@ -1,4 +1,4 @@
-# vllm-sm70: upstream vLLM for V100 (sm_70)
+# vllm-sm70: upstream vLLM for Volta (sm_70)
 
 A Nix flake that builds a pinned upstream vLLM release for Volta, with an
 out-of-tree plugin (`sm70/`) and a series of upstream-file patches
@@ -7,12 +7,12 @@ this file. How everything works: [docs/README.md](docs/README.md).
 
 ## Access
 
-- Host access (Tailscale in a cloud session, SSH, sudo) follows the flake
+- Host access (SSH, sudo) follows the flake
   repo's [CLAUDE.md](https://github.com/charlie-horse/flake/blob/main/CLAUDE.md#access).
-- SSH to the hosts and GPU runs on c4130 only when the user has allowed it
-  for the task.
+- SSH to the hosts and GPU runs only when the user has allowed it for the
+  task.
 - Never put IPs, tailnet names, passwords or tokens in code, logs, docs or a
-  PR. Host names (c4130, r440) are fine.
+  PR.
 
 ## Changes
 
@@ -29,6 +29,8 @@ this file. How everything works: [docs/README.md](docs/README.md).
    what the code declares (pins, hashes, options, defaults, kill switches,
    model entries, versions): read it from the source. Docs hold only what the
    code can't say: procedures, and rules whose breach the code can't prevent.
+   Name no specific host, GPU model or GPU count beyond what a procedure
+   needs; say "the serving host" or "the build host".
 2. **Docs say how things work now.** No history, dates of past events,
    rationale ("why"), measurements of past runs, plans, decisions, open
    questions, owners or status notes. Present tense, terse. A constraint you
