@@ -209,14 +209,15 @@ let
           }
         ];
         maxModelLen = 262144;
-        maxNumSeqs = 4;
+        maxNumSeqs = 8;
         maxNumBatchedTokens = 512;
-        gpuMemoryUtilization = 0.90;
+        gpuMemoryUtilization = 0.88;
         asyncScheduling = true;
-        lmcache = false;
+        lmcache = true;
+        lmcacheChunkSize = 256;
         # DSpark drafts need the V2 model runner.
         v2ModelRunner = true;
-        env = qwenEnv;
+        env = qwenEnv // { VLLM_USE_BREAKABLE_CUDAGRAPH = "1"; };
         preStart = ''
           python -m vllm_sm70.models.inkling2_sm70.draft ${targetDir} ${draftDir}
         '';

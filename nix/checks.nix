@@ -83,8 +83,8 @@ let
     ) "the default flint unit sets a VLLM_SM70_* variable";
     unitsOf "flint" tmOptions;
 
-  # inkling-2-mini: the serve flags, the V2 runner, the draft staging and no
-  # LMCache reach the rendered units.
+  # inkling-2-mini: the serve flags, the V2 runner, the draft staging and the
+  # LMCache settings reach the rendered units.
   inklingUnit =
     let
       cfg = (evalHost "inkling-2-mini" { }).config;
@@ -124,8 +124,16 @@ let
     assert lib.assertMsg (
       lib.hasInfix "--no-async-scheduling" exec == !m.asyncScheduling
     ) "inkling-2-mini async scheduling does not reach ExecStart";
-    assert lib.assertMsg (!(lib.hasInfix "--kv-transfer-config" exec)) "inkling-2-mini ExecStart has LMCache";
-    assert lib.assertMsg (!cfg.services.lmcache-sm70.enable) "inkling-2-mini enables vllm-lmcache";
+    assert lib.assertMsg (lib.hasInfix "--kv-transfer-config" exec == m.lmcache)
+      "inkling-2-mini LMCache connector does not follow its lmcache field";
+    assert lib.assertMsg (cfg.services.lmcache-sm70.enable == m.lmcache)
+      "inkling-2-mini vllm-lmcache does not follow its lmcache field";
+    assert lib.assertMsg (
+      !m.lmcache || cfg.services.lmcache-sm70.chunkSize == m.lmcacheChunkSize
+    ) "inkling-2-mini LMCache chunk size does not reach vllm-lmcache";
+    assert lib.assertMsg (
+      (svc.environment.VLLM_USE_BREAKABLE_CUDAGRAPH or null) == "1"
+    ) "inkling-2-mini does not set VLLM_USE_BREAKABLE_CUDAGRAPH";
     assert lib.assertMsg (
       (svc.environment.VLLM_USE_V2_MODEL_RUNNER or null) == "1"
     ) "inkling-2-mini does not run the V2 model runner";
