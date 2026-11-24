@@ -10,11 +10,8 @@ reaches c4130 on its next switch.
 hold for **that exact commit**:
 
 1. `main` CI is green on it.
-2. C1 passes on it: a side-by-side decode bench and quality run on c4130
-   against the fork build, with the method of the
-   [GPU gate](checks.md#gpu-gate).
-3. The [GPU gate](checks.md#gpu-gate) passes on it.
-4. The repo owner approves the move.
+2. The [GPU gate](checks.md#gpu-gate) passes on it.
+3. The repo owner approves the move.
 
 A gate run on another commit doesn't count, even if only docs changed in
 between. Never force-push `latest` or move it backwards. To roll back, revert
