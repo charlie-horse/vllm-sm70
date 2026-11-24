@@ -1,39 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU engine harness for the Inkling 2 paged caches, for tests only.
-
-`PagedHarness` plays the scheduler and the runner for modules that read and
-write the model-owned caches (`vllm_sm70.models.inkling2_sm70.cache`): it
-allocates blocks, binds a cache tensor to every owner, builds each owner's
-metadata with the owner's own builder (`backend.py`) and calls the module
-under a forward context, one call per TP rank.
-
-    harness = PagedHarness(tp_size=2, block_size=8)
-    for rank in range(2):
-        with harness.tp_rank(rank):            # TP world size and rank
-            modules.append(Module(harness.vllm_config(rank)))
-    harness.bind()
-    outputs = harness.run(scenarios(20, 14, prefix_len=8)["resume"], forward)
-
-`forward(rank, batch)` runs with the rank's forward context set and returns a
-tensor with one row per batch token.
-
-Fidelity:
-- Every owner has a block table of its own, with block ids no other owner
-  uses in the same order. Ranks share the tables and have their own caches.
-- A cache is [blocks, heads, tokens per block, head_size + head_size_v] in
-  the owner's dtype. Block 0 is the null block.
-- Unwritten slots, the null block and freed blocks hold `poison` (NaN).
-  Sliding-window owners lose the blocks before the window at the start of a
-  step, as upstream's SlidingWindowManager frees them.
-- Requests of one token come first in a batch.
-- A padded step gives the builders what the v0.33 runner gives them
-  (v1/worker/gpu_model_runner.py ``_build_attention_metadata``). `metadata`
-  "full", a FULL graph: padded slot mapping (-1), positions and request rows,
-  and the padded count as ``num_actual_tokens``. `metadata` "unpadded", a
-  PIECEWISE graph: slot mapping, positions and request rows of the scheduled
-  tokens only. The batch tensors (`HarnessBatch`) are padded in both.
-- At TP > 1 the ranks run in lockstep and `all_reduce` / `all_gather` of the
-  TP group combine their tensors.
+`PagedHarness` plays scheduler and runner for modules that use the model-owned
+caches (`inkling2_sm70.cache`): it allocates blocks, binds caches, builds each
+owner's metadata and calls the module once per TP rank. Build each rank's
+module under `tp_rank(rank)`, then `bind()`, then `run(plan, forward)`;
+`forward(rank, batch)` returns one row per batch token.
+- Each owner has its own block table; ranks share tables, not caches.
+- A cache is [blocks, heads, block tokens, head_size + head_size_v]; block 0
+  is null. Empty and freed slots (sliding-window owners lose blocks before
+  the window, as upstream) hold `poison` (NaN).
+- One-token requests come first. A padded step gives the builders what the
+  v0.33 runner does: `metadata` "full" (FULL graph: padded slot mapping,
+  positions and rows) or "unpadded" (PIECEWISE: scheduled tokens only).
+- At TP > 1 the ranks run in lockstep; TP collectives combine their tensors.
 """
 
 from __future__ import annotations
@@ -343,9 +322,7 @@ class _Table:
 
 
 class PagedHarness:
-    """See the module docstring.
-
-    block_size: tokens per attention block (`--block-size`).
+    """See the module docstring. block_size: tokens per attention block.
     conv_block_size: tokens per conv-state block, when the cache is to be
         allocated with more than the owner's `block_size`.
     dtype: model and cache dtype.

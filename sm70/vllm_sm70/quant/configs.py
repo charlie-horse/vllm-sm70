@@ -1,37 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M2 sm70-quant-gates: let SM70 through upstream's quant capability gates.
+"""Let SM70 through upstream's quantization capability gates.
 
-What: subclasses of upstream's ``Fp8Config`` and ``ModelOptNvFp4Config``,
-  registered under the existing names "fp8" and "modelopt_fp4". They
-  override only ``get_min_capability``: 70 when ``is_sm70_ready()``,
-  otherwise upstream's own value (75 for both at UP 4ba787e,
-  quantization/fp8.py:146-147 and modelopt.py:772-774). On every other device
-  the result is identical to upstream.
-Why: upstream refuses any GPU below ``get_min_capability()``
-  (config/vllm.py:926-936). Overwriting the built-in names (UP
-  quantization/__init__.py:88-97 and :195) keeps each name's place in the
-  override order (config/model.py:1395-1425). Flint's nested ModelOpt config
-  (quant_method "modelopt", quant_algo "W4A16_NVFP4") resolves through the
-  inherited ``override_quantization_method`` (modelopt.py:776-783) to
-  "modelopt_fp4", and so to the class below. ``from_config`` builds the
-  instance with ``cls(...)`` (fp8.py:158-174; modelopt.py:403-409 and
-  :830-837), so the instance is ours too.
-Kill-switch: VLLM_SM70_QUANT=0 skips registration. Upstream's classes stay in
-  place and refuse SM70 with their usual ValueError. VLLM_SM70_FP8_TURBOMIND=0
-  puts only the "fp8" gate back to upstream's value; "modelopt_fp4" is not
-  affected.
-
+Subclasses of upstream's ``Fp8Config`` and ``ModelOptNvFp4Config`` are
+registered under the existing names "fp8" and "modelopt_fp4". They override
+only ``get_min_capability``: 70 when ``is_sm70_ready()``, otherwise
+upstream's own value, so every other device sees upstream's behaviour.
+Overwriting the built-in names keeps each name's place in the override
+order; Flint's nested ModelOpt config resolves to "modelopt_fp4" and so to
+the class below. VLLM_SM70_QUANT=0 skips registration;
+VLLM_SM70_FP8_TURBOMIND=0 puts only the "fp8" gate back to upstream's value.
 Registration is an import side effect: the engine core unpickles
-``vllm_config.quant_config`` before it loads plugins (UP v1/engine/core.py
-:1462-1464 vs :132-135), and unpickling imports this module by qualname.
-Re-importing is safe: registering a name again only overwrites it with the
-module's current class (UP quantization/__init__.py:89-95).
-
-``vllm_sm70.quant.register()`` (K01's area hook) imports this module and
-calls ``register()`` below. It is not imported from ``vllm_sm70.platform``,
+``vllm_config.quant_config`` before it loads plugins, and unpickling imports
+this module by qualname. It is not imported from ``vllm_sm70.platform``,
 because importing vLLM's quantization package there would re-enter platform
-resolution.
-"""
+resolution."""
 
 from typing import Any
 
@@ -53,14 +35,14 @@ SM70_MIN_CAPABILITY = 70
 
 
 def _min_capability(upstream: int) -> int:
-    # K01's readiness check: every visible GPU is cc 7.0 (NVML, no CUDA
+    # Readiness check: every visible GPU is cc 7.0 (NVML, no CUDA
     # init) and _sm70_C is loaded. Looked up on the module so tests can
     # patch it.
     return SM70_MIN_CAPABILITY if sm70_platform.is_sm70_ready() else upstream
 
 
 def fp8_route_enabled() -> bool:
-    """M6 routing gate: SM70 ready and VLLM_SM70_FP8_TURBOMIND not "0"."""
+    """FP8 TurboMind routing gate: SM70 ready and VLLM_SM70_FP8_TURBOMIND not "0"."""
     return fp8_turbomind_enabled() and sm70_platform.is_sm70_ready()
 
 
@@ -68,8 +50,7 @@ class Sm70Fp8Config(Fp8Config):
     """Upstream ``Fp8Config`` with the SM70 capability gate (Qwen FP8).
 
     With VLLM_SM70_FP8_TURBOMIND=0 the gate returns upstream's value (75), so
-    upstream refuses FP8 on SM70, as the fork did: v1 has no other SM70 FP8
-    kernel.
+    upstream refuses FP8 on SM70: there is no other SM70 FP8 kernel.
     """
 
     @classmethod
@@ -80,10 +61,10 @@ class Sm70Fp8Config(Fp8Config):
         return _min_capability(upstream)
 
     def get_quant_method(self, layer, prefix: str):
-        """M6: Qwen block-FP8 linears and routed experts -> SM70 TurboMind.
+        """Qwen block-FP8 linears and routed experts -> SM70 TurboMind.
 
-        Only when is_sm70_ready() (K01) and VLLM_SM70_FP8_TURBOMIND is not 0.
-        Skipped layers (UP fp8.py:180-197, is_layer_skipped) and everything
+        Only when is_sm70_ready() and VLLM_SM70_FP8_TURBOMIND is not 0.
+        Skipped layers (is_layer_skipped) and everything
         else, including KV-cache methods, go to upstream. At TP outside
         (1, 2) the MoE method raises instead of falling back.
         """
@@ -122,17 +103,16 @@ class Sm70ModelOptNvFp4Config(ModelOptNvFp4Config):
     def get_min_capability(cls) -> int:
         return _min_capability(super().get_min_capability())
 
-    # M3: LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] is installed below by
+    # LINEAR_METHOD_BUILDERS["W4A16_NVFP4"] is installed below by
     # _install_m3, at import time, for the same unpickling reason as the
     # registration.
 
     def get_quant_method(self, layer, prefix: str):
-        """M4: routed experts -> the SM70 TurboMind NVFP4 MoE method.
+        """Routed experts -> the SM70 TurboMind NVFP4 MoE method.
 
-        Only when is_sm70_ready() (K01) and the layer is not excluded (UP
-        modelopt.py:236-239). Everything else, and every non-SM70 device,
-        goes to upstream (modelopt.py:226-262), whose FusedMoEMethodCls
-        (:1199) would select an NVFP4 MoE backend that cc 7.0 doesn't have.
+        Only when is_sm70_ready() and the layer is not excluded. Everything
+        else, and every non-SM70 device, goes to upstream, whose
+        FusedMoEMethodCls would select an NVFP4 MoE backend that cc 7.0 doesn't have.
         """
         from vllm.model_executor.layers.fused_moe.routed_experts import (
             RoutedExperts,
@@ -155,8 +135,8 @@ SM70_QUANT_CONFIGS: dict[str, type] = {
     "modelopt_fp4": Sm70ModelOptNvFp4Config,
 }
 
-# Flint's checkpoint shape (FORK cf9492a vllm/models/flint/convert_gguf.py
-# :114-123), used to check that override_quantization_method still names
+# Flint's checkpoint quantization config, used to check that
+# override_quantization_method still names
 # our registry slot.
 _FLINT_QUANT_CFG: dict[str, Any] = {
     "quant_method": "modelopt",
@@ -182,11 +162,11 @@ REGISTERED = _register_all()
 
 
 def _install_m3() -> bool:
-    """M3: route ModelOpt W4A16_NVFP4 linears to the SM70 TurboMind method
+    """Route ModelOpt W4A16_NVFP4 linears to the SM70 TurboMind method
     (vllm_sm70/quant/nvfp4_linear.py). The builder re-checks is_sm70_ready()
     for each layer and otherwise falls through to upstream's
     ModelOptLinearMethod. Kill switch: VLLM_SM70_MODELOPT_NVFP4_GEMV=0 only
-    drops the M<=2 GEMV; VLLM_SM70_QUANT=0 skips this together with M2."""
+    drops the M<=2 GEMV; VLLM_SM70_QUANT=0 skips this with the registration."""
     if not (REGISTERED and sm70_platform.is_sm70_ready()):
         return False
     from vllm_sm70.quant.nvfp4_linear import install_linear_builder
@@ -202,8 +182,8 @@ def register() -> None:
     """Plugin entry hook. Raises if the registration didn't take effect.
 
     Upstream changes that would otherwise make the override silently not
-    apply (D4) fail here instead. It never catches and logs: at cc 7.0 the
-    plugin fails startup on an area error (K03). It is idempotent and safe
+    apply fail here instead. It never catches and logs: at cc 7.0 the
+    plugin fails startup on an area error. It is idempotent and safe
     to retry, since it only re-checks the registry.
     """
     if not REGISTERED:

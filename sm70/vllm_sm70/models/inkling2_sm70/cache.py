@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the modules that own the paged caches.
 
-Every visit of a decoder layer (layer, pass) has two caches of its own: the
-attention K/V and the short-conv state. Each is one ``AttentionLayerBase``
-owner in vLLM's forward context, so the KV planner allocates and the runner
-binds them:
+Every visit of a decoder layer (layer, pass) has its own attention K/V cache
+and short-conv state, each one ``AttentionLayerBase`` owner in vLLM's forward
+context, so the KV planner allocates and the runner binds them:
 
     <prefix>.<layer>.attn[.pass<p>]        Inkling2AttentionCache
     <prefix>.<layer>.conv_state[.pass<p>]  Inkling2ConvState
 
-Pass 0 has no suffix. A name holds one integer, the layer
-(UP model_executor/models/utils.py ``extract_layer_index``).
-
-The conv state packs four streams per local KV head into one sliding-window
-spec of ``sconv_kernel_size`` tokens: K, V, attention output, MLP output. The
-two output streams hold the full hidden width on every rank. Layout as
-upstream's ``InklingConvState(replicate_hidden=True)``
-(UP c32251b models/inkling/nvidia/sconv_swa_attn.py), in the model dtype.
+Pass 0 has no suffix; a name holds one integer, the layer. The conv state
+packs four streams per local KV head into one sliding-window spec of
+``sconv_kernel_size`` tokens: K, V, attention output, MLP output. The two
+output streams hold the full hidden width on every rank; the layout is
+upstream's ``InklingConvState(replicate_hidden=True)``, in the model dtype.
 """
 
 from __future__ import annotations

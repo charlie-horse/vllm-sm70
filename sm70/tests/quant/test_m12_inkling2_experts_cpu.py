@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 torch expert path (moe.py).
+"""Tests for the Inkling 2 torch expert path (moe.py).
 
 CPU, without the Hugging Face Inkling 2 classes: the router and the experts of
 the tiny checkpoint (models/fixtures/inkling2_tiny/) are run at TP1 and as the

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// _sm70_C::flint_route (patch K13): the fused SM70 decode router for the
-// E256/K6 sigmoid MoE with an FP32 gate [256, 2048] and FP16 activations,
-// one or two tokens. Kernel: flint_router.cuh (verbatim from the fork).
+// _sm70_C::flint_route: the fused SM70 decode router for the E256/K6 sigmoid
+// MoE with an FP32 gate [256, 2048] and FP16 activations, one or two tokens.
+// Kernel: flint_router.cuh. Source: PROVENANCE.md.
 //
-// Ported from fork cf9492a csrc/sm70_turbomind/ops/sm70_router.cu:
-//   kept:    flint_route (:72-123), its schema (:131-133), check_sm70 (:27-31)
-//   dropped: top10, select_quantize and their helpers (GGUF E512 router,
-//            not used by Flint or Qwen), the separate TORCH_LIBRARY
-//            (vllm_sm70_router) and the pybind module.
 // The op is registered as a fragment of _sm70_C. The workspace (logits) and
 // the arrival counter are caller-owned and allocated once per layer before
 // CUDA graph capture (vllm_sm70/router.py); this op allocates nothing.

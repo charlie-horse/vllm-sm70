@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 model body on the Triton norm route (inkling2_sm70/norms.py),
+"""Inkling 2 model body on the Triton norm route (inkling2_sm70/norms.py),
 on CPU.
 
 The model of test_m12_inkling2_model_cpu.py runs a prefill and two decode

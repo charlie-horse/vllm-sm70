@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K07 CPU checks: Flash-V100 spec-decode verify (smallq -> XQA).
+"""CPU checks: Flash-V100 spec-decode verify (smallq -> XQA).
 
-Needs upstream v0.33.0's Python importable (skipped otherwise). Covers the
-token-wise verify expansion and its persistent buffers (restating fork
-tests/v1/attention/test_flash_v100_spec_metadata.py
-:test_persistent_draft_buffers_keep_addresses_across_replays and
-:test_capture_hook_preserves_small_query_lengths for v0.33), the builder
+Needs upstream vLLM's Python importable (skipped otherwise). Covers the
+token-wise verify expansion and its persistent buffers (addresses kept
+across replays, small query lengths kept by the capture hook), the builder
 with a speculative config (reorder threshold, decode/verify split, the
-non-causal DFlash draft staying on paged prefill: fork test_dflash2.py
-:test_noncausal_draft_cannot_enter_flash_v100_small_query_fast_path and
-:test_noncausal_dflash_capture_binds_paged_prefix_attention), the kill
-switch, the graph-support level and the impl forward on CPU stand-ins of
-the K05 ops against the SDPA reference.
+non-causal DFlash draft staying on paged prefill), the kill switch, the
+graph-support level and the impl forward on CPU stand-ins of the Flash-V100
+ops against the SDPA reference.
 """
 
 from __future__ import annotations
@@ -114,7 +110,7 @@ def test_expansion_rejects_more_rows_than_the_buffer():
 
 
 def test_cpu_expansion_never_uses_the_kernel():
-    # A1's Triton expansion is CUDA-only; CPU tensors (and vLLM-free
+    # The Triton expansion is CUDA-only; CPU tensors (and vLLM-free
     # imports) keep the torch path.
     from vllm_sm70.attention.flash_v100.spec.verify import VerifyExpansion
 
@@ -397,7 +393,7 @@ def _run_case(
 @pytest.mark.parametrize("heads", [(12, 2), (8, 1)], ids=["gqa6", "gqa8"])
 def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
-    monkeypatch.setenv("VLLM_SM70_FLASH_V100_VERIFY_KERNEL", "0")  # B2 off
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_VERIFY_KERNEL", "0")  # verify kernel off
     names = _run_case(
         monkeypatch,
         cpu_ops,
@@ -412,7 +408,7 @@ def test_qwen_verify_takes_xqa(monkeypatch, cpu_ops, heads):
     assert cpu_ops.calls[0][1]["rows"] == 3 * L
 
 
-# ------------------------------------------------- B2: verify kernel route
+# ------------------------------------------------------ verify kernel route
 
 VERIFY = "VLLM_SM70_FLASH_V100_VERIFY_KERNEL"
 
@@ -467,9 +463,9 @@ def test_other_verify_batches_keep_xqa(monkeypatch, verify_op, heads, query_lens
 
 @requires_vllm
 def test_eager_verify_keeps_one_workspace_at_growing_lengths(monkeypatch, verify_op):
-    # Eager B2 launches for the live length but sizes its workspace for the
-    # max_model_len envelope (4096 here -> 32 partitions): one cache entry,
-    # never one per length (Quinn's #114 review).
+    # The eager verify kernel launches for the live length but sizes its
+    # workspace for the max_model_len envelope (4096 here -> 32 partitions):
+    # one cache entry, never one per length.
     from vllm_sm70.ops import fv100
 
     launches = []
@@ -557,7 +553,7 @@ def test_verify_rows_cap_follows_the_workspace_budget():
     # Qwen3.8 TP2: 12 q heads, D256. 520 B per (row, head, 128-key partition).
     assert fv100.verify_max_rows(12, 256, 32768) == 168  # 21 requests
     assert fv100.verify_max_rows(12, 256, 150000) == 32  # 4 requests
-    assert fv100.verify_max_rows(8, 256, 262144) == 24  # Qwen3.6 TP2, 1Cat len
+    assert fv100.verify_max_rows(8, 256, 262144) == 24  # Qwen3.6 TP2 at 262144
     for heads, length in ((12, 32768), (12, 150000), (8, 262144)):
         rows = fv100.verify_max_rows(heads, 256, length)
         parts = -(-length // 128)
@@ -582,7 +578,7 @@ def test_verify_switch_registered_and_reads_only_zero(monkeypatch):
 @requires_vllm
 @pytest.mark.parametrize("fused", ["1", "0"])
 def test_flint_verify_takes_sink_decode(monkeypatch, cpu_ops, fused):
-    # K14: with its op built and its switch on, Flint's sink decode is the
+    # With its op built and its switch on, Flint's sink decode is the
     # one-launch fused kernel; otherwise the two-launch one. Which ops exist
     # depends on the build (a host with the real _sm70_C has the fused op).
     from vllm_sm70.ops import fv100
@@ -648,7 +644,7 @@ def test_noncausal_draft_window_is_two_sided(monkeypatch, cpu_ops):
     # DFlash drafts are non-causal with a sliding window: every draft token
     # sees w - 1 keys on each side, like Triton (|dist| < w) and upstream
     # FlashAttention's _maybe_symmetrize_window. A left-only (w - 1, 0)
-    # window would drop the draft's future keys (Bea's c4130 GPU run).
+    # window would drop the draft's future keys.
     from vllm_sm70.attention.flash_v100.impl import symmetric_window
 
     assert symmetric_window((2047, 0), False) == (2047, 2047)
@@ -674,8 +670,8 @@ def test_noncausal_draft_window_is_two_sided(monkeypatch, cpu_ops):
 def test_rebuild_refreshes_captured_buffers_in_place(monkeypatch, spec_tokens):
     # A captured graph keeps reading the tensors bound at capture. The V1
     # runner rebuilds metadata every step before replay, so each rebuild must
-    # write the new lengths/tables into those same buffers (Bea's c4130 run:
-    # replay without a rebuild read the capture-time seq_lens of 1).
+    # write the new lengths/tables into those same buffers; otherwise replay
+    # reads the capture-time seq_lens of 1.
     monkeypatch.delenv("VLLM_SM70_FLASH_V100_SPEC", raising=False)
     from vllm_sm70.attention.flash_v100.spec.verify import expand_reference
 

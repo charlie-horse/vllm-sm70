@@ -1,50 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Greedy vocab-parallel top-1 for all-greedy batches (F12).
+"""Greedy vocab-parallel top-1 for all-greedy batches.
 
-At temperature 0 the upstream V1 path all-gathers the full-vocabulary
-logits (Flint TP2: 150144 FP16 values per row), converts them to FP32 and
-runs the Sampler only to take ``argmax``. Here each TP rank takes the
-argmax of its own LM-head shard, and the ranks all-gather one
-(value, token id) pair per row and rank. Upstream already carries that
-reduction as ``LogitsProcessor.get_top_tokens`` (UP model_executor/layers/
-logits_processor.py:201-247: same LM-head GEMM through ``_apply_head``,
-same soft cap and scale, padding masked to -inf, FP32 pairs), and this
-module calls it.
-
-Why the token equals upstream's ``Sampler.greedy_sample``: FP16 to FP32 is
-exact, so the per-element values are those the Sampler compares. Each
-rank's ``max`` returns its first maximal index, ranks own increasing vocab
-ranges (no added vocab), and the cross-rank ``argmax`` picks the lowest
-rank on ties, so the result is the first maximal index over the whole
-vocabulary, as ``argmax`` over the gathered logits. Token ids travel as
-FP32 and are exact below 2^24.
-
-Port of fork cf9492a: switch VLLM_SM70_GREEDY_TOKEN_FASTPATH=1 (FORK
-envs.py:7033, kernel_config.layer_execution.greedy_token_fastpath, runner
-:1314), gate ``_can_use_greedy_token_fastpath`` (runner :7646-7695), call
-``_sample_greedy_token_fastpath`` (runner :7845-7862), and the Flint
-``get_top_tokens`` with ``fused_top1=False`` (FORK models/flint/model.py:
-571-578, :597-603), i.e. the plain LM-head GEMM, which is what upstream's
-``get_top_tokens`` does. The fork's DDTree greedy branch (runner :6940-6962,
-:7150-7176) is spec decode, which the U4 hook never sees. The runner side
-is ``Sm70HiddenStateSampler`` in vllm_sm70/sample_v1.py (patch U4).
-
-Pair exchange over the custom all-reduce buffers (fork
-``VLLM_SM70_TOP1_CUSTOM_AR``; here opt-in with ``=1``, default off): instead of the NCCL all-gather,
-each rank writes its pairs into upstream's ``CustomAllreduce`` eager buffer
-and one IPC kernel (``_sm70_C::custom_ar_top1_argmax``, csrc/custom_ar/
-top1_custom_ar.cu) reduces them with the same first-index tie rule. Port of
-FORK ``LogitsProcessor._maybe_custom_top1_argmax`` (logits_processor.py:
-817-847), ``CustomAllreduce.custom_top1_argmax`` / ``top1_argmax``
-(custom_all_reduce.py:771-790, :977-998) and ``cross_device_top1_argmax``
-(csrc/custom_all_reduce.cuh:1720-1750). Rank-uniform admission
-(``custom_ar_reject_reason``): the switch, TP > 1, CUDA, 1-128 rows, an
-enabled single-node custom all-reduce of 2/4/6/8 ranks on the TP group
-and a ``_sm70_C`` built with the kernel. Anything else, including
-the switch unset (anything but ``1``), TP1, CPU, or a custom all-reduce that was
-never initialised or is disabled, takes ``get_top_tokens`` and its
-all-gather as before.
-"""
+At temperature 0 each TP rank takes the argmax of its own LM-head shard and
+the ranks all-gather one (value, token id) pair per row and rank, instead of
+the full-vocabulary logits. It uses upstream's
+``LogitsProcessor.get_top_tokens`` (same LM-head GEMM, soft cap, scale and
+padding mask). The token equals ``Sampler.greedy_sample``'s: each rank's
+``max`` returns its first maximal index, ranks own increasing vocab ranges,
+and the cross-rank argmax picks the lowest rank on ties. Token ids travel
+as FP32 and are exact below 2^24.
+With ``VLLM_SM70_TOP1_CUSTOM_AR=1`` the pairs go through upstream's
+``CustomAllreduce`` eager buffer and one IPC kernel
+(``_sm70_C::custom_ar_top1_argmax``) instead of the NCCL all-gather, when
+``custom_ar_reject_reason`` admits it. The runner side is
+``Sm70HiddenStateSampler`` in vllm_sm70/sample_v1.py."""
 
 from __future__ import annotations
 
@@ -61,7 +30,7 @@ logger = logging.getLogger("vllm.sm70")
 TOP1_CUSTOM_AR_SWITCH = "VLLM_SM70_TOP1_CUSTOM_AR"
 KERNEL_NAMESPACE = "_sm70_C"
 KERNEL_NAME = "custom_ar_top1_argmax"
-# One CTA of 128 threads, one row each (fork: numel <= 256 FP32 values).
+# One CTA of 128 threads, one row each.
 MAX_CUSTOM_AR_ROWS = 128
 CUSTOM_AR_WORLD_SIZES = (2, 4, 6, 8)
 # Attributes of upstream's CustomAllreduce the exchange reads.
@@ -74,9 +43,9 @@ MAX_VOCAB = 1 << 24
 def metadata_reject_reason(sampling_metadata: Any) -> str | None:
     """Batch admission: the Sampler would do nothing but argmax.
 
-    FORK runner :7673-7694. The caller checks spec decode, structured output,
-    thinking budget and non-argmax-invariant logits processors (shared with
-    K16). Argmax-invariant processors (min-p, top-k/top-p) cannot change a
+    The caller checks spec decode, structured output, thinking budget and
+    non-argmax-invariant logits processors (shared with the top-k
+    sampler). Argmax-invariant processors (min-p, top-k/top-p) cannot change a
     greedy token, so they are not checked.
     """
     if not sampling_metadata.all_greedy:
@@ -95,7 +64,7 @@ def metadata_reject_reason(sampling_metadata: Any) -> str | None:
 
 
 def device_reject_reason(device: torch.device | None) -> str | None:
-    """FORK runner :7663-7668: CUDA and SM70 only."""
+    """CUDA and SM70 only."""
     if device is None or device.type != "cuda":
         return "non_cuda"
     if torch.cuda.get_device_capability(device) != (7, 0):
@@ -175,9 +144,8 @@ def custom_ar_reject_reason(
 
     Every input is the same on all TP ranks (environment, configuration,
     batch rows, upstream's collective init), so either every rank enters the
-    custom-AR kernel or every rank enters the all-gather. FORK
-    ``_maybe_custom_top1_argmax`` + ``custom_top1_argmax`` checks, minus the
-    capture branch (the U4 hook rejects capture before this).
+    custom-AR kernel or every rank enters the all-gather. Capture is
+    rejected by the caller before this.
     """
     if not custom_ar_switch_on():
         return "switch_off"
@@ -194,7 +162,7 @@ def custom_ar_reject_reason(
     if ca.world_size != tp_size or ca.world_size not in CUSTOM_AR_WORLD_SIZES:
         return "world_size"
     # Real IPC peers, not the multi-node fallback that repeats the local
-    # buffer (UP custom_all_reduce.py:309-311).
+    # buffer.
     ptrs = list(ca.buffer_ptrs)
     if len(ptrs) != ca.world_size or len(set(ptrs)) != len(ptrs):
         return "multi_node"
@@ -210,9 +178,9 @@ def local_pair(
 ) -> torch.Tensor:
     """This rank's [rows, 2] FP32 (max logit, global token id).
 
-    The first half of upstream ``get_top_tokens`` (UP logits_processor.py:
-    213-241), line for line: the same LM-head GEMM, soft cap, scale and
-    padding mask, so the pair is the one get_top_tokens all-gathers.
+    The first half of upstream ``get_top_tokens``, line for line: the same
+    LM-head GEMM, soft cap, scale and padding mask, so the pair is the one
+    get_top_tokens all-gathers.
     """
     logits = logits_processor._apply_head(lm_head, hidden_states, None)
     if logits_processor.soft_cap is not None:
@@ -304,7 +272,7 @@ def greedy_tokens(
             pair = local_pair(logits_processor, lm_head, hidden_states)
             try:
                 top = exchange_custom_ar(ca, pair)
-            except Exception as exc:  # noqa: BLE001 (fork: warn, then all-gather)
+            except Exception as exc:  # noqa: BLE001 (warn, then all-gather)
                 _log_once(
                     logging.WARNING,
                     f"SM70 custom top1 argmax failed; falling back to all_gather: {exc}",

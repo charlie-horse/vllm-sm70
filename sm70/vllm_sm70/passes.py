@@ -1,19 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """One composite post-grad Inductor pass carrying every SM70 fusion pattern.
 
-UP's PostGradPassManager hard-codes its passes (UP compilation/passes/
-pass_manager.py:139-222). The one open slot is
+vLLM's PostGradPassManager hard-codes its passes. The one open slot is
 `compilation_config.inductor_compile_config["post_grad_custom_post_pass"]`,
-which UP compilation/backends.py:983-1000 appends to the manager. The
-manager's uuid() includes each pass's uuid() (pass_manager.py:229-250), and
-Inductor uses that uuid in its FX-graph cache key (torch
-_inductor/codecache.py, FxGraphHashDetails, post_grad_custom_post_pass).
+which vLLM appends to the manager. The manager's uuid() includes each
+pass's uuid(), and Inductor uses it in its FX-graph cache key.
 
-vLLM's own compile-cache directory does *not* see this pass: the slot is
-excluded from CompilationConfig.compute_hash (UP config/compilation.py:
-832-834), and the cache dir is keyed by env, config and .py-source hashes
-(UP backends.py:1058-1080). The .so fingerprint therefore also goes into
-vllm.envs.compile_factors() through VLLM_SM70_EXT_FINGERPRINT (envs.py).
+vLLM's own compile-cache directory does not see this pass (the slot is
+excluded from CompilationConfig.compute_hash), so the .so fingerprint also
+goes into vllm.envs.compile_factors() through VLLM_SM70_EXT_FINGERPRINT.
 """
 
 from __future__ import annotations
@@ -41,7 +36,7 @@ class _Pattern:
         self.name, self.version, self.fn = name, version, fn
 
 
-# Filled by areas via register_pattern() from register() (K17: AR+RMSNorm).
+# Filled by areas via register_pattern() from register().
 _PATTERNS: list[_Pattern] = []
 
 
@@ -112,4 +107,4 @@ def register() -> None:
     """Area hook: each fusion area decides whether its pattern registers."""
     from vllm_sm70 import ar_rms_fusion
 
-    ar_rms_fusion.register()  # K17; a no-op (logged once) without the kernel
+    ar_rms_fusion.register()  # a no-op (logged once) without the kernel

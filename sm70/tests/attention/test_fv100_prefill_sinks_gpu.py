@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K05 GPU: learned sinks on the Flash-V100 paged prefill (Flint shapes).
+"""GPU: learned sinks on the Flash-V100 paged prefill (Flint shapes).
 
-Port of fork cf9492a tests/kernels/attention/test_sm70_flash_v100_sinks_prefill.py
-(GPU cases, :140-325). The fork's CPU cases check fork backend wiring
-(prefill.py executors) and are not ported; K06 owns the backend. The kernel
-is reached through vllm_sm70.ops.fv100 instead of flash_attn_v100, and the
-reference is the shared SDPA one (_fv100_ref.py). Head size 64 of the fork's
-last case is not built in K05 (lean subset: 128/256).
+The kernel is reached through vllm_sm70.ops.fv100 and checked against the
+shared SDPA reference (_fv100_ref.py). Head sizes 128 and 256 only; the
+build has no other prefill head size.
 """
 
 from __future__ import annotations

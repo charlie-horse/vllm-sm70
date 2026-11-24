@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 NVFP4 TurboMind expert route (moe_tm.py).
+"""Tests for the Inkling 2 NVFP4 TurboMind expert route (moe_tm.py).
 
 CPU: ``vllm_sm70.ops.tm`` is replaced by pure-torch ops with the same
 signatures (prepare packs 8 codes per int32, the dense stage dequantizes a

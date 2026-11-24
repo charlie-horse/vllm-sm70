@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the attention prologue of one layer visit, in torch.
 
-From the projections of the layer input it produces what the attention op
-reads, and stores this batch's keys and values:
+It produces what the attention op reads and stores the batch's keys and values:
 
     q_out    clip(q * q_scale), times tau in a global layer    [T, heads, D]
     rel_out  clip(r * rel_scale) (times tau) @ rel_proj        [T, heads, extent]
@@ -10,21 +9,10 @@ reads, and stores this batch's keys and values:
     V cache  rms_norm(conv(v)) per KV head, same slots
 
 Clips, norms and tau run in fp32 and round to the input dtype where the
-reference does (transformers modeling_inkling2_loop.py: scaled L2 clip, log
-scale, key/value projection). The K and V convs read and store streams
-STREAM_K and STREAM_V of the visit's conv state (sconv.py). rel_out[t, h, d]
-is the bias of query t on the key d tokens back.
-
-The K/V cache is vLLM's [blocks, kv_heads, tokens, 2 * D]: keys in the first
-D values of a head, values in the rest.
-
-On the Triton route of sconv.py (``sconv.on_triton``) the K and V convs, the
-clip, the norm and the K/V store run as one kernel launch
-(ops/paged_conv.py ``key_value_conv``). In a decode-only batch on the route
-of fused_small.py the q and r clips, tau and the projection of r run as one
-launch (ops/small_ops.py ``query_rel``); otherwise q and r run on torch.
-When both run kernels on a decode-only batch, the two are one launch on the
-route of visit_fusion.py (ops/visit.py ``prologue``).
+reference does. The K and V convs use streams STREAM_K and STREAM_V of the
+visit's conv state. rel_out[t, h, d] is the bias of query t on the key d
+tokens back. The K/V cache is [blocks, kv_heads, tokens, 2 * D]: keys, then
+values per head. Kernel routes: sconv.py, fused_small.py and visit_fusion.py.
 """
 
 from __future__ import annotations
@@ -268,19 +256,15 @@ def attention_prologue(
     """Prologue of one layer visit over the caches of `attn_owner`
     (``Inkling2AttentionCache``) and `conv_owner` (``Inkling2ConvState``).
 
-    q [T, heads * D], r [T, heads * d_rel], k and v [T, kv_heads * D] are the
-    projections of ``project_qkvr``; q_scale [heads, D], rel_scale
-    [heads, d_rel], rel_proj [d_rel, extent]. A sliding layer passes static
-    conv weights [C, K] or [C, 1, K] and no taps; a global layer passes the
-    static parts [K, C], the per-token taps [T, kv_heads * K] and
-    `log_scaling` (alpha, n_floor). Writes `q_out` [T, heads, D] and `rel_out`
-    [T, heads, extent] and stores K, V and the conv inputs.
-
-    The metadata is the current forward's and covers the first n =
-    ``num_actual_tokens`` rows (the slot-mapping rows of a decode-only
-    batch, sconv.py): rows after them are zero in `q_out` and `rel_out` and
-    are not stored. A forward without metadata stores nothing and applies no
-    tau.
+    q [T, heads * D], r [T, heads * d_rel], k and v [T, kv_heads * D] come
+    from ``project_qkvr``; q_scale [heads, D], rel_scale [heads, d_rel],
+    rel_proj [d_rel, extent]. A sliding layer passes static conv weights
+    [C, K] or [C, 1, K]; a global layer passes static parts [K, C], per-token
+    taps [T, kv_heads * K] and `log_scaling` (alpha, n_floor). Writes `q_out`
+    [T, heads, D] and `rel_out` [T, heads, extent] and stores K, V and the conv
+    inputs. Rows from n = ``num_actual_tokens`` on (the slot-mapping rows of a
+    decode-only batch) are zero in the outputs and not stored. A forward
+    without metadata stores nothing and applies no tau.
     """
     attn_metadata = cache_metadata(attn_owner)
     conv_metadata = cache_metadata(conv_owner)

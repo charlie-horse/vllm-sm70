@@ -1,25 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 paged short-conv kernels (inkling2_sm70/ops/paged_conv.py)
-and their route (sconv.py ``short_conv``, prologue.py
-``attention_prologue``), on CPU.
+"""Inkling 2 paged short-conv kernels (inkling2_sm70/ops/paged_conv.py) and
+their route (sconv.py ``short_conv``, prologue.py ``attention_prologue``).
 
-- the kill switch VLLM_SM70_INKLING_TRITON_SCONV and the route choice: on by
-  default for GPU tensors, torch off the GPU;
+- the kill switch VLLM_SM70_INKLING_TRITON_SCONV and the route choice;
 - the kernel source holds nothing sm_70 rejects;
-- through Triton's interpreter against the torch route, in fp32 within 1e-5
-  and in fp16 within 2e-3: pure prefill, pure decode, mixed batches,
-  positions across the 32-token block boundary, requests shorter than the
-  conv width, padded and unpadded metadata, a scheduled row without a slot,
-  the LBNHC cache view, static and dynamic convs, decode-only verify steps
-  of 8 tokens per request against the eager torch ops; the conv-state and
-  K/V caches after every scenario;
-- one kernel launch per short conv and per prologue K/V pair, and no host
-  sync or data-dependent op on the route;
+- through Triton's interpreter against the torch route (fp32 within 1e-5,
+  fp16 within 2e-3): prefill, decode, mixed and verify batches, block-edge
+  positions, short requests, padded metadata, a row without a slot, the
+  LBNHC view, static and dynamic convs, and the caches after each scenario;
+- one launch per short conv and per prologue K/V pair, no host sync;
 - the tiny model through the interpreted kernels against the torch route.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite); in the parent they show as skipped. The GPU
-version is test_m12_inkling2_triton_sconv_gpu.py.
+(test_interpreted_suite). GPU version: test_m12_inkling2_triton_sconv_gpu.py.
 """
 
 from __future__ import annotations

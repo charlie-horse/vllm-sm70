@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 weight-streaming GEMVs on an SM70 GPU.
+"""Inkling 2 weight-streaming GEMVs on an SM70 GPU.
 
 - ops/small_m_gemv.py against cuBLAS at the Inkling 2 Mini TP2 shapes (gated
   qkvr with its k and v inputs, wo, the sharded LM head), 1 to 8 rows;

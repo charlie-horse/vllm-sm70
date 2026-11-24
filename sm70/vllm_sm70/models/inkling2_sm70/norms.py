@@ -1,37 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the row-wise ops between the sublayers, on the vendored
-Triton kernels (ops/norm.py, attn_res.py, loop.py) and the gate and residual
-kernels of ops/fused.py, or on torch (ops/torch_ref.py).
+Triton kernels (ops/norm.py, attn_res.py, loop.py) and ops/fused.py, or on
+torch (ops/torch_ref.py).
 
-    rms_norm          weighted RMS norm of one stream
-    normed_state      one key of the AttnRes mixes
-    Bank              the keys of one forward, in one buffer, and the route
-                      of the forward's ops
-    Residual          the fp32 residual stream inside a layer
-    message_sources   what the message mixes of a loop pass read
-    message_mix       the messages of one core layer
-    sublayer_inputs   AttnRes mix, message gates and RMS norm of the input
-                      streams of a sublayer
-
-Route (``on_triton``): the kernels run on a decode-only batch
-(backend.is_decode_only), the torch ops on every other batch.
-VLLM_SM70_INKLING_TRITON_NORMS=0 puts every batch on the torch ops, =1 every
-batch on the kernels. Tensors off the GPU take the torch ops, except in
-Triton's interpreter. A forward's route is fixed when its ``Bank`` is made;
-a replayed CUDA graph keeps the route it was captured with.
-
-On the kernels one launch replaces the torch ops of a mix with its norm, and
-a layer's residual add is summed inside the kernels that read it. The
-message gates of a batch of at most ``fused.MAX_TOKENS`` tokens are three
-launches (``fused.gate_down``, ``fused.gate_up``, ``loop.blend_rms_norm``);
-larger batches run the two GEMMs on torch.bmm between ``loop.pair_rms_norm``
-and the blend.
-On the route of visit_fusion.py a mix over a ``Pending`` state runs the
-short conv that produces it in the same launch (ops/visit.py ``conv_mix``)
-and the three gate launches are one (``gate_blend``).
-
-The outputs of `message_sources` and `message_mix` are laid out per path and
-are read only by `message_mix` and `sublayer_inputs`.
+Route (``on_triton``): the kernels run on a decode-only batch, the torch ops
+on every other batch. VLLM_SM70_INKLING_TRITON_NORMS=0 puts every batch on
+the torch ops, =1 every batch on the kernels. Tensors off the GPU take the
+torch ops, except in Triton's interpreter. A forward's route is fixed when
+its ``Bank`` is made; a replayed CUDA graph keeps its route. On the kernels
+one launch runs a mix with its norm, a layer's residual add is summed inside
+the kernels that read it, and the message gates of up to
+``fused.MAX_TOKENS`` tokens are three launches. The outputs of
+`message_sources` and `message_mix` are laid out per route and read only by
+`message_mix` and `sublayer_inputs`.
 """
 
 from __future__ import annotations

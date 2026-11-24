@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Self-test for scripts/verify-port.py against a checkout of the fork.
+"""Self-test for scripts/verify-port.py against a checkout of the source tree.
 
-    scripts/verify-port-selftest.py <fork-checkout> [workdir]
+    scripts/verify-port-selftest.py <source-checkout> [workdir]
 
-1. Identity: several fork files compared with themselves must be all IDENTICAL
+1. Identity: several source files compared with themselves must be all IDENTICAL
    (run with an empty rule set, so normalization cannot hide anything).
 2. Mutation: a port copy is made with the expected adaptations done by an
    independent AST rewrite (not the regex rules), plus planted defects. The

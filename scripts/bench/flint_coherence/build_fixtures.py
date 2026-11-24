@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """Build the Gate A fixtures.
 
-Two files are written to ``fixtures/``:
+Writes two files to ``fixtures/``:
+* ``teacher_forced.jsonl``: ~30 (context, assistant turn) pairs from resolved
+  SWE-bench trajectories (mini-swe-agent 2.4.6), contexts spread
+  log-uniformly over 2K-32K prompt tokens, one per instance, round-robin
+  over repos, preferring turns with reasoning.
+* ``greedy_prompts.jsonl``: 20 code/math/prose prompts plus 4 long-context
+  prompts (~8K-32K tokens) built from this repo's own source.
+With ``--ssh HOST`` this file is piped to the remote interpreter (stdlib
+only), which streams slim records back and writes nothing::
 
-* ``teacher_forced.jsonl``: ~30 (context, assistant turn) pairs taken from
-  resolved SWE-bench instances of a known-good run (mini-swe-agent 2.4.6
-  trajectories). Contexts are spread log-uniformly over 2K-32K prompt tokens
-  (the server's own ``usage.prompt_tokens`` for that turn), one pair per
-  instance, round-robin over repos, preferring turns that carry reasoning.
-* ``greedy_prompts.jsonl``: 20 hand-written code/math/prose prompts asking
-  for 500-2000 output tokens, plus 4 long-context prompts (~8K/16K/24K/32K
-  tokens) built from this repo's own source with a question about it.
-
-The trajectories live on a remote host. Nothing is written there: this file
-is piped to the remote interpreter (stdlib only) which streams slim records
-to stdout::
-
-    .venv/bin/python build_fixtures.py --ssh r440 \\
-        --remote-python '~/flint-swebench/.venv/bin/python' \\
-        --runs-dir '~/flint-swebench/runs/att1'
-
+    build_fixtures.py --ssh HOST --remote-python PY --runs-dir DIR
 ``--runs-dir`` may also be a local copy (omit ``--ssh``).
 """
 

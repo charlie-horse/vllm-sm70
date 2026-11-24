@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 DSpark draft ops (inkling2_sm70/ops/dspark.py), on CPU.
+"""Inkling 2 DSpark draft ops (inkling2_sm70/ops/dspark.py), on CPU.
 
 - the Triton kernels through Triton's interpreter against the torch forms
   of the same ops, in fp32 within 1e-5 and in fp16 within 2e-3 of the

@@ -10,7 +10,7 @@
 #   lmcacheUi  wrapper with only bin/python, able to import
 #              lmcache.lmcache_frontend.app (kept off the system PATH).
 #   tree       the sm_70-built vLLM tree.
-#
+
 # vllm/python/lmcache/tree come from ./package.nix. LMCache 0.5.6 is built
 # from the sdist for sm_70 (./lmcache-build.nix, with ./patches/lmcache) and
 # sits on the wrapper's PYTHONPATH, so bin/lmcache and lmcacheUi's bin/python

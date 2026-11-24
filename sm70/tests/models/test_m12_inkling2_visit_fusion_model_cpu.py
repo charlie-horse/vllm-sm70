@@ -1,21 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 model body on the merged visit kernels
-(inkling2_sm70/visit_fusion.py), on CPU.
+"""Inkling 2 model body on the merged visit kernels (visit_fusion.py), on CPU.
 
-The model of test_m12_inkling2_model_cpu.py (tiny checkpoint, cudagraph
-mode FULL_DECODE_ONLY) runs a prefill and decode steps twice through
-Triton's interpreter: with the merged kernels (switch unset) and with
-VLLM_SM70_INKLING_VISIT_FUSION=0. Two requests decode side by side.
-
-- with the visit hook, every visit's state, the final state and the logits
-  agree; the hook reads each visit's output, so a layer output runs its conv
-  and add on its own (``conv_residual``);
-- without the hook, a layer output stays pending into the next visit's
-  attention input mix and the final norm, and the final state and the
-  logits agree;
+The model of test_m12_inkling2_model_cpu.py (FULL_DECODE_ONLY) runs a prefill
+and decode steps of two requests through Triton's interpreter, with the
+merged kernels and with VLLM_SM70_INKLING_VISIT_FUSION=0:
+- with the visit hook (each layer output runs its own conv and add,
+  ``conv_residual``) every visit's state, the final state and the logits agree;
+- without it a layer output stays pending into the next attention input mix
+  or the final norm, and the final state and the logits agree;
 - the Triton launches of a decode step drop by the count the merges remove
   per visit; the prefill step launches the same kernels on both routes.
-
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite); in the parent they show as skipped.
 """

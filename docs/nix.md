@@ -70,8 +70,7 @@ Serve rules:
   `VLLM_SM70_INKLING_DECODE_GRAPH=0` or a `visit_dump_dir`, no mode with FULL
   graphs is accepted. Capture sizes above q × `DECODE_GRAPH_MAX_BATCH` tokens
   are refused (q = 1, or 1 + `num_speculative_tokens`).
-  The full rule set is the docstring of
-  `sm70/vllm_sm70/models/inkling2_sm70/config.py`.
+  The checks are in `sm70/vllm_sm70/models/inkling2_sm70/config.py`.
 - With `VLLM_SM70_INKLING_ASYNC_SCHED=0`, don't pass `--async-scheduling`.
 - `sm70.inkling2` fields are set only through `--additional-config`
   (`'{"sm70":{"inkling2":{...}}}'`); they have no env variable.

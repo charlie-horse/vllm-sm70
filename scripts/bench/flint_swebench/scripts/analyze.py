@@ -1,68 +1,18 @@
 #!/usr/bin/env python3
 """Analyze a SWE-bench Verified run of `flint` (mini-swe-agent 2.4.6, swebench 5.0.2).
 
-README
-======
-Usage::
+    analyze.py [--runs DIR] [--out PREFIX] [--attempts 1,2] [--boot 10000]
+               [--timeout-is-model] [--include-pending] [--json]
 
-    /home/user/swe/.venv/bin/python /home/user/swe/scripts/analyze.py \
-        [--runs /home/user/swe/runs] [--out /home/user/swe/runs/analysis] \
-        [--attempts 1,2] [--boot 10000] [--timeout-is-model] [--include-pending]
-
-Writes ``<out>.md`` and ``<out>.json`` and prints the markdown to stdout (``--json``
-prints the JSON instead). Stdlib + numpy only; read-only on the run directories.
-
-Inputs (per attempt A, instance ID), produced by scripts/run_one.sh:
-  runs/attA/agent/ID/preds.json              {ID: {model_patch, model_name_or_path}}
-  runs/attA/agent/ID/ID/ID.traj.json         mini-swe-agent trajectory
-  runs/attA/agent/ID/exit_statuses_*.yaml    {instances_by_exit_status: {...}}
-  runs/attA/eval/done_ID                     {"id","attempt","agent_s","eval_s"}
-  runs/attA/eval/<model>.attA_ID.json        swebench run report
-  runs/attA/eval/logs/run_evaluation/attA_ID/<model>/ID/{report.json,run_instance.log}
-  runs/attA/log/ID.{agent,eval}.log          stdout/stderr of agent and harness
-
-Trajectory keys used: info.exit_status, info.submission, info.exception_str,
-info.traceback, info.model_stats.api_calls, messages[*].role
-(system/user/assistant/tool/exit), messages[*].extra.response.usage
-{prompt_tokens, completion_tokens}, messages[*].extra.timestamp. Format-error
-turns are role=user messages with extra.interrupt_type=FormatError that still
-carry extra.response (billed), so tokens are summed over every message with a
-usage block; "turns" counts assistant messages, "api_calls" counts usage blocks.
-
-An instance is counted only once done_ID exists (otherwise "pending", skipped).
-
-Categories (exactly one per instance, first match wins):
-  resolved               swebench report says resolved.
-  eval_infra_error       patch present but eval did not produce a usable verdict:
-                         report missing/empty, swebench infra_failure (environment
-                         tier: docker daemon, OOM, network), harness log shows image
-                         pull/build failure, docker error, 429/rate limit, or the
-                         test run timed out (use --timeout-is-model to count test
-                         timeouts as wrong_patch instead).
-  runner_infra_error     done_ID carries an "infra" field (r440 run_one.sh writes
-                         "pull_failed" | "api_failed"); takes precedence over all.
-  api_infra_error        endpoint failures that are not the model's fault: exit
-                         status APIConnectionError/APIError/Timeout/5xx/
-                         RateLimitError, or any 429 / rate-limit text.
-  agent_infra_error      agent never ran because the sandbox failed (docker run /
-                         image pull error, no trajectory). Excluded like eval infra.
-  context_overflow       API rejected the prompt for context length (400 "maximum
-                         context length", ContextWindowExceededError, max_tokens too
-                         large for remaining context, ...).
-  wrong_patch            non-empty patch, eval completed, not resolved (detail says
-                         if the patch failed to apply).
-  no_patch_or_step_limit empty submission with LimitsExceeded / TimeExceeded /
-                         Submitted-but-empty / agent timeout (6h `timeout`).
-  format_tool_error      RepeatedFormatError, FormatError, or a non-context model API
-                         exception (e.g. non-context BadRequestError).
-  other:<exit_status>    anything else (inspect manually).
-Infra categories are excluded from the pass@1 denominator and reported separately.
-
-Statistics: pass@1 per attempt = resolved / (done - infra). Across attempts: mean
-of per-attempt pass@1 with (a) a bootstrap 95% CI resampling instances (each
-replicate = mean over attempts of per-attempt rates over the resampled
-instances), (b) a normal approximation over per-instance mean scores
-(SE = sd(p_i)/sqrt(n)). With a single attempt the Wilson score interval is used.
+Reads runs/attA/{agent,eval,log}/ as written by run_one.sh (read-only) and
+writes <out>.md and <out>.json. Only instances with a done_ID marker count.
+Each instance gets exactly one category, first match wins: resolved,
+eval_infra_error, runner_infra_error (takes precedence), api_infra_error,
+agent_infra_error, context_overflow, wrong_patch, no_patch_or_step_limit,
+format_tool_error, other:<exit_status>. Infra categories are excluded from
+the pass@1 denominator. pass@1 per attempt = resolved / (done - infra);
+across attempts: mean with a bootstrap 95% CI over instances and a normal
+approximation; a single attempt uses the Wilson interval. Stdlib + numpy.
 """
 
 from __future__ import annotations

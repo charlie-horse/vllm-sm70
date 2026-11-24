@@ -1,25 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for M5 flint-sm70-model (vllm_sm70/models/flint_sm70/).
+"""Tests for the flint-sm70 model (vllm_sm70/models/flint_sm70/).
 
-CPU: fp16_rescale against frozen copies of the fork's math; a torch
-  oracle of K15's qk_norm_rope_kv (vllm_sm70/flint) against the unfused
-  route and against upstream's Triton KV-cache layout through K15's
-  _direct_cache_views (Flint's fused-route admission included);
-  FlintSm70ModelConfig refusals; registry wiring at cc 7.0 vs 8.0; and the
-  VLLM_SM70_FLINT_QK_ROPE_KV kill switch.
-GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
-  and the ``vllm`` service stopped; they run in the 00:00-06:00 window.
-  Paths come from env:
-    FLINT_SM70_CHECKPOINT  the ModelOpt NVFP4 Flint checkpoint dir
-    FLINT_SM70_GOLDEN      JSON of fork cf9492a greedy records (T5); c4130:
-                           ~/vllm-sm70-work/bea/golden/flint_cf9492a_greedy64.json
-    FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR,
-    FLINT_SM70_OURS_NOISE  teacher-forced T4a-T4e/T7 inputs (see the T4 section
-                           and docs/checks.md#gpu-gate)
-    FLINT_SM70_T5_FORK_GOLDEN_SCORES
-                           the fork's forced-decode scores of the golden
-                           sequences (T5 near-tie rule)
-    M5_MUTATION            planted bug for sm70/scripts/m5_mutation_check.sh
+CPU: fp16_rescale against frozen reference math; a torch oracle of
+  qk_norm_rope_kv against the unfused route and upstream's Triton KV-cache
+  layout; FlintSm70ModelConfig refusals; registry wiring at cc 7.0 vs 8.0;
+  the VLLM_SM70_FLINT_QK_ROPE_KV kill switch.
+GPU (``-m gpu``): tests T1-T8; "2 GPUs" tests run at TP2. Env inputs:
+  FLINT_SM70_CHECKPOINT (ModelOpt NVFP4 checkpoint dir), FLINT_SM70_GOLDEN
+  (fork cf9492a greedy records, T5), FLINT_SM70_T4_SEQS_DIR,
+  FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR, FLINT_SM70_OURS_NOISE
+  (teacher-forced T4a-T4e/T7 inputs, see the T4 section),
+  FLINT_SM70_T5_FORK_GOLDEN_SCORES (the fork's forced-decode scores of the
+  golden sequences, T5 near-tie rule), M5_MUTATION (planted bug for
+  sm70/scripts/m5_mutation_check.sh). Commands: docs/checks.md#m5-gates.
 """
 
 import functools
@@ -37,18 +30,17 @@ from types import SimpleNamespace
 
 import pytest
 
-# Deterministic TurboMind kernel choice for every engine these tests start
-# (Quinn/Astro, Nov 6): small-shape autotune picks kernels per instance by
-# timing. Set before any engine spawns; M5_ALLOW_TUNING=1 opts out.
+# Deterministic TurboMind kernel choice for every engine these tests start:
+# small-shape autotune picks kernels per instance by timing. Set before any
+# engine spawns; M5_ALLOW_TUNING=1 opts out.
 if os.environ.get("M5_ALLOW_TUNING") != "1":
     for _q in ("NVFP4", "FP8", "AWQ", "MXFP4"):
         os.environ.setdefault(f"VLLM_SM70_{_q}_TUNE_SMALL_SHAPES", "0")
-# Quinn (Nov 7, after #87): tuning on + a persisted LUT only in strict mode
-# (same rule as m5_teacher_forced.lut_strict_problem; fails collection).
+# Tuning on + a persisted LUT only in strict mode (same rule as m5_teacher_forced.lut_strict_problem; fails collection).
 if (os.environ.get("M5_ALLOW_TUNING") == "1" and os.environ.get("VLLM_SM70_GEMM_LUT_PATH")
         and os.environ.get("VLLM_SM70_GEMM_LUT_STRICT") != "1"):
     raise RuntimeError("M5_ALLOW_TUNING=1 with VLLM_SM70_GEMM_LUT_PATH set needs "
-                       "VLLM_SM70_GEMM_LUT_STRICT=1 (Quinn, Nov 7)")
+                       "VLLM_SM70_GEMM_LUT_STRICT=1")
 
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
@@ -61,12 +53,12 @@ from vllm_sm70 import platform as sm70_platform
 from vllm_sm70.models import flint_sm70
 from vllm_sm70.models.flint_sm70 import fp16_rescale as fr
 from vllm_sm70.flint import QK_ROPE_KV_OP_NAME, QK_ROPE_KV_SPLITTING_OP
-from vllm_sm70.flint import qk_norm_rope_kv as qk  # K15 (#54)
+from vllm_sm70.flint import qk_norm_rope_kv as qk
 
 # --------------------------------------------------------------------------
-# Frozen copies of the fork's FP16 math (FORK cf9492a
-# vllm/models/flint/model.py:95-107 and :696-753), kept verbatim as the
-# oracle for fp16_rescale.py.
+# Frozen copies of the reference FP16 math (fork cf9492a
+# vllm/models/flint/model.py:95-107 and :696-753): the oracle for
+# fp16_rescale.py.
 # --------------------------------------------------------------------------
 _F_MOE_UP = (".mlp.experts.", ".mlp.shared_expert.")
 _F_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
@@ -263,7 +255,7 @@ def test_lm_head_scale_folds_in_fp16_and_scales_logits_otherwise():
 
 
 # --------------------------------------------------------------------------
-# K15 qk_norm_rope_kv: torch oracle and the upstream Triton cache layout
+# qk_norm_rope_kv: torch oracle and the upstream Triton cache layout
 # --------------------------------------------------------------------------
 HQ, HKV, D, PAGE = 4, 2, 128, 16
 
@@ -281,7 +273,7 @@ def _qk_oracle(
     value_cache: torch.Tensor | None = None,
     slot_mapping: torch.Tensor | None = None,
 ) -> None:
-    """Pure-torch oracle with K15 ``qk.qk_norm_rope_kv``'s signature (CPU and
+    """Pure-torch oracle with ``qk.qk_norm_rope_kv``'s signature (CPU and
     GPU) and the kernel's rounding points (FORK
     vllm/models/flint/qk_norm_rope_kv.py:65-125): FP32 norm, one FP16
     rounding, RoPE in FP32 on the rounded values, one FP16 rounding. The
@@ -378,7 +370,7 @@ def _triton_impl():
 
 
 def _cache_views(kv):
-    """The K/V views K15's op writes for a TRITON_ATTN (or Flash-V100) layer:
+    """The K/V views the fused op writes for a TRITON_ATTN (or Flash-V100) layer:
     ``qk._direct_cache_views`` on a [B, Hkv, N, 2*D] layer cache."""
     layer = SimpleNamespace(impl=_triton_impl(), kv_cache_dtype="auto")
     slots = torch.zeros(1, dtype=torch.long, device=kv.device)
@@ -476,7 +468,7 @@ def test_direct_cache_views_refuses_other_layouts():
 
 
 class _OtherImpl:
-    """A backend with its own KV writer (e.g. Kai's CUSTOM Flash-V100)."""
+    """A backend with its own KV writer (e.g. the CUSTOM Flash-V100)."""
 
     head_size = D
 
@@ -546,9 +538,9 @@ def test_op_registered_under_sm70_name():
 
 
 def test_fused_route_runs_k15_op_and_attention():
-    """M5's fused route calls K15's registered op (the one the platform hook
-    splits out and the mutation hooks patch), then K15's
-    attention_after_fused_write; M5 keeps no copy of either."""
+    """The model's fused route calls the registered qk_norm_rope_kv op (the
+    one the platform hook splits out and the mutation hooks patch), then
+    attention_after_fused_write; the model keeps no copy of either."""
     import inspect
 
     from vllm_sm70.models.flint_sm70 import model as m
@@ -783,8 +775,7 @@ def test_model_class_surface():
 
 
 # --------------------------------------------------------------------------
-# GPU plan (c4130). "1 GPU": one V100. "2 GPUs": TP2, both V100s, service
-# stopped, 00:00-06:00 window only.
+# GPU tests. "1 GPU": one GPU. "2 GPUs": TP2 (docs/checks.md#gpu-rules).
 # --------------------------------------------------------------------------
 def _gpu_ok(n=1) -> bool:
     return (
@@ -880,16 +871,14 @@ def _greedy_once(n=64, prompts=PROMPTS, **llm_kw):
         _shutdown(llm)
 
 
-# T2 contract for qk_norm_rope_kv (Astro, Nov 5, from Bea's t2_diag):
-# bitwise at decode sizes; at prefill sizes q/k/cached K within atol+rtol of
+# T2 contract for qk_norm_rope_kv: bitwise at decode sizes; at prefill sizes q/k/cached K within atol+rtol of
 # the torch-GPU oracle and no less accurate than torch-GPU vs a CPU FP32
 # oracle; cached V and unwritten slots exact.
 T2_BITWISE_MAX_N = 17
 T2_ATOL = 2e-3
 T2_RTOL = 1e-3
-# Mean-error slack vs torch-GPU: Bea's diag had the kernel at 287 vs 281 (q)
-# and 120 vs 117 (k) mismatches against the CPU oracle, i.e. equal within
-# noise; a strict <= on the mean would fail on that noise alone.
+# Mean-error slack vs torch-GPU: kernel and torch-GPU mismatch the CPU
+# oracle about equally often, so a strict <= on the mean fails on noise.
 T2_MEAN_SLACK = 1.25
 
 
@@ -927,8 +916,7 @@ def test_t2_triton_kernel_bitwise_vs_reference(rope, n):
 
     Prefill sizes: the oracle's CUDA ``mean(-1)`` reduces in a different
     order than the kernel's per-row sum, and with RoPE that shows up as a
-    few large-ulp differences on near-zero outputs (Bea's diag, Nov 5:
-    |delta| <= 1.95e-3 on 28 of 4.2M q values at n=8192). Contract (Astro):
+    few large-ulp differences on near-zero outputs. Contract:
     - q, k and the cached K within T2_ATOL + T2_RTOL of the torch-GPU oracle;
     - the kernel is no less accurate than torch-GPU itself: against a CPU
       FP32 oracle (same math and rounding points), the kernel's max abs
@@ -1098,8 +1086,7 @@ def test_t1_tiny_random_forward(tmp_path):
 
 
 # The route line comes from init_logger("vllm.sm70.flint"), under vLLM's
-# configured "vllm" logger (it used to be "vllm_sm70.models.flint_sm70.model",
-# which vLLM's default config silently drops). T3 still passes an explicit
+# configured "vllm" logger. T3 passes an explicit
 # logging config that routes both "vllm" and "vllm_sm70" to stdout, so the
 # check does not depend on vLLM's default handler or log level.
 _T3_LOGGING_CONFIG = {
@@ -1155,32 +1142,20 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
     assert all(len(t) == 64 for t in toks)
 
 
-# T4a-T4e/T7: teacher-forced closeness, anchored on the fork (Astro, Nov 6-7).
-# All scoring goes through sm70/scripts/m5_teacher_forced.py (the same code
-# calibrates the fork), one sequence at a time (M=1 in eager and in replay).
-# Metrics per continuation token: "decode" (forced decode: every token is a
-# real decode step, raw logprob of the forced token) and "prefill"
-# (prompt_logprobs over the whole sequence).
-#   FLINT_SM70_T4_SEQS_DIR      setK.json from `m5_teacher_forced.py gen` (>= 3 sets)
-#   FLINT_SM70_T4_ENVELOPE      `m5_teacher_forced.py envelope` over the fork's
-#                               scores: per pair/metric, anchor = max over sets
-#   FLINT_SM70_FORK_SCORES_DIR  the fork's scores,
-#                               setK/{eager,eager2,graphs,unfused,graphsonly}.json
-#                               (the envelope's input; T4d reads graphs.json;
-#                               graphsonly.json makes the T4e pair)
-#   FLINT_SM70_OURS_NOISE       optional: ours_eager_vs_eager envelope JSON.
-#                               T4c writes it (two separate eager instances);
-#                               T4a/T4d/T7 print it on every gate line.
-# Every score comes from its own engine instance (one LLM build per score).
-# Gate (Quinn, Nov 7; factors PROVISIONAL, constants at the top of
-# m5_teacher_forced.py), per set and metric, against tf.effective_anchor():
-# ours mean <= 1.5x that metric's anchor mean; ours max <= 1.5x the pair's
-# anchor max over decode AND prefill; ours count > 1.0 nats <= max(1,
-# ceil(1.5x the pair's anchor count over both metrics)). An envelope built
-# before Nov 7 (no over_1_0) fails closed: rebuild it (`envelope`, CPU only).
-# Each line also shows count > 0.1 nats, our own eager-vs-eager instance
-# noise, the fork's, and the effective limits. docs/checks.md#gpu-gate
-# has the commands.
+# T4a-T4e/T7: teacher-forced closeness, anchored on the fork's scores, all
+# through sm70/scripts/m5_teacher_forced.py, one sequence at a time, one
+# engine instance per score. Metrics per continuation token: "decode" (each
+# token a real decode step) and "prefill" (prompt_logprobs).
+#   FLINT_SM70_T4_SEQS_DIR      setK.json from `m5_teacher_forced.py gen`
+#   FLINT_SM70_T4_ENVELOPE      `envelope` over the fork's scores
+#   FLINT_SM70_FORK_SCORES_DIR  setK/{eager,eager2,graphs,unfused,graphsonly}.json
+#   FLINT_SM70_OURS_NOISE       optional ours_eager_vs_eager envelope (T4c
+#                               writes it; T4a/T4d/T7 print it)
+# Gate per set and metric against tf.effective_anchor() (factors are
+# constants in m5_teacher_forced.py): mean <= 1.5x the anchor mean, max <=
+# 1.5x the pair's max over both metrics, count > 1.0 nats <= max(1,
+# ceil(1.5x the anchor count)). An envelope without over_1_0 fails closed.
+# Commands: docs/checks.md#m5-gates.
 T4_SEQS_DIR = os.environ.get("FLINT_SM70_T4_SEQS_DIR")
 T4_ENVELOPE = os.environ.get("FLINT_SM70_T4_ENVELOPE")
 FORK_SCORES_DIR = os.environ.get("FLINT_SM70_FORK_SCORES_DIR")
@@ -1300,7 +1275,7 @@ def _gate_anchors(env, tag, metrics):
 
 def _effective(anchor, fork_env):
     """An anchor fit for tf.gate_failures. Effective anchors pass through. A
-    raw per-metric anchor taken from fork_env (#86's G2 passes
+    raw per-metric anchor taken from fork_env (a caller passing
     env["pairs"][pair][metric]["anchor"] and env) is resolved, by identity,
     to tf.effective_anchor(fork_env, pair, metric); an old envelope raises
     there. Anything else passes through and tf.gate_failures fails it."""
@@ -1318,7 +1293,7 @@ def _gate_sets(tag, label, anchor, metric, a_by_set, b_by_set, ours_noise=None,
     """Gate every set's |dlogprob| stats (a vs b) against one effective
     anchor (see _effective); print a verdict line per set (counts > 0.1 and
     > 1.0, our instance noise, the fork's and the effective limits
-    included); with pooled (T4a/T4d/T7; Quinn, Nov 7) also the pooled-mean
+    included); with pooled (T4a/T4d/T7) also the pooled-mean
     gate over all sets (tf.pooled_gate), one more line; return the
     breaches."""
     tf = _tf_module()
@@ -1571,10 +1546,9 @@ def test_envelope_gate():
 
 
 def test_effective_anchor_max_is_union_over_metrics():
-    """Quinn, Nov 7: the max gate uses the pair's anchor max over decode AND
-    prefill (the fork's set1 decode max 2.616 sat at one token while its
-    prefill max was 0.895; ours had a prefill max of 2.394); the mean stays
-    per metric; the >1.0 count anchor is the max over metrics too."""
+    """The max gate uses the pair's anchor max over decode AND prefill; the
+    mean stays per metric; the >1.0 count anchor is the max over metrics
+    too."""
     tf = _tf_module()
     env = _env({"eager_vs_graphs": {"decode": _anchor(0.02, 2.616, 9, 2),
                                     "prefill": _anchor(0.03, 0.895, 4, 0)}})
@@ -1587,7 +1561,7 @@ def test_effective_anchor_max_is_union_over_metrics():
                    "max_over": ["decode", "prefill"],
                    "max_by_metric": {"decode": 2.616, "prefill": 0.895}}
     ours_prefill = {"mean": 0.03, "max": 2.394, "over_0_1": 5, "over_1_0": 3}
-    assert tf.gate_failures(ours_prefill, pre) == []  # old per-metric rule: 2.394 > 1.34
+    assert tf.gate_failures(ours_prefill, pre) == []  # a per-metric max rule would fail: 2.394 > 1.34
     assert tf.gate_failures(ours_prefill, _anchor(0.03, 0.895) | {"max_over": ["x"]})
     # A decode-only pair (e.g. a decode-only graphsonly score) unions over what it has.
     one = tf.effective_anchor(_env({"p": {"decode": _anchor(0.1, 0.5, 1, 1)}}), "p", "decode")
@@ -1610,12 +1584,12 @@ def test_over_1_0_count_gate(anchor_count, ours, ok):
     if not ok:
         assert len(bad) == 1 and bad[0].startswith(f">1.0 count {ours} > ")
     assert tf.count_limit(anchor_count) == max(1, -(-3 * anchor_count // 2))
-    # Ours without the count (stats from before Nov 7) never passes.
+    # Ours without the count never passes.
     assert tf.gate_failures({"mean": 0.0, "max": 0.0}, anchor)
 
 
 def test_old_envelope_fails_closed(tmp_path):
-    """An envelope built before the over_1_0 counts never gates silently:
+    """An envelope without the over_1_0 counts never gates silently:
     effective_anchor raises with the rebuild command, gate_failures fails on
     any anchor without the count or the union, and _gate_anchors turns the
     error into a test FAIL before any model load."""
@@ -1633,7 +1607,7 @@ def test_old_envelope_fails_closed(tmp_path):
                                                   raw)[0]
     with pytest.raises(pytest.fail.Exception, match="T4a: envelope .*rebuild"):
         _gate_anchors(env, "T4a", tf.METRICS)
-    # #86's G2 passes env["pairs"][pair]["decode"]["anchor"] and env to
+    # A caller passing env["pairs"][pair]["decode"]["anchor"] and env to
     # _gate_sets: resolved to the effective anchor, or fails closed.
     sets = {0: {"seqs": [{"decode": [-1.0] * 4}]}}
     with pytest.raises(tf.EnvelopeError, match="predates"):
@@ -1719,7 +1693,7 @@ def test_envelope_includes_graphsonly_pair_when_scored(tmp_path, capsys, tf_main
 
 
 def test_t4b_exact_runs_only_on_triton(monkeypatch):
-    """Quinn, Nov 7: exact T4b only with VLLM_SM70_FLASH_V100=0 (TRITON);
+    """Exact T4b only with VLLM_SM70_FLASH_V100=0 (TRITON);
     under Flash-V100 it skips, pointing at T4e."""
     monkeypatch.setenv("VLLM_SM70_FLASH_V100", "0")
     assert _t4b_exact_skip_reason() is None
@@ -1761,7 +1735,7 @@ def test_t5_near_tie_inputs(tmp_path):
         "prefill": _anchor(0.03, 0.9, 1, 0) | {"seq_mean_max": 0.06}}})))
     fork = _fork_golden_scores(tmp_path / "f.json", seqs, [[-1.0] * 3] * 3)
     anchor, ready, why = _t5_near_tie_inputs(golden, ["p1"], str(env_path), fork)
-    # Quinn, Nov 7: the mean is the fork's largest per-sequence decode mean.
+    # The mean is the fork's largest per-sequence decode mean.
     assert anchor["max"] == 0.9 and anchor["mean"] == 0.05 and why == {}
     assert anchor["mean_basis"] == "per-sequence"
     assert ready["p1"][0] == seqs[1] and ready["p1"][1]["decode"] == [-1.0] * 3
@@ -1795,7 +1769,7 @@ def test_t5_near_tie_inputs(tmp_path):
 
 
 def test_t5_near_tie_verdict():
-    """T5 (Quinn, Nov 7): an early divergence passes only if (a) the golden
+    """T5: an early divergence passes only if (a) the golden
     token is our #2 within T4_NEAR_TIE AND (b) forced decode of the golden
     sequence passes the T4d gate vs the fork."""
     tf = _tf_module()
@@ -1823,7 +1797,7 @@ def _set_stats(means, n=512):
 
 
 def test_lut_strict_required_when_tuning_with_a_lut():
-    """Quinn, Nov 7 (after #87): tuning on + a LUT needs strict mode, in the
+    """Tuning on + a LUT needs strict mode, in the
     harness and both runner scripts."""
     tf = _tf_module()
     lut = {"M5_ALLOW_TUNING": "1", "VLLM_SM70_GEMM_LUT_PATH": "/x.lut"}
@@ -1840,9 +1814,9 @@ def test_lut_strict_required_when_tuning_with_a_lut():
 
 
 def test_pooled_mean_gate_nov7_numbers():
-    """Quinn/Astro, Nov 7: T4a/T4d/T7 add a pooled-mean gate at 1.25x the
-    fork's pooled mean. Nov 7 T4d: unmutated 0.82x PASS, moe_decode_scale
-    (x1.01) 1.57x CAUGHT even though every set passed the per-set gate."""
+    """T4a/T4d/T7 add a pooled-mean gate at 1.25x the fork's pooled mean,
+    which catches a mutation (moe_decode_scale) that passes every per-set
+    gate."""
     tf = _tf_module()
     assert tf.POOLED_FACTOR == 1.25 and tf.POOLED_INVESTIGATE == 1.30
     fork = _set_stats([0.01557, 0.01996, 0.02421])
@@ -1899,11 +1873,10 @@ def test_mutation_moe_decode_scale_half_is_the_floor_probe():
 
 
 def test_t5_sequence_anchor_nov7_sky():
-    """Quinn, Nov 7: rule (b) gates ONE 64-token sequence, so its mean is
-    anchored on the fork's largest per-sequence eager_vs_graphs decode mean
-    (0.0503 on Nov 7; 3 of the fork's 24 sequences exceed the 0.0363 set
-    limit), not the 512-token set mean. Nov 7 sky: mean 0.0381, max 0.227,
-    >1.0 0 -> PASS at the sequence anchor, FAIL at the set anchor."""
+    """Rule (b) gates ONE 64-token sequence, so its mean is anchored on the
+    fork's largest per-sequence eager_vs_graphs decode mean, not the
+    512-token set mean: a sequence can pass at the sequence anchor and fail
+    at the set anchor."""
     tf = _tf_module()
     env = _env({"eager_vs_graphs": {
         "decode": _anchor(0.02421, 2.616, 32, 2) | {"seq_mean_max": 0.0503},
@@ -1926,9 +1899,9 @@ def test_t5_sequence_anchor_nov7_sky():
 
 
 def test_teacher_forced_cli_keeps_handed_out_commands(tmp_path, monkeypatch, capsys, tf_main):
-    """Bea's commands (greedy, compare-greedy, seqs-from-golden, score,
-    envelope) still parse with the flags already handed out; the CPU ones
-    run end to end."""
+    """The m5_teacher_forced.py commands (greedy, compare-greedy,
+    seqs-from-golden, score, envelope) parse with their documented flags;
+    the CPU ones run end to end."""
     tf = _tf_module()
     seen = {}
     for cmd in ("cmd_greedy", "cmd_score"):
@@ -1973,12 +1946,12 @@ def _qk_call(n, slots=None, blocks=3):
 
 
 def _run_registered_op(monkeypatch, n, slots=None):
-    """Call K15's torch.ops.vllm.<QK_ROPE_KV_OP_NAME> on CPU with a fake
+    """Call torch.ops.vllm.<QK_ROPE_KV_OP_NAME> on CPU with a fake
     attention context whose layer takes the direct cache-write branch.
 
     direct_register_custom_op registers the module's Python op body under the
     platform's dispatch key: CPU on a host without the SM70 platform, CUDA
-    where it is active (c4130 with CUDA_VISIBLE_DEVICES="", Felix). For the
+    where it is active (a GPU host with CUDA_VISIBLE_DEVICES=""). For the
     latter, register the same body for CPU for the duration of the call, so
     the call still goes through the registered op's dispatch."""
     import vllm.model_executor.layers.attention.attention as attention
@@ -2011,7 +1984,7 @@ def _reference(n, qkv, qw, kw, pos, slots, blocks=3):
     return q, k, kv
 
 def test_mutation_fired_marker_only_when_a_call_changes(capfd):
-    """Quinn: a mutation must be shown to have FIRED. The qk wrapper marks
+    """A mutation must be shown to have FIRED. The qk wrapper marks
     fired only on a call it changed (<= 8 tokens), once per process."""
     import inspect
 
@@ -2037,7 +2010,7 @@ def test_mutation_fired_marker_only_when_a_call_changes(capfd):
 
 
 def test_mutation_moe_decode_scale_scales_k12_output():
-    """moe_decode_scale wraps flint_moe_decode_out (looked up by M4 as a
+    """moe_decode_scale wraps flint_moe_decode_out (looked up by the MoE layer as a
     module attribute at call time) and scales its output by 1.01."""
     import types
 
@@ -2176,11 +2149,9 @@ def test_t4a_teacher_forced_eager_vs_graphs():
     """T4a (2 GPUs): our eager vs our compiled + CUDA graphs, teacher-forced
     on every prompt set, decode AND prefill metrics.
 
-    Bea's t4_bisect (Nov 6): Inductor codegen accounts for all of the
-    eager/compiled prefill difference (graphs_only = 0.0), and free decode
-    under graph replay diverges too, so the decode metric (real decode steps,
-    replayed graphs) is gated as well as prefill. Gate per set and metric
-    (Quinn, Nov 7): mean <= 1.5x that metric's anchor mean, max <= 1.5x the
+    Inductor codegen and graph replay both change the numerics, so the
+    decode metric (real decode steps, replayed graphs) is gated as well as
+    prefill. Gate per set and metric: mean <= 1.5x that metric's anchor mean, max <= 1.5x the
     fork's eager_vs_graphs anchor max over decode and prefill, count > 1.0
     nats <= max(1, ceil(1.5x the anchor count))."""
     seq_sets = _seq_sets()
@@ -2204,8 +2175,8 @@ GRAPHS_ONLY = {"mode": 0, "cudagraph_mode": "FULL"}
 
 
 def _t4b_exact_skip_reason():
-    """Why exact T4b does not apply here (None: it does). Quinn, Nov 7: it
-    needs identical kernels in both arms, i.e. TRITON attention."""
+    """Why exact T4b does not apply here (None: it does). It needs
+    identical kernels in both arms, i.e. TRITON attention."""
     from vllm_sm70 import attention as sm70_attention
 
     if not sm70_attention.flash_v100_enabled():
@@ -2225,16 +2196,15 @@ def test_t4b_graph_replay_exact(max_num_seqs):
 
     Mode NONE + cudagraph FULL takes Inductor out; at max_num_seqs 1 and 2
     every decode step has M <= 2 (no capture padding beyond the batch), which
-    covers the K11/K12 M<=2 paths. Greedy tokens must equal eager's for all
+    covers the M<=2 GEMV and MoE decode paths. Greedy tokens must equal eager's for all
     256 tokens: any flip is a capture/replay bug, not numerics.
 
-    Premise (Quinn, Nov 7): exactness holds only if both arms run identical
+    Exactness holds only if both arms run identical
     kernels. That is true on TRITON attention, so this runs only with
     VLLM_SM70_FLASH_V100=0. Under Flash-V100 (the default) the capture path
-    uses envelope decode hints and the K14 one-launch decode, which eager
+    uses envelope decode hints and the one-launch decode, which eager
     does not, so the test is skipped there and T4e gates replay against the
-    fork's own eager-vs-graphs-only envelope instead. Mara is confirming the
-    premise with data (the fork's own eager vs graphs-only greedy run)."""
+    fork's own eager-vs-graphs-only envelope instead."""
     reason = _t4b_exact_skip_reason()
     if reason is not None:
         pytest.skip(reason)
@@ -2252,7 +2222,7 @@ def test_t4b_graph_replay_exact(max_num_seqs):
 @needs_ckpt
 @needs_envelope
 def test_t4e_forced_decode_eager_vs_graphs_only():
-    """T4e (2 GPUs; Quinn, Nov 7): T4b's replacement under Flash-V100.
+    """T4e (2 GPUs): T4b's replacement under Flash-V100.
 
     Forced decode (decode metric, max_num_seqs 1) of our eager vs our
     graphs-only (mode NONE + FULL CUDA graphs: no Inductor, so the arms differ
@@ -2322,11 +2292,10 @@ def test_t4c_eager_repeatable_across_engine_instances():
 
     Reports the forced-decode (and prefill) |dlogprob| stats per set and the
     free-run greedy first divergence per prompt (64 tokens, one prompt at a
-    time). Gate: forced-decode logprobs bitwise identical. Bea (Nov 6): two
-    instances gave different free-run tokens on 7/8 prompts with real
-    logprob shifts (suspected startup autotuning, e.g. TurboMind kernel
-    selection by timing), so this is EXPECTED to fail on today's build: a
-    finding, not a test bug. It also writes our eager_vs_eager envelope to
+    time). Gate: forced-decode logprobs bitwise identical. Startup
+    autotuning (e.g. TurboMind kernel selection by timing) can make two
+    instances differ, so a failure is a finding, not a test bug. It also
+    writes our eager_vs_eager envelope to
     FLINT_SM70_OURS_NOISE (before the gate), which T4a/T4d/T7 print as
     ours_eager_vs_eager on every line."""
     seq_sets = _seq_sets()
@@ -2385,7 +2354,7 @@ def test_t4d_graphs_vs_fork_graphs():
         f"T4d outside {T4_ENVELOPE_FACTOR}x the fork's eager_vs_graphs anchor: {failures}")
 
 
-# Earliest fork self-divergence in Bea's golden is token 40 (prefix-cache path).
+# Earliest fork self-divergence in the golden is token 40 (prefix-cache path).
 GOLDEN_EXACT_TOKENS = 32
 # T5 near-tie rule (b): the fork's forced decode of the golden sequences.
 T5_FORK_GOLDEN_SCORES = os.environ.get("FLINT_SM70_T5_FORK_GOLDEN_SCORES")
@@ -2403,7 +2372,7 @@ T5_FORK_HOWTO = (
 def _t5_near_tie_inputs(golden, prompts, envelope_path, fork_scores_path):
     """CPU half of T5 rule (b) for the near-tie `prompts`: (anchor, ready,
     why). anchor is the T4d pair's (eager_vs_graphs) decode SEQUENCE anchor
-    (tf.sequence_anchor: the fork's largest per-sequence mean; Quinn, Nov 7);
+    (tf.sequence_anchor: the fork's largest per-sequence mean);
     ready maps prompt -> (our golden seq, the fork's score record); why maps
     every other prompt to what is missing (each is a FAIL)."""
     tf = _tf_module()
@@ -2449,7 +2418,7 @@ def _t5_near_tie_inputs(golden, prompts, envelope_path, fork_scores_path):
 
 
 def _t5_near_tie_verdict(prompt, gap, forced, anchor, missing=None):
-    """Quinn, Nov 7: a golden-stable prompt may diverge before
+    """A golden-stable prompt may diverge before
     GOLDEN_EXACT_TOKENS only if (a) the golden token at the first mismatch
     is our #2 within T4_NEAR_TIE nats (gap; None if it is not our #2) and
     (b) forced decode of the golden sequence, our graphs vs the fork's
@@ -2505,34 +2474,24 @@ def _t5_near_tie_gate(golden, near):
 def test_t5_golden_tokens_vs_fork():
     """T5 (2 GPUs): greedy tokens match the fork cf9492a golden.
 
-    Golden file (Bea, captured from live fork Flint, raw /v1/completions,
-    temperature 0, max_tokens 64): a JSON list of {"prompt",
-    "prompt_token_ids", "token_ids", "stable_across_2_runs", ...}.
-
-    Each prompt is generated alone (as the golden was captured).
-
-    Gate: prompts whose golden was stable across the fork's own two runs
-    must match the first GOLDEN_EXACT_TOKENS tokens exactly, with one
-    exception (Quinn, Nov 7): an earlier divergence passes only if (a) the
-    golden token at the first mismatch is our #2 within T4_NEAR_TIE nats
-    and (b) forced decode of the golden sequence (prompt + golden
-    continuation) with our graphs passes the T4d gate against the fork's
-    forced decode of the same sequence (FLINT_SM70_T5_FORK_GOLDEN_SCORES; see
-    _t5_near_tie_verdict). (a) without the fork file is a FAIL saying what
-    to run. Prompts the fork itself could not reproduce are INFO only: we
-    print the common prefix and, at the first mismatch, whether the golden
-    token is our #2 and our top-2 gap (one-sided near-tie check; the golden
-    has no logprobs). There must be at least one stable prompt."""
+    Golden file: a JSON list of {"prompt", "prompt_token_ids", "token_ids",
+    "stable_across_2_runs", ...} (greedy, max_tokens 64). Each prompt is
+    generated alone. Stable prompts must match the first GOLDEN_EXACT_TOKENS
+    tokens, unless (a) the golden token at the first mismatch is our #2
+    within T4_NEAR_TIE nats and (b) forced decode of the golden sequence
+    passes the T4d gate against the fork's
+    (FLINT_SM70_T5_FORK_GOLDEN_SCORES; see _t5_near_tie_verdict). (a)
+    without the fork file is a FAIL. Unstable prompts are INFO only (common
+    prefix, our #2 and top-2 gap). At least one prompt must be stable."""
     from vllm import SamplingParams
 
     with open(os.environ["FLINT_SM70_GOLDEN"]) as f:
         golden = json.load(f)
     assert any(g.get("stable_across_2_runs") for g in golden), "no stable prompt"
-    # One request at a time, as the golden was captured (raw /v1/completions
-    # on live fork Flint, one prompt per request): decode then runs at M=1
-    # like the fork did (K11 GEMV, K12 decode). Batching the prompts changes
-    # M per step and with it the kernel route and the greedy result (Bea,
-    # Nov 6: the 8K prompt matches 16/16 alone, diverges at 10 batched).
+    # One request at a time, as the golden was captured (one prompt per
+    # request): decode then runs at M=1 (GEMV and decode kernels). Batching
+    # the prompts changes M per step and with it the kernel route and the
+    # greedy result.
     llm = _llm()
     try:
         sp = SamplingParams(temperature=0, max_tokens=64, logprobs=2)

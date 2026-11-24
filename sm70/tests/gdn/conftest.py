@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K08 GDN tests.
+"""Fixtures for the GDN tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C (with the K08 GDN ops) and vLLM's Python source.
+vllm_sm70._sm70_C (with the GDN ops) and vLLM's Python source.
 Run them from the repo root with:
 
     pytest -m gpu sm70/tests/gdn
@@ -49,7 +49,7 @@ def gdn_gpu():
     """vllm_sm70.gdn.kernels on a real SM70 GPU with _sm70_C loaded, else skip.
 
     On an SM70 GPU a missing extension or missing GDN ops fails the test, so
-    a nightly run cannot pass on stubs.
+    a run cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):

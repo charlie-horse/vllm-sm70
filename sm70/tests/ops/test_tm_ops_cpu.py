@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K03 CPU checks for the TurboMind op bindings (no GPU, no built _sm70_C).
+"""CPU checks for the TurboMind op bindings (no GPU, no built _sm70_C).
 
 What: every `_sm70_C` schema registered by the TurboMind sources has a
   register_fake in vllm_sm70/ops/tm.py; the prepare fakes return the shapes,
-  dtypes and devices the C++ ops return (meta on CPU); nothing references
-  the fork's `_C` namespace or `native_policy` any more.
+  dtypes and devices the C++ ops return (meta on CPU); nothing references a
+  `_C` namespace or `native_policy`.
 How: when `_sm70_C` is not built, the schemas parsed from the C++ sources
   are defined in a Python torch.library so tm.py registers its fakes against
   them; the ops are then called on meta tensors.
@@ -58,7 +58,7 @@ def test_every_schema_has_a_fake():
 
 
 def _code_only(path: pathlib.Path) -> str:
-    """Source without comments and docstrings (they may name the fork API)."""
+    """Source without comments and docstrings (they may name foreign APIs)."""
     text = path.read_text(errors="replace")
     if path.suffix == ".py":
         import ast
@@ -116,7 +116,7 @@ def test_schemas_have_no_policy_arg_and_cuda_impls():
         ):
             for op in re.findall(r'm\.impl\("(\w+)"', block.group(2)):
                 impls.add((op, block.group(1)))
-    # K02's two workspace ops are registered with m.def(schema, &fn), a
+    # The two workspace ops are registered with m.def(schema, &fn), a
     # catch-all kernel, which is fine for ops without tensor arguments.
     catch_all = {"sm70_gemm_configure_workspace", "sm70_gemm_workspace_storage"}
     for name, schema in sm70_schemas().items():

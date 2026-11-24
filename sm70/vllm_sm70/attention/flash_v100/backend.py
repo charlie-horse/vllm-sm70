@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FLASH_ATTN_V100: the Flash-V100 attention backend for vLLM v0.33.0 (K06).
+"""FLASH_ATTN_V100: the Flash-V100 attention backend for vLLM v0.33.0.
 
-Rebuilt from fork cf9492a vllm/v1/attention/backends/flash_v100/backend.py
-(52 lines) against the v0.33.0 interface (Ivy's section B, sec. 5). Like the
-fork it subclasses the Triton backend, so the KV-cache write
+It subclasses the Triton backend, so the KV-cache write
 (`do_kv_cache_update` -> triton_reshape_and_cache_flash), the metadata base
 and the encoder/unsupported-feature fallback are upstream's.
 
@@ -29,7 +27,7 @@ if TYPE_CHECKING:
 
 # Human-readable name for logs. get_name() must return the enum member name
 # ("CUSTOM"): every upstream Attention layer does
-# AttentionBackendEnum[backend.get_name()] (UP attention.py:433), and
+# AttentionBackendEnum[backend.get_name()], and
 # FLASH_ATTN_V100 is not a member.
 BACKEND_NAME = "FLASH_ATTN_V100"
 ENUM_NAME = "CUSTOM"
@@ -39,7 +37,7 @@ SUPPORTED_HEAD_SIZES = (128, 256)
 class FlashAttnV100Backend(TritonAttentionBackend):
     """Flash-V100 paged attention on Volta (sm_70), fp16 only."""
 
-    # fp16 activations and KV only: the lean kernels (K05) instantiate fp16.
+    # fp16 activations and KV only: the kernels instantiate fp16.
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16"]
 
@@ -64,7 +62,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
         return FlashAttnV100MetadataBuilder
 
-    # -- KV cache layout (sec. 5.1-5.3) ------------------------------------
+    # -- KV cache layout ---------------------------------------------------
 
     @staticmethod
     def get_supported_kernel_block_sizes(
@@ -90,7 +88,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
         # needs no packing beyond upstream's default (K | V per head).
         return spec
 
-    # -- capability flags (sec. 5.8) ---------------------------------------
+    # -- capability flags --------------------------------------------------
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -118,7 +116,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        # Non-causal paged prefill (draft models) is compiled (K05).
+        # Non-causal paged prefill (draft models) is compiled.
         return True
 
     @classmethod

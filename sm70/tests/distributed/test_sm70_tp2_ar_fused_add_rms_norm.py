@@ -1,26 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K17: _sm70_C TP2 all-reduce + fused_add_rms_norm against the unfused ops.
+"""_sm70_C TP2 all-reduce + fused_add_rms_norm against the unfused ops.
 
-Ported from fork cf9492a tests/distributed/test_sm70_tp2_ar_fused_add_rms_norm.py.
-Two V100s. The reference is what the model runs without the fusion:
+Two SM70 GPUs. The reference is what the model runs without the fusion:
 upstream's custom all-reduce (cross_device_reduce_1stage), the elementwise
-scale or partial-sum add where present, then vLLM's C fused_add_rms_norm
-kernel. Every output must be bitwise equal to it, on both ranks.
-
-Run under the server's conditions as well: the allocator with
-expandable_segments, operands allocated before graph capture (static
-buffers the peer cannot open over IPC), graphs captured inside and outside
-the communicator's capture context (FULL and PIECEWISE capture, and
-capture-time warmup that runs eagerly), and ranks entering the collective at
-different times. With expandable segments upstream's own capture path must
-copy (register_graph_buffers=False, as CudaCommunicator does for a cuMem
-pool); the fused op never registers graph buffers in either mode (R5).
-
-Differences from the fork: the communicator is upstream's CustomAllreduce
-and the kernel is _sm70_C's, called with its handle (no vLLM patch); an
-op-level section drives torch.ops.vllm_sm70.tp2_all_reduce_fused_add_rms_norm
-through a group stand-in, fused (decode rows) and unfused (prefill rows).
+scale or partial-sum add where present, then vLLM's fused_add_rms_norm.
+Every output must be bitwise equal to it, on both ranks. Also run with
+expandable_segments, operands allocated before graph capture, graphs
+captured inside and outside the communicator's capture context, and ranks
+entering at different times. With expandable segments upstream's capture
+path must copy (register_graph_buffers=False); the fused op never registers
+graph buffers. An op-level section drives the vllm_sm70 op through a group
+stand-in, fused (decode rows) and unfused (prefill rows).
 
     pytest -m gpu sm70/tests/distributed/test_sm70_tp2_ar_fused_add_rms_norm.py
 """

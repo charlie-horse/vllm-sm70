@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 Triton kernels compile for sm_70, on CPU.
+"""Inkling 2 Triton kernels compile for sm_70, on CPU.
 
-Every kernel of inkling2_sm70/ops (paged_conv.py, paged_attention.py with
-its split-KV pair,
-norm.py, attn_res.py, loop.py, fused.py, activation.py, grouped_gemm.py,
-routing.py, dspark.py, small_ops.py, top1.py, visit.py, small_m_gemv.py,
-nvfp4_gemv.py) goes through Triton's compiler and ptxas for
-GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
-128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps, expert
-intermediate 576 per rank, 128 experts, top-8, decode batches of 1 to 8
-tokens, message-gate rank 64, d_rel 16, rel extent 1024; draft: 8-query
-blocks, 4 feature taps, Markov rank 256), with the
-constexprs and launch options of its launcher. The PTX holds no tanh.approx, mma or bf16.
-This catches what the interpreter tests cannot: Triton's constexpr and
-static control-flow rules. Skipped without Triton's CUDA backend or ptxas.
+Every kernel of inkling2_sm70/ops goes through Triton's compiler and ptxas
+for GPUTarget("cuda", 70, 32) at Inkling 2 Mini sizes (hidden 2304, head dim
+128, 12 query and 4 KV heads per rank at TP2, KV block 32, 4 conv taps,
+expert intermediate 576 per rank, 128 experts, top-8, decode batches of 1
+to 8 tokens, message-gate rank 64, d_rel 16, rel extent 1024; draft: 8-query
+blocks, 4 feature taps, Markov rank 256), with the constexprs and launch
+options of its launcher. The PTX holds no tanh.approx, mma or bf16. This
+catches what the interpreter tests cannot: Triton's constexpr and static
+control-flow rules. Skipped without Triton's CUDA backend or ptxas.
 """
 
 from __future__ import annotations

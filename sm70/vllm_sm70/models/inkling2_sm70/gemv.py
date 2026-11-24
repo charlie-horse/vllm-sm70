@@ -1,28 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 on SM70: the route of the weight-streaming GEMVs of small
-batches.
+"""Inkling 2 on SM70: the route of the weight-streaming GEMVs of small batches.
 
-    linear      x [M, K] @ weight [N, K]^T: the GEMV of ops/small_m_gemv.py
-                for 1 <= M <= 8 (``min_rows`` to ``max_rows``), F.linear
-                otherwise.
-                Serves the qkvr projection of a local layer (prologue.py),
-                the attention output projection (attention_torch.py) and,
-                up to 4 rows, the LM head (model.py)
-    segments    one GEMV launch for the projections of a gated or global
-                layer, whose weight row segments read different inputs
-                (prologue.py ``project_qkvr``, ``project_packed``); None
-                when the route is off
-    on_nvfp4    whether the one-row expert slots of moe_tm.py take the
-                NVFP4 GEMV of ops/nvfp4_gemv.py (W13 with the soft-capped
-                SwiGLU in its epilogue, then W2) instead of the two
-                TurboMind stages and the SwiGLU kernel
+    linear      x [M, K] @ weight [N, K]^T: the GEMV of ops/small_m_gemv.py for
+                ``min_rows`` <= M <= ``max_rows``, else F.linear. Serves a local
+                layer's qkvr projection, the attention output projection and,
+                up to 4 rows, the LM head
+    segments    one GEMV launch for a gated or global layer's row segments
+    on_nvfp4    whether one-row expert slots of moe_tm.py take ops/nvfp4_gemv.py
+                instead of the TurboMind stages and the SwiGLU kernel
 
-The dense route needs fp16 operands with unit stride along K.
-VLLM_SM70_INKLING_SMALL_M_GEMV=0 sends the dense projections back to
-cuBLAS; VLLM_SM70_INKLING_NVFP4_GEMV=0 sends the expert slots back to
-TurboMind. Tensors off the GPU take cuBLAS and TurboMind, except in
-Triton's interpreter. Both switches are read on every eager call; a
-replayed CUDA graph keeps the route it was captured with.
+The dense route needs fp16 operands with unit stride along K. Switches
+VLLM_SM70_INKLING_SMALL_M_GEMV=0 and VLLM_SM70_INKLING_NVFP4_GEMV=0 are read on
+every eager call; a replayed graph keeps its route. Tensors off the GPU take
+cuBLAS and TurboMind, except in Triton's interpreter.
 """
 
 from __future__ import annotations
@@ -50,8 +40,7 @@ SMALL_M_SWITCH = "VLLM_SM70_INKLING_SMALL_M_GEMV"
 NVFP4_SWITCH = "VLLM_SM70_INKLING_NVFP4_GEMV"
 _small_m_enabled = envs.environment_variables()[SMALL_M_SWITCH]
 _nvfp4_enabled = envs.environment_variables()[NVFP4_SWITCH]
-# LM head shard on a V100 (tools/bench_inkling2_gemv.py): the GEMV beats
-# cuBLAS from 1 to 4 rows, cuBLAS wins at 8.
+# Rows of an LM head shard that take the GEMV; larger batches take cuBLAS.
 HEAD_MIN_ROWS = 1
 HEAD_MAX_ROWS = 4
 

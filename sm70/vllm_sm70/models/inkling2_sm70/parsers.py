@@ -7,7 +7,7 @@ subclass adds the Inkling 2 parts of upstream's `vllm/parser/inkling.py`
 (see PROVENANCE.md): the vocabulary check, ``is_reasoning_end`` for prompts
 that end between messages, and the JSON response-format structural tag.
 
-Use (0 upstream lines): ``--reasoning-parser-plugin
+Use: ``--reasoning-parser-plugin
 vllm_sm70.models.inkling2_sm70.parsers --reasoning-parser inkling2_sm70
 --tool-parser-plugin vllm_sm70.models.inkling2_sm70.parsers
 --tool-call-parser inkling2_sm70 --enable-auto-tool-choice``. The plugin

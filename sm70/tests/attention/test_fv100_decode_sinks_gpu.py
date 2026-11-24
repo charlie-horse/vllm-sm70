@@ -1,18 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K05 GPU: learned sinks in the Flash-V100 paged decoder (Flint shapes).
-
-Port of the non-fused GPU cases of fork cf9492a
-tests/kernels/attention/test_sm70_flash_v100_sinks_decode.py (:188-420 and
-the dominant-sink case :862-882). The fused one-launch cases (:420-860,
-incl. the gibberish regression test_decode_sinks_descending_capture_regression)
-and the CPU dispatch cases (:942-1591) belong to K14 (C4) and K06.
+"""GPU: learned sinks in the Flash-V100 paged decoder (Flint shapes).
 
 D128, GQA 8:1 (TP1 32q/4kv, TP2 16q/2kv), sliding window 513 and full
 attention, fp16 paged KV, P256/P512/P1024, batches 1-8, verifier rows and
 CUDA-graph replay. With sinks, these shapes take the one-launch fused kernel
-since K14 (VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0: the grouped two-launch
-kernel); the grouped-vs-per-head case runs both routes. The fused-only cases
-are in test_fv100_fused_decode_gpu.py.
+(VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0: the grouped two-launch kernel); the
+grouped-vs-per-head case runs both routes. The fused-only cases are in
+test_fv100_fused_decode_gpu.py.
 """
 
 from __future__ import annotations

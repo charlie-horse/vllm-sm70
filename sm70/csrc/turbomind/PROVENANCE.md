@@ -1,12 +1,15 @@
-# TurboMind SM70 GEMM core and ops: provenance (patches K02, K03, K11, M12)
+# TurboMind SM70 GEMM core and ops: provenance
 
-Source: charlie-horse/vLLM at **cf9492a01**. The lmdeploy upstream commit isn't recorded in the fork (see `lmdeploy/NOTICE`). Line counts are `wc -l`. "fork last-touch" is `git log -1 --format=%h -- <fork path>`. Re-verify against a fork checkout with:
-
-```
-sm70/tools/check_turbomind_provenance.py --fork <fork checkout at cf9492a>
-```
+Source: charlie-horse/vLLM at commit `cf9492a01`, `csrc/sm70_turbomind/`
+and `csrc/sm70_policy.h`. The lmdeploy files under `lmdeploy/` derive from
+LMDeploy TurboMind (Apache-2.0, `lmdeploy/LICENSE`, `lmdeploy/NOTICE`); the
+upstream lmdeploy commit is not recorded in the fork. Line counts are
+`wc -l`; "fork last-touch" is `git log -1 --format=%h -- <fork path>`.
+Check with `sm70/tools/check_turbomind_provenance.py [--fork <checkout at
+cf9492a>]`.
 
 ## Status values
+
 | status | meaning |
 |---|---|
 | verbatim | byte-identical to the fork file, so `sha256` == `fork sha256` |
@@ -14,683 +17,6 @@ sm70/tools/check_turbomind_provenance.py --fork <fork checkout at cf9492a>
 | rewritten | edited, see the per-function list below |
 | new | no fork counterpart |
 | external | taken from upstream lmdeploy, not from the fork |
-
-## What changed, function by function (for review against cf9492a)
-
-### `lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu` (trimmed)
-- **Deleted:**
-  - `#include "sm70_policy.h"`;
-  - `PaddedActivationConfig` (GGUF only);
-  - `GgufLatticeNarrowKernelImpl`, `GgufPrefillNarrowKernelImpl`;
-  - `Qwen38Nvfp4W2CacheBKernelImpl`, `Qwen38Nvfp4W13TailN64KernelImpl`.
-- **In `Registry::sm70_884_4()`:**
-  - Deleted the GGUF lattice/LUT/bit-plane blocks, the `Config_U2_Affine` block and the GGUF `Config_U4_d` group-32 block (fork lines 111-342).
-  - Deleted the `Config_MXF4` block (434-444).
-  - Deleted the `Qwen38CacheB` / `Qwen38W13TailN64` entries of the `Config_NVF4` block (453-456).
-  - Wrapped the `Config_U4_d` g128 and `Config_U4_g` blocks (370-432) in `#ifdef VLLM_SM70_TM_AWQ`.
-- **Unchanged:**
-  - `QuantizedBatch<fp4>` block;
-  - the remaining NVF4 entries (incl. `ExactMnkKernelImpl` 8704x5120 / 5120x4352);
-  - `Sm70Nvfp4PrescaledCounterpart`.
-
-### `lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu` (trimmed)
-- **In `Registry::sm70_884_8()`:** deleted the `Config_U8_Affine` dense and grouped block (fork lines 67-80).
-- **Unchanged:** the fp8 `QuantizedBatch`, `Config_E4M3` and `Config_E4M3_Prescaled` blocks.
-
-### `ops/gemm_runtime.h` (trimmed)
-- **`TuneKeyKind`:** deleted `kMxfp4Dense`=6, `kMxfp4Moe`=8 and `kGguf*`=10..17. The remaining values keep their numbers.
-- **Declarations deleted:**
-  - `mxfp4_moe_compact_grouped_decode_enabled`, `mxfp4_moe_broadcast_input_decode_enabled`;
-  - `mxfp4_moe_grouped_m8_enabled`, `mxfp4_moe_grouped_verifier_enabled`, `mxfp4_moe_grouped_m8_expert_rows_enabled`;
-  - `select_mxfp4_dense_dispatch_policy`, `select_mxfp4_moe_dispatch_policy`.
-
-### `ops/gemm_runtime.cpp` (rewritten)
-- **Include:** `#include "sm70_policy.h"` became `#include "tm_config.h"`.
-- **Tune keys** (`DenseTuneKey::operator==`, `DenseTuneKeyHash::operator()`, `MoeTuneKey::operator==`, `MoeTuneKeyHash::operator()`): dropped the `policy` member (`vllm::sm70::active_policy_key`) from the key, equality and hash.
-- **`struct TurboMindRuntime`:**
-  - no longer derives from `vllm::sm70::RuntimeResource`;
-  - `close()` loses `override`;
-  - `gemm_cache` is keyed by `int device`, not `(device, policy)`;
-  - `imported_cache_devices` is a `std::set<int>`.
-- **`runtime()`:** returns one function-static `TurboMindRuntime`. It no longer looks up a per-engine `current_native_runtime().resources["turbomind"]`.
-- **Deleted functions:**
-  - `mxfp4_tune_small_shapes_enabled`, `mxfp4_moe_compact_grouped_decode_enabled`, `mxfp4_moe_broadcast_input_decode_enabled`;
-  - `mxfp4_moe_grouped_m8_enabled`, `mxfp4_moe_grouped_verifier_enabled`, `mxfp4_moe_grouped_m8_expert_rows_enabled`, `mxfp4_moe_grouped_m8_fast_selector_enabled`;
-  - `mxfp4_dense_tune_max_m`;
-  - `select_mxfp4_dense_dispatch_policy`, `select_mxfp4_moe_dispatch_policy`.
-- **`has_imported_cache`, `select_dense_dispatch_policy_impl`, `select_moe_dispatch_policy_impl`:** imported-cache lookup by `device` only.
-- **`get_workspace`:** dropped the `cached_owner` / `current_native_runtime().id` part of the thread-local fast path.
-- **`get_gemm`:** dropped the owner and policy parts of the thread-local fast path and of the cache key.
-- **`configure_gemm_workspace`:** dropped `TORCH_CHECK(vllm::sm70::active_runtime, ...)`. There's no engine owner any more.
-- **`sm70_gemm_import_cache`:** `imported_cache_devices.insert(device)`.
-- **CHANGED [CONTROL] (#77, Astro-approved interim deviation from the fork):** `tune_small_shapes_enabled`, `fp8_tune_small_shapes_enabled` and `nvfp4_tune_small_shapes_enabled` default to **0** (fork: 1). `awq_tune_small_shapes_enabled` was already 0. Reason: kMeasure timed small shapes per instance and per TP rank, and captured untuned shapes fell back to kDefault, so eager vs CUDA-graph decode and separate instances picked different kernels and diverged (Bea, T4: graph == eager on 8/8 with tuning off). `VLLM_SM70_{AWQ,FP8,NVFP4}_TUNE_SMALL_SHAPES=1` restores tuning. The path back to the fork's default is the pre-capture warmup plus LUT below (#78), once a 4K tok/s A/B (tuned+LUT vs default-off) passes.
-- **`fp8_dense_tune_max_m`, `nvfp4_dense_tune_max_m`:** fallback 16 became `vllm::sm70::k{Fp8,Nvfp4}DenseTuneMaxMDefault` (64). These are the fork's c4130 auto-defaults.
-- **Op registration:** `TORCH_LIBRARY_FRAGMENT(_C, m)` became `TORCH_LIBRARY_FRAGMENT(_sm70_C, m)` for `sm70_gemm_configure_workspace` and `sm70_gemm_workspace_storage`. This follows the `_sm70_C` decision in section A. The other K02 op entry points (`sm70_gemm_import_cache`, `sm70_gemm_export_cache`) have no registration here; K03's bindings file registers them.
-- **Unchanged:**
-  - all other fp8/nvfp4/awq/f16 knob readers (they now read `tm_config.h`);
-  - `maybe_preserve_*`, `dispatch_policy_override`;
-  - the `select_{dense,awq,fp8,nvfp4}_dense_*`, `select_{prefill_,fp8_,nvfp4_,}moe_*` selectors;
-  - workspace allocation, the f16 weight cache, `sm70_gemm_export_cache`.
-
-### `ops/tm_config.h` (rewritten from `csrc/sm70_policy.h`, `sm70_policy_fields.inc`, `sm70_runtime_state.h`)
-- **42 knobs** (fork env names): 41 used by the K02 files, plus `batch_gemm_layouts` for the K03 Python. Defaults stay at the call sites.
-- **c4130 defaults:** `kFp8DenseTuneMaxMDefault`=64 and `kNvfp4DenseTuneMaxMDefault`=64 (fork call-site default 16), `kBatchGemmLayoutsDefault`=true (fork env default 0), `kAwqWarmupMaxMDefault`=64 (recorded only). Source: fork `vllm/platforms/runtime_defaults.py:36-44`, applied for cc 7.0 via `:254` from `vllm/config/vllm.py:1426`.
-- **One cached `getenv` pass:** `knobs()`, a function-local static.
-- **Kept API** (fork names): `PolicyField`, `policy_name`, `policy_value`, `policy_atoi`, `policy_exact_one`, `DispatchOverride` / `policy_dispatch_override`, `GemmTargetPolicy` / `parse_gemm_targets` (copied) / `policy_gemm_targets`, `diagnostic_counter`.
-- **Dropped:**
-  - policy tokens and the ABI (`prepared_policy`, `PolicyScope`, `with_policy`, `legacy_policy`, `policy_key`, `active_policy*`);
-  - `RuntimeState` / `active_runtime` / `enter_runtime` / `exit_runtime`;
-  - the Marlin policy.
-- **Behaviour change:** the fork's `dynamic_legacy=true` re-read of `TM_GEMM_CACHE_SUMMARY` and `VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC` on every call is gone. All knobs are fixed at first use.
-
-### `ops/sm70_policy.h` (new)
-A shim, `#include "tm_config.h"`, so `gemm.cu`, `dispatch_cache.cu` and `sm70_dflash_context.h` stay verbatim.
-
-## K03: TurboMind ops moved out of `awq_sm70_gemm.cu`
-
-Fork `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` at cf9492a (10,913 lines, last touch `899e9ed33`) is split into the files below. Commit "move ... verbatim" carries every function body byte for byte: `scripts/verify-port.py --port <tm files> --fork <fork awq_sm70_gemm.cu>` reports IDENTICAL=120 on that commit (with the `ns:` rules off, since these files keep `vllm::awq_sm70`). The next commit makes the adaptations listed after the move table. Line ranges include the comment block directly above each definition.
-
-### Move table (fork `awq_sm70_gemm.cu` lines → new file)
-
-**`ops/tm_ops_common_sm70.cuh`** (4 definitions)
-
-| fork lines | definition |
-|---|---|
-| 46-62 | `sm70_silu_and_mul_fp16_kernel` |
-| 64-75 | `sm70_silu_and_mul_fp16_out` |
-| 77-94 | `sm70_silu_and_mul_interleaved_fp16_kernel` |
-| 96-108 | `sm70_silu_and_mul_interleaved_fp16_out` |
-
-**`ops/tm_f16_sm70.cu`** (15 definitions)
-
-| fork lines | definition |
-|---|---|
-| 193-208 | `silu_and_mul_interleaved` |
-| 971-976 | `validate_f16_weight` |
-| 978-994 | `validate_f16_input` |
-| 996-1025 | `validate_f16_gate_mul_input` |
-| 1115-1120 | `warp_reduce_sum` |
-| 1690-1749 | `sm70_f16_gate_mul_kernel` |
-| 2418-2426 | `interleave_gated_silu_cols` |
-| 4051-4061 | `sm70_f16_prepare` |
-| 4849-4936 | `sm70_f16_gemm_out` |
-| 6016-6039 | `sm70_f16_gate_mul_out` |
-| 6053-6073 | `sm70_f16_gemm` |
-| 6249-6251 | `sm70_f16_prepare` |
-| 6260-6262 | `sm70_f16_gemm` |
-| 6391-6394 | `sm70_f16_gemm_out` |
-| 6550-6553 | `sm70_f16_gate_mul_out` |
-
-**`ops/tm_fp8_sm70.cu`** (20 definitions)
-
-| fork lines | definition |
-|---|---|
-| 957-969 | `validate_fp8_inputs` |
-| 2318-2318 | `kFp8PrefillDequantThreads` |
-| 2319-2319 | `kFp8QuantValuesPerWord` |
-| 2320-2320 | `kFp8OutputColumnsPerTile` |
-| 2322-2371 | `fp8_sm70_dequantize_kernel` |
-| 2373-2416 | `fp8_sm70_dequantize_out` |
-| 3679-3810 | `fp8_sm70_prepare` |
-| 4254-4353 | `fp8_gemm_sm70_out` |
-| 4355-4362 | `sm70_fp8_prefill_cutlass_gated_silu_enabled` |
-| 4364-4400 | `fp8_gemm_sm70_prefill_dispatch_out` |
-| 4776-4834 | `fp8_gemm_sm70_out_auto` |
-| 4836-4847 | `fp8_gemm_sm70_out_meta` |
-| 6218-6224 | `fp8_sm70_prepare` |
-| 6226-6231 | `fp8_sm70_dequantize_out` |
-| 6287-6294 | `fp8_gemm_sm70_out` |
-| 6296-6304 | `fp8_gemm_sm70_prefill_prescaled_out` |
-| 6306-6315 | `fp8_gemm_sm70_prescaled_m1_out` |
-| 6317-6324 | `fp8_gemm_sm70_prefill_dispatch_out` |
-| 6376-6381 | `fp8_gemm_sm70_out_auto` |
-| 6383-6389 | `fp8_gemm_sm70_out_meta` |
-
-**`ops/tm_nvfp4_sm70.cu`** (6 definitions)
-
-| fork lines | definition |
-|---|---|
-| 943-955 | `validate_nvfp4_inputs` |
-| 3933-4049 | `nvfp4_sm70_prepare` |
-| 4479-4563 | `nvfp4_gemm_sm70_out` |
-| 6241-6247 | `nvfp4_sm70_prepare` |
-| 6334-6340 | `nvfp4_gemm_sm70_out` |
-| 6342-6348 | `nvfp4_gemm_sm70_prescaled_out` |
-
-**`ops/tm_moe_sm70.cu`** (55 definitions)
-
-| fork lines | definition |
-|---|---|
-| 110-112 | `sm70_profile_trace_enabled` |
-| 114-125 | `sm70_scalar_type_name` |
-| 127-138 | `sm70_capture_status_name` |
-| 140-151 | `sm70_capture_status_bit` |
-| 153-174 | `maybe_log_sm70_moe_route_once` |
-| 6082-6092 | `select_awq_moe_dispatch_policy` |
-| 6264-6267 | `sm70_fp8_moe_prepare_vec_enabled` |
-| 6563-6577 | `awq_moe_fill_strided_ptrs_kernel` |
-| 6581-6633 | `awq_moe_build_strided_ptrs` |
-| 6793-6860 | `awq_moe_single_token_exact_layout_prepare_kernel` |
-| 6862-6935 | `awq_moe_single_token_exact_layout_prepare` |
-| 6937-6942 | `awq_moe_gemm_sm70_out` |
-| 6944-6948 | `awq_moe_gemm_sm70_per_expert_dispatch_out` |
-| 6950-6957 | `awq_moe_gemm_sm70_out_impl` |
-| 6959-7099 | `awq_moe_single_token_prepare_kernel` |
-| 7318-7333 | `awq_moe_single_token_weighted_reduce_kernel` |
-| 7335-7366 | `awq_moe_single_token_weighted_reduce_half2_kernel` |
-| 7368-7442 | `awq_moe_single_token_weighted_reduce_out` |
-| 7444-7448 | `fp8_e4m3_to_float` |
-| 7450-7499 | `fp8_moe_w2_direct_reduce_kernel` |
-| 7501-7580 | `fp8_moe_w2_direct_reduce_sm70_out` |
-| 7582-7761 | `awq_moe_single_token_sm70_out` |
-| 7763-7946 | `awq_moe_gemm_sm70_out_impl` |
-| 7948-7957 | `awq_moe_gemm_sm70_out` |
-| 7959-7967 | `awq_moe_gemm_sm70_per_expert_dispatch_out` |
-| 7969-8013 | `awq_moe_indexed_dense_w13_sm70_out` | DROPPED (TP4-only; cleanup PR) |
-| 8030-8078 | `awq_moe_dense_stage_sm70_out` |
-| 8224-8254 | `awq_moe_build_active_expert_segments_kernel` |
-| 8335-8411 | `awq_moe_active_dense_stage_sm70_out` |
-| 8415-8426 | `awq_moe_lower_bound_source_row` |
-| 8428-8448 | `awq_moe_chunk_ranges_kernel` |
-| 8450-8458 | `awq_moe_prefix_chunk_offsets_kernel` |
-| 8460-8477 | `awq_moe_fill_chunk_indices_kernel` |
-| 8479-8504 | `awq_moe_chunk_weighted_reduce_kernel` |
-| 8508-8676 | `awq_moe_chunked_w2_sm70_out` |
-| 8678-8721 | `awq_moe_single_token_dense_stage_sm70_out` |
-| 8723-8764 | `awq_moe_single_token_indexed_dense_stage_sm70_out` |
-| 8766-8860 | `awq_moe_single_token_dense_w13_sm70_out` |
-| 8862-8957 | `awq_moe_single_token_indexed_dense_w13_sm70_out` |
-| 8959-9067 | `awq_moe_single_token_compact_dense_w13_sm70_out` |
-| 9069-9270 | `fp8_moe_gemm_sm70_out_impl` |
-| 9272-9282 | `fp8_moe_gemm_sm70_out` |
-| 9284-9293 | `fp8_moe_gemm_sm70_per_expert_dispatch_out` |
-| 9295-9345 | `fp8_moe_dense_stage_sm70_out` |
-| 9570-9709 | `nvfp4_moe_gemm_sm70_out_impl` |
-| 9711-9756 | `nvfp4_moe_indexed_dense_stage_sm70_out_impl` | DROPPED (TP4-only; cleanup PR) |
-| 9758-9766 | `nvfp4_moe_indexed_dense_stage_sm70_out` | DROPPED (TP4-only; cleanup PR) |
-| 9768-9776 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | DROPPED (TP4-only; cleanup PR) |
-| 9778-9858 | `nvfp4_moe_dense_stage_sm70_out` |
-| 9979-10024 | `fp8_moe_single_token_dense_stage_sm70_out` |
-| 10026-10069 | `fp8_moe_single_token_indexed_dense_stage_sm70_out` |
-| 10071-10166 | `fp8_moe_single_token_dense_w13_sm70_out` |
-| 10168-10264 | `fp8_moe_single_token_indexed_dense_w13_sm70_out` |
-| 10266-10376 | `fp8_moe_single_token_compact_dense_w13_sm70_out` |
-| 10378-10707 | `fp8_moe_single_token_sm70_out` |
-
-**`ops/tm_awq_sm70.cu`** (24 definitions)
-
-| fork lines | definition |
-|---|---|
-| 40-41 | `unpack_awq_gemm` |
-| 898-910 | `validate_awq_inputs` |
-| 912-927 | `validate_uint4_inputs` |
-| 2229-2229 | `kAwqPrefillDequantThreads` |
-| 2230-2230 | `kAwqQuantValuesPerWord` |
-| 2231-2231 | `kAwqOutputColumnsPerTile` |
-| 2233-2237 | `awq_prefill_physical_nibble` |
-| 2239-2272 | `awq_sm70_dequantize_kernel` |
-| 2274-2316 | `awq_sm70_dequantize_out` |
-| 2428-2439 | `pack_awq_compact_source_kernel` |
-| 2441-2452 | `compact_awq_stats_kernel` |
-| 3327-3520 | `awq_sm70_prepare_impl` |
-| 3522-3529 | `awq_sm70_prepare` |
-| 3531-3536 | `awq_sm70_prepare_compact` |
-| 3538-3677 | `uint4_sm70_prepare` |
-| 4063-4164 | `awq_gemm_sm70_out` |
-| 4166-4172 | `awq_gemm_sm70_out` |
-| 6041-6051 | `awq_gemm_sm70` |
-| 6186-6193 | `awq_sm70_prepare` |
-| 6195-6200 | `awq_sm70_prepare_compact` |
-| 6202-6207 | `awq_sm70_dequantize_out` |
-| 6209-6216 | `uint4_sm70_prepare` |
-| 6253-6258 | `awq_gemm_sm70` |
-| 6269-6275 | `awq_gemm_sm70_out` |
-
-`ops/qwen38_prefill_cutlass.cuh` is verbatim. `ops/qwen38_prefill_cutlass.cu` is verbatim apart from its first line (`sm70_policy.h` → `tm_config.h`).
-
-### Not carried from `awq_sm70_gemm.cu`
-
-| bucket | fork lines (main ranges) | where it goes |
-|---|---|---|
-| lm_head top1/top20, rerank, sampler, dynamic draft vocab | 1027-1113, 1751-2226, 4938-6014, 6442-6548 | not K03 (Rosa's sampler, or dropped) |
-| GGUF | 2454-3326, 6097-6184 | dropped |
-| GLM mhc/kda, glm53 MoE permute | 889-896, 1129-1689, 6396-6440, 8082-8333 | dropped |
-| MXFP4 dense + MoE | 929-941, 3812-3931, 4402-4477, 9351-9568, 9860-9977, 6233-6239, 6326-6332 | dropped |
-| NVFP4 raw/warp/h2 GEMV | 565-885, 4565-4774, 6350-6374 | dropped (K11 carries `nvfp4_tm_gemv`) |
-| `awq_gemm_sm70_out_tile_reduce` | 4174-4252, 6277-6285 | dropped (needs custom all-reduce) |
-| `fp8_moe_single_token_router_sm70_out` | 10709-10911 | dropped (`VLLM_ENABLE_SM70_TURBOMIND_EXPERIMENTAL_MOE` only) |
-| global `silu_and_mul` | 178-191 | dropped (upstream has the op) |
-| `Top1Epilogue`/`Top20Epilogue`, `Sm70_s884_top1/top20` | 212-557 | dropped (lm_head top-k) |
-
-### Adaptations (commit after the moves)
-- **`ops/tm_ops_common_sm70.cuh`:** the fork's include block (lines 1-37) with three changes: `tm_config.h` replaces `sm70_policy.h`; `custom_all_reduce.cuh` is dropped (only the dropped tile-reduce used it); `<cutlass/half.h>` is dropped (no `cutlass::` use left, so only `qwen38_prefill_cutlass.cu` needs CUTLASS).
-- **`ops/tm_f16_sm70.cu`:** the global `silu_and_mul_interleaved` (fork 193-208) is now `vllm_sm70::silu_and_mul_interleaved`, with the body unchanged, so it can't clash with upstream symbols.
-- **Every `ops/tm_*_sm70.cu`:**
-  - `#include <torch/library.h>`;
-  - one `TORCH_LIBRARY_FRAGMENT(_sm70_C, m)` with the fork schemas (fork `csrc/torch_bindings.cpp` line in a comment above each def) minus `str? native_policy=None`;
-  - one `TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m)`;
-  - the AWQ ops are registered only under `VLLM_SM70_TM_AWQ`.
-  - Schema change (Mara's K03 contract): `nvfp4_sm70_prepare` defaults `group_size=16, interleave_gated_silu=False`, and `nvfp4_gemm_sm70_out` defaults `gated_silu=False`. Call sites that pass every argument are unaffected.
-- **`ops/tm_moe_sm70.cu`:** the fork's `#if defined(ENABLE_SM70_TURBOMIND)` wrapper (6559/10913) is gone, since the plugin always builds TurboMind. AWQ-only MoE ops sit under `#ifdef VLLM_SM70_TM_AWQ` in their fork order.
-- **`ops/tm_awq_sm70.cu`:** the AWQ dense ops, entirely under `#ifdef VLLM_SM70_TM_AWQ` (K04).
-- **`ops/tm_config.h`:** five more knobs.
-  - K03: `profile_trace` (`VLLM_SM70_PROFILE_TRACE`), `fp8_prefill_cutlass`, `fp8_moe_prepare_vec`.
-  - K04: `awq_moe_batched_active_exact_w2`, `awq_qwen38_moe_compact_grouped_decode`.
-  - Env names are the fork's (`sm70_policy_fields.inc`).
-- **`ops/gemm_runtime.cpp`** (K03 changes on top of K02):
-  - `TurboMindRuntime` gains `generation` and `release()`.
-  - `get_workspace()` and `get_gemm()` drop their thread-local fast-path pointers when `generation` changes.
-  - New `tm_runtime_close()`.
-  - Registrations: `sm70_gemm_import_cache` / `sm70_gemm_export_cache` (fork `torch_bindings.cpp:1155,1161`, minus `native_policy`) with CUDA impls, and `tm_runtime_close() -> ()` with a CompositeExplicitAutograd impl.
-  - `#include <torch/library.h>`, `<atomic>`.
-- **`sources.cmake`:** now appends to K01's `SM70_CXX_SRCS` / `SM70_CUDA_SRCS` / `SM70_INCLUDE_DIRS`. The K02 version set only `VLLM_SM70_TM_*`, which K01 never read. It adds the K03 sources and requires `VLLM_SM70_CUTLASS_DIR`.
-
-### Python: `vllm_sm70/ops/tm.py`
-Ported from fork `vllm/_sm70/{auxiliary,linear,moe}.py`. Each block is marked `# fork vllm/_sm70/<file>:<lines>`.
-
-- **Mechanical rewrites** (the `scripts/verify-port.toml` python rules):
-  - `call_native(_op(x), native_policy, ...)` → `_op(x)(...)`;
-  - `native_policy` parameters dropped;
-  - `"_C::"` → `"_sm70_C::"`;
-  - `hasattr(torch.ops._C, x)` → `has_op(x)`;
-  - `@direct_native("_C")` removed.
-- **Real changes:**
-  - The six prepare fakes create `meta` on CPU, as the C++ ops do; the fork faked it on the weight's device.
-  - `nvfp4_sm70_prepare(..., group_size=16)` gets a default and a docstring for Mara's contract.
-  - The `nvfp4` fakes take the schema defaults.
-  - New fakes for `fp8_gemm_sm70_out_auto`, `fp8_gemm_sm70_out_meta`, `sm70_gemm_import_cache`, `sm70_gemm_export_cache`, `sm70_gemm_configure_workspace`, `sm70_gemm_workspace_storage` and `tm_runtime_close`.
-  - New wrappers for the last three.
-
-| fork file | lines | op | kind |
-|---|---|---|---|
-| `vllm/_sm70/auxiliary.py` | 10-11 | `silu_and_mul_interleaved` | wrapper |
-| `vllm/_sm70/auxiliary.py` | 14-19 | `silu_and_mul_interleaved` | fake |
-| `vllm/_sm70/auxiliary.py` | 706-711 | `sm70_f16_gate_mul_out` | wrapper |
-| `vllm/_sm70/auxiliary.py` | 714-722 | `sm70_f16_gate_mul_out` | fake |
-| `vllm/_sm70/linear.py` | 78-94 | `awq_sm70_prepare` | wrapper |
-| `vllm/_sm70/linear.py` | 97-118 | `awq_sm70_prepare` | fake |
-| `vllm/_sm70/linear.py` | 121-137 | `awq_sm70_prepare_compact` | wrapper |
-| `vllm/_sm70/linear.py` | 140-161 | `awq_sm70_prepare_compact` | fake |
-| `vllm/_sm70/linear.py` | 164-173 | `awq_sm70_dequantize_out` | wrapper |
-| `vllm/_sm70/linear.py` | 176-187 | `awq_sm70_dequantize_out` | fake |
-| `vllm/_sm70/linear.py` | 190-206 | `uint4_sm70_prepare` | wrapper |
-| `vllm/_sm70/linear.py` | 209-235 | `uint4_sm70_prepare` | fake |
-| `vllm/_sm70/linear.py` | 238-252 | `fp8_sm70_prepare` | wrapper |
-| `vllm/_sm70/linear.py` | 255-276 | `fp8_sm70_prepare` | fake |
-| `vllm/_sm70/linear.py` | 279-288 | `fp8_sm70_dequantize_out` | wrapper |
-| `vllm/_sm70/linear.py` | 291-302 | `fp8_sm70_dequantize_out` | fake |
-| `vllm/_sm70/linear.py` | 350-364 | `nvfp4_sm70_prepare` | wrapper |
-| `vllm/_sm70/linear.py` | 367-392 | `nvfp4_sm70_prepare` | fake |
-| `vllm/_sm70/linear.py` | 395-398 | `sm70_f16_prepare` | wrapper |
-| `vllm/_sm70/linear.py` | 401-408 | `sm70_f16_prepare` | fake |
-| `vllm/_sm70/linear.py` | 432-450 | `awq_gemm_sm70` | wrapper |
-| `vllm/_sm70/linear.py` | 453-470 | `awq_gemm_sm70` | fake |
-| `vllm/_sm70/linear.py` | 473-495 | `awq_gemm_sm70_out` | wrapper |
-| `vllm/_sm70/linear.py` | 498-512 | `awq_gemm_sm70_out` | fake |
-| `vllm/_sm70/linear.py` | 572-610 | `fp8_gemm_sm70_out` | wrapper |
-| `vllm/_sm70/linear.py` | 613-628 | `fp8_gemm_sm70_out` | fake |
-| `vllm/_sm70/linear.py` | 631-651 | `fp8_gemm_sm70_prefill_prescaled_out` | wrapper |
-| `vllm/_sm70/linear.py` | 654-667 | `fp8_gemm_sm70_prefill_prescaled_out` | fake |
-| `vllm/_sm70/linear.py` | 670-690 | `fp8_gemm_sm70_prescaled_m1_out` | wrapper |
-| `vllm/_sm70/linear.py` | 693-706 | `fp8_gemm_sm70_prescaled_m1_out` | fake |
-| `vllm/_sm70/linear.py` | 1672-1698 | `fp8_gemm_sm70_prefill_dispatch_out` | wrapper |
-| `vllm/_sm70/linear.py` | 1701-1718 | `fp8_gemm_sm70_prefill_dispatch_out` | fake |
-| `vllm/_sm70/linear.py` | 1763-1785 | `nvfp4_gemm_sm70_out` | wrapper |
-| `vllm/_sm70/linear.py` | 1788-1802 | `nvfp4_gemm_sm70_out` | fake |
-| `vllm/_sm70/linear.py` | 1848-1870 | `nvfp4_gemm_sm70_prescaled_out` | wrapper |
-| `vllm/_sm70/linear.py` | 1873-1887 | `nvfp4_gemm_sm70_prescaled_out` | fake |
-| `vllm/_sm70/linear.py` | 2001-2010 | `fp8_gemm_sm70_out_auto` | wrapper |
-| `vllm/_sm70/linear.py` | 2013-2031 | `fp8_gemm_sm70_out_meta` | wrapper |
-| `vllm/_sm70/linear.py` | 2034-2037 | `sm70_f16_gemm` | wrapper |
-| `vllm/_sm70/linear.py` | 2040-2052 | `sm70_f16_gemm` | fake |
-| `vllm/_sm70/linear.py` | 2055-2065 | `sm70_f16_gemm_out` | wrapper |
-| `vllm/_sm70/linear.py` | 2068-2079 | `sm70_f16_gemm_out` | fake |
-| `vllm/_sm70/linear.py` | 2103-2106 | `sm70_gemm_import_cache` | wrapper |
-| `vllm/_sm70/linear.py` | 2109-2112 | `sm70_gemm_export_cache` | wrapper |
-| `vllm/_sm70/moe.py` | 837-863 | `nvfp4_moe_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 866-882 | `nvfp4_moe_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 885-913 | `nvfp4_moe_indexed_dense_stage_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 916-933 | `nvfp4_moe_indexed_dense_stage_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 936-964 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 967-984 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 1083-1099 | `awq_moe_build_strided_ptrs` | wrapper |
-| `vllm/_sm70/moe.py` | 1102-1116 | `awq_moe_build_strided_ptrs` | fake |
-| `vllm/_sm70/moe.py` | 1119-1145 | `awq_moe_gemm_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1148-1174 | `awq_moe_gemm_sm70_per_expert_dispatch_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1177-1193 | `awq_moe_gemm_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1196-1212 | `awq_moe_gemm_sm70_per_expert_dispatch_out` | fake |
-| `vllm/_sm70/moe.py` | 1215-1242 | `awq_moe_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1245-1261 | `awq_moe_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1264-1293 | `awq_moe_indexed_dense_w13_sm70_out` | wrapper | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 1296-1313 | `awq_moe_indexed_dense_w13_sm70_out` | fake | DROPPED (TP4-only; cleanup PR) |
-| `vllm/_sm70/moe.py` | 1316-1345 | `awq_moe_active_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1348-1365 | `awq_moe_active_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1368-1417 | `awq_moe_chunked_w2_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1420-1447 | `awq_moe_chunked_w2_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1450-1477 | `awq_moe_single_token_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1480-1496 | `awq_moe_single_token_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1499-1526 | `awq_moe_single_token_indexed_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1529-1545 | `awq_moe_single_token_indexed_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1548-1583 | `awq_moe_single_token_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1586-1606 | `awq_moe_single_token_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1609-1644 | `awq_moe_single_token_indexed_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1647-1667 | `awq_moe_single_token_indexed_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1670-1709 | `awq_moe_single_token_compact_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1712-1734 | `awq_moe_single_token_compact_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1737-1758 | `awq_moe_single_token_exact_layout_prepare` | wrapper |
-| `vllm/_sm70/moe.py` | 1761-1774 | `awq_moe_single_token_exact_layout_prepare` | fake |
-| `vllm/_sm70/moe.py` | 1777-1796 | `awq_moe_single_token_weighted_reduce_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1799-1811 | `awq_moe_single_token_weighted_reduce_out` | fake |
-| `vllm/_sm70/moe.py` | 1860-1915 | `awq_moe_single_token_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 1918-1973 | `awq_moe_single_token_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 1976-2002 | `fp8_moe_gemm_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2005-2031 | `fp8_moe_gemm_sm70_per_expert_dispatch_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2034-2050 | `fp8_moe_gemm_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2053-2069 | `fp8_moe_gemm_sm70_per_expert_dispatch_out` | fake |
-| `vllm/_sm70/moe.py` | 2072-2099 | `fp8_moe_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2102-2118 | `fp8_moe_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2121-2148 | `fp8_moe_single_token_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2151-2167 | `fp8_moe_single_token_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2170-2197 | `fp8_moe_single_token_indexed_dense_stage_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2200-2216 | `fp8_moe_single_token_indexed_dense_stage_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2219-2254 | `fp8_moe_single_token_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2257-2277 | `fp8_moe_single_token_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2280-2315 | `fp8_moe_single_token_indexed_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2318-2338 | `fp8_moe_single_token_indexed_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2341-2380 | `fp8_moe_single_token_compact_dense_w13_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2383-2405 | `fp8_moe_single_token_compact_dense_w13_sm70_out` | fake |
-| `vllm/_sm70/moe.py` | 2408-2485 | `fp8_moe_single_token_sm70_out` | wrapper |
-| `vllm/_sm70/moe.py` | 2488-2529 | `fp8_moe_single_token_sm70_out` | fake |
-
-## K11: Flint NVFP4 M≤2 GEMV (`ops/nvfp4_tm_gemv_sm70.cu`)
-
-The source is fork `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu` (535 lines, last touch `0c9f3ee73`). Commit "import ... verbatim" copies it byte for byte, and the next commit adapts it (491 lines).
-
-### Kept (fork line → same name in the new file)
-| fork lines | definition |
-|---|---|
-| 36-41 | `nvfp4_gemm_sm70_out` declaration (K03 `tm_nvfp4_sm70.cu`; the `#ifndef VLLM_NVFP4_TM_GEMV_STANDALONE` guard is gone) |
-| 45-56 | `kTmGemvMaxRows`, `VLLM_TM_GEMV_TABLE` (launch table) |
-| 58-65 | `VLLM_SM70_TM_GEMV_MMA` |
-| 78-97 | `decode_e2m1x8` |
-| 100-104 | `TmGemvStage` |
-| 109-114 | `tm_gemv_d_row`, `tm_gemv_d_col` |
-| 118-127 | `tm_gemv_lanes_per_output` |
-| 130-135 | `tm_gemv_element_used` |
-| 142-296 | `nvfp4_tm_gemv_sm70_kernel` |
-| 298-304 | `TmGemvConfig` |
-| 306-316 | `launch_tm_gemv` |
-| 354-370 | `dispatch_tm_gemv_rows` |
-| 372-385 | `tm_gemv_config_valid` |
-| 387-413 | `tm_gemv_operands_ok` |
-| 415-431 | `TmGemvEntry`, `kTmGemvTable` |
-| 433-441 | `tm_gemv_config` |
-| 443-477 | `run_tm_gemv` |
-| 481-484 | `nvfp4_tm_gemv_sm70_supported` |
-| 486-506 | `nvfp4_tm_gemv_dispatch_sm70_out` (unchanged; its `#ifndef STANDALONE` guard at 486/508 is gone) |
-
-Function bodies are unchanged.
-
-### Dropped
-- The `VLLM_NVFP4_TM_GEMV_STANDALONE` launch list and its `#else` (fork 318-352, 27 untuned configurations) are gone. `VLLM_TM_GEMV_SHAPES` is now always the measured table, so only the measured configurations are compiled (4 distinct (G, warps, prefetch, pipelined, min blocks) tuples × M ∈ {1, 2}).
-- `nvfp4_tm_gemv_sm70_tune_out` and `TORCH_LIBRARY_FRAGMENT(_tm_gemv_dev)` (fork 510-535) are gone. They were a tuning-only extension.
-
-### Added
-- `#include <torch/library.h>`.
-- `TORCH_LIBRARY_FRAGMENT(_sm70_C)`: `nvfp4_tm_gemv_dispatch_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, int scale_shift=14) -> ()`. This is fork `csrc/torch_bindings.cpp:956-961` minus `str? native_policy`, with a CUDA impl.
-- `sources.cmake` lists the file with the K03 sources. It must be in the same `.so`, because it calls `nvfp4_gemm_sm70_out` directly.
-- Python, `vllm_sm70/ops/tm.py`:
-  - the wrapper and fake (fork `vllm/_sm70/linear.py:1805-1845`, minus `native_policy`);
-  - `NVFP4_TM_GEMV_SHAPES` and `nvfp4_tm_gemv_takes_gemv()`, a Python mirror of the op's shape gate.
-
-### Admitted shape set (audited for Flint TP2 on 2×V100)
-The GEMV runs only when all of these hold. Anything else runs K03's `nvfp4_gemm_sm70_out` inside the same op:
-- 1 ≤ M ≤ 2;
-- `group_size == 16`;
-- `k_ld == 32*K`;
-- `q_ld == N`;
-- (K, N) is in the launch table;
-- the operands pass `tm_gemv_operands_ok`: fp16 activations with unit column stride, row stride ≥ K and a multiple of 8 halves, 16-byte-aligned base; dense int32 weight [K, N/8] and fp16 scales [K/16, N].
-
-| layer (per rank, TP2) | K | N | groups | warps | prefetch | pipelined | min blocks | rounds |
-|---|---|---|---|---|---|---|---|---|
-| qkv | 2048 | 2560 | 2 | 8 | 2 | yes | 1 | 2 |
-| o | 2048 | 2048 | 2 | 8 | 2 | yes | 1 | 2 |
-| shared-expert gate/up | 2048 | 1024 | 2 | 8 | 2 | yes | 1 | 2 |
-| shared-expert down | 512 | 2048 | 1 | 8 | 2 | yes | 1 | 1 |
-| dense-MLP gate/up | 2048 | 6144 | 2 | 4 | 2 | no | 8 | 4 |
-| dense-MLP down | 3072 | 2048 | 2 | 8 | 2 | yes | 1 | 3 |
-
-- **Consistency with Flint's TP2 layout:** all six are per-rank TP2 shapes for hidden 2048. qkv 2560 is 16 q heads and 2 kv heads of 128 per rank. Dense intermediate is 3072 per rank; shared-expert intermediate is 512 per rank.
-- **Validity:** every entry passes `tm_gemv_config_valid` (N % 32 == 0, K % (32·G) == 0, (K / (32·G)) % (warps·prefetch) == 0). So no admitted Flint TP2 shape silently falls back to TurboMind. `tests/ops/test_k11_nvfp4_tm_gemv_cpu.py` checks this.
-- **Same set in three places:** the table, `tm.NVFP4_TM_GEMV_SHAPES` and M3's `MODELOPT_NVFP4_GEMV_SHAPES` are the same set, and the CPU test keeps them equal.
-- **Not GEMV:** Qwen TP2 (e.g. 5120×8704), transposed Flint and TP4 shapes all take TurboMind. The GPU test checks that those shapes give bit-identical TurboMind output.
-
-## Pre-capture warmup (`vllm_sm70/warmup/`, Python only)
-
-Source: fork cf9492a `vllm/model_executor/warmup/awq_sm70_warmup.py` (1336
-lines), `sm70_native_cache.py` (127) and their call site
-`kernel_warmup.py:18,67`. Ours is called from `Sm70CudaPlatform.kernel_warmup`
-(U1, patches/0002, upstream `kernel_warmup.py:227`). That runs after the compile
-warmup and before `capture_model` (UP `v1/worker/gpu_worker.py:982-994`). No C++
-changed. It uses K02's dispatch policy (`gemm_runtime.cpp:441-600`) and K03's
-`sm70_gemm_{import,export}_cache` (`gemm_runtime.cpp:825-884`).
-
-Why: `select_*_dispatch_policy` gives kMeasure on a shape's first eager call
-(a timed autotune, which can pick differently run to run and per TP rank) and
-kDefault on an untuned shape under capture. After a warmed call the shape is in
-`dense_tuned_shapes`/`moe_tuned_shapes`, so capture gets kReuse. After an import
-the device is "imported", so NVFP4/FP8 dense and every MoE shape get kReuse in
-capture. `Gemm::Impl::Measure` returns early on an exact cache hit, and
-`DispatchCache::Import` replaces existing entries (`dispatch_cache.cu:212-239`).
-
-TP mechanism (the fork's `_run_coordinated_dense_warmup`, :190-252): the source
-rank tunes, exports its whole dispatch cache, and broadcasts the bytes on the TP
-group's gloo `cpu_group`. Every rank, the source included, imports the bytes and
-replays the same calls. The source rank is the lowest rank that has TurboMind
-work. Every rank makes the same three collectives whatever its layers:
-all-gather(has_work), broadcast(payload or error), all-gather(digest or error).
-An error on any rank is shared before any rank raises, so no rank is left
-waiting. All TurboMind kinds share one phase and one export. The fork coordinated
-only the dense routes, and each rank tuned MoE on its own.
-
-### Kept (fork function → new location)
-
-| Fork (`awq_sm70_warmup.py` unless noted) | New | Change |
-|---|---|---|
-| `sm70_awq_warmup` :1229-1336 | `warmup/__init__.py: run` | one coordinated phase for all kinds; kill switch `VLLM_SM70_TM_PRECAPTURE_WARMUP` replaces `awq_warmup`; refuses under capture; INFO summary (calls per kind, seconds, rank agreement) |
-| `_run_coordinated_dense_warmup` :190-252 | `warmup/coord.py: coordinate` | covers every kind; source = lowest rank with work (agreed by all-gather); errors shared; cache digests compared; gloo `cpu_group` used directly, not `GroupCoordinator.broadcast_object` (which may use the message-queue broadcaster) |
-| `_warmup_dense_quantized_layers_coordinated` :274-294 | `warmup/__init__.py: _warm` + `coordinate` | AWQ dense dropped; MoE added to the same phase |
-| `_spec_decode_query_len` :306-310, `_get_decode_m_values` :313-333 | `warmup/plan.py: decode_m_values` | adds every eager-only decode M above the largest capture size (every M from 1 when graphs or the mixed mode are off) and caps at `max_num_batched_tokens`; keeps the fork set {1,2,4,8,16,32,64} (c4130 `awq_warmup_max_m`=64) |
-| `_get_moe_token_counts` :336-346, `_get_nvfp4_moe_token_counts` :1054-1090 | `plan.py: build, item_ms` | every token count up to the C++ MoE slot limit (tokens × top_k ≤ 128), not just the decode M set: eager MoE dispatch has no imported-cache reuse, so an unwarmed count would be timed on first use. The fork's cap was 8 tokens, plus compact widths we do not ship |
-| `_build_balanced_offsets` :349-363 | `warmup/kinds.py: moe_routing` | balanced synthetic top-k ids fed through the layer's own routing |
-| `_iter_unique_fp4_dense_layers` :452-470 | `plan.py: _classify` (NVFP4 dense) | NVFP4 only; key adds `tm_gemv` (K11 owns M ≤ 2) |
-| `_iter_unique_fp8_dense_layers` :381-449 | `plan.py: _classify` (FP8 dense, FP8 QPN8 TM copy) | plain TM and block-QPN8 TM-copy branches only |
-| `_is_nvfp4_moe_sm70_layer` :553-569, `_iter_unique_nvfp4_moe_layers` :572-589 | `plan.py: _classify` (NVFP4 MoE) | keyed on M4's `sm70_nvfp4_*` attributes; key adds K12 admission |
-| (fork FP8 MoE went through `_iter_unique_moe_layers` :492-511 and `_warmup_moe_dense_stage_layers`) | `plan.py: _classify` (FP8 MoE) | keyed on M6's `sm70_num_experts`/`sm70_fp8_moe_compact` |
-| `_warmup_fp4_dense_layers` :721-793 (nvfp4, non-prescaled, non-scale-code) | `kinds.py: run` | through M3's `apply_prepared_linear`, so the K11 GEMV operator choice and the output padding match forward |
-| `_warmup_fp8_dense_layers` :620-718 (plain TM :666-677 and :680-696; block-QPN8 copy :635-640 and :683-684) | `kinds.py: run` | `tm.fp8_gemm_sm70_out` with the operands M6/M8 pass |
-| `_warmup_nvfp4_moe_decode_layers` :952-1051, `_warmup_moe_dense_stage_layers` :796-878 | `kinds.py: run` | calls the layer's own `quant_method.apply` (M4/M6), so the dispatch keys at each M match the runtime's (batched; FP8 compact M == 1; decomposed) |
-| `_resolve_lut_path` :79-88, `_load_lut_cache` :124-144 | `warmup/cache.py: resolve_path, load_lut`; `warmup/__init__.py: run` | env `VLLM_SM70_GEMM_LUT_PATH` (fork name; unset = no file); imported on every rank; calls the manifest covers are not measured (see "Pinning specs"); `{rank}` is the TP rank |
-| `_save_lut_cache` :147-165, `sm70_native_cache.export_cache` :98-122 | `warmup/cache.py: write_lut, write_atomic`; `warmup/__init__.py: _export_lut` | env `VLLM_SM70_GEMM_LUT_EXPORT_PATH`; the source rank writes after coordination, temp file + `os.replace`; raw table only (no `.policy-v1`), plus a `<path>.plan.json` manifest (table sha256, warmup calls, identity: `_sm70_C` fingerprint, GPU name, `ops` knob snapshot); both files mode 0644 whatever the umask |
-| `_export_lut_bytes` :168-177, `_import_lut_bytes` :180-187 | `cache.py: export_bytes, import_bytes` | raw table only (no policy partitions) |
-| `sm70_native_cache.py: import_cache` :64-95, `packed_cache_bytes` :125-127, `_MAGIC` :16, `_key(())` :55-57 | `cache.py: legacy_table, load_lut` | the only partition is "legacy": a raw file is imported as is, and an `SM70POLICY1` file gives its "legacy" entry |
-| `vllm/_sm70/linear.py` op wrappers | `vllm_sm70/ops/tm.py` (K03) | unchanged, used as is |
-
-### Dropped
-
-| Fork | Why |
-|---|---|
-| `_warmup_dense_layers` :592-617, `_iter_unique_dense_layers` :366-378, `_group_size_from_tm_scales` :74-76 | AWQ dense: no AWQ layers on main (AWQ ops only in a `VLLM_SM70_TM_AWQ` build) |
-| `_warmup_moe_dense_stage_layers` AWQ parts, `_warmup_moe_single_token_layers` :1093-1226, `_is_awq_moe_sm70_layer` :473-489, `_iter_unique_moe_layers` :492-511, `_silu_and_mul_w13` :297-303 | AWQ MoE (incl. Qwen3.8 active-grouped decode, legacy compact), not shipped |
-| `_warmup_mxfp4_moe_b1_layers` :881-949, `_is_mxfp4_moe_sm70_layer` :514-530, `_iter_unique_mxfp4_moe_layers` :533-550, mxfp4 branch of `_warmup_fp4_dense_layers` | MXFP4 not shipped |
-| NVFP4 prescaled / scale-code (`nvfp4_qpn2_compact_tm_gemm_sm70_out`) branches of `_warmup_fp4_dense_layers`; compact grouped NVFP4 MoE (`_prepare_compact_slot_groups`, `_use_compact_grouped`) | M3 never prescales or interleaves; M4 has no compact grouped route (QPN2/Qwen3.8 lanes dropped in M4) |
-| FP8 batch-QPN8 (`sm70_fp8_batch_tm`), grouped BMM (`sm70_fp8_bmm*`, `fp8_moe_gemm_sm70_per_expert_dispatch_out`), ModelOpt FP8, gated-SiLU and prescaled-prefill branches of `_warmup_fp8_dense_layers` / `_iter_unique_fp8_dense_layers` | not on main: DeepSeek grouped BMM, PP2/TP4 batch layouts, ModelOpt FP8 and gated SiLU were dropped in M6/M8 |
-| `_warmup_fp8_dense_layers_coordinated` :255-271 | replaced by the single coordinated phase |
-| `_lut_cache_disabled_for_dynamic_quant_dispatch` :91-121 | **intentional difference.** The fork skipped LUT import and export whenever dispatch was "dynamic" (NVFP4/FP8 small-shape tuning on, its default), so fork Flint never used a LUT and two instances could differ. We do the opposite: with a LUT, every rank imports it and the calls it covers are not measured. Uncovered calls are tuned before the import (see "Pinning specs") |
-| `_warmup_policy` :41-52, `_warmup_native` :55-58, `_native_number` :61-71, `sm70_native_cache._prepared_policies/_policies/_accepts_legacy_seed` :19-52, `vllm/_sm70/policy.py NativeBindings` | no policy tokens: knobs are env-read in C++ (tm_config.h), and `plan.py: limits/knob` mirrors the C++ defaults |
-| F16 dense (`sm70_f16_gemm*`) | no layer routes there on main (K18 DFlash2 FP16 uses its own M≤8 kernel and `F.linear`, not TurboMind) |
-| TP4-only paths (e.g. the `nvfp4_qwen38_tp4_m1` selector shapes) | TP 1/2 only; those calls would be kDefault anyway |
-
-### Shape and M set (audited for 2×V100 TP2)
-
-M values = capture sizes ∪ {1 + num_speculative_tokens} ∪ eager decode M
-(above the largest capture size up to max_num_seqs × (spec + 1); every M from 1
-with graphs or the mixed mode off) ∪ {1,2,4,8,16,32,64}, capped at
-`max_num_batched_tokens`. Each kind keeps only the M that reach a tunable
-TurboMind GEMM. Above the C++ limit the policy is kDefault in eager and in
-capture alike, so the result is deterministic.
-
-| Kind | Layers (main) | M kept | C++ gate mirrored |
-|---|---|---|---|
-| `nvfp4_dense` | M3 ModelOpt W4A16 NVFP4 linears | M ≤ 64; M ≤ 2 skipped for K11-admitted Flint shapes (2048×2560, 2048×2048, 2048×1024, 512×2048, 2048×6144, 3072×2048) | `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES`, `VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M` (64) |
-| `fp8_dense` | M6 block-FP8 TurboMind linears | M ≤ 64 | `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, `VLLM_SM70_FP8_DENSE_TUNE_MAX_M` (64); the 0dot3 selector → generic gate (16) |
-| `fp8_qpn8_tm` | M8 QPN8 linears that keep a TurboMind copy | qpn8_max_m < M ≤ 64 (8, or 32 with `VLLM_SM70_FP8_QPN8_M32=1`); no copy → nothing to warm | as `fp8_dense` |
-| `nvfp4_moe` | M4 Flint experts (E256 H2048 I256/rank top-6) | every token count with tokens × 6 ≤ 128 (1..21); M ≤ 2 skipped when K12 is admitted | `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` (128 slots) |
-| `fp8_moe` | M6 Qwen3.6 experts (top-8) | every token count with tokens × 8 ≤ 128 (1..16) | `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, `VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS` (128 slots) |
-
-Example (test): Flint TP2, capture [1,2,4,8,16,24,32,40], max_num_seqs 8,
-4 spec tokens → NVFP4 dense M {4,5,8,16,24,32,40,64} for each of the 6 shapes,
-NVFP4 MoE tokens 3..21: 67 calls.
-
-### Pinning specs
-
-Timed tuning can pick differently on every start, so two instances of one model
-can diverge even with their TP ranks agreeing. To pin the specs:
-
-1. Start once with `VLLM_SM70_GEMM_LUT_EXPORT_PATH=/path/tm-{arch}.bin`. After
-   the warmup the source rank writes its whole dispatch cache there atomically
-   (temp file + rename, mode 0644), plus `/path/tm-sm70.bin.plan.json` (table
-   sha256, the warmup calls it covers, and its identity: the `_sm70_C`
-   fingerprint `abi=<n>;so=<sha256>` as in `VLLM_SM70_EXT_FINGERPRINT`, the GPU
-   name, and every knob of the `ops` env section except
-   `VLLM_SM70_PROFILE_TRACE`). The path and sha256 are logged at INFO. Nothing
-   is exported when the TP ranks disagree.
-2. Serve with `VLLM_SM70_GEMM_LUT_PATH=/path/tm-{arch}.bin`. Every rank imports
-   it, and no call the manifest covers is measured, so those specs are the same
-   on every start. Calls it lacks (a new capture size, spec count or model) are
-   tuned on the source before the import and listed in a WARNING. Tuning before
-   the import matters: an import makes uncovered NVFP4/FP8 dense calls take
-   kReuse (LowerBound) instead of measuring. Without a manifest (e.g. a fork
-   file) every call is tuned first, and the LUT then overrides the shapes it
-   holds. A manifest whose identity differs from this process (another
-   `_sm70_C` build, GPU, or knob value; or a v1 manifest without one) refuses
-   the LUT: a WARNING ("refusing TurboMind LUT ...") names each difference,
-   nothing is imported, and the warmup tunes as without a LUT (the summary
-   says "LUT <path>: not loaded"). That is a stale cache, not an error, so it
-   does not stop startup, unless `VLLM_SM70_GEMM_LUT_STRICT=1` (gate runs):
-   then a missing or unreadable LUT file, a missing, unreadable or non-v2
-   manifest, a sha256 that does not match
-   the table, or any identity difference raises RuntimeError on every rank
-   (through the coordination protocol, so no rank waits), listing every
-   difference.
-
-After the warmup the TP ranks compare sha256 digests of their caches. A
-mismatch raises RuntimeError on every rank (they all hold the same digests),
-naming `VLLM_SM70_TM_PRECAPTURE_WARMUP=0`: graph replay would differ between
-ranks.
-
-One file per arch is enough: every rank imports it, and the TP ranks share the
-source's cache anyway. Use `{arch}` in the path. `{rank}` and `{device}` are
-still substituted (fork `_resolve_lut_path` semantics, with `{rank}` the TP
-rank), but a per-rank import path that is missing on a follower just means that
-follower receives the LUT through the source's payload. We use two variables
-(import, export) rather than one "import if present, else export" path, so a
-serving run can never overwrite its pin by accident.
-
-Why imported entries are used without C++ changes (gemm_runtime.cpp, gemm.cu,
-dispatch_cache.cu):
-- An import marks the device imported. NVFP4 dense then always takes kReuse
-  (`reuse_imported_cache=true`), and FP8 dense does too while
-  `VLLM_SM70_FP8_REUSE_IMPORTED_CACHE` is unset or 1. kReuse looks up with
-  `LowerBound`, which returns the exact entry when one exists.
-- MoE (`select_moe_dispatch_policy_impl`) has no imported check in eager. It
-  returns kMeasure for a shape not yet in `moe_tuned_shapes`, and so does FP8
-  dense with the reuse knob at 0. But `Gemm::Impl::Measure` returns at once on an
-  exact cache hit (`cache_.Find(desc)`), and `Dispatch` then takes that entry.
-  So a covered call never times a kernel, whatever the policy. `GemmDesc` holds
-  only shape and type fields, no pointers, so the exported keys match.
-- Under capture, an imported device gives kReuse for every kind.
-- Gap closed in Python: an MoE token count missing from the LUT would be timed
-  in eager on first use, so the plan warms (and so exports) every MoE token
-  count up to the slot limit.
-
-Interaction with small-shape tuning off by default (#77). With tuning off every
-call is kDefault: deterministic, but slower, and no LUT is needed. The warmup
-then has nothing to tune and does not read the LUT. `plan.py`
-`TUNE_SMALL_SHAPES_DEFAULT` mirrors the C++ default, and #77 must set it to 0.
-The intended production mode is tuning on plus a LUT, which is deterministic and
-fast: `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1` with
-`VLLM_SM70_GEMM_LUT_PATH`.
-
-T4c (two fresh instances bitwise-identical at full tuned speed):
-1. Run 1 with tuning on and `VLLM_SM70_GEMM_LUT_EXPORT_PATH=<dir>/tm-{arch}.bin`
-   writes the LUT.
-2. Runs 2 and 3 start fresh with tuning on and `VLLM_SM70_GEMM_LUT_PATH` set to
-   the same template. Each logs "tuned (measured) 0 calls on this rank" and
-   "N/N calls covered", and graph replay and eager use the same specs on every
-   rank.
-
-The INFO summary reports the LUT path, records imported or exported, and the
-calls measured on this rank.
-
-Re-export after a change to the build, model, TP size, capture sizes or tuning
-knobs (a build, GPU or knob change is refused on import, see above). A table whose kernels are missing from the build drops those records on
-import ("No kernel found"); those calls then fall back as uncovered.
-
-### Nix
-
-`services.vllm-sm70.turbomind` in `nix/module.nix` sets these knobs:
-`tuneSmallShapes` sets `VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1`, and
-`gemmLutPath`, `gemmLutExportPath` and `gemmLutStrict` set the three LUT
-variables below (AWQ stays 0). Exporting and using the LUT:
-[docs/nix.md](../../../docs/nix.md).
-
-### Env
-
-In the `warmup` section of `vllm_sm70/envs.py`:
-- `VLLM_SM70_TM_PRECAPTURE_WARMUP`: kill switch, default on. It is read before
-  the first collective, so every TP rank must see the same value.
-- `VLLM_SM70_GEMM_LUT_PATH`: LUT to import, default none.
-- `VLLM_SM70_GEMM_LUT_EXPORT_PATH`: LUT to write, default none.
-- `VLLM_SM70_GEMM_LUT_STRICT`: opt-in (only "1" acts), default 0. With a LUT
-  path set, a missing or unreadable LUT file or any manifest problem raises
-  instead of the INFO/WARNING + re-tune; with the path unset it does nothing.
-  Not in the `ops` section, so it is not part of the LUT identity.
-
-### Tests
-
-`sm70/tests/warmup/test_tm_precapture_warmup_cpu.py`: M sets and plans for Flint
-TP2 and Qwen3.8/3.6 configs; limits; a 2-rank threaded group with a fake per-rank
-cache (identical specs; no deadlock when a rank lacks a kind or has no layers;
-source and follower failures; missing export); kill switch; refusal under capture;
-platform hook; cache-file format; LUT export (source rank only, atomic, no temp
-file left, old file kept on failure) and import (pinned specs with no
-measurement on any rank; uncovered calls tuned before the import with a WARNING;
-no-manifest and absent-file cases; files mode 0644 under umask 077; a manifest from another build, GPU or knob setting, or a v1 manifest, is refused and everything is tuned); a digest mismatch between ranks raises on every rank; a policy-faithful fake asserting tuning on +
-LUT gives no timed kMeasure on two fresh instances (also with the FP8 reuse knob
-at 0), and tuning off needs no LUT. GPU: `test_lut_pins_specs_across_processes`
-(run 1 exports; runs 2-3 import, trace shows no `measure`, outputs bitwise equal). `test_tm_precapture_warmup_gpu.py` (gpu): with
-`TM_GEMM_TRACE`, a warmed M is `reuse` and an unwarmed M is `default` inside
-capture; with 2 GPUs over gloo, both ranks end with the same cache digest.
-
-### Open risks
-
-- Without a LUT, measurement is timed, so specs can differ between runs (TP
-  ranks agree). Pin them with an exported LUT (above).
-- Eager calls outside the plan still measure per rank: prefill chunks within
-  the tune limits that are not decode M values, and MoE above the plan. NVFP4/FP8
-  dense get kReuse once a device holds an imported cache (TP ≥ 2).
-- Elastic EP (`process_local_only`) runs the warmup per process without
-  collectives; SM70 MoE refuses EP, so this path is unused.
-
-## M12: Inkling 2 grouped expert prefill (`ops/tm_moe_sm70.cu`, `ops/tm_config.h`)
-
-- **`nvfp4_moe_dense_stage_sm70_out`:** a third exact grouped-prefill shape set, `exact_inkling2_prefill_shape`: more than 64 input rows, 128 experts, and (k 2304, n 1152) or (k 576, n 2304), the W13 and W2 banks of Inkling 2 Mini at TP2 (`vllm_sm70/models/inkling2_sm70/moe_tm.py`). Such a call is one grouped `nvfp4_moe_gemm_sm70_out_impl` launch over all experts instead of the per-expert loop of 128 launches. Its route log key is `logged_nvfp4_inkling2_grouped_prefill`. The Qwen and Flint shape sets are unchanged.
-- **New `sm70_inkling_tm_grouped_prefill_enabled()`** (file-local): false only when `VLLM_SM70_INKLING_TM_GROUPED_PREFILL` is exactly `"0"`. `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=0` also turns the Inkling 2 branch off.
-- **`tm_config.h`:** one more knob, `inkling_tm_grouped_prefill` (`VLLM_SM70_INKLING_TM_GROUPED_PREFILL`), registered in the `ops` section of `vllm_sm70/envs.py`.
-- **Tuning:** none added. The grouped calls run at more than `COMPACT_BATCH_MAX_SLOTS` (640) routed slots with compact groups on, above the NVFP4 MoE tuning limit that the Inkling 2 engine hook sets (at most 512 slots), so they always run `kDefault` and nothing is measured in capture or in eager prefill.
-- **Python mirror:** `vllm_sm70/ops/tm.py` `nvfp4_moe_dense_stage_route()` and `NVFP4_MOE_GROUPED_PREFILL_SHAPES`. `tests/quant/test_m12_inkling2_grouped_prefill_cpu.py` parses the op's shape sets and row cut-offs and keeps the mirror equal to them.
 
 ## Files
 
@@ -803,20 +129,284 @@ capture; with 2 GPUs over gloo, both ranks end with the same cache digest.
 | `sm70/csrc/turbomind/lmdeploy/src/turbomind/utils/parser.cc` | `csrc/sm70_turbomind/lmdeploy/src/turbomind/utils/parser.cc` | verbatim | 39 | 39 | ee0bc6a87 | `cf1167c34048cd0e1cf78ce823f95aefd406059c5715c6a0850fec41d82220a6` | `cf1167c34048cd0e1cf78ce823f95aefd406059c5715c6a0850fec41d82220a6` |
 | `sm70/csrc/turbomind/lmdeploy/src/turbomind/utils/parser.h` | `csrc/sm70_turbomind/lmdeploy/src/turbomind/utils/parser.h` | verbatim | 30 | 30 | ee0bc6a87 | `5644190d0b80adddedcbac37934b72c78b74d251c1f69e4563985c7876aa0773` | `5644190d0b80adddedcbac37934b72c78b74d251c1f69e4563985c7876aa0773` |
 | `sm70/csrc/turbomind/lmdeploy/src/turbomind/utils/string_utils.h` | `csrc/sm70_turbomind/lmdeploy/src/turbomind/utils/string_utils.h` | verbatim | 84 | 84 | ee0bc6a87 | `7caae49d69950416a3c227150d73490fc70abe77ea660f873f95275ec3b3befe` | `7caae49d69950416a3c227150d73490fc70abe77ea660f873f95275ec3b3befe` |
-| `sm70/csrc/turbomind/ops/gemm_runtime.cpp` | `csrc/sm70_turbomind/ops/gemm_runtime.cpp` | rewritten | 897 | 895 | 4db646d45 | `d48b715c6ee5db758f9ab95f19af7f5441fadfefe8094bd90277114ec407fc05` | `55d4e35e7c7f9cbb439d4c1126c3647da18d62a8d02dc2008c05d5d3ff8c7085` |
+| `sm70/csrc/turbomind/ops/gemm_runtime.cpp` | `csrc/sm70_turbomind/ops/gemm_runtime.cpp` | rewritten | 896 | 895 | 4db646d45 | `1565fddf8f22f26f2f935a0af2eba0535d60556752412f53f1639de7040ad9d9` | `55d4e35e7c7f9cbb439d4c1126c3647da18d62a8d02dc2008c05d5d3ff8c7085` |
 | `sm70/csrc/turbomind/ops/gemm_runtime.h` | `csrc/sm70_turbomind/ops/gemm_runtime.h` | trimmed | 86 | 113 | 4db646d45 | `1082262db91911f54016bbdb4cd2626bb5b3c810154ef794eea840be33250021` | `305543af6e3e3850f62c82e245619894aee634ec02b53770ad459cf366ecbc6f` |
-| `sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu` | `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu` | rewritten | 491 | 535 | 0c9f3ee73 | `3847c5a005604379476599266e212ff74fc58f4ad96746f485705a5471895c6f` | `2c999c8def4d1391b09c68e52e16d0048422298a6ba238cd0d2bcbf4c865cae3` |
+| `sm70/csrc/turbomind/ops/nvfp4_tm_gemv_sm70.cu` | `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu` | rewritten | 481 | 535 | 0c9f3ee73 | `a9a711968588d0c936351b8cbfee1e220c0aead2dcaef91526fb5eb918fa331e` | `2c999c8def4d1391b09c68e52e16d0048422298a6ba238cd0d2bcbf4c865cae3` |
 | `sm70/csrc/turbomind/ops/packed_gemm.h` | `csrc/sm70_turbomind/ops/packed_gemm.h` | verbatim | 76 | 76 | 156ec4deb | `da56a140b05e0c21baa37400110871a0600236b536102997ef86f1ac155b5b1f` | `da56a140b05e0c21baa37400110871a0600236b536102997ef86f1ac155b5b1f` |
 | `sm70/csrc/turbomind/ops/qwen38_prefill_cutlass.cu` | `csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cu` | rewritten | 127 | 127 | 495fb442a | `c99a0a489487d381a9809dde7c1ce54a6f966c02f56eb94e3b6f3af41ba39e92` | `4934d496d3aa5da5e0ddb8f35f867cd1f79c30a604eff9bbca3fda3780a5dd2d` |
 | `sm70/csrc/turbomind/ops/qwen38_prefill_cutlass.cuh` | `csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cuh` | verbatim | 13 | 13 | 58beb3433 | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` | `51aaa6486cebfbbb82ab0a8edd3296ed3bf4dcdca7fd7f653fc96662dbbbdfa0` |
-| `sm70/csrc/turbomind/ops/sm70_policy.h` | `-` | new | 9 | - | - | `e22e683997b19651e2d31f7bf9597a39e97574aa34348c7a0a0be05d4dec02df` | `-` |
-| `sm70/csrc/turbomind/ops/tm_awq_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 744 | 10913 | 899e9ed33 | `0d179aa7673d8b1a21105012bbb3d1dc3af8285119ed2a7869e11fc30d5bce08` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_config.h` | `csrc/sm70_policy.h` | rewritten | 269 | 315 | c43f5d78c | `cdc5b8d68f8a2c94f461c73b019b3d23bac84a29d85302af2d9141d2c6c4b5c4` | `b2c935891ef32cc8c70367fb109c65f574beaff64b193b08565164b0a9e53981` |
-| `sm70/csrc/turbomind/ops/tm_f16_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 375 | 10913 | 899e9ed33 | `39219d6437ea5ebd06a5468731caa7e6a5e16496a1e1342de3fa336244c74da5` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_fp8_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 615 | 10913 | 899e9ed33 | `493ed6e2d7c920bb8f6c82d8c8046feb0fb566c4318c6f0b5e9cd5fa1daf790b` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3438 | 10913 | 899e9ed33 | `054abb60efa5fabdea6199955552c49ca498524eba858779dbdef8e83340b723` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_nvfp4_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 288 | 10913 | 899e9ed33 | `98028afde445b8ecc1827be9ac32982bbbbf6afc6ae6cb3a269ba9423ec97c0f` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
-| `sm70/csrc/turbomind/ops/tm_ops_common_sm70.cuh` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 119 | 10913 | 899e9ed33 | `f00da8f4ef8450a75bbd8cae4d798fa12be683d0e406606410b4db97ccd96bb7` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/sm70_policy.h` | `-` | new | 8 | - | - | `2a17a9b0d8c56e20d498fca3170ff965925786425e8ffe84a0a128e6042745ae` | `-` |
+| `sm70/csrc/turbomind/ops/tm_awq_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 737 | 10913 | 899e9ed33 | `348203d48d4bb6e3bec19104c98b3cb9a73462432c0ca90539b0352273147620` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_config.h` | `csrc/sm70_policy.h` | rewritten | 244 | 315 | c43f5d78c | `8ba2e7e81730a0eb3ebea9f7f5c906fece2aab7a4039bbca9d59073f5e4a0352` | `b2c935891ef32cc8c70367fb109c65f574beaff64b193b08565164b0a9e53981` |
+| `sm70/csrc/turbomind/ops/tm_f16_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 368 | 10913 | 899e9ed33 | `3a32b899243d3a37627dfbaec05c9c887e929943c7266453c3aa195d0ded12bb` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_fp8_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 606 | 10913 | 899e9ed33 | `9721677210882df94ff183f2737bcb55d2c8ce6b010e5a163b64e662573ffd51` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_moe_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 3413 | 10913 | 899e9ed33 | `d0d6e8da51e412b3561adf6ccbea2e681994761008f3d7e36659ff915a0e2213` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_nvfp4_sm70.cu` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 284 | 10913 | 899e9ed33 | `768704c984b8b0c0f58edb9bf76199f2938417059d592477d5acb47d1abce55a` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
+| `sm70/csrc/turbomind/ops/tm_ops_common_sm70.cuh` | `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` | rewritten | 115 | 10913 | 899e9ed33 | `d971e58836fbf1ec04c62855eee581d795295d99f7bb718e07316ff3f43469b7` | `69d722af79000d1df70bf1ac3172903435d3ab4ec26a6e6c9067c4c2697f9e89` |
 | `sm70/csrc/turbomind/ops/tm_registry_sm70.cu` | `csrc/sm70_turbomind/ops/tm_registry_sm70.cu` | verbatim | 38 | 38 | 58beb3433 | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` | `9025732862826d2bd1322da9be4157578c7e3db45b13cde725f88f3f57af73d8` |
-| `sm70/csrc/turbomind/sources.cmake` | `-` | new | 104 | - | - | `035e38342ec48ecc036ccbd81d113ffffec11cd6a750ddb9738fe50594de1045` | `-` |
+| `sm70/csrc/turbomind/sources.cmake` | `-` | new | 91 | - | - | `4e05783a79c4704ecf700a5a4ac6ac807a77b7e9720c1f8854e1e76645168646` | `-` |
 | `sm70/csrc/sm70_tile_runtime_signal.cuh` | `csrc/sm70_tile_runtime_signal.cuh` | verbatim | 49 | 49 | 58beb3433 | `91f2977cbdd206c7bbf37f40330fcd99a1266f04da585b713f1c4e514982c350` | `91f2977cbdd206c7bbf37f40330fcd99a1266f04da585b713f1c4e514982c350` |
+
+## Changes from the source
+
+### GEMM core
+
+- `lmdeploy/.../kernel/sm70_884_4.cu` (trimmed): deleted
+  `#include "sm70_policy.h"`, `PaddedActivationConfig`, the GGUF kernel
+  impls and registry blocks, `Config_U2_Affine`, `Config_MXF4`, and the
+  `Qwen38CacheB` / `Qwen38W13TailN64` NVF4 entries. The `Config_U4_d` g128
+  and `Config_U4_g` blocks are wrapped in `#ifdef VLLM_SM70_TM_AWQ`.
+- `lmdeploy/.../kernel/sm70_884_8.cu` (trimmed): deleted the
+  `Config_U8_Affine` block.
+- `ops/gemm_runtime.h` (trimmed): deleted the MXFP4 and GGUF `TuneKeyKind`
+  values (the rest keep their numbers) and the MXFP4 declarations.
+- `ops/gemm_runtime.cpp` (rewritten):
+  - includes `tm_config.h`; tune keys and caches no longer carry a policy
+    or engine owner; `runtime()` is one process-wide `TurboMindRuntime`
+    with `generation`, `release()` and `tm_runtime_close()`;
+  - MXFP4 functions deleted;
+  - `tune_small_shapes_enabled`, `fp8_tune_small_shapes_enabled` and
+    `nvfp4_tune_small_shapes_enabled` default to 0 (fork: 1);
+  - `fp8_dense_tune_max_m` / `nvfp4_dense_tune_max_m` fall back to 64
+    (fork: 16);
+  - ops registered in `_sm70_C`: `sm70_gemm_configure_workspace`,
+    `sm70_gemm_workspace_storage`, `sm70_gemm_import_cache`,
+    `sm70_gemm_export_cache` (fork schemas minus `str? native_policy`) and
+    `tm_runtime_close`.
+- `ops/tm_config.h` (rewritten from fork `csrc/sm70_policy.h`,
+  `sm70_policy_fields.inc`, `sm70_runtime_state.h`): the knobs the kept code
+  reads, under the fork's env names, read in one cached `getenv` pass and
+  fixed at first use. Kept API: `PolicyField`, `policy_name`,
+  `policy_value`, `policy_atoi`, `policy_exact_one`,
+  `policy_dispatch_override`, `parse_gemm_targets` (copied),
+  `policy_gemm_targets`, `diagnostic_counter`. Dropped: policy tokens and
+  scopes, the runtime-state ABI, the Marlin policy. Defaults
+  `kFp8DenseTuneMaxMDefault`/`kNvfp4DenseTuneMaxMDefault` 64,
+  `kBatchGemmLayoutsDefault` true, `kAwqWarmupMaxMDefault` 64 come from fork
+  `vllm/platforms/runtime_defaults.py` (applied there for cc 7.0).
+- `ops/sm70_policy.h` (new): a shim that includes `tm_config.h`, so
+  `gemm.cu`, `dispatch_cache.cu` and `sm70_dflash_context.h` stay verbatim.
+- `sources.cmake` (new).
+
+### Ops split out of `awq_sm70_gemm.cu`
+
+Fork `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` (10913 lines) is split into
+the files below with each function body unchanged.
+`ops/qwen38_prefill_cutlass.cu` differs from the fork only in its include
+(`sm70_policy.h` -> `tm_config.h`) and comments.
+
+**`ops/tm_ops_common_sm70.cuh`** (4 definitions)
+
+| fork lines | definition |
+|---|---|
+| 46-62 | `sm70_silu_and_mul_fp16_kernel` |
+| 64-75 | `sm70_silu_and_mul_fp16_out` |
+| 77-94 | `sm70_silu_and_mul_interleaved_fp16_kernel` |
+| 96-108 | `sm70_silu_and_mul_interleaved_fp16_out` |
+
+**`ops/tm_f16_sm70.cu`** (15 definitions)
+
+| fork lines | definition |
+|---|---|
+| 193-208 | `silu_and_mul_interleaved` |
+| 971-976 | `validate_f16_weight` |
+| 978-994 | `validate_f16_input` |
+| 996-1025 | `validate_f16_gate_mul_input` |
+| 1115-1120 | `warp_reduce_sum` |
+| 1690-1749 | `sm70_f16_gate_mul_kernel` |
+| 2418-2426 | `interleave_gated_silu_cols` |
+| 4051-4061 | `sm70_f16_prepare` |
+| 4849-4936 | `sm70_f16_gemm_out` |
+| 6016-6039 | `sm70_f16_gate_mul_out` |
+| 6053-6073 | `sm70_f16_gemm` |
+| 6249-6251 | `sm70_f16_prepare` |
+| 6260-6262 | `sm70_f16_gemm` |
+| 6391-6394 | `sm70_f16_gemm_out` |
+| 6550-6553 | `sm70_f16_gate_mul_out` |
+
+**`ops/tm_fp8_sm70.cu`** (20 definitions)
+
+| fork lines | definition |
+|---|---|
+| 957-969 | `validate_fp8_inputs` |
+| 2318-2318 | `kFp8PrefillDequantThreads` |
+| 2319-2319 | `kFp8QuantValuesPerWord` |
+| 2320-2320 | `kFp8OutputColumnsPerTile` |
+| 2322-2371 | `fp8_sm70_dequantize_kernel` |
+| 2373-2416 | `fp8_sm70_dequantize_out` |
+| 3679-3810 | `fp8_sm70_prepare` |
+| 4254-4353 | `fp8_gemm_sm70_out` |
+| 4355-4362 | `sm70_fp8_prefill_cutlass_gated_silu_enabled` |
+| 4364-4400 | `fp8_gemm_sm70_prefill_dispatch_out` |
+| 4776-4834 | `fp8_gemm_sm70_out_auto` |
+| 4836-4847 | `fp8_gemm_sm70_out_meta` |
+| 6218-6224 | `fp8_sm70_prepare` |
+| 6226-6231 | `fp8_sm70_dequantize_out` |
+| 6287-6294 | `fp8_gemm_sm70_out` |
+| 6296-6304 | `fp8_gemm_sm70_prefill_prescaled_out` |
+| 6306-6315 | `fp8_gemm_sm70_prescaled_m1_out` |
+| 6317-6324 | `fp8_gemm_sm70_prefill_dispatch_out` |
+| 6376-6381 | `fp8_gemm_sm70_out_auto` |
+| 6383-6389 | `fp8_gemm_sm70_out_meta` |
+
+**`ops/tm_nvfp4_sm70.cu`** (6 definitions)
+
+| fork lines | definition |
+|---|---|
+| 943-955 | `validate_nvfp4_inputs` |
+| 3933-4049 | `nvfp4_sm70_prepare` |
+| 4479-4563 | `nvfp4_gemm_sm70_out` |
+| 6241-6247 | `nvfp4_sm70_prepare` |
+| 6334-6340 | `nvfp4_gemm_sm70_out` |
+| 6342-6348 | `nvfp4_gemm_sm70_prescaled_out` |
+
+**`ops/tm_moe_sm70.cu`** (55 definitions)
+
+| fork lines | definition |
+|---|---|
+| 110-112 | `sm70_profile_trace_enabled` |
+| 114-125 | `sm70_scalar_type_name` |
+| 127-138 | `sm70_capture_status_name` |
+| 140-151 | `sm70_capture_status_bit` |
+| 153-174 | `maybe_log_sm70_moe_route_once` |
+| 6082-6092 | `select_awq_moe_dispatch_policy` |
+| 6264-6267 | `sm70_fp8_moe_prepare_vec_enabled` |
+| 6563-6577 | `awq_moe_fill_strided_ptrs_kernel` |
+| 6581-6633 | `awq_moe_build_strided_ptrs` |
+| 6793-6860 | `awq_moe_single_token_exact_layout_prepare_kernel` |
+| 6862-6935 | `awq_moe_single_token_exact_layout_prepare` |
+| 6937-6942 | `awq_moe_gemm_sm70_out` |
+| 6944-6948 | `awq_moe_gemm_sm70_per_expert_dispatch_out` |
+| 6950-6957 | `awq_moe_gemm_sm70_out_impl` |
+| 6959-7099 | `awq_moe_single_token_prepare_kernel` |
+| 7318-7333 | `awq_moe_single_token_weighted_reduce_kernel` |
+| 7335-7366 | `awq_moe_single_token_weighted_reduce_half2_kernel` |
+| 7368-7442 | `awq_moe_single_token_weighted_reduce_out` |
+| 7444-7448 | `fp8_e4m3_to_float` |
+| 7450-7499 | `fp8_moe_w2_direct_reduce_kernel` |
+| 7501-7580 | `fp8_moe_w2_direct_reduce_sm70_out` |
+| 7582-7761 | `awq_moe_single_token_sm70_out` |
+| 7763-7946 | `awq_moe_gemm_sm70_out_impl` |
+| 7948-7957 | `awq_moe_gemm_sm70_out` |
+| 7959-7967 | `awq_moe_gemm_sm70_per_expert_dispatch_out` |
+| 7969-8013 | `awq_moe_indexed_dense_w13_sm70_out` (dropped, TP4 only) |
+| 8030-8078 | `awq_moe_dense_stage_sm70_out` |
+| 8224-8254 | `awq_moe_build_active_expert_segments_kernel` |
+| 8335-8411 | `awq_moe_active_dense_stage_sm70_out` |
+| 8415-8426 | `awq_moe_lower_bound_source_row` |
+| 8428-8448 | `awq_moe_chunk_ranges_kernel` |
+| 8450-8458 | `awq_moe_prefix_chunk_offsets_kernel` |
+| 8460-8477 | `awq_moe_fill_chunk_indices_kernel` |
+| 8479-8504 | `awq_moe_chunk_weighted_reduce_kernel` |
+| 8508-8676 | `awq_moe_chunked_w2_sm70_out` |
+| 8678-8721 | `awq_moe_single_token_dense_stage_sm70_out` |
+| 8723-8764 | `awq_moe_single_token_indexed_dense_stage_sm70_out` |
+| 8766-8860 | `awq_moe_single_token_dense_w13_sm70_out` |
+| 8862-8957 | `awq_moe_single_token_indexed_dense_w13_sm70_out` |
+| 8959-9067 | `awq_moe_single_token_compact_dense_w13_sm70_out` |
+| 9069-9270 | `fp8_moe_gemm_sm70_out_impl` |
+| 9272-9282 | `fp8_moe_gemm_sm70_out` |
+| 9284-9293 | `fp8_moe_gemm_sm70_per_expert_dispatch_out` |
+| 9295-9345 | `fp8_moe_dense_stage_sm70_out` |
+| 9570-9709 | `nvfp4_moe_gemm_sm70_out_impl` |
+| 9711-9756 | `nvfp4_moe_indexed_dense_stage_sm70_out_impl` (dropped, TP4 only) |
+| 9758-9766 | `nvfp4_moe_indexed_dense_stage_sm70_out` (dropped, TP4 only) |
+| 9768-9776 | `nvfp4_moe_indexed_fused_swiglu_sm70_out` (dropped, TP4 only) |
+| 9778-9858 | `nvfp4_moe_dense_stage_sm70_out` |
+| 9979-10024 | `fp8_moe_single_token_dense_stage_sm70_out` |
+| 10026-10069 | `fp8_moe_single_token_indexed_dense_stage_sm70_out` |
+| 10071-10166 | `fp8_moe_single_token_dense_w13_sm70_out` |
+| 10168-10264 | `fp8_moe_single_token_indexed_dense_w13_sm70_out` |
+| 10266-10376 | `fp8_moe_single_token_compact_dense_w13_sm70_out` |
+| 10378-10707 | `fp8_moe_single_token_sm70_out` |
+
+**`ops/tm_awq_sm70.cu`** (24 definitions)
+
+| fork lines | definition |
+|---|---|
+| 40-41 | `unpack_awq_gemm` |
+| 898-910 | `validate_awq_inputs` |
+| 912-927 | `validate_uint4_inputs` |
+| 2229-2229 | `kAwqPrefillDequantThreads` |
+| 2230-2230 | `kAwqQuantValuesPerWord` |
+| 2231-2231 | `kAwqOutputColumnsPerTile` |
+| 2233-2237 | `awq_prefill_physical_nibble` |
+| 2239-2272 | `awq_sm70_dequantize_kernel` |
+| 2274-2316 | `awq_sm70_dequantize_out` |
+| 2428-2439 | `pack_awq_compact_source_kernel` |
+| 2441-2452 | `compact_awq_stats_kernel` |
+| 3327-3520 | `awq_sm70_prepare_impl` |
+| 3522-3529 | `awq_sm70_prepare` |
+| 3531-3536 | `awq_sm70_prepare_compact` |
+| 3538-3677 | `uint4_sm70_prepare` |
+| 4063-4164 | `awq_gemm_sm70_out` |
+| 4166-4172 | `awq_gemm_sm70_out` |
+| 6041-6051 | `awq_gemm_sm70` |
+| 6186-6193 | `awq_sm70_prepare` |
+| 6195-6200 | `awq_sm70_prepare_compact` |
+| 6202-6207 | `awq_sm70_dequantize_out` |
+| 6209-6216 | `uint4_sm70_prepare` |
+| 6253-6258 | `awq_gemm_sm70` |
+| 6269-6275 | `awq_gemm_sm70_out` |
+
+Not carried: lm_head top-1/top-20, rerank, sampler and draft-vocab code;
+GGUF; GLM kernels; MXFP4 dense and MoE; the raw NVFP4 GEMVs;
+`awq_gemm_sm70_out_tile_reduce`; `fp8_moe_single_token_router_sm70_out`; the
+global `silu_and_mul`; the top-1/top-20 epilogues.
+
+Adaptations:
+- `ops/tm_ops_common_sm70.cuh`: the fork include block with `tm_config.h`
+  for `sm70_policy.h`; `custom_all_reduce.cuh` and `<cutlass/half.h>`
+  dropped.
+- `ops/tm_f16_sm70.cu`: `silu_and_mul_interleaved` is in `vllm_sm70`.
+- Every `ops/tm_*_sm70.cu`: `TORCH_LIBRARY_FRAGMENT(_sm70_C)` with the fork
+  schemas minus `str? native_policy=None`, CUDA impls; AWQ ops only under
+  `VLLM_SM70_TM_AWQ`. `nvfp4_sm70_prepare` defaults `group_size=16,
+  interleave_gated_silu=False`; `nvfp4_gemm_sm70_out` defaults
+  `gated_silu=False`.
+- `ops/tm_moe_sm70.cu`: the `#if defined(ENABLE_SM70_TURBOMIND)` wrapper is
+  gone. Added `exact_inkling2_prefill_shape` and
+  `sm70_inkling_tm_grouped_prefill_enabled()`: Inkling 2 W13/W2 banks
+  (128 experts, (k 2304, n 1152) or (k 576, n 2304), more than 64 rows) run
+  one grouped `nvfp4_moe_gemm_sm70_out_impl` launch; knob
+  `inkling_tm_grouped_prefill` in `tm_config.h`.
+- Comments edited in every rewritten file.
+
+### Flint NVFP4 M<=2 GEMV (`ops/nvfp4_tm_gemv_sm70.cu`)
+
+Source: fork `csrc/sm70_turbomind/ops/nvfp4_tm_gemv_sm70.cu`. Function bodies
+are unchanged:
+
+| fork lines | definition |
+|---|---|
+| 36-41 | `nvfp4_gemm_sm70_out` declaration (`#ifndef VLLM_NVFP4_TM_GEMV_STANDALONE` guard removed) |
+| 45-56 | `kTmGemvMaxRows`, `VLLM_TM_GEMV_TABLE` (launch table) |
+| 58-65 | `VLLM_SM70_TM_GEMV_MMA` |
+| 78-97 | `decode_e2m1x8` |
+| 100-104 | `TmGemvStage` |
+| 109-114 | `tm_gemv_d_row`, `tm_gemv_d_col` |
+| 118-127 | `tm_gemv_lanes_per_output` |
+| 130-135 | `tm_gemv_element_used` |
+| 142-296 | `nvfp4_tm_gemv_sm70_kernel` |
+| 298-304 | `TmGemvConfig` |
+| 306-316 | `launch_tm_gemv` |
+| 354-370 | `dispatch_tm_gemv_rows` |
+| 372-385 | `tm_gemv_config_valid` |
+| 387-413 | `tm_gemv_operands_ok` |
+| 415-431 | `TmGemvEntry`, `kTmGemvTable` |
+| 433-441 | `tm_gemv_config` |
+| 443-477 | `run_tm_gemv` |
+| 481-484 | `nvfp4_tm_gemv_sm70_supported` |
+| 486-506 | `nvfp4_tm_gemv_dispatch_sm70_out` (`#ifndef STANDALONE` guard removed) |
+
+Dropped: the `VLLM_NVFP4_TM_GEMV_STANDALONE` launch list (only the table
+configurations are compiled), `nvfp4_tm_gemv_sm70_tune_out` and
+`TORCH_LIBRARY_FRAGMENT(_tm_gemv_dev)`. Added: `TORCH_LIBRARY_FRAGMENT(_sm70_C)`
+`nvfp4_tm_gemv_dispatch_sm70_out` (fork schema minus `str? native_policy`)
+with a CUDA impl.
+
+### Python (`vllm_sm70/ops/tm.py`)
+
+From fork `vllm/_sm70/{auxiliary,linear,moe}.py`: `native_policy` and
+`call_native` removed, `_C::` -> `_sm70_C::`, `hasattr(torch.ops._C, x)` ->
+`has_op(x)`; the prepare fakes create `meta` on CPU.

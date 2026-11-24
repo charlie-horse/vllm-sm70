@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M11 GPU exit test: Qwen GDN layer decode output, K08 vs the upstream path.
+"""GPU: Qwen GDN layer decode output, FlashQLA vs the upstream path.
 
-What: on SM70, the M11 subclass's `_forward_core_decode_non_spec` (upstream
-  conv1d update + K08 FlashQLA decode) against the same method with
+What: on SM70, the layer subclass's `_forward_core_decode_non_spec` (upstream
+  conv1d update + FlashQLA decode) against the same method with
   VLLM_SM70_GDN_DECODE_FLASHQLA=0 (upstream conv1d update + packed Triton
   decode), from identical conv/SSM state, at the Qwen3.6 and Qwen3.8 TP2
   shapes with a strided mixed_qkv (the fp16 forward_cuda layout) and padded

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Check sm70/csrc/qpn8/PROVENANCE.md against the tree and a fork checkout (K09).
+"""Check sm70/csrc/qpn8/PROVENANCE.md against the tree and a fork checkout.
 
-Same rules as check_turbomind_provenance.py (K02):
-
-For every row:
+Same rules as check_turbomind_provenance.py. For every row:
   * the new file exists and its `wc -l` matches the recorded count;
   * verbatim rows: sha256(new file) == recorded sha256, and, when --fork is
     given, sha256(fork file) == recorded sha256 too (byte-identical copy);
   * trimmed/rewritten rows with --fork: the fork file exists and its
-    `wc -l` and sha256 match the recorded fork values (so the baseline that
-    reviewers diff against is pinned).
+    `wc -l` and sha256 match the recorded fork values.
 It also fails if a file under sm70/csrc/qpn8 has no row.
 
-Usage:
   sm70/tools/check_qpn8_provenance.py [--fork /path/to/fork@cf9492a]
 Exit status: 0 = all good, 1 = mismatch, 2 = usage/parse error.
 """

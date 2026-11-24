@@ -1,7 +1,7 @@
 {
  "version": 1,
  "created": "2026-11-16",
- "note": "Recreated greedy-identity prompt set; the Nov 8 S1c-base1 set was deleted with charlie's home. Send each with temperature 0, max_tokens 256, seed 0; compare reasoning+content text.",
+ "note": "Greedy-identity prompt set. Send each with temperature 0, max_tokens 256, seed 0; compare reasoning+content text.",
  "params": {
   "temperature": 0,
   "max_tokens": 256,

@@ -1,4 +1,4 @@
-# r440 overlay on the official config. Use as (after `. ~/flint-swebench/env.sh`):
+# Overlay on the official config. Use as (after `. ~/flint-swebench/env.sh`):
 #   -c swebench.yaml -c $R/flint.yaml -c model.model_kwargs.api_base=$FLINT_API_BASE
 # api_base comes from FLINT_API_BASE (env.sh) via the key=value override above.
 model:
@@ -14,7 +14,7 @@ model:
     max_tokens: 65536  # NVFP4 card client budget; card min 32768
     timeout: 1800
 environment:
-  # rootless podman (nix) on r440; on PATH via env.sh
+  # rootless podman (nix); on PATH via env.sh
   executable: podman
   # No internet inside the task container (card: "no internet access").
   # --cpus=6: cpu controller is delegated (cgroup v2), 2 parallel -> <=12 cores.

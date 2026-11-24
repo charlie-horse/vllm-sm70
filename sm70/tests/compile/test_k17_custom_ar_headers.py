@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K17: the upstream headers csrc/custom_ar is built against are the pinned ones.
+"""The upstream headers csrc/custom_ar is built against are the pinned ones.
 
 sm70/csrc/custom_ar reads upstream's CustomAllreduce, which lives in vLLM's
 _C_custom_ar .so, through custom_all_reduce.cuh and custom_collective_common.cuh

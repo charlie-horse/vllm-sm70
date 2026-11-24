@@ -1,23 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K09 GPU checks for the QPN8 block-FP8 GEMV on SM70 (V100).
+"""GPU checks for the QPN8 block-FP8 GEMV on SM70.
 
-What:
-- Port of fork tests/kernels/quantization/test_sm70_qpn8_block_fp8.py on
-  vllm_sm70.ops.qpn8 (qpn8_prepare + qpn8_linear instead of the fork's
-  QPN8Fp8BlockScaledMMLinearKernel): output vs the dequantized reference
-  (rel-L2 < 1e-3) for M in {0, 1, 6, 8, 9, 20, 64, 512}, with and without
-  the TurboMind FP8 copy; M>32 with the copy equals TurboMind FP8 bit for
-  bit; without it, the dequantize + mm path, with or without a caller
+- vllm_sm70.ops.qpn8 (qpn8_prepare + qpn8_linear) vs the dequantized
+  reference (rel-L2 < 1e-3) for M in {0, 1, 6, 8, 9, 20, 64, 512}, with and
+  without the TurboMind FP8 copy; M>32 with the copy equals TurboMind FP8
+  bit for bit; without it, dequantize + mm, with or without a caller
   scratch; two streams with their own per-call scratch.
-- With VLLM_SM70_FP8_QPN8_M32 unset (default) and =1 (opt-in QPN8 M9..32):
-  accuracy at the Qwen3.6 / Qwen3.8 TP2 dense shapes (qkv, o, GDN in/out,
-  MLP / shared expert), M in {1, 2, 4, 8, 9, 16, 17, 24, 32} (M 9..32 is the
-  block-scaled two-row-tile path, DFlash2 k=7 verify for 2-4 requests): max|y - ref| / max|ref| < 1e-2
-  and rel-L2 < 1e-3 against x @ dequant(W)^T in float32.
-- Kernel-level parts of fork tests/quantization/
-  test_block_fp8_qpn8_capabilities.py: unaligned shapes are refused,
-  prepare/dequantize round-trip, opcheck on the three ops, and CUDA graph
-  capture of the GEMV at M=1, 16 and 32.
+- With VLLM_SM70_FP8_QPN8_M32 unset and =1 (opt-in QPN8 M9..32): accuracy
+  at the Qwen3.6 / Qwen3.8 TP2 dense shapes, M up to 32, max|y - ref| /
+  max|ref| < 1e-2 and rel-L2 < 1e-3 against x @ dequant(W)^T in float32.
+- Unaligned shapes are refused, prepare/dequantize round-trips, opcheck on
+  the three ops, and CUDA graph capture of the GEMV at M=1, 16 and 32.
 
 Run from the repo root: pytest -m gpu sm70/tests/qpn8
 """
@@ -33,8 +26,7 @@ pytestmark = pytest.mark.gpu
 
 
 def _weight(n: int, k: int, scale_dtype=torch.float32, seed=None):
-    """Random e4m3 weight + block scales and the float32 [N, K] reference
-    (fork test_sm70_qpn8_block_fp8.py:39-55)."""
+    """Random e4m3 weight + block scales and the float32 [N, K] reference."""
     gen = torch.Generator(device="cuda").manual_seed(n + k if seed is None else seed)
     raw = torch.randint(0, 256, (n, k), dtype=torch.uint8, device="cuda", generator=gen)
     # 0x7F/0xFF are e4m3 NaN codes; a checkpoint never stores them.
@@ -151,7 +143,7 @@ def test_one_layout_uses_caller_scratch(qpn8_gpu, m):
 
 
 def test_concurrent_streams_keep_their_own_dense_buffer(qpn8_gpu):
-    # fork test_concurrent_streams_keep_their_own_prefill_buffer (dense_only).
+    # Concurrent streams keep their own prefill buffer (dense only).
     wa, sa, ref_a = _weight(8192, 1024)
     wb, sb, ref_b = _weight(4096, 1024)
     pa = qpn8_gpu.qpn8_prepare(wa, sa)

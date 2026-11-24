@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the looped decoder stack.
 
-`Inkling2Sm70LoopModel` runs the layer visits of one forward in the order of
-the reference (transformers modeling_inkling2_loop.py
-``Inkling2LoopTextModel.forward``): the prelude, ``num_loop_passes`` passes
-of the loop core, then the coda.
+`Inkling2Sm70LoopModel` runs the layer visits of one forward as the reference
+does: the prelude, ``num_loop_passes`` passes of the loop core, the coda.
 
-    visit        (layer, pass); a core layer has one visit per pass, each
-                 with K/V and conv-state caches of its own (cache.py)
-    hidden       the residual stream [T, H], model dtype
-    bank         the normed block states [T, N, H] fp32: one per block
-                 boundary passed, the keys and values of the AttnRes mixes
-    pass restart every pass after the first starts again from the hidden
-                 and the bank at the loop entry
-    messages     AttnRes mix of the previous pass's own block states and its
-                 output, one query row per input stream of each core layer
+    visit     (layer, pass); each visit has K/V and conv-state caches of its own
+    hidden    the residual stream [T, H], model dtype
+    bank      the normed block states [T, N, H] fp32, the AttnRes keys/values
+    restart   every pass after the first restarts from the hidden and the
+              bank at the loop entry
+    messages  AttnRes mix of the previous pass's block states and output, one
+              query row per input stream of each core layer
 
 T is the padded batch; the caches hold everything before it.
 """

@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K05 CPU checks for the Flash-V100 op bindings (no GPU, no built _sm70_C).
+"""CPU checks for the Flash-V100 op bindings (no GPU, no built _sm70_C).
 
 What: every `_sm70_C::fv100_*` schema is an out op with a CUDA impl and a
   register_fake in vllm_sm70/ops/fv100.py whose parameters match the
-  schema; the fakes run on meta tensors; nothing references the fork's
-  pybind module, `_C` namespace or env policy; the fused one-launch decode
-  (K14) and its op stay behind their #ifdef, which the build turns on; the KV-view helpers accept upstream's LBNHC
-  interleave; the decode plan and workspace logic; the wrappers thread their
-  arguments in schema order; the SDPA reference used by the GPU tests
-  agrees with a direct softmax reference.
+  schema; the fakes run on meta tensors; no pybind module, `_C` namespace
+  or env policy outside vllm_sm70.envs is referenced; the fused one-launch
+  decode and its op stay behind their #ifdef, which the build turns on; the
+  KV-view helpers accept upstream's LBNHC interleave; the decode plan and
+  workspace logic; the wrappers thread their arguments in schema order; the
+  SDPA reference used by the GPU tests agrees with a direct softmax
+  reference.
 How: as tests/ops/test_tm_ops_cpu.py, schemas are parsed from the C++
   sources and, when `_sm70_C` is not built, defined in a Python
   torch.library so fv100.py registers its fakes against them.
@@ -39,8 +40,8 @@ EXPECTED_OPS = {
     "fv100_decode_paged_xqa",
     "fv100_prefill_paged",
     "fv100_prefill_paged_sinks",
-    "fv100_decode_paged_sinks_fused",  # K14, under FUSED_GUARD
-    "fv100_decode_verify",  # B2 (verify_decode.cu)
+    "fv100_decode_paged_sinks_fused",  # under FUSED_GUARD
+    "fv100_decode_verify",  # verify_decode.cu
 }
 FUSED_OP = "fv100_decode_paged_sinks_fused"
 FUSED_GUARD = "VLLM_SM70_FV100_FUSED_DECODE"
@@ -171,8 +172,8 @@ def _guarded_lines(text: str) -> list[str]:
 
 
 def test_fused_decode_is_guarded_and_built_by_default():
-    """The C4/K14 one-launch path and its op exist only under the #ifdef,
-    and sources.cmake defines it unless configured OFF."""
+    """The one-launch path and its op exist only under the #ifdef, and
+    sources.cmake defines it unless configured OFF."""
     cmake = (CSRC / "sources.cmake").read_text()
     assert re.search(
         r"option\(VLLM_SM70_FV100_FUSED_DECODE\s+\"[^\"]*\"\s+ON\)", cmake
@@ -228,11 +229,11 @@ def test_sources_cmake_builds_the_lean_files_only():
         "flash_decode_paged.cu",
         "fused_mha_forward_paged.cu",
         "fv100_ops.cpp",
-        "verify_decode.cu",  # B2
+        "verify_decode.cu",
     }
     top = (SM70 / "CMakeLists.txt").read_text()
     assert 'include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_v100/sources.cmake")' in top
-    # Per-file nvcc options set by the area must survive K01's gencode step.
+    # Per-file nvcc options set by the area must survive the gencode step.
     assert "APPEND PROPERTY COMPILE_OPTIONS" in top
 
 
@@ -487,7 +488,7 @@ class _Recorder:
 
 
 def test_decode_wrapper_threads_schema_order(fv100, monkeypatch):
-    # The two-launch sink op; the fused one (K14) is covered in
+    # The two-launch sink op; the fused one is covered in
     # test_fv100_fused_decode_cpu.py.
     monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "0")
     rec = _Recorder()

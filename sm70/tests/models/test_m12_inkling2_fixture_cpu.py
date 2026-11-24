@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 tiny fixtures (fixtures/inkling2_tiny/).
+"""Tests for the Inkling 2 tiny fixtures (fixtures/inkling2_tiny/).
 
 CPU only, and without the Hugging Face Inkling 2 classes: the committed files
 against manifest.json, the tiny checkpoint against the released checkpoint's

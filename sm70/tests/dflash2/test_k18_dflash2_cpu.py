@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K18 CPU tests: schemas, fakes, shape admission, U1 selection, kill switch.
+"""CPU tests: schemas, fakes, shape admission, GEMM selection, kill switch.
 
 No GPU or built _sm70_C needed: the op schemas are read from
 sm70/csrc/dflash2/*.cu and their fakes run on meta tensors.
@@ -67,7 +67,7 @@ def test_sources_cmake_lists_both_files():
 
 # ---------------------------------------------------------------- env / kill
 def test_switch_registered_kill_switch(monkeypatch):
-    """K18 is a kill switch since E3: unset or anything but "0" is on."""
+    """The switch is a kill switch: unset or anything but "0" is on."""
     assert KILL in envs.environment_variables()
     assert KILL in envs._SECTIONS["ops"]
     assert envs.VLLM_SM70_DFLASH2_FP16 is True  # default ON (unset)
@@ -84,7 +84,7 @@ def test_k18_wanted_only_for_the_qwen38_contract(monkeypatch):
     assert not dflash2.k18_wanted(QWEN36)  # MoE arch: not qualified
     assert not dflash2.k18_wanted(qwen_vllm_config(k=5))
     assert not dflash2.k18_wanted(None)
-    # Independent of the verifier switch: VERIFIER=0 is "K18 alone" (E3 B).
+    # Independent of the verifier switch: VERIFIER=0 keeps the FP16 GEMM.
     monkeypatch.setenv("VLLM_SM70_DFLASH2_VERIFIER", "0")
     sm70_cfg.clear_cache()
     assert dflash2.k18_wanted(QWEN38)
@@ -97,7 +97,7 @@ def test_k18_wanted_only_for_the_qwen38_contract(monkeypatch):
 
 def test_unqualified_engine_selects_and_marks_nothing(monkeypatch):
     """Qwen3.6 (and any engine outside the contract) keeps upstream dispatch
-    exactly, with K18's switch at its default."""
+    exactly, with the FP16 GEMM switch at its default."""
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: QWEN36)
     assert dflash2.enabled()
@@ -138,10 +138,9 @@ def test_each_engine_decides_for_itself(monkeypatch):
 
 def test_selection_logged_once_per_switch(monkeypatch):
     """The "prepared" lines come from marking/packing; only this line shows
-    the U1 dispatcher was picked (Quinn, #108). Logged once per switch to the
-    dispatcher, not per config object: on c4130 the draft is built under its
-    own qualified VllmConfig, and per-key logging printed it twice per rank
-    (Bea's #108 smoke)."""
+    the dispatcher was picked. It is logged once per switch to the
+    dispatcher, not per config object: the draft is built under its own
+    qualified VllmConfig, which must not log a second line per rank."""
     pytest.importorskip("vllm")
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     lines = []
@@ -194,7 +193,7 @@ def _draft_shards(cfg: dict, tp: int) -> dict[str, tuple[int, int]]:
     }
 
 
-# Public config.json values of the incoai/*-DFlash2 drafts the host serves.
+# Public config.json values of the incoai/*-DFlash2 drafts.
 DRAFT_CONFIGS = {
     "qwen3.8-27b-dflash2": dict(
         hidden_size=5120,
@@ -233,7 +232,7 @@ def test_admitted_set_is_exactly_the_tp2_drafts():
 
 
 def test_fork_tp4_only_shapes_dropped():
-    # FORK sm70_dflash2_fp16.py:14-20; only the replicated (1280, 5120) stays.
+    # TP4-only shapes are not admitted; only the replicated (1280, 5120) is.
     for shape in [(1536, 5120), (5120, 1024), (8704, 5120), (5120, 4352)]:
         assert shape not in dflash2.GEOMETRY
     assert dflash2.GEOMETRY[(1280, 5120)] == (16, 16)
@@ -257,7 +256,7 @@ def test_geometry_valid(n, k, tile, warps, ok):
 @pytest.mark.parametrize("tile", [16, 32])
 def test_pack_weight_layout(tile):
     # packed[b, g, s, :] = W[b*tile + col(s), 16g:16g+16]: a slot permutation
-    # inside each tile; every row appears exactly once (FORK :45-56).
+    # inside each tile; every row appears exactly once.
     n, k = 2 * tile, 64
     weight = torch.arange(n * k, dtype=torch.float32).reshape(n, k)
     packed = dflash2.pack_weight(weight, tile)
@@ -275,7 +274,7 @@ def test_pack_weight_layout(tile):
                 assert torch.equal(packed[b, g, s], weight[row, 16 * g : 16 * g + 16])
 
 
-# ------------------------------------------------------------ U1 selection
+# ------------------------------------------------------- GEMM selection hook
 def test_select_off_without_ops(monkeypatch):
     monkeypatch.setattr(dflash2, "gemm_available", lambda: False)
     assert dflash2.select_unquantized_gemm("auto") is None
@@ -423,7 +422,7 @@ def test_topk_fake_runs_on_meta(dflash2_stub):
     assert mod.compact_half_topk(torch.randn(8, 1024)) is None
 
 
-# ---------------------------------------------------- marking (M7 layers)
+# --------------------------------------------- marking (draft model layers)
 def _linear_method():
     pytest.importorskip("vllm")
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -513,7 +512,7 @@ def test_reload_repacks_in_place_without_autograd(monkeypatch):
     assert list(layer.state_dict()) == ["weight"]
 
 
-# ------------------------------------------- M7 hook (regression guard)
+# ------------------------------------------------------- draft model hook
 def _m7_classes(monkeypatch):
     pytest.importorskip("vllm")
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -571,10 +570,10 @@ WEIGHTS = {"on": False}
 
 
 def _build_m7_layer(m7, weights=False, vllm_config=QWEN38):
-    """M7's draft decoder layer under ``vllm_config`` (default: the qualified
-    Qwen3.8 contract, so K18 marks at its default). The fake weights use the
-    Qwen3.6 TP2 shard shapes only to keep CPU tensors small; K18 admits by
-    shard shape, independently of which contract enabled it."""
+    """The draft decoder layer under ``vllm_config`` (default: the qualified
+    Qwen3.8 contract, so the FP16 GEMM marks at its default). The fake
+    weights use the Qwen3.6 TP2 shard shapes only to keep CPU tensors small;
+    admission is by shard shape, whichever contract enabled it."""
     from types import SimpleNamespace
 
     WEIGHTS["on"] = weights

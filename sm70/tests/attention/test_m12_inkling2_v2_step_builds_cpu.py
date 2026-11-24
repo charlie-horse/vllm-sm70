@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: on the V2 runner the Inkling 2 metadata builders build once
+"""CPU checks: on the V2 runner the Inkling 2 metadata builders build once
 per (builder class, spec) and fill the token index once per step
 (models/inkling2_sm70/backend.py ``_StepBuilds``); on the V1 runner every
 build is its own.

@@ -1,41 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K18: DFlash2 draft FP16 M<=8 GEMM and compact FP16 top-64 (_sm70_C ops).
+"""DFlash2 draft FP16 M<=8 GEMM and compact FP16 top-64 (_sm70_C ops).
 
-What: the DFlash2 draft's unquantized projections (qkv, o, gate_up, down and
-  the two conv kernel projections per layer) run a split-K mma.m8n8k4 GEMM
-  with FP32 accumulation when M (tokens) is 1..8; every other call keeps
-  upstream's ``F.linear``. The weight is repacked once after load into a
-  second, non-persistent buffer (the original stays for M>8 and prefill).
-How it hooks in: patch U1. ``Sm70CudaPlatform.get_unquantized_gemm`` returns
-  :func:`dflash2_unquantized_gemm` (via :func:`select_unquantized_gemm`); it
-  serves only layers that :func:`mark_draft_linears` flagged and
-  :func:`prepare_dflash2_fp16_m8` packed, and calls ``F.linear`` (UP
-  ``default_unquantized_gemm``) for everything else. M7's DFlash2 draft
-  subclass marks the layers at construction and packs them in load_weights.
-Default: on for the qualified Qwen3.8 DFlash2 contract only
-  (:func:`k18_wanted`: M1's ``dflash2_verifier_qualified``, the fork's
-  verifier contract), approved by Astro on E3 (2026-11-09: -1.1 ms/step
-  alone, -2.0 ms/step with M9a; probe acceptance unchanged alone, -1.6% with
-  M9a). Every other engine (Qwen3.6, Flint, no DFlash2) keeps upstream
-  dispatch exactly: ``get_unquantized_gemm`` returns None and nothing is
-  marked.
-Switch: ``VLLM_SM70_DFLASH2_FP16=0`` turns it off everywhere (and with it
-  M9a, which rides on this hook). It is independent of
-  ``VLLM_SM70_DFLASH2_VERIFIER=0``, which turns off M9a only.
-Selection is decided once per engine: the first ``select_unquantized_gemm``
-  call made under a VllmConfig decides, logs once per switch to the
-  dispatcher, and is cached per (engine config, linear_backend) (UP calls
-  ``dispatch_unquantized_gemm()`` on every forward of lm_head and the MoE
-  router gate); a call with no current config returns the most recent
-  engine's decision, or None before any. Each layer's route (N, K, tile,
-  warps) is fixed when it is packed (``ROUTE_ATTR``); a call only checks
-  ``x``.
+The DFlash2 draft's unquantized projections (qkv, o, gate_up, down and the
+conv kernel projections) run a split-K mma.m8n8k4 GEMM with FP32
+accumulation when M (tokens) is 1..8; every other call keeps ``F.linear``.
+The weight is repacked once after load into a second buffer (the original
+stays for M>8 and prefill).
 
-Ported from fork cf9492a vllm/model_executor/layers/quantization/
-sm70_dflash2_fp16.py and vllm/model_executor/layers/sm70_compact_topk.py;
-see sm70/csrc/dflash2/PROVENANCE.md for the line map and what changed.
-"""
+``Sm70CudaPlatform.get_unquantized_gemm`` (patches/0002) returns
+:func:`dflash2_unquantized_gemm` via :func:`select_unquantized_gemm`, only
+for the qualified Qwen3.8 DFlash2 contract (:func:`k18_wanted`); every
+other engine keeps upstream dispatch. The DFlash2 draft subclass marks
+layers (:func:`mark_draft_linears`) and packs them
+(:func:`prepare_dflash2_fp16_m8`). The decision is cached per (engine
+config, linear_backend). ``VLLM_SM70_DFLASH2_FP16=0`` turns it off."""
 
 from __future__ import annotations
 
@@ -61,7 +40,7 @@ from vllm_sm70 import _ext  # noqa: E402
 
 _ext.load()
 
-from vllm_sm70.ops import dflash2_fp8  # noqa: E402  (M9a, rides on this hook)
+from vllm_sm70.ops import dflash2_fp8  # noqa: E402  (channel-FP8 route, same hook)
 
 logger = logging.getLogger("vllm.sm70")
 
@@ -79,15 +58,9 @@ ROUTE_ATTR = "_sm70_dflash2_fp16_route"
 MAX_M = 8
 
 # (N, K) of the local weight shard -> (tile, warps). Admission is by shape:
-# a marked layer whose shard is not listed keeps F.linear.
-#
-# ported from FORK sm70_dflash2_fp16.py:14-20, which held the five Qwen3.8-27B
-# TP4 shards measured at M8. Only (1280, 5120) (the conv kernel projection,
-# replicated, so the same at every TP size) is kept from it; the four TP4-only
-# entries are dropped (PROVENANCE.md). The TP2 entries are new and their
-# geometry is not yet measured: chosen by the fork's rule of thumb (tile 16 x
-# 16 warps when N/32 < 80 SMs, else tile 32; 16 warps for K >= 5120, else 8),
-# which keeps 4-34 K16 groups per split. Bea's bench tunes them.
+# a marked layer whose shard is not listed keeps F.linear. Rule of thumb:
+# tile 16 x 16 warps when N/32 < 80 SMs, else tile 32; 16 warps for
+# K >= 5120, else 8.
 DRAFT_SHAPES_TP2: dict[str, dict[str, tuple[int, int]]] = {
     # hidden 5120, 32 q / 8 kv heads x 128, intermediate 17408, conv
     # kernel 2 x group 16 -> kernel_projection 2*2*(5120/16) = 1280.
@@ -110,14 +83,14 @@ DRAFT_SHAPES_TP2: dict[str, dict[str, tuple[int, int]]] = {
 }
 
 GEOMETRY: dict[tuple[int, int], tuple[int, int]] = {
-    # measured in the fork (Qwen3.8 draft, M8)
+    # Qwen3.8 draft conv kernel projection (same at every TP size)
     (1280, 5120): (16, 16),
-    # Qwen3.8 draft, TP2 (provisional)
+    # Qwen3.8 draft, TP2
     (3072, 5120): (32, 16),
     (5120, 2048): (32, 8),
     (17408, 5120): (32, 16),
     (5120, 8704): (32, 16),
-    # Qwen3.6-35B-A3B draft, TP2 (provisional)
+    # Qwen3.6-35B-A3B draft, TP2
     (3072, 2048): (32, 8),
     (2048, 2048): (16, 16),
     (6144, 2048): (32, 8),
@@ -164,7 +137,7 @@ def _is_sm70(device: torch.device) -> bool:
 
 
 # --------------------------------------------------------------------------
-# GEMM: U1 hook
+# GEMM: get_unquantized_gemm hook
 # --------------------------------------------------------------------------
 def dflash2_unquantized_gemm(
     layer: torch.nn.Module,
@@ -172,20 +145,20 @@ def dflash2_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """U1 GEMM for DFlash2 draft layers: M9a's channel-FP8 route (M 8..32),
-    else the M<=8 FP16 kernel, else F.linear (FORK linear.py:396-410 order)."""
+    """GEMM for DFlash2 draft layers: the channel-FP8 route (M 8..32),
+    else the M<=8 FP16 kernel, else F.linear."""
     out = dflash2_fp8.apply_dflash2_fp8_m8(layer, x, bias)
     if out is not None:
         return out
     out = apply_dflash2_fp16_m8(layer, x, bias)
     if out is not None:
         return out
-    # UP model_executor/layers/utils.py default_unquantized_gemm
+    # upstream default_unquantized_gemm
     return F.linear(x, weight, bias)
 
 
 def _qualified(vllm_config: Any) -> bool:
-    """The fork's Qwen3.8 DFlash2 verifier contract (M1), getattr only."""
+    """The Qwen3.8 DFlash2 verifier contract (getattr only)."""
     from vllm_sm70.config import dflash2_verifier_qualified
 
     return dflash2_verifier_qualified(
@@ -196,10 +169,10 @@ def _qualified(vllm_config: Any) -> bool:
 
 
 def k18_wanted(vllm_config: Any) -> bool:
-    """K18 for this engine: not killed, ops built, and the Qwen3.8 contract.
+    """This route for this engine: not killed, ops built, and the Qwen3.8 contract.
 
-    Independent of ``VLLM_SM70_DFLASH2_VERIFIER`` (that switch turns off M9a
-    only, so its "=0" arm is K18 alone, E3 arm B).
+    Independent of ``VLLM_SM70_DFLASH2_VERIFIER`` (that switch turns off only
+    the channel-FP8 route).
     """
     return vllm_config is not None and enabled() and _qualified(vllm_config)
 
@@ -221,10 +194,9 @@ _LATEST: dict[str, Callable[..., Any] | None] = {}
 def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] | None:
     """What Sm70CudaPlatform.get_unquantized_gemm returns (None -> upstream).
 
-    Called when each UnquantizedLinearMethod is built (UP linear.py:176),
-    inside model construction where the engine's VllmConfig is current, and
-    on every forward of lm_head (UP vocab_parallel_embedding.py:83) and the
-    MoE router gate (UP moe_runner.py:910). Decided once per (engine config,
+    Called when each UnquantizedLinearMethod is built, inside model
+    construction where the engine's VllmConfig is current, and on every
+    forward of lm_head and the MoE router gate. Decided once per (engine config,
     linear_backend) and cached, so a second engine in the same process (TP1
     tests) decides for itself. A call with no current config returns the most
     recent engine's decision for that backend, or None before any engine;
@@ -240,9 +212,8 @@ def select_unquantized_gemm(linear_backend: str = "auto") -> Callable[..., Any] 
     if choice is not None and _LATEST.get(linear_backend) is not choice:
         # Once per switch to the dispatcher, not per config object: the
         # draft is built under its own (equally qualified) VllmConfig, which
-        # re-decides, so per-key logging printed the line twice per rank
-        # (Bea's #108 smoke). The "prepared" lines come from marking and
-        # packing; this is the evidence that U1 picked the dispatcher.
+        # re-decides, so per-key logging would print the line twice per rank.
+        # This line shows that the hook picked the dispatcher.
         logger.info(
             "vllm_sm70: K18 DFlash2 draft GEMM dispatcher selected for "
             "linear_backend=%s (default: Qwen3.8 DFlash2 verifier contract; "
@@ -261,8 +232,8 @@ def reset_selection_cache() -> None:
 def _select(linear_backend: str, vllm_config: Any) -> Callable[..., Any] | None:
     if not k18_wanted(vllm_config):
         return None
-    # An explicit FlashInfer BF16 backend keeps upstream's choice (UP
-    # layers/utils.py:695); "auto" there is default_unquantized_gemm, which
+    # An explicit FlashInfer BF16 backend keeps upstream's choice; "auto"
+    # there is default_unquantized_gemm, which
     # dflash2_unquantized_gemm falls back to.
     try:
         from vllm.model_executor.layers import utils as up_utils
@@ -279,11 +250,10 @@ def mark_draft_linears(
 ) -> list[torch.nn.Module]:
     """Flag one DFlash2 draft decoder layer's unquantized projections.
 
-    ported from FORK qwen3_dflash2.py:280-298, without its TP==4 condition
-    (admission is by shard shape, GEOMETRY). Nothing is flagged unless
+    Admission is by shard shape (GEOMETRY). Nothing is flagged unless
     :func:`k18_wanted` holds for ``vllm_config``. ``fp8`` also flags them for
-    M9a's channel-FP8 route (the caller decides: verifier on and k == 7,
-    FORK :295-297). Returns the flagged modules.
+    the channel-FP8 route (the caller decides: verifier on and k == 7).
+    Returns the flagged modules.
     """
     if not k18_wanted(vllm_config):
         return []
@@ -324,7 +294,6 @@ def pack_weight(
     With ``out`` (same shape/dtype/device, contiguous) the result is written
     into it in place, without allocating a second packed copy.
     """
-    # ported from FORK sm70_dflash2_fp16.py:45-56
     n, k = weight.shape
     slots = torch.arange(tile, device=weight.device)
     columns = (
@@ -351,7 +320,6 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
     inference_mode), so the buffer stays an ordinary tensor that a later
     in-place repack may write to.
     """
-    # ported from FORK sm70_dflash2_fp16.py:23-67
     if not getattr(layer, MARK_ATTR, False):
         return False
     if not enabled():
@@ -409,8 +377,8 @@ def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
 def prepare_marked(modules: Iterable[torch.nn.Module] | torch.nn.Module) -> int:
     """Pack every marked layer under ``modules``; returns how many were packed.
 
-    A layer M9a admits gets the channel-FP8 copy instead of the FP16 M8
-    packing (FORK linear.py:351-352). Safe to call again after a weight
+    A layer the channel-FP8 route admits gets the FP8 copy instead of the
+    FP16 M8 packing. Safe to call again after a weight
     reload: existing buffers are refilled.
     """
     if isinstance(modules, torch.nn.Module):
@@ -426,7 +394,6 @@ def apply_dflash2_fp16_m8(
     layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor | None:
     """The kernel's output, or None when this call keeps F.linear."""
-    # ported from FORK sm70_dflash2_fp16.py:70-92
     route = getattr(layer, ROUTE_ATTR, None)  # decided once, at pack time
     if route is None:
         return None
@@ -468,7 +435,6 @@ def compact_half_topk(
     FP32 logits to FP16 to qualify: ranking uses the original FP16 values.
     Returns None (caller uses torch.topk) when the input does not qualify.
     """
-    # ported from FORK sm70_compact_topk.py:10-39
     if (
         not logits.is_cuda
         or logits.dtype != torch.float16

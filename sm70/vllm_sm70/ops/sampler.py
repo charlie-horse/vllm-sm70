@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Top-k candidate sampler ops (K16): wrappers and fakes over torch.ops._sm70_C.
+"""Top-k candidate sampler ops: wrappers and fakes over torch.ops._sm70_C.
 
-The fork registered `sm70_local_top32_half` and
-`sm70_sample_topk_candidates` in upstream's `_C` namespace from its
-`_sm70_sampler_C` sidecar (fork vllm/v1/sample/ops/sm70_topk_candidates.py:63-69, :267,
-:336-345). Here the two ops are part of `_sm70_C`, with the fork schemas
-unchanged (csrc/sampler/sampler_ops.cpp). The sampling logic that uses them
+The two ops, `sm70_local_top32_half` and `sm70_sample_topk_candidates`, are
+defined in csrc/sampler/sampler_ops.cpp. The sampling logic that uses them
 is vllm_sm70/sample.py.
 """
 
@@ -28,7 +25,7 @@ _ext.load()
 
 OPS = ("sm70_local_top32_half", "sm70_sample_topk_candidates")
 
-# Kernel constants (csrc/sampler/topk_candidates_sampler.cu:51-60).
+# Kernel constants (csrc/sampler/topk_candidates_sampler.cu).
 LOCAL_K = 32  # kLocalK: candidates per TP rank
 WIRE_WIDTH = 2 * LOCAL_K  # kWireWidth: 32 values, then 32 token ids
 TILE = 2048  # kTile: logits per selection block
@@ -49,7 +46,7 @@ def has_op(name: str) -> bool:
 
 
 def available() -> bool:
-    """Both K16 ops are present in the loaded _sm70_C."""
+    """Both sampler ops are present in the loaded _sm70_C."""
     return all(has_op(name) for name in OPS)
 
 

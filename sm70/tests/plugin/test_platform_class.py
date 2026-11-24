@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sm70CudaPlatform: resolves lazily, subclasses CudaPlatform, U1 defaults."""
+"""Sm70CudaPlatform: resolves lazily, subclasses CudaPlatform, hook defaults."""
 
 from types import SimpleNamespace
 
@@ -34,7 +34,7 @@ def test_is_cuda_platform(platform_cls):
 def test_u1_hooks_default_to_upstream(platform_cls, monkeypatch):
     from vllm_sm70.ops import dflash2
 
-    # Without the K18 ops (CPU-only build) the GEMM hook keeps upstream.
+    # Without the DFlash2 FP16 ops (CPU-only build) the GEMM hook keeps upstream.
     monkeypatch.setattr(dflash2, "gemm_available", lambda: False)
     dflash2.reset_selection_cache()
     assert platform_cls.get_unquantized_gemm("auto") is None
@@ -48,7 +48,7 @@ def test_u1_gemm_hook_k18(platform_cls, monkeypatch):
     # A current engine config; whether it is the Qwen3.8 contract is patched.
     monkeypatch.setattr(dflash2, "_current_vllm_config", lambda: object())
     cases = (
-        # (qualified, switch value, K18 selected)
+        # (qualified, switch value, FP16 GEMM selected)
         (True, None, True),  # default on for the Qwen3.8 contract
         (True, "1", True),
         (True, "0", False),  # kill switch
@@ -90,7 +90,7 @@ def test_check_and_update_config_installs_pass(platform_cls, monkeypatch):
 def test_check_and_update_config_installs_flint_splitting_op(
     platform_cls, monkeypatch, kill
 ):
-    """K15: the fused Flint q/k-norm+RoPE+KV op is split out next to
+    """The fused Flint q/k-norm+RoPE+KV op is split out next to
     unified_kv_cache_update unless VLLM_SM70_FLINT_QK_ROPE_KV=0."""
     from vllm.config import CompilationConfig
     from vllm.config.compilation import CompilationMode
@@ -137,10 +137,10 @@ def test_get_attn_backend_cls_falls_through(platform_cls, monkeypatch):
 def test_fused_add_rms_norm_priority_is_vllm_c(
     platform_cls, monkeypatch, inductor, admitted
 ):
-    """K17: when K17 admits the model (Flint), fused_add_rms_norm lowers to
-    vllm_c (FP16 residual) under Inductor too, where upstream's CUDA default
-    is ["native"] (FP32 residual). Other models (e.g. Qwen) keep upstream's
-    priority (fork parity). Other ops always keep upstream's defaults."""
+    """When the TP2 all-reduce fusion admits the model (Flint),
+    fused_add_rms_norm lowers to vllm_c (FP16 residual) under Inductor too,
+    where upstream's CUDA default is ["native"] (FP32 residual). Other models
+    (e.g. Qwen) and other ops keep upstream's defaults."""
     from vllm.config.compilation import CompilationMode
     from vllm.platforms.cuda import CudaPlatform
 
@@ -214,8 +214,8 @@ def test_fused_add_rms_norm_priority_merges_into_kernel_config(
     ],
 )
 def test_fused_add_rms_norm_pin_is_logged(platform_cls, monkeypatch, reason, expect):
-    """The pin's state is logged at INFO, with K17's reason when off, so a
-    missing kernel can never silently leave it off."""
+    """The pin's state is logged at INFO, with the fusion's reason when off,
+    so a missing kernel can never silently leave it off."""
     from vllm.config.compilation import CompilationMode
 
     from vllm_sm70 import _cuda_platform, ar_rms_fusion

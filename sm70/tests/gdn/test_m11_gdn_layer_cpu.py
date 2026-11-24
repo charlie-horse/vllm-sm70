@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M11 CPU checks for the Qwen GDN layer subclass (vllm_sm70/gdn/layer.py).
+"""CPU checks for the Qwen GDN layer subclass (vllm_sm70/gdn/layer.py).
 
 What: the subclass is installed over upstream QwenGatedDeltaNetAttention via
   PluggableLayer.register_oot and is what `QwenGatedDeltaNetAttention(...)`
-  builds; non-spec decode runs upstream's conv1d update then K08's
+  builds; non-spec decode runs upstream's conv1d update then the FlashQLA
   flashqla_decode, falling back to upstream's packed Triton decode with the
   exact arguments upstream passes; VLLM_SM70_GDN_DECODE_FLASHQLA=0 (or a
   build without the op) runs the upstream method untouched; the warmup runs

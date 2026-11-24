@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 token embedding split over the TP ranks (weights.py,
+"""Inkling 2 token embedding split over the TP ranks (weights.py,
 loop.py ``embed_input_ids``), on CPU with the tiny checkpoint.
 
 - the weight map: rank r holds rows [r V/2, (r + 1) V/2) of the padded

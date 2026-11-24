@@ -7,11 +7,11 @@
 #   $out/vllm_sm70/                       package incl. _sm70_C*.so
 #   $out/vllm_sm70-<version>.dist-info/   METADATA + entry_points.txt, so vLLM
 #                                         finds the plugins via importlib.metadata
-#
-# Inputs (agreed with Felix): buildVenv (torch: any change rebuilds this),
+
+# Inputs: buildVenv (torch: any change rebuilds this),
 # cuda, the CUTLASS source from deps.nix, the sm70/ fileset, and vLLM's
 # patched source (vllmSrc, ./source.nix: BASE + series) for its csrc headers.
-# sm70/csrc/custom_ar (K17) includes custom_all_reduce.cuh and
+# sm70/csrc/custom_ar includes custom_all_reduce.cuh and
 # custom_collective_common.cuh from it, so the bytes match what vLLM's _C was
 # built from; any change to patches/ therefore rebuilds this too.
 {
@@ -32,7 +32,7 @@ let
       lib.fileset.unions [
         (lib.fileset.maybeMissing (root + "/tests"))
         (lib.fileset.maybeMissing (root + "/tools"))
-        # Inert fork source kept for a later port; never compiled.
+        # Reference source only; never compiled.
         (lib.fileset.maybeMissing (root + "/reference"))
       ]
     );
@@ -75,7 +75,7 @@ cuda.backendStdenv.mkDerivation {
     # setup.py imports torch, whose CUDA libs ship in the nvidia-* wheels.
     export LD_LIBRARY_PATH="$(find -L ${site}/nvidia ${site}/torch/lib \
       -name '*.so*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd:)"
-    # nvcc needs a few GB per job; never more than 8 (r440 limit).
+    # nvcc needs a few GB per job; never more than 8 jobs.
     export MAX_JOBS=$(( NIX_BUILD_CORES > 8 ? 8 : NIX_BUILD_CORES ))
     ${buildVenv}/bin/python setup.py build_ext --inplace
     runHook postBuild

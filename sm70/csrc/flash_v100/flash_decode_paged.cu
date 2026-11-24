@@ -2058,28 +2058,20 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-#ifdef VLLM_SM70_FV100_FUSED_DECODE  // K14: one-launch sink decode (C4)
+#ifdef VLLM_SM70_FV100_FUSED_DECODE  // one-launch sink decode
 // Single-kernel grouped D128 decode with sinks: the partition kernel and the
-// cross-partition reducer above fused into one launch per layer.
-//
-// The two-kernel route launches one CTA per (sequence, KV head, partition)
-// over the whole captured envelope (1024 partitions at a 262K workspace), so
-// at short context almost every CTA exits at once, and the reducer is a
-// second launch whose latency chain sits behind the partition kernel. Here
-// the grid is (sequence, KV head, Z) with Z sized on the host to fill the
-// device once (independent of sequence lengths, so it is CUDA-graph safe),
-// and the in-window token range [lo, seq_len) is split on the device into
-// balanced chunks of at most MAX_CHUNK tokens:
+// cross-partition reducer above fused into one launch per layer. The grid is
+// (sequence, KV head, Z) with Z sized on the host to fill the device once
+// (independent of sequence lengths, so it is CUDA-graph safe); the in-window
+// token range [lo, seq_len) is split on the device into balanced chunks:
 //   chunks  N = min(Z * ceil(len / (Z * MAX_CHUNK)), ceil(len / kMinChunk))
 //   CTAs    W = min(Z, N) work; CTA z takes chunks z, z + W, ...
 // A CTA combines its chunks online in fp32 registers and writes one partial
-// (fp16 normalised output, fp32 max and sum: the reducer's inputs). The last
-// CTA of the (sequence, KV head) to arrive, found with a device-scope atomic
-// counter, combines the W partials in index order (so the result does not
-// depend on which CTA arrives last), applies the sink exactly as
-// flash_attention_decode_gqa8_d128_reduce_kernel does, writes the output and
-// resets the counter for the next launch. With W == 1 (short windows on a
-// small grid) the CTA writes the output directly from registers.
+// (fp16 normalised output, fp32 max and sum). The last CTA of the (sequence,
+// KV head) to arrive (device-scope atomic counter) combines the W partials in
+// index order, applies the sink as flash_attention_decode_gqa8_d128_reduce_
+// kernel does, writes the output and resets the counter. With W == 1 the CTA
+// writes the output directly from registers.
 constexpr int kGqaFusedMaxChunk = 256;
 constexpr int kGqaFusedMinChunk = 64;
 constexpr int kGqaFusedMaxCtasPerHead = 256;
@@ -2921,7 +2913,7 @@ static at::Tensor decode_paged_sinks_impl(
               "anchor_lens and a positive anchored_window must be provided "
               "together");
   const bool use_anchored = anchor_lens.has_value();
-  // K05 lean build: the anchored-SWA kernels are not compiled.
+  // The anchored-SWA kernels are not compiled.
   TORCH_CHECK(!use_anchored,
               "Flash-V100 (K05 lean build) has no anchored decode window");
   const int* anchor_lens_ptr = nullptr;
@@ -3077,7 +3069,7 @@ at::Tensor flash_attention_decode_paged_sinks_fused(
 }
 #endif  // VLLM_SM70_FV100_FUSED_DECODE
 
-// The sink-free ABI keeps its original arity for existing direct callers.
+// The sink-free entry point takes no sinks argument.
 at::Tensor flash_attention_decode_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
@@ -3120,7 +3112,7 @@ at::Tensor flash_attention_decode_paged_xqa(
                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
               "XQA decode supports fp16, fp8_e4m3, and fp8_e5m2 KV cache "
               "only");
-  // K05 lean build: only the fp16-KV XQA instantiations are compiled.
+  // Only the fp16-KV XQA instantiations are compiled.
   TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
               "Flash-V100 (K05 lean build) XQA decode supports fp16 KV only");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
@@ -3199,7 +3191,7 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  // Default only the shape with exact direct and model-level evidence.
+  // Padded shared memory only for group size 6 with partition 256.
   const bool padded_smem_enabled = xqa_padded_smem_enabled();
   const bool use_padded_smem =
       padded_smem_enabled && q_per_kv == 6 && partition_size == 256;

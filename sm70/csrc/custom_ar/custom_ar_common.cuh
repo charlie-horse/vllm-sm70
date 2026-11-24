@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Shared by the csrc/custom_ar kernels (K17 TP2 all-reduce + RMSNorm,
-// F12 custom-AR greedy top-1): the ABI pins of upstream's CustomAllreduce
-// and the staged start barrier. See PROVENANCE.md.
+// Shared by the csrc/custom_ar kernels (TP2 all-reduce + RMSNorm, custom-AR
+// greedy top-1): the ABI pins of upstream's CustomAllreduce and the staged
+// start barrier.
 //
 // Every kernel here gets upstream's CustomAllreduce handle (`fa`,
 // CustomAllreduce::_ptr in Python), which lives in vLLM's _C_custom_ar .so,
@@ -61,9 +61,8 @@ static_assert(offsetof(vllm::CustomAllreduce, ipc_handles_) == 248);
 // Upstream's barrier_at_start publishes its flag with a plain volatile store:
 // the stock kernels only read inputs written by earlier kernels. The staged
 // kernels here have every rank write its staging buffer in the same kernel,
-// so (as the fork's barrier_at_start does, fork custom_all_reduce.cuh:
-// 617-631) a system fence orders those stores before the flag, and one more
-// after the poll orders the peer reads after it.
+// so a system fence orders those stores before the flag, and one more after
+// the poll orders the peer reads after it.
 __device__ __forceinline__ void membar_sys() {
   asm volatile("membar.sys;" ::: "memory");
 }

@@ -1,31 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """TP coordination of the pre-capture warmup: one rank measures, all replay.
 
-ported from FORK cf9492a vllm/model_executor/warmup/awq_sm70_warmup.py:190-252
-(``_run_coordinated_dense_warmup``). The mechanism is the fork's: the source
-rank tunes, exports its whole TurboMind dispatch cache
-(``sm70_gemm_export_cache``), the bytes are broadcast on the TP group's CPU
+The source rank tunes and exports its whole TurboMind dispatch cache
+(``sm70_gemm_export_cache``); the bytes are broadcast on the TP group's CPU
 (gloo) group, and every rank, the source included, imports them
-(``sm70_gemm_import_cache``) and then replays the same calls. Import replaces
-a rank's entry for every shape in the payload (dispatch_cache.cu:212-239),
-and a replayed kMeasure call returns early on an exact cache hit
-(gemm.cu Measure), so every rank ends on the source's launch specs. Import
-also marks the device "imported", so in capture any shape of a kind gets
-kReuse (gemm_runtime.cpp:441-475, :548-559).
-
-Changes from the fork:
-- One phase covers every kind (NVFP4/FP8 dense and NVFP4/FP8 MoE). The fork
-  coordinated only the dense routes and let each rank tune MoE on its own.
-- The source is the lowest rank that has TurboMind work (rank 0 in practice)
-  and is agreed by an all-gather first, so a rank without a layer of some
-  kind, or without any, still makes the same collectives and never hangs.
-- A failure on any rank is shared before anyone raises, so no rank is left
-  waiting in a collective. The fork used a barrier and let errors escape.
-- The ranks compare sha256 digests of their final caches, for the log.
-
-Collective sequence, identical on every rank whatever its layers:
-  1. all_gather(has_work)
-  2. broadcast(payload or error) from the source
+(``sm70_gemm_import_cache``) and replays the same calls. Import replaces a
+rank's entry for every shape in the payload, and a replayed kMeasure call
+returns early on a cache hit, so every rank ends on the source's specs.
+Import also marks the device "imported", so in capture any shape of a kind
+gets kReuse. The source is the lowest rank with TurboMind work, agreed by
+an all-gather first. A failure on any rank is shared before anyone raises,
+so no rank waits forever. Collectives, identical on every rank:
+  1. all_gather(has_work)  2. broadcast(payload or error) from the source
   3. all_gather(digest or error)
 """
 
@@ -186,7 +172,7 @@ def coordinate(
                 res.imported += int(import_bytes(payload))
             else:
                 # No export op or an empty cache: keep the collectives in
-                # step and tune locally (the fork's fallback). Specs may differ.
+                # step and tune locally. Specs may differ.
                 res.mode = "fallback"
                 logger.warning(
                     "vllm_sm70: TP rank %d got no TurboMind dispatch cache from "

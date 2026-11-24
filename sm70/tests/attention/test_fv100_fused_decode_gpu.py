@@ -1,27 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K14 (C4) GPU: the one-launch sink decode and its capture-time counters.
+"""GPU: the one-launch sink decode and its capture-time counters.
 
-Port of the fused GPU cases of fork cf9492a
-tests/kernels/attention/test_sm70_flash_v100_sinks_decode.py :400-860:
-
-* fused vs two launches vs the FP32 reference, eager and in the server's
-  262K capture envelope (:411-451);
-* CUDA-graph replay in the server envelope at changing lengths (:454-514);
+* fused vs two launches vs the fp32 reference, eager and in the server's
+  262K capture envelope;
+* CUDA-graph replay in the server envelope at changing lengths;
 * descending capture, largest batch first, with and without the eager
-  prepare (:517-659);
-* capture on a fresh stream after 0 or 1 warmups (:662-735);
-* **the gibberish regression** `test_decode_sinks_descending_capture_regression`
-  (:738-858): batches 8/4/2/1 captured on a poisoned shared graph pool with no
-  eager call, batch 1 replayed first at 65/300/5000 tokens. Before fork
-  7f12d21b8 the counters were created inside the first capture, so only the
-  batch-8 graph zeroed them and every other graph decoded garbage above 64
-  tokens (the `--max-num-seqs 20` bug).
-
-Changes from the fork: `vllm_sm70.ops.fv100` instead of the pybind interface
-(the fixture FAILS on SM70 when the fused op is missing, since the default
-build has it); caches are reset with `fv100.clear_workspaces()`; the shared
-decode workspace is not optional any more; an LBNHC (upstream v0.33.0 KV
-layout) case for the TP2 shape is added.
+  prepare;
+* capture on a fresh stream after 0 or 1 warmups;
+* batches 8/4/2/1 captured on a poisoned shared graph pool with no eager
+  call, batch 1 replayed first at 65/300/5000 tokens: counters created
+  inside the first capture would be zeroed only by that graph;
+* an LBNHC (upstream KV layout) case for the TP2 shape.
+The fixture fails on SM70 when the fused op is missing, since the default
+build has it; caches are reset with `fv100.clear_workspaces()`.
 """
 
 from __future__ import annotations
@@ -41,7 +32,7 @@ pytestmark = pytest.mark.gpu
 HEAD_DIM = 128
 SCALE = HEAD_DIM**-0.5
 WINDOWS = pytest.mark.parametrize("window", [SWA513, FULL], ids=["swa513", "full"])
-# Query/KV heads per rank: TP1 32q/4kv and TP2 16q/2kv (2xV100), GQA 8:1.
+# Query/KV heads per rank: TP1 32q/4kv and TP2 16q/2kv, GQA 8:1.
 HEADS = pytest.mark.parametrize("heads", [(32, 4), (16, 2)], ids=["tp1", "tp2"])
 ATOL = 5e-4
 RTOL = 3e-2
@@ -113,9 +104,9 @@ def _kv(seq_lens, num_kv_heads, device, seed, layout="separate"):
 def test_decode_sinks_fused_matches_two_launches(
     fv100_fused, monkeypatch, window, heads, seq_lens, capacity
 ):
-    """fork :411-451. One launch per layer against partition kernel plus
-    reducer; ``capacity`` is the server's 262K capture envelope (the fused
-    grid fills the device and the last CTA reduces many partials)."""
+    """One launch per layer against partition kernel plus reducer;
+    ``capacity`` is the server's 262K capture envelope (the fused grid fills
+    the device and the last CTA reduces many partials)."""
     device, fv100 = fv100_fused
     num_heads, num_kv_heads = heads
     k_cache, v_cache, block_table = _kv(
@@ -148,8 +139,8 @@ def test_decode_sinks_fused_matches_two_launches(
 @pytest.mark.parametrize("seq_lens", [[1, 600], [4096, 65, 513]], ids=["b2", "b3"])
 @torch.inference_mode()
 def test_decode_sinks_fused_lbnhc_tp2(fv100_fused, window, seq_lens):
-    """New: TP2 16q/2kv on upstream's LBNHC cache (K and V interleaved per
-    head, stride(2) = 2D), as the K06 backend passes it."""
+    """TP2 16q/2kv on upstream's LBNHC cache (K and V interleaved per head,
+    stride(2) = 2D), as the backend passes it."""
     device, fv100 = fv100_fused
     k_cache, v_cache, block_table = _kv(seq_lens, 2, device, seed=61, layout="lbnhc")
     assert k_cache.stride(2) == 2 * HEAD_DIM
@@ -176,8 +167,8 @@ def test_decode_sinks_fused_lbnhc_tp2(fv100_fused, window, seq_lens):
 @WINDOWS
 @torch.inference_mode()
 def test_decode_sinks_fused_cuda_graph_server_envelope(fv100_fused, window):
-    """fork :454-514. The server's capture: hint 1, a 262K envelope; replays
-    follow new lengths both ways, are bit-stable, keep the empty row zero."""
+    """The server's capture: hint 1, a 262K envelope; replays follow new
+    lengths both ways, are bit-stable, keep the empty row zero."""
     device, fv100 = fv100_fused
     capacity = 262144
     k_cache, v_cache, block_table = _kv([40000, 40000], 2, device, seed=95)
@@ -230,9 +221,9 @@ def test_decode_sinks_fused_cuda_graph_server_envelope(fv100_fused, window):
 
 
 def _descending_capture(fv100, device, window, stream, *, eager_first):
-    """fork :534-590. Graphs for batches 8, 4, 2, 1 on one stream, largest
-    first, rows being prefixes of shared persistent buffers (as the runner's
-    are); the decode workspace grows during the first (largest) capture."""
+    """Graphs for batches 8, 4, 2, 1 on one stream, largest first, rows being
+    prefixes of shared persistent buffers (as the runner's are); the decode
+    workspace grows during the first (largest) capture."""
     rows = CAPTURE_BATCHES[0]
     k_cache, v_cache, block_table = _kv([CAPTURE_CAPACITY] * rows, 2, device, seed=111)
     q = _query(rows, 16, device, seed=112)
@@ -309,11 +300,11 @@ def _two_launch(fv100, monkeypatch, state, window, batch):
 def test_decode_sinks_fused_descending_capture(
     fv100_fused, monkeypatch, window, eager_first
 ):
-    """fork :612-659. Without an eager call first no counters may be created
-    under capture (every graph takes two launches); with the eager prepare,
-    every graph takes the fused path. Either way the smallest graph decodes
-    65, 300 and 5000 tokens as the two-launch kernels do, and the counters
-    are back at zero after each replay."""
+    """Without an eager call first no counters may be created under capture
+    (every graph takes two launches); with the eager prepare, every graph
+    takes the fused path. Either way the smallest graph decodes 65, 300 and
+    5000 tokens as the two-launch kernels do, and the counters are back at
+    zero after each replay."""
     device, fv100 = fv100_fused
     stream = torch.cuda.Stream(device)
     graphs, state, fused_calls = _descending_capture(
@@ -353,9 +344,9 @@ def test_decode_sinks_fused_descending_capture(
 @pytest.mark.parametrize("warmups", [0, 1])
 @torch.inference_mode()
 def test_decode_sinks_fused_capture_on_fresh_stream(fv100_fused, window, warmups):
-    """fork :662-735. vLLM's order: eager on the default stream, then capture
-    on a fresh side stream after 0 or 1 eager warmups there. Either way the
-    graph takes the one-launch path with the device's counters."""
+    """vLLM's order: eager on the default stream, then capture on a fresh
+    side stream after 0 or 1 eager warmups there. Either way the graph takes
+    the one-launch path with the device's counters."""
     device, fv100 = fv100_fused
     k_cache, v_cache, block_table = _kv([5000], 2, device, seed=131)
     q = _query(1, 16, device, seed=132)
@@ -421,8 +412,8 @@ def test_decode_sinks_fused_capture_on_fresh_stream(fv100_fused, window, warmups
 
 
 def _dirty_graph_pool(device, pool, stream):
-    """fork :738-759. Leave freed memory of the shared graph pool full of
-    0x7fffffff, so later captures on the pool reuse poisoned memory."""
+    """Leave freed memory of the shared graph pool full of 0x7fffffff, so
+    later captures on the pool reuse poisoned memory."""
     numel = 64 << 20  # 256 MiB of int32
     poison = torch.cuda.CUDAGraph()
     with torch.cuda.graph(poison, pool=pool, stream=stream):
@@ -443,11 +434,10 @@ def _dirty_graph_pool(device, pool, stream):
 @WINDOWS
 @torch.inference_mode()
 def test_decode_sinks_descending_capture_regression(fv100_fused, monkeypatch, window):
-    """fork :762-858, the --max-num-seqs 20 gibberish regression. Black box:
-    graphs captured largest first on a fresh stream and a shared, poisoned
+    """Graphs captured largest first on a fresh stream and a shared, poisoned
     graph pool with no eager decode call; batch 1 replays first at 65, 300
-    and 5000 tokens before batch 8 ever replays. Uses only the public
-    decode entry point."""
+    and 5000 tokens before batch 8 ever replays. Uses only the public decode
+    entry point."""
     device, fv100 = fv100_fused
     rows, capacity = 8, 8192
     k_cache, v_cache, block_table = _kv([capacity] * rows, 2, device, 141)
@@ -533,10 +523,10 @@ def test_decode_sinks_descending_capture_regression(fv100_fused, monkeypatch, wi
 def test_decode_sinks_descending_capture_after_impl_prepare(
     fv100_fused, monkeypatch, window
 ):
-    """New (R4): the K14 production order. The impl prepared the counters at
-    layer construction; then batches 20, 16, 8, 4, 2, 1 (--max-num-seqs 20)
-    are captured largest first on a poisoned pool, all on the fused path,
-    and every graph replays correctly at lengths above 64."""
+    """The serving order: the impl prepared the counters at layer
+    construction; then batches 20, 16, 8, 4, 2, 1 (--max-num-seqs 20) are
+    captured largest first on a poisoned pool, all on the fused path, and
+    every graph replays correctly at lengths above 64."""
     device, fv100 = fv100_fused
     assert fv100.flash_attn_decode_paged_sinks_prepare(device)
     rows, capacity = 20, 8192
@@ -580,7 +570,7 @@ def test_decode_sinks_descending_capture_after_impl_prepare(
     del poison
     assert fv100.flash_attn_decode_paged_sinks_capture_counts() == (len(batches), 0)
     (buffer,) = [e.buffer for e in fv100._fused_decode_counter_cache.values()]
-    for batch in reversed(batches):  # smallest first, as the gibberish needed
+    for batch in reversed(batches):  # smallest first
         for step, length in enumerate((65, 300, 5000)):
             q.copy_(_query(rows, 16, device, seed=180 + step))
             lens.fill_(0)

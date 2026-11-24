@@ -1,24 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 inkling2-sm70-quant: the "inkling2" quantization method on SM70.
+"""The "inkling2" quantization method on SM70.
 
-What: ``Inkling2Sm70QuantConfig``, registered under "inkling2". It claims a
-  checkpoint whose config ``model_type`` is "inkling2_loop", accepts fp16
-  activations at capability 70 and returns no per-layer quant method: only
-  the routed experts are quantized (NVFP4 or MXFP8) and the model's own
-  expert loader handles them. ``expert_formats`` and ``load_expert_formats``
-  read the per-layer expert format from hf_quant_config.json.
-Why: config.json declares ``{"quant_method": "modelopt", "quant_algo":
-  "NVFP4"}``, which upstream resolves to "modelopt_fp4" and its linear and
-  MoE methods. Custom methods are probed before the built-in ones and get
-  ``hf_config`` (UP config/model.py:1423-1433).
-Kill-switch: VLLM_SM70_QUANT=0 skips registration; the checkpoint then
-  resolves to "modelopt_fp4" as upstream.
-
-Registration is an import side effect, as in vllm_sm70/quant/configs.py: the
-engine core unpickles ``vllm_config.quant_config`` before it loads plugins.
-``vllm_sm70.quant.register()`` imports this module in every process and calls
-``register()`` below; the package's own ``register()`` stays free of vLLM's
-quantization imports.
+``Inkling2Sm70QuantConfig``, registered under "inkling2", claims a checkpoint
+whose config ``model_type`` is "inkling2_loop", accepts fp16 activations at
+capability 70 and returns no per-layer quant method: only the routed experts
+are quantized (NVFP4 or MXFP8) and the model's expert loader handles them.
+``expert_formats`` and ``load_expert_formats`` read the per-layer expert
+format from hf_quant_config.json. config.json declares modelopt NVFP4, which
+upstream resolves to "modelopt_fp4"; custom methods are probed first.
+VLLM_SM70_QUANT=0 skips registration. Registration is an import side effect,
+as in vllm_sm70/quant/configs.py: the engine core unpickles
+``vllm_config.quant_config`` before it loads plugins, so
+``vllm_sm70.quant.register()`` imports this module in every process.
 """
 
 from __future__ import annotations

@@ -1,28 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the M12 Inkling 2 grouped expert route
-(inkling2_sm70/ops/grouped_gemm.py) and the soft-capped SwiGLU kernel
-(ops/activation.py).
+"""GPU tests for the Inkling 2 grouped expert route (ops/grouped_gemm.py)
+and the soft-capped SwiGLU kernel (ops/activation.py).
 
-One V100. The route (Triton kernels on) is compared with the torch expert
-sum of moe.py, max-abs-rel under 2e-3:
-- at the real per-rank shape (128 experts, top-8, hidden 2304, local
-  intermediate 576 at TP2) with random fp16 experts at M in {1, 2, 8, 64,
-  512}, with padding rows and with skewed routing past the capacity;
-- captured in a CUDA graph and replayed on new routing (equal to the eager
-  route), and eagerly under ``torch.cuda.set_sync_debug_mode("error")``;
-- on the tiny checkpoint's MXFP8 layer through the module;
-- an MXFP8 layer held 8-bit: its decode is exact, its route equals the
-  dequantized layer's within fp16 rounding (torch expert sum bit for bit)
-  and its time per visit is printed beside the fp16 route's;
-- on the real MXFP8 layers 20-23 at both TP2 ranks when
-  INKLING2_SM70_CHECKPOINT names the checkpoint directory (skipped
-  otherwise).
-The SwiGLU kernel is within 1 fp16 ulp of the torch form on random and
-saturating inputs (tiny magnitudes included), bounded by 800, and allocates
-nothing. ``test_time_per_visit`` prints the time per layer visit of the
-route (eager and graph replay) and of the torch expert sum (row by row in a
-graph for M <= 8, eager grouped otherwise); with INKLING2_SM70_TIMING_OUT
-set it also writes them there as JSON.
+One SM70 GPU. The route is compared with the torch expert sum of moe.py,
+max-abs-rel under 2e-3: at the real per-rank shape with random fp16 experts,
+padding rows and skewed routing; replayed in a CUDA graph and under sync
+debug "error"; on the tiny checkpoint's MXFP8 layer; for MXFP8 layers held
+8-bit; and on the real MXFP8 layers 20-23 when INKLING2_SM70_CHECKPOINT
+names the checkpoint directory. The SwiGLU kernel is within 1 fp16 ulp of
+the torch form, bounded by 800, and allocates nothing. ``test_time_per_visit``
+prints per-visit times (INKLING2_SM70_TIMING_OUT also writes them as JSON).
 
     python -m pytest -q -s -p no:cacheprovider \
         sm70/tests/quant/test_m12_inkling2_grouped_moe_gpu.py -m gpu

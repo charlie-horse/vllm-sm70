@@ -2,19 +2,16 @@
 """Inkling 2 paged short convs as single Triton kernels (sm_70: no tl.dot,
 no PDL, no inline tanh).
 
-    short_conv       one launch: cache read, taps, conv, residual, cache
-                     write, zero padding rows                    sconv.py
-    key_value_conv   one launch: the K and V convs of a prologue, the L2 clip
-                     of K, the RMS norm of V and the K/V cache store
-                                                                 prologue.py
+    short_conv       cache read, taps, conv, residual, cache write and zero
+                     padding rows in one launch                   sconv.py
+    key_value_conv   the K and V convs of a prologue, the L2 clip of K, the
+                     RMS norm of V and the K/V cache store         prologue.py
 
-Math, tap rule and rounding as the torch ops of sconv.py and prologue.py,
-which stay the reference. A program reads its taps before it stores its
-rows; a tap from the cache is a position before its request's first batch
-row, which no program of the launch writes. Metadata is read on the device
-only: no host sync, and grids and buffers depend on the tensor shapes alone.
-`num_tokens` (n) is a kernel argument; rows from n on are zero in the
-output and stored nowhere.
+Math, tap rule and rounding as the torch ops of sconv.py and prologue.py, the
+reference. A program reads its taps before it stores its rows; a tap from
+the cache precedes its request's first batch row, which no program of the
+launch writes. Metadata is read on the device only. Rows from `num_tokens`
+on are zero in the output and stored nowhere.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K07 GPU benchmark: captured-decode envelope cost (sm70/tools/bench_fv100_capture.py).
+"""GPU benchmark: captured-decode envelope cost (sm70/tools/bench_fv100_capture.py).
 
 Prints the table (run with -s to see it); asserts only that every number
 was measured and that each captured workspace covers its grid in tokens,

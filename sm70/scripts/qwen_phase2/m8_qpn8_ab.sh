@@ -1,28 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# M8 QPN8 A/B on c4130 (2x V100-32GB, TP2, --dtype half, TRITON_ATTN).
-#
-#   m8_qpn8_ab.sh
-#
-# Serves Qwen3.8-27B-FP8 + Qwen3.8-27B-DFlash2 (qwen_matrix.sh row-4
-# settings: dflash, k=7, probabilistic) with --max-num-seqs 4, twice:
-#   on   block QPN8 (Sm70Config.fp8_block_qpn8=True),
-#        VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32 (default 1: K09 M9..32 opt-in)
-#   off  VLLM_SM70_FP8_BLOCK_QPN8=0 (plain M6 TurboMind)
-# QP2_QPN8_COPY=auto|true|false (default auto = None) sets
-# Sm70Config.fp8_block_qpn8_turbomind_copy via --additional-config, on both
-# arms. rows = 4 x (7 + 1) = 32. auto admits QPN8 with no copy iff
-# rows <= max_m (32 with M32=1; 8 with M32=0, then auto leaves the "on" arm
-# on M6). true keeps a second TurboMind copy (~2x dense FP8 per GPU); false
-# admits QPN8 with no copy, dense fallback above max_m.
-# Each: 127.0.0.1:8100 -> /health -> probe.py ab-run (decode tok/s at
-# concurrency 1-4: ~1K-token prompt, 256 forced tokens with ignore_eos,
-# temperature 0, median of 3; greedy first 32 tokens of 5 fixed prompts)
-# -> server killed (trap on EXIT). Then probe.py ab-compare.
-# PASS = QPN8/M6 tok/s >= 0.98 at every concurrency and greedy outputs match.
-# The M8 admission/rejection log lines are copied to $OUT/m8/<arm>/m8_log.txt.
-# Never touches systemd, the vllm service, /etc/nixos or activeModel.
-#
+# QPN8 A/B (TP2, --dtype half, TRITON_ATTN). Serves Qwen3.8-27B-FP8 +
+# DFlash2 (qwen_matrix.sh row 4: k=7, probabilistic, --max-num-seqs 4) twice:
+#   on   block QPN8, VLLM_SM70_FP8_QPN8_M32=$QP2_QPN8_M32 (default 1)
+#   off  VLLM_SM70_FP8_BLOCK_QPN8=0 (plain TurboMind)
+# QP2_QPN8_COPY=auto|true|false sets Sm70Config.fp8_block_qpn8_turbomind_copy
+# on both arms; auto admits QPN8 without a copy iff rows (4 x 8 = 32) <= max_m.
+# Each arm: serve on 127.0.0.1:8100, probe.py ab-run (decode tok/s at
+# concurrency 1-4, greedy first 32 tokens of 5 prompts), kill. Then probe.py
+# ab-compare: PASS = on/off tok/s >= 0.98 at every concurrency and greedy
+# outputs match. Admission log lines go to $OUT/m8/<arm>/m8_log.txt.
 # Env: VLLM_BIN, VLLM_PY (required), QWEN_STAGE, OUT, MAX_MODEL_LEN (32768),
 #      HEALTH_TIMEOUT (seconds, 1500), GPU_MEM_UTIL (0.85), QP2_QPN8_COPY (auto),
 #      QP2_QPN8_M32 (1).
@@ -44,7 +31,7 @@ M8_LOG_RE='SM70 FP8 QPN8'
 QP2_QPN8_COPY="${QP2_QPN8_COPY:-auto}"
 QP2_QPN8_M32="${QP2_QPN8_M32:-1}"
 
-[[ $# -eq 0 ]] || { sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $# -eq 0 ]] || { sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ "$QP2_QPN8_M32" == 0 || "$QP2_QPN8_M32" == 1 ]] \
   || qp2_refuse "QP2_QPN8_M32=$QP2_QPN8_M32 (want 0 or 1)"
 case "$QP2_QPN8_COPY" in

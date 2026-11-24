@@ -1,38 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Small-batch top-k/top-p sampling from vocab-parallel logit candidates (K16).
+"""Small-batch top-k/top-p sampling from vocab-parallel logit candidates.
 
 Each TP rank selects the 32 largest logits of its FP16 shard; the ranks
 exchange only those (value, token) rows, and one kernel applies temperature,
 top-k (keeping ties at the k-th value), top-p and the exponential race of
 ``random_sample`` to the gathered candidates. With k <= 20 this is the
-reference sampler (``apply_top_k_top_p_pytorch`` + ``random_sample`` with
-FP32 exponential noise) restricted to the only tokens it can return. The
-kernel draws the exact exponentials ``q.exponential_()`` would draw for those
-tokens and advances the generator by the same offset, so the same RNG state
-samples the same token.
-
-The route replaces the full-vocabulary logits all-gather, two
-full-vocabulary softmaxes and the radix sort of the eager sampler.
-
-Known limit: a rank sends at most 32 candidates. When a rank's 32nd
-candidate still reaches the k-th value, logits tied with it beyond those 32
-cannot be sampled, while the reference would keep them (top-k keeps all
-ties). With k <= 20 that needs more than 12 extra exact FP16 ties on one
-rank. The kernel counts such rows on the device; ``sample_topk_candidates``
-reads the count back asynchronously every ``_OVERFLOW_CHECK_INTERVAL``
-calls and logs a warning when it grows.
-
-Ported from fork cf9492a vllm/v1/sample/ops/sm70_topk_candidates.py (see
-csrc/sampler/PROVENANCE.md for the function map). This module knows nothing
-about the model runner: callers pass the sampling metadata, the host copy of
-the per-row top-k, and the LM head. The V1 runner hook (patch U4) that calls
-it is vllm_sm70/sample_v1.py.
-
-R4 (capture-time state): the overflow counter is created by ``prepare()``,
-once per device, before any CUDA graph capture. ``sample_topk_candidates``
-never creates it; without it the kernel runs uncounted.
-"""
+reference sampler restricted to the only tokens it can return; the kernel
+draws the exponentials ``q.exponential_()`` would draw for those tokens and
+advances the generator by the same offset.
+Limit: a rank sends at most 32 candidates, so logits tied with the k-th
+value beyond those 32 cannot be sampled. The kernel counts such rows; the
+count is read back every ``_OVERFLOW_CHECK_INTERVAL`` calls and logged.
+Callers (vllm_sm70/sample_v1.py) pass the sampling metadata, the host copy
+of the per-row top-k, and the LM head. The overflow counter is created by
+``prepare()`` before any CUDA graph capture."""
 
 from __future__ import annotations
 
@@ -363,7 +345,7 @@ def shard_supported(logits: torch.Tensor, *, vocab_start: int, num_valid: int) -
         and LOCAL_K <= num_valid <= logits.shape[1] <= _MAX_LOCAL_VOCAB
         and vocab_start >= 0
         and vocab_start + logits.shape[1] <= ops.MAX_TOKEN_ID
-        # The kernel's row-stride check (topk_candidates_sampler.cu:341-343).
+        # The kernel's row-stride check (topk_candidates_sampler.cu).
         and (rows == 1 or logits.shape[1] <= logits.stride(0) <= (1 << 31) // rows)
         and _is_sm70(logits.device.index)
         and ops_available()

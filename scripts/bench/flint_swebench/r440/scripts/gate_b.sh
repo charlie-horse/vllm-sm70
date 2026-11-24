@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Gate B: slice50_ids.txt (repo-stratified, seed 0) x1 at P=12 against a
-# --max-num-seqs 20 server. Same agent/eval config as the 500x1 baseline;
+# --max-num-seqs 20 server. Same agent/eval config as the run_all.sh defaults;
 # only the task container --cpus (1) and the parallelism differ.
 # 12 task containers x 1 CPU, everything pinned to cores 0-15 (<= 16 cores).
 # Images are pre-pulled (scripts/prepull.sh), so they are kept afterwards.

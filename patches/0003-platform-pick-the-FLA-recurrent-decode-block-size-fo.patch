@@ -8,11 +8,10 @@ What: fused_recurrent_gated_delta_rule_fwd and the packed decode ask
   largest BV in (32, 16, 8) that launches at least two waves of CTAs
   (cdiv(V, BV) * N * HV >= 2 * SMs); elsewhere it returns the caller's BV
   unchanged.
-Why: V100 (80 SMs) at TP2 runs few sequences with Hv=16/24 GDN heads, so
-  upstream's fixed BV=32 launches 64-96 CTAs, under one wave. The fork
-  (cf9492a fla/ops/fused_recurrent.py:29-95) uses this schedule; its
-  fused_sigmoid_gating default on sm_70 equals upstream's (BV=32, 4
-  warps), so that file is left alone.
+Why: with few sequences and Hv=16/24 GDN heads per GPU, upstream's fixed
+  BV=32 launches fewer CTAs than a V100 (80 SMs) runs in one wave. The
+  fused_sigmoid_gating default on sm_70 already matches (BV=32, 4 warps),
+  so that file is left alone.
 Upstream-files: vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
 Kill-switch: VLLM_SM70_FLA_RECURRENT_SCHED=0 -> upstream BV
 Tests: sm70/tests/gdn/test_u2_recurrent_schedule.py (CPU)

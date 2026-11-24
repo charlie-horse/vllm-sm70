@@ -2,17 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM70 vocab-parallel top-k candidate sampler against the reference sampler.
 
-Port of FORK tests/kernels/core/test_sm70_topk_candidates_sampler.py
-(cf9492a, 230 lines). The reference is upstream's PyTorch-native path:
-FP32 logits divided by the temperature, ``apply_top_k_top_p_pytorch`` and
-``random_sample`` with FP32 exponential noise. Upstream v0.33 added
-``use_fp64_gumbel`` (UP topk_topp_sampler.py:366); the kernel reproduces the
-FP32 draw only, so every reference call pins ``use_fp64_gumbel=False`` (I16).
-TP ranks are simulated by splitting the vocabulary into shards.
-
-Added for the port: the Flint TP2 shape set (k=20, 75072-logit shards, a
-padded last shard) and the R4 descending-capture regression (graphs captured
-largest batch first on a poisoned pool, smallest replayed first).
+The reference is upstream's PyTorch-native path: FP32 logits divided by the
+temperature, ``apply_top_k_top_p_pytorch`` and ``random_sample`` with FP32
+exponential noise. The kernel reproduces the FP32 draw only, so every
+reference call pins ``use_fp64_gumbel=False``. TP ranks are simulated by
+splitting the vocabulary into shards. Also the Flint TP2 shape set (k=20,
+75072-logit shards, a padded last shard) and the descending-capture case
+(graphs captured largest batch first on a poisoned pool, smallest replayed
+first).
 """
 
 import math
@@ -66,7 +63,7 @@ def _reference(logits, metadata):
     scaled = logits.float().div_(metadata.temperature.unsqueeze(1))
     masked = topk_topp.apply_top_k_top_p_pytorch(scaled, metadata.top_k, metadata.top_p)
     probs = masked.softmax(dim=-1, dtype=torch.float32)
-    # Pinned FP32 Gumbel/exponential noise (I16).
+    # Pinned FP32 Gumbel/exponential noise.
     return topk_topp.random_sample(probs, metadata.generators, False), masked
 
 
@@ -273,14 +270,13 @@ def test_flint_tp2_k20_shards(sampler_gpu, rows, org_vocab):
     assert matches >= 15  # as above: an FP32 rounding tie may flip one draw
 
 
-# --------------------------------------------- R4: descending-capture pattern
+# ------------------------------------------------ descending-capture pattern
 
 
 def _dirty_graph_pool(device, pool, stream):
-    """Fill a graph pool with garbage before the real captures (pattern of
-    FORK tests/kernels/attention/test_sm70_flash_v100_sinks_decode.py:735-758):
-    tensors allocated in a throwaway capture on the pool are filled by one
-    replay and freed, so later captures on the pool reuse poisoned memory."""
+    """Fill a graph pool with garbage before the real captures: tensors
+    allocated in a throwaway capture on the pool are filled by one replay and
+    freed, so later captures on the pool reuse poisoned memory."""
     poison = torch.cuda.CUDAGraph()
     with torch.cuda.graph(poison, pool=pool, stream=stream):
         blocks = [torch.empty(16 << 20, dtype=torch.int32, device=device)]
@@ -297,14 +293,12 @@ def _dirty_graph_pool(device, pool, stream):
 
 @torch.inference_mode()
 def test_descending_capture_regression(sampler_gpu):
-    """Black box, as C4's test_decode_sinks_descending_capture_regression.
-
-    Captures TP2 candidate sampling at batches 8, 4, 2, 1 on a fresh stream
-    and a shared, poisoned graph pool, with no eager sampler call first; then
-    replays batch 1 before any larger graph. Each replay must equal an eager
-    call from the same RNG state, and capture must not create the overflow
-    counter (or any other per-device state) lazily: it exists from prepare()
-    and keeps its storage.
+    """Black box: TP2 candidate sampling captured at batches 8, 4, 2, 1 on a
+    fresh stream and a shared, poisoned graph pool, with no eager sampler
+    call first; then batch 1 replays before any larger graph. Each replay
+    must equal an eager call from the same RNG state, and capture must not
+    create the overflow counter (or any other per-device state) lazily: it
+    exists from prepare() and keeps its storage.
     """
     device, candidates = sampler_gpu
     monitor = candidates._overflow_monitor(device)

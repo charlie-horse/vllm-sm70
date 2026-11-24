@@ -1,25 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 DSpark draft (inkling2_sm70/dspark.py, speculator.py), on CPU.
+"""Inkling 2 DSpark draft (inkling2_sm70/dspark.py, speculator.py), on CPU.
 
-A tiny random draft (3 layers, local layers 0 and 2 with a window of 6,
-blocks of 8, Markov rank 8) is loaded from upstream-named tensors into one
-module per TP rank. The paged engine harness (inkling2_harness.py) runs
-draft rounds: a context step stores the K/V of the committed tokens, a
-block step drafts 8 positions, then the 8 positions are taken back and the
-next context step rewrites them. The speculator's sequential Markov
-sampling runs on each block. Its fp32 logits are compared with a dense fp32
-reference built from the unsharded tensors: within 1e-4 in fp32 and 1e-2
-of the largest logit in fp16, with no inf/NaN, at TP1 and TP2, with
-contexts past the window (the harness frees the blocks before it and
-fills them with NaN).
-
-Rounds that verify no drafts (a context step alone, as the speculator's
-propose with num_speculative_tokens 0) leave the later rounds' drafts and
-logits as in a run that drafted every round.
-
-Also: the weight loader's checks, the fold, f_rnn after rejected tokens,
-and the registered class names. The fp16 TP1 cases run again in a child
-pytest with TRITON_INTERPRET=1, through the Triton kernels.
+A tiny random draft (3 layers, local layers 0 and 2 with window 6, blocks
+of 8, Markov rank 8), loaded from upstream-named tensors into one module per
+TP rank, runs draft rounds on the paged engine harness: a context step stores
+the committed tokens' K/V, a block step drafts 8 positions, which the next
+context step rewrites. Its fp32 logits match a dense fp32 reference (1e-4 in
+fp32, 1e-2 of the largest logit in fp16, no inf/NaN) at TP1 and TP2, with
+contexts past the window. Rounds that verify no drafts leave later rounds as
+in a run that drafted every round. Also: the loader's checks, the fold,
+f_rnn after rejected tokens, the registered class names; the fp16 TP1 cases
+run again with TRITON_INTERPRET=1 through the Triton kernels.
 """
 
 from __future__ import annotations

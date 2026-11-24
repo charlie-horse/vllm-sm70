@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K08 GPU test references: inputs, the float64 recurrence and the upstream
+"""GDN GPU test references: inputs, the float64 recurrence and the upstream
 Triton chunk comparison that runs in a spawned child (see
 test_k08_gdn_gpu.py::test_prefill_matches_triton_chunk).
 
@@ -73,8 +73,8 @@ def errors_vs_fp64(q, k, v, g, beta, h0, cu, o, ht) -> dict[str, float]:
 def chunk_prefill_errors(h: int, hv: int) -> dict[str, float]:
     """FlashQLA prefill vs upstream Triton chunk_gated_delta_rule (spawn child).
 
-    On sm_70 Triton 3.8 lowers the chunk kernels' tl.dot to FMA; their
-    autotuned variants take ~10 min of ptxas per shape (c4130, 2026-11-06).
+    On sm_70 Triton lowers the chunk kernels' tl.dot to FMA; their autotuned
+    variants take minutes of ptxas per shape.
     """
     from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
 

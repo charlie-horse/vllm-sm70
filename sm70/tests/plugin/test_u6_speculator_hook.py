@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U6 (patches/0006): V2 speculator class hook and the inkling2_dspark draft
+"""patches/0006: V2 speculator class hook and the inkling2_dspark draft
 kept out of the DeepSeek DSpark fallback.
 
 The patched-source checks skip on a vLLM without patches/0006; the plugin

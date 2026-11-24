@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: the cache-plumbing stub (inkling2_stub.py) under vLLM's
+"""CPU checks: the cache-plumbing stub (inkling2_stub.py) under vLLM's
 real scheduler, hybrid KV cache manager and V1 model runner.
 
 Each case starts an engine in a fresh process on the CPU platform, with

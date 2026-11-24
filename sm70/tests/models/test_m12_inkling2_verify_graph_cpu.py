@@ -1,32 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: verify steps of speculative decoding as FULL decode graphs.
-
-With a speculative config of K draft tokens, a decode step holds q = K + 1
-query tokens per request. On the tiny checkpoint (fixtures/inkling2_tiny),
-driven by the paged engine harness under FULL_DECODE_ONLY:
-
-- a verify step with the metadata a replayed FULL graph gets (padded
-  requests and slot mapping, the runner's block-table width) is decode-only,
-  and its real rows equal the eager route of the same step
-  (VLLM_SM70_INKLING_DECODE_GRAPH=0: the ops of mixed batches) within 1e-5
-  in fp32 and 4e-3 in fp16 of the largest value (one fp16 ulp of the visit
-  states after 48 visits; the attention and conv ops alone are within 2e-3,
-  ops/test_m12_inkling2_triton_*_cpu.py), across steps whose tail drafts
-  are rejected (the next step recomputes their positions) and sliding
-  windows and conv taps that reach into the same step's rows. The tiny
-  model's router scores are saturated sigmoids with near-ties, so in fp16
-  each router's bias pins its top-k: a rounding difference of the two
-  routes then cannot flip an expert;
-- a padded verify step has no host sync and launches the same ops on the
-  same allocation sizes at other positions and request counts;
-- only uniform steps of q tokens per request (zero-token padding requests
-  last) are decode-only; the builders declare UNIFORM_BATCH graphs and a
-  reorder threshold of q with a speculative config, and keep
-  UNIFORM_SINGLE_TOKEN_DECODE and 1 without one;
+"""Inkling 2: verify steps of speculative decoding as FULL decode graphs.
+K draft tokens give q = K + 1 query tokens per request. Tiny checkpoint,
+paged engine harness under FULL_DECODE_ONLY:
+- a verify step with FULL-graph metadata is decode-only and its real rows
+  equal the eager route (VLLM_SM70_INKLING_DECODE_GRAPH=0) within 1e-5 (fp32)
+  and 4e-3 (fp16) of the largest value, across rejected tail drafts and
+  windows reaching into the step's own rows (in fp16 each router's bias pins
+  its top-k, so rounding cannot flip an expert);
+- a padded verify step has no host sync and one op trace;
+- only uniform steps of q tokens per request are decode-only; builders
+  declare UNIFORM_BATCH and reorder threshold q with a speculative config;
 - the engine-config hook counts the capture cap in requests of q tokens;
-- with a dynamic speculative-decoding schedule (spec_policy.py), steps of
-  q = 1 and of q = K + 1 are both decode-only, and requests that switch
-  between them mid-stream, after rejected drafts, match the eager route.
+- under a dynamic schedule (spec_policy.py) steps of q = 1 and q = K + 1 are
+  both decode-only and requests switching between them match the eager route.
 """
 
 from __future__ import annotations

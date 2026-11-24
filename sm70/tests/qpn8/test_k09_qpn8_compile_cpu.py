@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K09: the shared dense scratch survives torch.compile without a clone.
+"""The shared QPN8 dense scratch survives torch.compile without a clone.
 
 `qpn8_native_linear` declares `dense_scratch` as `Tensor(a!)?` (mutated in
 place). Functionalization turns that into auto_functionalized_v2 plus a

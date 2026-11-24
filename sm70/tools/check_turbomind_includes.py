@@ -8,8 +8,8 @@
 2. Every `#include <...>` is a C++ standard, CUDA toolkit, torch or CUTLASS
    header.
 3. No kept file names a dropped symbol (gguf, Lattice, MXF4/MXFP4,
-   U8_Affine, U2_Affine, Lut4, BitPlane) outside an allowlist of files known to keep such references
-   verbatim. Every hit is printed with the reason it is allowed.
+   U8_Affine, U2_Affine, Lut4, BitPlane) outside an allowlist of files that
+   keep such references verbatim. Every hit is printed with the reason it is allowed.
 4. Every source listed in sources.cmake exists.
 Preprocessor conditionals are ignored, so (1)/(2) over-approximate.
 
@@ -39,11 +39,11 @@ CUDA = set(
     "cuda_fp8.h cuda_pipeline_primitives.h cublas_v2.h cublasLt.h "
     "cusparseLt.h".split()
 )
-# cutlass/: headers from VLLM_SM70_CUTLASS_DIR (K03 qwen38_prefill_cutlass.cu).
+# cutlass/: headers from VLLM_SM70_CUTLASS_DIR (qwen38_prefill_cutlass.cu).
 PREFIXES = ("cub/", "torch/", "ATen/", "c10/", "cutlass/")
 
-# Dropped-format names (Kai's list plus U2_Affine/Lut4/BitPlane) that remain (R7: headers kept verbatim;
-# no kernels for these formats are registered any more).
+# Dropped-format names that remain in headers kept verbatim; no kernels for
+# these formats are registered.
 DROPPED = re.compile(
     r"gguf|Gguf|GGUF|Lattice|lattice|MXF4|Mxfp4|mxfp4|MXFP4|U8_Affine|U2_Affine"
     r"|Lut4|BitPlane"

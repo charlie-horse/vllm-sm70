@@ -1,29 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 paged decode-attention kernel
-(inkling2_sm70/ops/paged_attention.py) and its route (attention_torch.py
-``gather_attention``), on CPU.
+"""Inkling 2 paged decode-attention kernel (inkling2_sm70/ops/
+paged_attention.py) and its route (attention_torch.py ``gather_attention``).
 
-- the kill switch VLLM_SM70_INKLING_TRITON_DECODE_ATTN and the route
-  choice: on by default for GPU tensors, torch off the GPU and with
-  ``hf_rounding``;
+- the kill switch VLLM_SM70_INKLING_TRITON_DECODE_ATTN and the route choice;
 - the kernel source holds nothing sm_70 rejects;
-- through Triton's interpreter against the torch route, in fp32 within 1e-5
-  and in fp16 within 2e-3: decode-only batches with padding rows, eager
-  batches with one-query rows before and after a prefill, decode-only
-  verify batches of 8 queries per request against the eager route, global
-  and sliding layers, contexts across many 32-token blocks, a bias extent
-  longer than a block, GQA, a head dim that is not a power of 2. Every slot
-  a row may not read (null block, unwritten slots, keys out of the window)
-  holds NaN.
-
+- through Triton's interpreter against the torch route (fp32 within 1e-5,
+  fp16 within 2e-3): decode-only, eager and verify batches, global and
+  sliding layers, long contexts, GQA, a non-power-of-2 head dim; every slot
+  a row may not read holds NaN;
 - split-KV (the default): ``split_count`` from static bounds, the kill
-  switch VLLM_SM70_INKLING_SPLIT_KV_ATTN, and interpreted parity against the
-  torch route and the unsplit kernel at contexts from one key to past the
-  window and many chunks, decode-only, eager and verify rows.
-
+  switch VLLM_SM70_INKLING_SPLIT_KV_ATTN, and parity against the torch route
+  and the unsplit kernel.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
-(test_interpreted_suite); in the parent they show as skipped. The AOT
-compile check is test_m12_inkling2_triton_sm70_compile_cpu.py.
+(test_interpreted_suite). AOT compile: test_m12_inkling2_triton_sm70_compile_cpu.py.
 """
 
 from __future__ import annotations

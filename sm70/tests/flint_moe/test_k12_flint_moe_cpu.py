@@ -1,27 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K12 CPU checks: Flint NVFP4 MoE M<=2 QPN decode (no GPU, no built _sm70_C).
+"""CPU checks: Flint NVFP4 MoE M<=2 QPN decode (no GPU, no built _sm70_C).
 
-What:
   * Bindings: exactly the two out ops, CUDA impls only, fakes whose
-    parameters match the schemas and that run on meta tensors; no fork
-    namespace, policy or single-launch (persistent) code left; the C++
-    contract constants equal the Python ones; sources.cmake builds the one TU
-    without fast math; PROVENANCE.md checks out.
-  * Admission, ported from the CPU decode cases of fork cf9492a
-    tests/kernels/moe/test_sm70_nvfp4_contract_flint.py:
-      test_decode_qpn_contract_is_flint_tp2_only (:554-566),
-      test_decode_qpn_scale_shift_keeps_fp16_headroom (:569-585),
-      test_decode_qpn_scale_shift_rejects_non_finite_scales (:588-592),
-      test_decode_qpn_load_admits_flint_tp2_with_workspace (:615-624),
-      test_decode_qpn_load_pre_shifts_large_scales (:627-632),
-      test_decode_qpn_load_falls_back (:635-651),
-      test_decode_qpn_kill_switch_env (:661-674).
-    Dropped: test_decode_qpn_explicit_request_fails_closed_without_ops
-    (:654; the environment can only turn the decode off here, so there is no
-    explicit request) and every persistent case (:677-792).
-  * New: the per-call (metadata-only) guard, the composite wrapper's
-    argument order and int64 ID handling, workspace allocation refused under
-    CUDA graph capture (R4), and M4's decode constants agree with K12's.
+    parameters match the schemas and that run on meta tensors; no foreign
+    namespace, policy or single-launch (persistent) code; the C++ contract
+    constants equal the Python ones; sources.cmake builds the one TU without
+    fast math; PROVENANCE.md checks out.
+  * Admission: the Flint-TP2-only contract, the FP16 scale shift and its
+    non-finite refusal, load-time admission with a workspace, pre-shifted
+    large scales, fallbacks and the kill switch.
+  * The per-call (metadata-only) guard, the composite wrapper's argument
+    order and int64 ID handling, workspace allocation refused under CUDA
+    graph capture, and quant/nvfp4_moe.py using this module's constants.
 """
 
 from __future__ import annotations
@@ -416,14 +406,14 @@ def test_allocate_workspace_sizes_and_zero_counters(flint_stub):
 
 
 def test_allocate_workspace_refuses_under_capture(flint_stub, monkeypatch):
-    """R4: no workspace may be born inside a CUDA graph capture."""
+    """No workspace may be born inside a CUDA graph capture."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="graph capture"):
         flint_stub.allocate_workspace("cuda")
 
 
 def test_no_lazy_state_in_the_module():
-    """R4: no module-level caches that a first call could fill under capture."""
+    """No module-level caches that a first call could fill under capture."""
     tree = ast.parse(PY.read_text())
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -533,12 +523,9 @@ def test_composite_copies_int64_ids_into_the_workspace(flint_stub, monkeypatch):
 
 
 def test_m4_uses_k12_admission_not_a_private_copy(flint_stub):
-    """M4 (vllm_sm70/quant/nvfp4_moe.py) wires the decode through this module
-    (admit_layer, allocate_workspace, can_decode, flint_moe_decode_out); the
-    fork constants it pre-wired with are gone, so they cannot drift.
-
-    Taken over from Mara's PR #52 (models/m4-k12-wiring @ 3d2cc70). Skipped
-    while M4 (main before #52) still carries its private DECODE_* copy."""
+    """vllm_sm70/quant/nvfp4_moe.py wires the decode through this module
+    (admit_layer, allocate_workspace, can_decode, flint_moe_decode_out) and
+    keeps no private copy of its constants, so they cannot drift."""
     pytest.importorskip("vllm")
     try:
         from vllm_sm70.quant import nvfp4_moe as m4

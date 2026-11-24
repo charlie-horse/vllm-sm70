@@ -3,23 +3,16 @@
 //
 // TurboMind SM70 tuning knobs for the vllm-sm70 plugin.
 //
-// Replaces the fork's per-engine "native policy" ABI (fork cf9492a
-// csrc/sm70_policy.h + sm70_policy_fields.inc + sm70_runtime_state.h). Every
-// knob is a compile-time default that one cached getenv() pass can override,
-// read once per process. There are no policy tokens, no per-call scopes and
-// no engine-owned runtime objects. The names below keep the fork's
-// vllm::sm70::{PolicyField, policy_atoi, policy_value, ...} spelling, so the
-// vendored lmdeploy files (gemm.cu, dispatch_cache.cu, sm70_dflash_context.h)
-// stay verbatim. They include this through the sm70_policy.h shim.
-//
-// Environment names are the fork's, so existing tuning notes still apply.
-// Only knobs read by the vendored files are listed: the K02 set,
-// batch_gemm_layouts (shared with K03 Python), the K03 op files and the
-// K04 AWQ MoE code.
+// Every knob is a compile-time default that one cached getenv() pass can
+// override, read once per process. There are no policy tokens, no per-call
+// scopes and no engine-owned runtime objects. The vllm::sm70::{PolicyField,
+// policy_atoi, policy_value, ...} names let the vendored lmdeploy files
+// (gemm.cu, dispatch_cache.cu, sm70_dflash_context.h) stay verbatim; they
+// include this through the sm70_policy.h shim. Only knobs read by the
+// vendored files, the op files and the Python side are listed.
 #pragma once
 
-// Same std headers the fork's sm70_policy.h chain provided, so vendored
-// includers that relied on them transitively keep compiling.
+// Vendored includers rely on these std headers transitively.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -36,7 +29,7 @@
 
 namespace vllm::sm70 {
 
-// X(field, env name). Defaults live at each call site (the fork's fallback
+// X(field, env name). Defaults live at each call site (the fallback
 // argument), so this table only maps fields to environment variables.
 #define VLLM_SM70_TM_KNOBS(X)                                                \
   X(tm_gemm_trace, "TM_GEMM_TRACE")                                          \
@@ -86,41 +79,26 @@ namespace vllm::sm70 {
   X(nvfp4_moe_tune_max_tokens, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS")        \
   X(f16_dense_max_m, "VLLM_SM70_F16_DENSE_MAX_M")                            \
   X(batch_gemm_layouts, "VLLM_SM70_BATCH_GEMM_LAYOUTS")                      \
-  /* K03 op files (tm_*_sm70.cu, qwen38_prefill_cutlass.cu) */               \
+  /* op files (tm_*_sm70.cu, qwen38_prefill_cutlass.cu) */                   \
   X(profile_trace, "VLLM_SM70_PROFILE_TRACE")                                \
   X(fp8_prefill_cutlass, "VLLM_SM70_FP8_PREFILL_CUTLASS")                    \
   X(fp8_moe_prepare_vec, "VLLM_SM70_FP8_MOE_PREPARE_VEC")                    \
-  /* K04 (AWQ MoE, under VLLM_SM70_TM_AWQ) */                                \
+  /* AWQ MoE, under VLLM_SM70_TM_AWQ */                                      \
   X(awq_moe_batched_active_exact_w2,                                         \
     "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2")                             \
   X(awq_qwen38_moe_compact_grouped_decode,                                   \
     "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE")                       \
-  /* M12 (Inkling 2 NVFP4 expert prefill, tm_moe_sm70.cu) */                 \
+  /* Inkling 2 NVFP4 expert prefill, tm_moe_sm70.cu */                       \
   X(inkling_tm_grouped_prefill, "VLLM_SM70_INKLING_TM_GROUPED_PREFILL")
 
-// c4130 production defaults.
-//
-// The fork overrode some call-site defaults on every SM70 run. The dict is
-// _SM70_BATCH_GEMM_DEFAULTS, fork cf9492a vllm/platforms/runtime_defaults.py:36-44.
-// It is applied for any participating capability-7.0 device, and only for
-// unset variables, by _apply_sm70_batch_gemm_defaults (:103-112). The call
-// chain is apply_runtime_policy_defaults (:254, loop at :263) from
-// VllmConfig.__post_init__ (fork vllm/config/vllm.py:1426). We make those
-// values our defaults. An explicitly set variable still wins.
-//   VLLM_SM70_FP8_DENSE_TUNE_MAX_M=64    fork call-site default 16.
-//     Consumer: gemm_runtime.cpp fp8_dense_tune_max_m()
-//     -> select_fp8_dense_dispatch_policy (K02).
-//   VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=64  fork call-site default 16.
-//     Consumer: gemm_runtime.cpp nvfp4_dense_tune_max_m()
-//     -> select_nvfp4_dense_dispatch_policy (K02).
-//   VLLM_SM70_BATCH_GEMM_LAYOUTS=1       fork envs.py default 0.
-//     No C++ consumer. The Python prepare path reads it (fork
-//     sm70_turbomind.py:151-159 use_batched_gemm_layouts(), called from
-//     kernels/linear/qpn/nvfp4.py:37,287,316 and
-//     compressed_tensors_w8a16_fp8.py:450), so the K03 Python port needs it.
-//     The constant is recorded here so both sides share one value.
-//   VLLM_SM70_AWQ_WARMUP_MAX_M=64        same dict. Python AWQ warmup only
-//     (K04). Recorded, not read here.
+// Defaults for SM70 (capability 7.0). An explicitly set variable wins.
+//   VLLM_SM70_FP8_DENSE_TUNE_MAX_M=64: gemm_runtime.cpp
+//     fp8_dense_tune_max_m() -> select_fp8_dense_dispatch_policy.
+//   VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=64: gemm_runtime.cpp
+//     nvfp4_dense_tune_max_m() -> select_nvfp4_dense_dispatch_policy.
+//   VLLM_SM70_BATCH_GEMM_LAYOUTS=1: no C++ consumer; recorded as the
+//     shared default.
+//   VLLM_SM70_AWQ_WARMUP_MAX_M=64: Python AWQ warmup only; not read here.
 inline constexpr int kFp8DenseTuneMaxMDefault = 64;
 inline constexpr int kNvfp4DenseTuneMaxMDefault = 64;
 inline constexpr bool kBatchGemmLayoutsDefault = true;
@@ -146,8 +124,8 @@ inline const char* policy_name(PolicyField field) {
 
 // The one getenv pass. It runs on first use and is thread-safe (magic static).
 // An unset variable stays nullptr, and the call site's default applies.
-// The fork re-read a few knobs on every call ("dynamic_legacy"). Here every
-// knob is fixed at first use: set the environment before the first GEMM.
+// Every knob is fixed at first use: set the environment before the first
+// GEMM.
 struct Knobs {
   std::array<bool, policy_size> present{};
   std::array<std::string, policy_size> raw{};
@@ -197,7 +175,6 @@ inline DispatchOverride policy_dispatch_override(PolicyField field) {
 }
 
 // VLLM_SM70_AWQ_TP2_FAST_TARGETS="<desc>|MxNxK:splits:swizzle:mgroup[@name];..."
-// The parser is copied from fork csrc/sm70_policy.h (parse_gemm_targets).
 struct GemmTargetPolicy {
   std::string descriptor;
   std::string entry;
@@ -250,15 +227,13 @@ inline const std::vector<GemmTargetPolicy>& policy_gemm_targets() {
   return targets;
 }
 
-// VLLM_SM70_BATCH_GEMM_LAYOUTS with the c4130 default (on). For the K03
-// bindings to expose to Python. No K02 code branches on it.
+// VLLM_SM70_BATCH_GEMM_LAYOUTS, default on. No GEMM code branches on it.
 inline bool batch_gemm_layouts_enabled() {
   return policy_atoi(PolicyField::batch_gemm_layouts,
                      kBatchGemmLayoutsDefault ? 1 : 0) != 0;
 }
 
-// Process-wide named counters (the fork kept them per engine runtime). Used
-// only to rate-limit TM_GEMM_TRACE output.
+// Process-wide named counters. Used only to rate-limit TM_GEMM_TRACE output.
 inline std::atomic<unsigned>& diagnostic_counter(const std::string& name) {
   static std::mutex mutex;
   static std::unordered_map<std::string, std::atomic<unsigned>> counters;

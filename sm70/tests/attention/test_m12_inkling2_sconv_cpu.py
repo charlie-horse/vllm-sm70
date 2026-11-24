@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 CPU checks: the paged torch short convs and attention prologue of
+"""CPU checks: the paged torch short convs and attention prologue of
 Inkling 2 (models/inkling2_sm70/sconv.py, prologue.py).
 
 The ops run over fake paged caches (_inkling2_paged_conv.py) with metadata from
@@ -7,7 +7,7 @@ the real builders and are compared in fp32 with the dense reference ops
 (ops/torch_ref.py) on whole sequences, for a sliding layer and a global
 layer of the tiny fixture's config and random weights.
 
-Needs upstream v0.33.0's Python importable (skipped otherwise).
+Needs upstream vLLM's Python importable (skipped otherwise).
 """
 
 from __future__ import annotations

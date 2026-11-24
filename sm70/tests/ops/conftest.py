@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K03 op tests.
+"""Fixtures for the TurboMind op tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
 vllm_sm70._sm70_C. Run them with:
@@ -22,7 +22,7 @@ def tm_gpu():
 
     # On a real SM70 GPU a missing extension is a broken build or a wrong
     # PYTHONPATH (e.g. the source tree shadowing the built package), not a
-    # reason to skip: fail so the nightly run cannot pass on stubs.
+    # reason to skip: fail so a run cannot pass on stubs.
     if not _ext.is_loaded():
         pytest.fail(
             "SM70 GPU present but vllm_sm70._sm70_C is not loaded: "

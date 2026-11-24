@@ -2,20 +2,17 @@
 """Inkling 2 decode kernels around the vendored norm kernels (norm.py,
 attn_res.py, loop.py): the message-gate projections and the residual add.
 
-    gate_down      low = down(rms([dest, message])) of each stream: the
-                   weightless pair norm, the model-dtype cast and the down
-                   GEMV in one kernel; [S, T, R] fp32, rounded once to the
-                   dtype of the down weight as F.linear returns it
-    gate_up        [gain, forget] = low @ [gain, forget]^T in fp32, the
-                   input of loop.blend_rms_norm; [S, T, 2D]
-    residual_add   ((base + update) + addend) in fp32, rounded once to the
-                   dtype of `out`: the residual stream after a layer
+    gate_down      low = down(rms([dest, message])) of each stream: pair norm,
+                   model-dtype cast and down GEMV in one kernel; [S, T, R] fp32
+                   rounded once to the down weight's dtype
+    gate_up        [gain, forget] = low @ [gain, forget]^T in fp32, the input
+                   of loop.blend_rms_norm; [S, T, 2D]
+    residual_add   ((base + update) + addend) in fp32, rounded once to `out`
 
-A gate kernel serves up to three streams, each with its own weights; the
-program of stream s reads the weight arguments of index s. Programs run per
-(stream, token, block of outputs), so the weights are read once per token:
-these kernels are for decode batches (`MAX_TOKENS`). Products and sums run
-in fp32 (GEMVs as elementwise products and row sums, no tl.dot).
+A gate kernel serves up to three streams, each with its own weights. Programs
+run per (stream, token, block of outputs), so the weights are read once per
+token: these kernels are for decode batches (`MAX_TOKENS`). Products and sums
+run in fp32 (GEMVs as elementwise products and row sums).
 """
 
 from __future__ import annotations

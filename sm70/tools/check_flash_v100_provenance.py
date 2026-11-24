@@ -2,21 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check sm70/csrc/flash_v100/PROVENANCE.md against the tree and a fork checkout.
 
-Two tables are checked (same idea as check_turbomind_provenance.py, K02):
-
 Files (`new path | fork path | status | lines | fork lines | fork last-touch |
-sha256 | fork sha256`):
-  * the new file exists, its `wc -l` and sha256 match the record;
-  * with --fork: the fork file's `wc -l` and sha256 match the record;
-    verbatim rows are byte-identical; trimmed rows are a line subsequence of
-    the fork file (deletions only).
+sha256 | fork sha256`): the new file's `wc -l` and sha256 match; with --fork,
+the fork file's too, verbatim rows are byte-identical and trimmed rows are a
+line subsequence of the fork file (deletions only).
 Definitions (`new file | definition | lines | fork lines | status | sha256`):
-  * sha256 of the new file's lines `lines` (joined with "\\n") matches;
-  * with --fork: verbatim rows equal the fork's `fork lines` text; trimmed
-    rows are a line subsequence of it.
+sha256 of the new file's `lines` (joined with "\\n") matches; with --fork,
+verbatim rows equal the fork's `fork lines` text, trimmed rows are a line
+subsequence of it.
 Every file under sm70/csrc/flash_v100 (except PROVENANCE.md) needs a file row.
 
-Usage:
   sm70/tools/check_flash_v100_provenance.py [--fork /path/to/fork@cf9492a]
 Exit status: 0 = all good, 1 = mismatch, 2 = usage/parse error.
 """

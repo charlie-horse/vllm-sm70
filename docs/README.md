@@ -1,6 +1,7 @@
 # Docs
 
-These docs explain the code in this repository and the chip it runs on.
+These docs explain the code in this repository, with only the hardware
+detail needed to use it.
 Anything the code states (versions, options, defaults) is read from the
 code itself; the docs point to where. Rules for writing them:
 [CLAUDE.md](../CLAUDE.md#documentation-policy).

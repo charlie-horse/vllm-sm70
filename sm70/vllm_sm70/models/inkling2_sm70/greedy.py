@@ -2,22 +2,17 @@
 """Inkling 2 on SM70: greedy tokens without the full-vocabulary logits.
 
 The model opts in to the V1 hidden-state sampler (vllm_sm70/sample_v1.py,
-``supports_sm70_topk_sampler``), so an all-greedy batch the F12 fast path
+``supports_sm70_topk_sampler``), so an all-greedy batch the greedy fast path
 admits (vllm_sm70/sample_greedy.py) takes ``get_top_tokens`` in place of
-compute_logits, the fp16 logit all-gather and the Sampler. Batches it does
-not admit (sampling, logprobs, penalties, ...) keep the upstream path; the
-top-k candidate route refuses the soft cap before any work.
-
-``get_top_tokens`` of the logits processor (model.py): the head GEMM, then
-one kernel per shard that soft-caps each logit and keeps the first maximum
-of every run of ``ops/top1.SPLIT_COLS`` columns, an all-gather of those
-(value, id) pairs at TP > 1, and one kernel that picks the first maximal
-pair. Tensors off the GPU, a scale other than 1 and vocabulary padding take
-upstream's ``get_top_tokens``. Same token as upstream's argmax over the
-gathered, soft-capped fp32 logits (lowest id on ties).
-
-VLLM_SM70_INKLING_GREEDY_TOP1=0 withdraws the opt-in: every batch takes
-compute_logits and the upstream Sampler. Read on every step.
+compute_logits, the logit all-gather and the Sampler. Other batches keep the
+upstream path; the top-k candidate route refuses the soft cap.
+``get_top_tokens`` runs the head GEMM, one kernel per shard that soft-caps
+each logit and keeps the first maximum of every ``ops/top1.SPLIT_COLS``
+columns, an all-gather of those pairs at TP > 1, and one kernel that picks
+the first maximal pair: upstream's argmax token (lowest id on ties).
+Tensors off the GPU, a scale other than 1 and vocabulary padding take
+upstream's ``get_top_tokens``. VLLM_SM70_INKLING_GREEDY_TOP1=0 withdraws the
+opt-in; read on every step.
 """
 
 from __future__ import annotations

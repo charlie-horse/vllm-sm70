@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# Shared preflight for the Qwen Phase 2 window scripts. Sourced, not run.
+# Shared preflight for the Qwen GPU check scripts. Sourced, not run.
 # Touches nothing outside $OUT: no systemd, no vllm service, no /etc/nixos.
 # shellcheck shell=bash
 
 QP2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034  # used by m7_e2e.sh
 QP2_REPO="$(cd "$QP2_DIR/../../.." && pwd)"
-QWEN_STAGE="${QWEN_STAGE:-$HOME/vllm-sm70-work/mara/qwen-weights}"
-OUT="${OUT:-$HOME/vllm-sm70-work/bea/qwen-phase2/$(date +%Y%m%dT%H%M)}"
-QP2_GPU_IDLE_MIB="${QP2_GPU_IDLE_MIB:-1024}"   # >1 GiB used => prod still up
+QWEN_STAGE="${QWEN_STAGE:-./qwen-weights}"
+OUT="${OUT:-./out/qwen-phase2/$(date +%Y%m%dT%H%M)}"
+QP2_GPU_IDLE_MIB="${QP2_GPU_IDLE_MIB:-1024}"   # >1 GiB used => a server is still up
 
 # Env defaults (only if unset).
-# v0.33.0 no longer reads VLLM_ATTENTION_BACKEND; the backend goes on the
-# serve command line as --attention-backend.
+# vLLM does not read VLLM_ATTENTION_BACKEND; the backend goes on the serve
+# command line as --attention-backend.
 QP2_ATTN_BACKEND="${QP2_ATTN_BACKEND:-TRITON_ATTN}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
-# The Nix wrapper defaults VLLM_USE_V2_MODEL_RUNNER=0 for Flint (roadmap D2).
+# The Nix wrapper defaults VLLM_USE_V2_MODEL_RUNNER=0 for Flint.
 # DFlash drafts need the V2 runner ("Model Runner V1 does not support: DFlash
 # candidate-head drafts"), so the Qwen scripts run every row on V2.
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -29,7 +29,7 @@ qp2_refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
 
 qp2_require_exec() {  # NAME
   local name="$1" val="${!1:-}"
-  [[ -n "$val" ]] || qp2_refuse "$name is not set (use the Felix-built main venv, e.g. $name=<venv>/bin/...)"
+  [[ -n "$val" ]] || qp2_refuse "$name is not set (use the main venv, e.g. $name=<venv>/bin/...)"
   [[ -x "$val" ]] || qp2_refuse "$name=$val is not an executable file"
 }
 
@@ -49,7 +49,7 @@ qp2_check_gpus_idle() {
     if (( used > QP2_GPU_IDLE_MIB )); then busy+=" GPU$idx=${used}MiB"; fi
   done <<<"$out"
   (( n >= 2 )) || qp2_refuse "need 2 GPUs, nvidia-smi shows $n"
-  [[ -z "$busy" ]] || qp2_refuse "GPU memory in use:$busy (> ${QP2_GPU_IDLE_MIB} MiB). Is prod (vllm/Flint) still up, or LMCache not yet idle? Wait ~2 min after stopping Flint."
+  [[ -z "$busy" ]] || qp2_refuse "GPU memory in use:$busy (> ${QP2_GPU_IDLE_MIB} MiB). Is a server (vllm/Flint) still up, or LMCache not yet idle? Wait ~2 min after stopping it."
 }
 
 # Wait up to SECS for both GPUs to drop to idle; return 1 on timeout.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A fake paged K/V cache for the M12 attention CPU tests.
+"""A fake paged K/V cache for the Inkling 2 attention CPU tests.
 
 One cache tensor in the logical per-layer shape vLLM binds
 ([num_blocks, kv_heads, block_size, 2 * D], here a view of block-compact

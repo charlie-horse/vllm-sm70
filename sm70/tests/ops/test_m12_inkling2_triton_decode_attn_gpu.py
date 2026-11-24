@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 paged decode-attention kernel
+"""Inkling 2 paged decode-attention kernel
 (inkling2_sm70/ops/paged_attention.py) on an SM70 GPU.
 
 The cases of test_m12_inkling2_triton_decode_attn_cpu.py

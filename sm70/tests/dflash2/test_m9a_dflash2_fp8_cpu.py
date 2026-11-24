@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M9a CPU tests: DFlash2 draft channel-FP8 M8 route behind U1/K18.
+"""CPU tests: DFlash2 draft channel-FP8 M8 route behind the FP16 GEMM hook.
 
-No GPU or built _sm70_C: K09's two ops are replaced by CPU references
+No GPU or built _sm70_C: the two QPN8 ops are replaced by CPU references
 (prepare keeps the E4M3 weight and scales; the GEMM dequantizes and
 multiplies in FP32), and the SM70 device check is patched. What this
 covers: row admission, split choice, the quantizer, layer admission and the
-kill switch, route order in the U1 dispatcher, FP8 replacing the FP16
-packing, the verifier gate M7 uses, and the op's fake under FakeTensorMode.
+kill switch, route order in the GEMM dispatcher, FP8 replacing the FP16
+packing, the verifier gate the draft model uses, and the op's fake under
+FakeTensorMode.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def _ref_gemm(out, x, codes, scales, split_k, chains, fast, prefetch):
 
 @pytest.fixture
 def cpu_qpn8(monkeypatch):
-    """K09 ops as CPU references; the CPU counts as SM70; switches on."""
+    """QPN8 ops as CPU references; the CPU counts as SM70; switches on."""
     calls = {"gemm": 0}
 
     def gemm(*args):
@@ -232,7 +233,7 @@ def test_fp8_replaces_fp16_packing(cpu_qpn8, monkeypatch):
     assert getattr(root.a, dflash2_fp8.ROUTE_ATTR, None) is not None
 
     fp16_calls.clear()
-    monkeypatch.setenv(VERIFIER, "0")  # killed: back to K18 FP16 packing
+    monkeypatch.setenv(VERIFIER, "0")  # killed: back to FP16 packing
     c = _linear(64, 256)
     assert dflash2.prepare_marked([c]) == 1
     assert fp16_calls == [c]
@@ -301,7 +302,7 @@ def test_gate_tolerates_missing_configs(_fresh_cfg):
 # ----------------------------------------------------------- marking (vllm)
 def test_mark_draft_linears_sets_fp8_flag(monkeypatch):
     linear = pytest.importorskip("vllm.model_executor.layers.linear")
-    monkeypatch.delenv(K18, raising=False)  # K18 is on by default for Qwen3.8
+    monkeypatch.delenv(K18, raising=False)  # the FP16 GEMM is on by default for Qwen3.8
     monkeypatch.setattr(dflash2, "gemm_available", lambda: True)
     cfg = _vllm_config()
 
@@ -324,7 +325,7 @@ def test_mark_draft_linears_sets_fp8_flag(monkeypatch):
     other.mlp.down_proj = proj()
     (m,) = dflash2.mark_draft_linears(other, vllm_config=cfg)
     assert not getattr(m, dflash2_fp8.FP8_MARK_ATTR, False)
-    # K18's kill switch also stops M9a's flag (the route rides on K18's hook).
+    # The FP16 GEMM kill switch also stops the FP8 flag (it rides on that hook).
     monkeypatch.setenv(K18, "0")
     third = nn.Module()
     third.mlp = nn.Module()

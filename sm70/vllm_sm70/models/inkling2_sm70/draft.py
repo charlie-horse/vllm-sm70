@@ -2,19 +2,16 @@
 """The Inkling 2 DSpark draft: its staged directory, engine check and
 speculator class.
 
-Staged directory: ``config.json`` (model_type ``inkling2_dspark``,
-architecture ``DRAFT_ARCH``, built by ``Inkling2DSparkConfig.from_target``
-from the target's ``mtp_config``) and a symlink to the target's
-``mtp.safetensors``. Stage it with
+Staged directory: ``config.json`` (model_type ``inkling2_dspark``, built by
+``Inkling2DSparkConfig.from_target`` from the target's ``mtp_config``) and a
+symlink to the target's ``mtp.safetensors``. Stage it with
 
     python -m vllm_sm70.models.inkling2_sm70.draft <target dir> <draft dir>
 
 and pass the draft dir as ``"model"`` with ``"method": "dspark"`` in
-``--speculative-config``. The draft's tokenizer is the target's.
-
-``speculative_rejection`` is the engine-config hook's check (config.py).
-``speculator_cls`` answers the U6 platform hook (patches/0006,
-``Sm70CudaPlatform.get_speculator_cls``) for the V2 runner.
+``--speculative-config``. ``speculative_rejection`` is the engine-config
+hook's check; ``speculator_cls`` answers the platform hook
+``Sm70CudaPlatform.get_speculator_cls`` for the V2 runner.
 ``VLLM_SM70_INKLING_DSPARK=0`` turns both off.
 """
 

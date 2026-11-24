@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U2 (patches/0003): the FLA recurrent decode block size on sm_70. CPU only.
+"""patches/0003: the FLA recurrent decode block size on sm_70. CPU only.
 
 What: sm70_recurrent_bv() in vllm/third_party/flash_linear_attention/ops/
-  fused_recurrent.py returns the fork's Volta BV (the largest of 32/16/8
-  that gives >= 2 waves of CTAs on 80 SMs) on compute capability 7.0, and
-  the caller's (upstream) BV on any other GPU or with
-  VLLM_SM70_FLA_RECURRENT_SCHED=0. Both launch sites call it.
+  fused_recurrent.py returns the Volta BV (the largest of 32/16/8 that gives
+  >= 2 waves of CTAs on 80 SMs) on compute capability 7.0, and the caller's
+  (upstream) BV on any other GPU or with VLLM_SM70_FLA_RECURRENT_SCHED=0.
+  Both launch sites call it.
 Needs vLLM's Python source with the patch series applied; skips on an
 unpatched vLLM (CI installs the released wheel).
 """
@@ -26,7 +26,7 @@ V100_SMS = 80
 @pytest.fixture
 def schedule(monkeypatch):
     if not hasattr(fr, "sm70_recurrent_bv"):
-        # CI tests against the released vllm wheel (unpatched), like U1.
+        # CI tests against the released vllm wheel (unpatched).
         pytest.skip("vLLM without patches/0003 (U2)")
     monkeypatch.delenv("VLLM_SM70_FLA_RECURRENT_SCHED", raising=False)
     if not hasattr(fr.triton, "next_power_of_2"):

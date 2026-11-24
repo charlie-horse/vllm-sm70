@@ -1,40 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M6 qwen-fp8-turbomind (MoE): Qwen3.6-35B-A3B block-FP8 routed experts on SM70.
+"""Qwen block-FP8 routed experts on SM70 (TurboMind W8A16).
 
-What: ``Fp8Sm70MoEMethod``, a direct-apply MoE method on M4's shared base
-  (vllm_sm70/fused_moe/method.py): not monolithic, no modular kernel. It
-  creates UP 4ba787e ``Fp8MoEMethod``'s block-quant parameters (fp8.py
-  :530-668: w13/w2 e4m3, w13/w2_weight_scale_inv fp32 [E, N/128, K/128]).
-  ``process_weights_after_loading`` repacks every expert with
-  ``tm.fp8_sm70_prepare`` and builds the strided pointer tables.
-  ``apply`` has three routes:
-  - batched (any M): UP moe_permute_with_scratch, then TurboMind
-    ``fp8_moe_gemm_sm70_out`` for W13, UP silu_and_mul, the W2 batched GEMM,
-    and UP moe_unpermute;
-  - compact decode (M == 1, the default): the fork's legacy compact route,
-    one fused ``fp8_moe_single_token_sm70_out`` launch with exact_layout
-    (FORK fp8_sm70_moe.py:547-554, fork defaults envs.py:8858/9138 and
-    sm70_moe.py:344-347, frozen in M1's CONSTANTS);
-  - decomposed decode (M == 1, compact killed): the active-expert W13 op
-    (``fp8_moe_single_token_dense_w13_sm70_out``, which builds its own slot
-    order), SiLU*up, the indexed W2 stage and moe_unpermute.
-  The output is the local, un-reduced [M, H] fp16; the runner all-reduces.
-  ``Sm70Fp8Config.get_quant_method`` (quant/configs.py) returns it for routed
-  experts when ``is_sm70_ready()``.
-Why: UP's FP8 MoE oracle has no cc 7.0 backend. Ported from FORK cf9492a
-  quantization/fp8_sm70_moe.py:100-649 (Fp8SM70MoEMethod) with
-  fused_moe/sm70/stages.py:18-196 and single_token.py:19-151. Dropped: the
-  compact-compare diagnostics (:348-398), the compact route's decomposed
-  and top-k-descriptor variants (:420-444; CONSTANTS FP8_MOE_COMPACT_
-  DECOMPOSED is False and exact layout is True), the per-expert-dispatch and chunked W2 variants, the
-  non-block (per-tensor) checkpoints, and the dequant-to-FP16 fallback.
-Kill-switch: ``VLLM_SM70_FP8_MOE_DECODE=0`` (``Sm70Config.fp8_moe_decode``)
-  turns off both single-token routes; the batched route then serves M == 1.
-  ``VLLM_SM70_FP8_MOE_COMPACT_DECODE=0`` (``Sm70Config.fp8_moe_compact_
-  decode``) swaps the compact op for the decomposed plan.
-  ``VLLM_SM70_FP8_TURBOMIND=0`` refuses FP8 on SM70 altogether (M2 gate),
-  and get_quant_method then never builds this class.
-"""
+``Fp8Sm70MoEMethod`` is a direct-apply MoE method on the shared base
+(vllm_sm70/fused_moe/method.py). It creates upstream ``Fp8MoEMethod``'s
+block-quant parameters, and ``process_weights_after_loading`` repacks every
+expert with ``tm.fp8_sm70_prepare``. ``apply`` has three routes:
+- batched (any M): permute, TurboMind ``fp8_moe_gemm_sm70_out`` for W13,
+  silu_and_mul, the W2 batched GEMM and moe_unpermute;
+- compact decode (M == 1, default): one fused
+  ``fp8_moe_single_token_sm70_out`` launch with exact_layout;
+- decomposed decode (M == 1, compact off): active-expert W13, SiLU*up,
+  indexed W2 and moe_unpermute.
+The output is the local, un-reduced [M, H] fp16; the runner all-reduces.
+Kill: VLLM_SM70_FP8_MOE_DECODE=0 (batched only),
+VLLM_SM70_FP8_MOE_COMPACT_DECODE=0 (decomposed instead of compact)."""
 
 from __future__ import annotations
 
@@ -75,7 +54,7 @@ REQUIRED_OPS: Final = (
 DECODE_W13_OP: Final = "fp8_moe_single_token_dense_w13_sm70_out"
 DECODE_W2_OP: Final = "fp8_moe_single_token_indexed_dense_stage_sm70_out"
 COMPACT_OP: Final = "fp8_moe_single_token_sm70_out"
-# Frozen fork values (M1 CONSTANTS; FORK config/sm70_moe.py:344-349).
+# Fixed values (config.CONSTANTS).
 COMPACT_EXACT_LAYOUT: Final = bool(CONSTANTS["FP8_MOE_COMPACT_EXACT_LAYOUT"])
 COMPACT_NATIVE_UNPERMUTE: Final = bool(CONSTANTS["FP8_MOE_COMPACT_NATIVE_UNPERMUTE"])
 if not CONSTANTS["FP8_MOE_LEGACY_COMPACT"] or CONSTANTS["FP8_MOE_COMPACT_DECOMPOSED"]:
@@ -103,9 +82,8 @@ def compact_policy_enabled(vllm_config: Any = None) -> bool:
 class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
     """TurboMind W8A16 block-FP8 experts (FP16 activations)."""
 
-    # UP Fp8MoEMethod.__init__ signature (fp8.py:480)
+    # upstream Fp8MoEMethod.__init__ signature
     def __init__(self, quant_config: Any, layer: RoutedExperts) -> None:
-        # ported from FORK fp8_sm70_moe.py:108-125
         check_fp8_sm70_config(quant_config)
         super().__init__(layer.moe_config)
         if self.moe.has_bias:
@@ -131,7 +109,7 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # UP fp8.py:530-668, block branch (== FORK fp8_sm70_moe.py:147-214).
+        # Upstream Fp8MoEMethod.create_weights, block branch.
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = self.weight_block_size
@@ -189,12 +167,7 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        """Repack experts for TurboMind and bind the persistent workspace.
-
-        ported from FORK fp8_sm70_moe.py:216-311 (block branch), with
-        fused_moe/sm70/weight_codec.py:33-60 (per-expert prepare) and
-        workspace.py (persistent buffers, now M4's shared workspace).
-        """
+        """Repack experts for TurboMind and bind the persistent workspace."""
         missing = [name for name in REQUIRED_OPS if not has_tm_op(name)]
         if missing:
             raise RuntimeError(
@@ -288,12 +261,8 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Local (un-reduced) routed output [M, H] fp16.
-
-        ported from FORK fp8_sm70_moe.py:521-647 (minus legacy compact and
-        compare), stages.py:107-196 (batched) and single_token.py:19-151.
-        """
-        del shared_experts, shared_experts_input  # run by the UP runner
+        """Local (un-reduced) routed output [M, H] fp16."""
+        del shared_experts, shared_experts_input  # run by the runner
         hidden = int(layer.sm70_hidden_size)
         inter = int(layer.sm70_intermediate_size)
         experts = int(layer.sm70_num_experts)
@@ -353,11 +322,7 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
 
     @staticmethod
     def _allocate_compact_buffers(layer: Any, top_k: int) -> None:
-        """Per-layer scratch of the compact op (top_k rows of pointer descriptors).
-
-        ported from FORK fused_moe/sm70/workspace.py:75-126 (single-token part)
-        and fp8_sm70_moe.py:274-289 (pointer rows).
-        """
+        """Per-layer scratch of the compact op (top_k rows of pointer descriptors)."""
         dev = layer.w13_tm_weight.device
         row = int(layer.w13_strided_ptrs_w.numel() // layer.sm70_num_experts)
         layer.sm70_fp8_ptr_rows = {
@@ -388,11 +353,10 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
 
     @staticmethod
     def _apply_compact(layer, x, topk_weights, topk_ids, buffers, output):
-        """M == 1 default: one fused legacy compact launch, exact layout.
+        """M == 1 default: one fused compact launch, exact layout.
 
-        ported from FORK fp8_sm70_moe.py:399-410 and :447-490 (exact layout,
-        no fused SiLU/reduce/broadcast/direct-reduce/indexed pointers), with
-        the optional native unpermute at :491-500 (off per CONSTANTS).
+        No fused SiLU/reduce/broadcast/direct-reduce/indexed pointers; the
+        native unpermute is off (CONSTANTS).
         """
         top_k = int(layer.sm70_top_k)
         rows = layer.sm70_fp8_ptr_rows
@@ -452,11 +416,7 @@ class Fp8Sm70MoEMethod(Sm70MoEMethodBase):
         """M == 1 decomposed plan: active-expert W13 (builds its own slot
         order), SiLU*up, indexed W2, moe_unpermute.
 
-        ported from FORK single_token.py:19-151 with plan w13="active_dense",
-        w2="indexed". The fork's effective single-token reduce was the native
-        weighted reduce (M1 CONSTANTS MOE_SINGLE_TOKEN_REDUCE="weighted",
-        awq_moe_single_token_weighted_reduce_out); this fallback uses UP
-        moe_unpermute for the same weighted sum. It only runs with
+        moe_unpermute does the weighted sum. It only runs with
         VLLM_SM70_FP8_MOE_COMPACT_DECODE=0; the compact op is the default.
         """
         tm = _tm()

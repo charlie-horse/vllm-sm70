@@ -6,10 +6,7 @@
 // dispatch is restricted to accepted SM70 tensor/layout contracts and can be
 // disabled with VLLM_SM70_FP8_QPN8=0.
 // See LICENSE.v100-skinny in this directory for the retained MIT notice.
-//
-// vllm-sm70 (K09): vendored from fork cf9492a, trimmed to prepare,
-// dequantize and the M<=32 GEMM, registered in the _sm70_C namespace.
-// PROVENANCE.md lists every change.
+// Source and changes: PROVENANCE.md.
 
 #include <torch/all.h>
 #include <torch/library.h>
@@ -770,10 +767,10 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
-  // K09: M=9..32 with block scales (block-FP8 checkpoints) runs the M<=16
+  // M=9..32 with block scales (block-FP8 checkpoints) runs the M<=16
   // two-row-tile kernel, which reads the per-(K/128, 32-column) scale just
-  // like the M<=8 launch, in 16-row chunks. The fork admitted M>8 for
-  // channel scales only; those keep the fork's pair / two-phase kernels.
+  // like the M<=8 launch, in 16-row chunks. Channel scales use the pair /
+  // two-phase kernels.
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
                   split_k == 32,
               "fp8_qpn8_gemm_sm70_out: unsupported split_k");
@@ -857,8 +854,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   }
 
   // Keep the M=1 reduction order restricted to the two tuned output/down
-  // projections. Extending it to the other split variants changed the frozen
-  // random-sampling token stream without an end-to-end decode win.
+  // projections; the other split variants keep their reduction order.
   if (m == 1 && accumulator_chains == 2 && fast_decoder && !prefetch_codes &&
       (split_k == 12 || split_k == 16)) {
     if (split_k == 12) {
@@ -889,7 +885,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     }                                                                        \
   } while (0)
 
-  // K09: one pass for M<=16; block-scaled M=17..32 runs two 16-row chunks
+  // One pass for M<=16; block-scaled M=17..32 runs two 16-row chunks
   // (each re-reads the weight codes).
   for (int64_t row0 = 0; row0 < m; row0 += 16) {
     const int chunk_m = static_cast<int>(std::min<int64_t>(16, m - row0));
@@ -957,9 +953,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// K09: registration in the _sm70_C namespace (the fork registered these in
-// csrc/torch_bindings.cpp:723-758 under _C with a native_policy argument).
-// Fakes live in vllm_sm70/ops/qpn8.py.
+// Registration in the _sm70_C namespace. Fakes live in vllm_sm70/ops/qpn8.py.
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
   m.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   m.def(

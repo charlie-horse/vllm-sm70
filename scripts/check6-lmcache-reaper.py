@@ -1,53 +1,18 @@
 #!/usr/bin/env python3
 """Regression check 6: LMCache still stores and serves after 1 h of quiet.
 
-Guards nix/patches/lmcache/0001-mp-worker-heartbeat-from-registration.patch.
-Without it, a vLLM worker that sees no prompt of at least one 256-token chunk
-within --worker-registration-grace-seconds (3600 s) of registering is reaped
-by the LMCache MP server while alive and never re-registers, so every later
-STORE is rejected.
+Guards nix/patches/lmcache/0001-mp-worker-heartbeat-from-registration.patch
+(a worker idle past --worker-registration-grace-seconds must not be reaped).
+Operator steps: docs/checks.md. Phases: start (after `systemctl restart vllm`;
+wait for registration, record the anchor), finish (wait to anchor + --wait-min,
+send one long prompt twice with a GPU prefix-cache flood in between, judge),
+run (start + wait + finish), judge (re-judge, e.g. with --journal-file).
 
-Procedure (docs/checks.md has the operator steps):
-
-  start   Run right after the operator's restart,
-          `sudo systemctl restart vllm`
-          (this script never uses sudo). Waits until the API is up and both GPU
-          instances are registered, records the anchor (the last
-          "Registered KV cache" journal line, else the moment registration was
-          observed), checks that no prompt over 200 tokens was served since
-          the vllm start and optionally sends one tiny prompt.
-  finish  Waits until anchor + --wait-min, then sends the same ~11K-token
-          prompt twice (unique per run via a random nonce), evicting vLLM's
-          own GPU prefix cache in between so the second request can only hit
-          through LMCache, and judges.
-  run     start + wait + finish, for tmux/nohup.
-  judge   Re-judges a finished run, e.g. with --journal-file when the
-          journal was not readable without sudo.
-
-PASS iff all of:
-  1. no "Reaped GPU instance" line in `journalctl -u vllm-lmcache` since the
-     vllm start (pinged=True or False);
-  2. /status `registered_gpu_ids` lists --expect-gpus ids after the wait and
-     after the requests;
-  3. request 2 gets an external (KV connector) prefix-cache hit:
-     the vllm:external_prefix_cache_hits counter grows across it, and
-     usage.prompt_tokens_details.cached_tokens > 0 when vLLM reports it.
-TTFT of request 1 vs 2 is printed as supporting information.
-
-The result is INVALID (exit 2, no verdict on the fix) if
-  - vllm restarted, a prompt over 200 tokens or an LMCache store arrived
-    during the quiet period, or the wait was shorter than the server's
-    registration grace plus one reaper interval (the run did not test the
-    bug; ignored with --dry-run); or
-  - the eviction did not take request 1 out of vLLM's GPU prefix cache:
-    the eviction errored, the flood was capped below --flood-factor x the
-    KV capacity, or request 2 got GPU prefix-cache hits and no external
-    ones (criterion 3 was not tested). A reap or a wrong
-    registered_gpu_ids count is still a FAIL.
-
-Exit status: 0 PASS (or SMOKE-PASS with --dry-run), 2 INVALID (or
-SMOKE-INVALID), 1 anything else (FAIL, INCOMPLETE, errors).
-Python 3 stdlib only.
+PASS iff no "Reaped GPU instance" journal line, /status lists --expect-gpus
+ids after the wait and the requests, and request 2 gets an external
+(KV connector) prefix-cache hit. INVALID if the quiet period was broken or
+too short, or the flood did not evict request 1 from the GPU prefix cache.
+Exit status: 0 PASS, 2 INVALID, 1 anything else. Python 3 stdlib only.
 """
 from __future__ import annotations
 

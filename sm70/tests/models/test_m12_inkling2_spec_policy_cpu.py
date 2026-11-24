@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: when a DSpark engine speculates (inkling2_sm70/spec_policy.py).
+"""Inkling 2: when a DSpark engine speculates (inkling2_sm70/spec_policy.py).
 
 CPU only, no model. The batch-size schedule the engine-config hook sets
 from ``sm70.inkling2``, as v0.33's scheduler reads it (its dense lookup);

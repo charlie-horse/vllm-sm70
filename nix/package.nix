@@ -1,6 +1,6 @@
 # Upstream vLLM built for sm_70 (CUDA 12.6) on a uv2nix wheel env.
 #
-# Structure follows charlie-horse/vLLM nix/package.nix + flint.nix @ cf9492a:
+# Structure:
 #   venv  Python deps from ./pyenv/uv.lock (torch 2.14.0+cu126, triton 3.8.0, cp313),
 #         wheels used as-is; native libs come from the wrapper's LD_LIBRARY_PATH.
 #         vLLM itself is not in the venv.
@@ -50,7 +50,7 @@ let
   site = "${buildVenv}/${python.sitePackages}";
 
   # The sm70/ plugin (vllm_sm70 + _sm70_C), built separately so a kernel
-  # edit doesn't rebuild vLLM's tree. Owned by Kai (nix/sm70-ext.nix).
+  # edit doesn't rebuild vLLM's tree (nix/sm70-ext.nix).
   sm70ext = import ./sm70-ext.nix {
     inherit pkgs lib cuda buildVenv site deps;
     vllmSrc = src;
@@ -124,7 +124,7 @@ let
       )}
 
       # nvcc needs a few GB per job: one job per builder core, never more
-      # than 8 (two 16-job CUDA trees hung r440 on 2026-11-04).
+      # than 8.
       export MAX_JOBS=$(( NIX_BUILD_CORES > 8 ? 8 : NIX_BUILD_CORES ))
       ${buildVenv}/bin/python setup.py build_ext --inplace
       runHook postBuild
@@ -191,10 +191,9 @@ let
         # flashinfer_sampler_supported() imports flashinfer before checking
         # the GPU (v1/sample/ops/topk_topp_sampler.py:117-124); flashinfer is
         # not in the env (sm80+), so default it off.
-        # VLLM_USE_V2_MODEL_RUNNER defaults to 0 (V1) until D2 (V1 vs V2 on
-        # Flint) is decided: Flint ran V1 on the fork, and U4's sampler hook
-        # targets V1. Unset, v0.33.0 picks V2 whenever no unsupported feature
-        # is on (config/vllm.py:748-765). Set it to 1 to run V2.
+        # VLLM_USE_V2_MODEL_RUNNER defaults to 0 (V1): the sm70 sampler hook
+        # targets V1. Unset, vLLM picks V2 whenever no unsupported feature is
+        # on (config/vllm.py:748-765). Set it to 1 to run V2.
         for exe in python vllm lmcache; do
           args=(--argv0 ${venv}/bin/python)
           [ $exe = vllm ] && args+=(--add-flags "-m vllm.entrypoints.cli.main")

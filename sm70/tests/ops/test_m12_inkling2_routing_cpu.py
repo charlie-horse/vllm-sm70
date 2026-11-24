@@ -1,24 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 routing kernels (inkling2_sm70/ops/routing.py) and the
-fused routing of moe.py, on CPU.
+"""Inkling 2 routing kernels (inkling2_sm70/ops/routing.py) and the fused
+routing of moe.py, on CPU.
 
-- the kill switch VLLM_SM70_INKLING_FUSED_ROUTING and the route choice:
-  the slot bound, tensors off the GPU, a layer on the torch expert sum;
-- through Triton's interpreter:
-  - the router GEMV against F.linear in fp32;
-  - ``route`` from the same logits against the torch routing (torch_ref.
-    router, moe.route's padding masks): identical ids, weights within
-    1e-6 in fp32, at the tiny and the Inkling 2 Mini sizes, with padding
-    rows; on tied logits against the lowest-id rule of torch.topk on CUDA;
-    the tiny checkpoint's recorded router (layer 1) end to end, which has
-    no tie at the top-k edge;
-  - the slot sort, group offsets and row gather against moe_tm.py's torch
-    sort; ``combine`` against its index_add_ sum;
-  - the module forward on the grouped route and on the TurboMind route (the
-    pure-torch tm of tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py) against
-    the switch-off forward, padding rows zero, without a host sync
-    (inkling2_sync_guard) and with the same ops for two routings.
-
+- the kill switch VLLM_SM70_INKLING_FUSED_ROUTING and the route choice;
+- through Triton's interpreter: the router GEMV against F.linear in fp32;
+  ``route`` against the torch routing (identical ids, weights within 1e-6,
+  padding rows, the lowest-id tie rule, the tiny checkpoint's recorded
+  router); the slot sort, group offsets, row gather and ``combine`` against
+  moe_tm.py; the module forward on the grouped and the TurboMind route
+  against the switch-off forward, padding rows zero, without a host sync.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite). The AOT compile check is
 test_m12_inkling2_triton_sm70_compile_cpu.py; the GPU cases are

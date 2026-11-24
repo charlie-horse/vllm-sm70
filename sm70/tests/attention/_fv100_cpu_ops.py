@@ -30,7 +30,7 @@ class CpuOps:
         return self._decode(name)
 
     def _verify(self, name):
-        # B2: same expanded-row contract as the XQA decode (row b's query at
+        # Same expanded-row contract as the XQA decode (row b's query at
         # position seq_lens[b] - 1), 8 rows per request, 128-key partitions.
         def op(out, q, k, v, table, lens, tmp, mx, es, scale, query_len, launch):
             assert query_len == 8 and q.shape[0] % 8 == 0
@@ -41,7 +41,7 @@ class CpuOps:
             self.calls.append(
                 (name, {"rows": q.shape[0], "launch": launch, "query_len": query_len})
             )
-            # Full attention: B2 takes no window and no sinks.
+            # Full attention: the verify op takes no window and no sinks.
             ref = decode_reference(
                 q, k, v, table, lens, scale=scale, window=FULL, sinks=None
             )

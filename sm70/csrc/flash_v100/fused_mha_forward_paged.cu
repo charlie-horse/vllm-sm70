@@ -2845,8 +2845,6 @@ void launcher_flash_attention_forward_paged(
           page_block_size == 16 ||
           flash_v100::policy::value(
               flash_v100::policy::Field::prefill_contig_fast_off);
-      // Default only for the measured hybrid-cache page size. Other
-      // page sizes retain the prior layout unless explicitly enabled.
       const bool use_low_smem_output_stride_268 =
           page_block_size == 784
               ? flash_v100::policy::value(
@@ -2956,7 +2954,7 @@ static at::Tensor prefill_paged_forward(
               "anchor_lens and a positive anchored_window must be provided "
               "together");
   const bool use_anchored = anchor_lens.has_value();
-  // K05 lean build: the anchored-SWA kernels are not compiled.
+  // The anchored-SWA kernels are not compiled.
   TORCH_CHECK(!use_anchored,
               "Flash-V100 (K05 lean build) has no anchored prefill window");
   const int* anchor_lens_ptr = nullptr;

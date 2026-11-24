@@ -1,51 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM70 CUDA-graph capture sizes and graph-memory profiling (T8, T9).
+"""SM70 CUDA-graph capture sizes and graph-memory profiling.
 
-What: on the Flash-V100 compile path, replace upstream's default CUDA-graph
-  capture sizes with the fork's SM70 tables, and (V1 runner only) turn off
-  upstream's CUDA-graph memory estimate in the KV budget.
-  - No speculative decoding: {1, 2, 4, 8, 16, 32} up to min(max_num_seqs,
-    32), plus 1, 2 and that cap. max_num_seqs=20 gives [1, 2, 4, 8, 16, 20];
-    upstream gives [1, 2, 4, 8, 16, 20, 24, 32, 40] (2 x max_num_seqs, UP
-    config/vllm.py:2398-2611).
-  - Speculative decoding (k draft tokens, q = k + 1): q x {1, 2, 3, 4, 6, 8,
-    12, 16} up to min(max_num_seqs, 32), plus q x that cap, plus the
-    auxiliary sizes {1, 2, 4, 8, 9, 18} and the mixed prefill+verify sizes
-    {64, 96, 128, 160, 192, 256}.
-  - max_cudagraph_capture_size: the largest of those sizes that is
-    <= max_num_batched_tokens.
-  - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 when the V1 model runner is
-    used and the variable is unset (upstream default 1, UP envs.py:2219).
-Why: fork parity. Port of FORK vllm/platforms/runtime_defaults.py:22-33
-  (tables), :200-251 (size functions) and :549-603, :636-642 (applied for
-  cc 7.0 under the Flash-V100 0.0.3 compile graph). B32 is the largest
-  concurrency the fork validated end to end on SM70; fewer sizes also mean
-  less graph memory and a shorter capture.
-  The fork's MTP split-draft sizes (VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS,
-  default off there) and its Flash-V100 small-q auto-raise (only when
-  k + 1 > 16; c4130's DFlash2 has k + 1 = 8) are not ported.
-When it applies (all must hold; else upstream sizing is untouched):
-  - VLLM_SM70_GRAPH_CAPTURE_SIZES is not "0" (sizes) /
-    VLLM_SM70_GRAPH_MEMORY_POLICY is not "0" (memory estimate);
-  - a model config, no enforce_eager, cudagraph_mode not NONE,
-    TORCH_COMPILE_DISABLE and VLLM_USE_BREAKABLE_CUDAGRAPH not on (fork
-    rule: compile not disabled by the user);
-  - the Flash-V100 baseline: VLLM_SM70_FLASH_V100 is not "0" and no
-    attention backend other than CUSTOM (Flash-V100) was chosen;
-  - sizes only: the user set neither cudagraph_capture_sizes nor
-    max_cudagraph_capture_size (an explicit --compilation-config always
-    wins), and no dynamic speculative-decoding schedule is configured;
-  - memory only: the V1 model runner, and the user did not set
-    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS.
-Hook: Sm70CudaPlatform.apply_config_platform_defaults, which upstream calls
-  in VllmConfig.__post_init__ (UP config/vllm.py:1825) before
-  _set_cudagraph_sizes (:2013), so the sizes go through upstream's own
-  filtering (<= max_num_batched_tokens) and the V1 spec-decode rounding.
-Note: the TurboMind pre-capture warmup plans one call per capture size, so a
-  GEMM LUT exported with other capture sizes does not cover these (re-export).
+On the Flash-V100 compile path, replace upstream's default CUDA-graph
+capture sizes with the SM70 tables below (fewer sizes: less graph memory,
+shorter capture), and (V1 runner only) set
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 when it is unset.
+Not applied (see the *_rejection functions) under enforce_eager,
+cudagraph_mode NONE, a disabled compile, a non-Flash-V100 attention
+backend, or explicit user capture sizes.
 
-This module imports nothing from vllm at import time.
-"""
+Called from Sm70CudaPlatform.apply_config_platform_defaults, before
+upstream's _set_cudagraph_sizes, so the sizes still go through upstream's
+filtering (<= max_num_batched_tokens) and spec-decode rounding. A GEMM LUT
+exported with other capture sizes does not cover these sizes.
+This module imports nothing from vllm at import time."""
 
 from __future__ import annotations
 
@@ -60,13 +28,12 @@ SIZES_SWITCH = "VLLM_SM70_GRAPH_CAPTURE_SIZES"
 MEMORY_SWITCH = "VLLM_SM70_GRAPH_MEMORY_POLICY"
 UPSTREAM_MEMORY_ENV = "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
 
-# FORK runtime_defaults.py:22-33.
 NOMTP_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 SPEC_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 SPEC_AUX_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 # Mixed steps that join a short prompt to the resident verifier rows.
 SPEC_MIXED_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
-# B32: largest concurrency with end-to-end SM70 graph validation (fork).
+# Largest request count that gets SM70 graph sizes.
 MAX_GRAPH_REQS = 32
 
 
@@ -75,7 +42,7 @@ def _graph_reqs(max_num_seqs: int) -> int:
 
 
 def nomtp_capture_sizes(max_num_seqs: int) -> list[int]:
-    """FORK _sm70_nomtp_cudagraph_capture_sizes (runtime_defaults.py:200)."""
+    """{1, 2, 4, 8, 16, 32} up to min(max_num_seqs, 32), plus 1, 2 and that cap."""
     cap = _graph_reqs(max_num_seqs)
     sizes = {s for s in NOMTP_CAPTURE_SIZES if s <= cap}
     sizes.update((1, 2, cap))
@@ -83,7 +50,7 @@ def nomtp_capture_sizes(max_num_seqs: int) -> list[int]:
 
 
 def speculative_capture_sizes(max_num_seqs: int, decode_query_len: int) -> list[int]:
-    """FORK _sm70_speculative_cudagraph_capture_sizes (runtime_defaults.py:234)."""
+    """q x request sizes up to the cap, plus q x cap, aux and mixed sizes (q = k + 1)."""
     cap = _graph_reqs(max_num_seqs)
     reqs = {s for s in SPEC_REQUEST_SIZES if s <= cap}
     reqs.add(cap)
@@ -101,10 +68,10 @@ def capture_sizes(max_num_seqs: int, num_speculative_tokens: int = 0) -> list[in
 
 
 def max_capture_size(sizes: Iterable[int], max_num_batched_tokens: int) -> int:
-    """FORK _sm70_max_cudagraph_capture_size (runtime_defaults.py:212).
+    """The largest size <= max_num_batched_tokens.
 
     Upstream drops sizes above max_num_batched_tokens; a larger cap would
-    then contradict the sizes and fail validation (UP config/vllm.py:2612).
+    then contradict the sizes and fail validation.
     """
     return max(s for s in sizes if s <= max_num_batched_tokens)
 
@@ -199,7 +166,7 @@ def _info_once(fmt: str, *args: Any) -> None:
 
 
 def apply(vllm_config: Any) -> None:
-    """Apply T8 and T9 to a VllmConfig before upstream sizes its graphs."""
+    """Apply the capture sizes and memory policy before upstream sizes graphs."""
     reason = sizes_rejection(vllm_config)
     if reason is None:
         sched = vllm_config.scheduler_config
@@ -226,8 +193,8 @@ def apply(vllm_config: Any) -> None:
         return  # a rebuilt VllmConfig in this process: already applied
     reason = memory_rejection(vllm_config)
     if reason is None:
-        # Read by the workers' memory profiler (UP v1/worker/gpu_worker.py:
-        # 719-723); they are spawned after this, so they inherit it.
+        # Read by the workers' memory profiler; they are spawned after this,
+        # so they inherit it.
         os.environ[UPSTREAM_MEMORY_ENV] = "0"
         _memory_env_written = True
         _info_once(

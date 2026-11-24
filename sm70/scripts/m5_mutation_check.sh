@@ -1,47 +1,26 @@
 #!/usr/bin/env bash
-# M5 mutation check (Quinn): T4d and T7 must FAIL on planted bugs.
-# Runs each GPU gate node with each mutation (one pytest process per run,
-# M5_MUTATION set, sm70/tests/models/m5_mutations first on PYTHONPATH so its
-# sitecustomize patches the fused q/k-norm+RoPE+KV op in every process) and
-# PASSes only if every REQUIRED mutated run fails the GATE:
-#   - pytest exit != 0, junit: tests > 0, failures > 0, errors == 0,
-#     skipped == 0 (a crash or a skip does not count as catching the bug);
-#   - the failure message is the gate's ("outside ... the fork");
-#   - the mutation demonstrably took effect: hook mutations print
-#     "M5_MUTATION <name> installed in pid N" from >= 3 processes (pytest +
-#     2 TP workers; 2 for moe_decode_scale) AND "M5_MUTATION <name> fired in
-#     pid N" at least once (it actually changed a call); rope_theta_1p01
-#     prints its hf_overrides line.
-# Mutations (sm70/tests/models/m5_mutations/m5_mutation.py) and the nodes
-# that MUST catch them (Quinn/Astro, Nov 6):
-#   rope_pos_decode  positions + 1 on <= 8-token fused-op calls   -> t4d t7
-#   kv_slot_decode   slot_mapping + 1 on <= 8-token fused-op calls -> t4d t7
-#   moe_decode_scale K12 M<=2 MoE decode output x 1.01            -> t4d
-#                    (caught by T4d's pooled-mean gate; Quinn, Nov 7)
-#   moe_decode_scale_half  the same x 1.005                       -> INFO only
-#                    (probe of the sensitivity floor, never required)
-#                    (both T7 arms run the same MoE, so T7 cannot see it)
-#   rope_theta_1p01  rope_theta x 1.01 via hf_overrides            -> INFO only
-#                    (too weak at ~70-token positions; reported, not gated)
+# Mutation check: T4d and T7 must FAIL on planted bugs. Runs each gate node
+# once per mutation (sm70/tests/models/m5_mutations first on PYTHONPATH, so
+# its sitecustomize patches the fused q/k-norm+RoPE+KV op in every process).
+# A required run counts as caught only if pytest fails with failures > 0,
+# errors == skipped == 0, the gate's own failure message, and the mutation
+# printed "installed" (from every process that runs the op) and "fired".
+# Required catches (MUST below): rope_pos_decode and kv_slot_decode by t4d
+# and t7, moe_decode_scale by t4d (both T7 arms run the same MoE).
+# moe_decode_scale_half and rope_theta_1p01 are INFO only: reported, never
+# required (moe_decode_scale_half must still apply and fire).
 # The unmutated T4d/T7 must PASS first (m5_window.sh, or M5_BASELINE=1 here).
-#
-# Required env: as m5_window.sh (VLLM_PY, FLINT_SM70_CHECKPOINT,
-# FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR).
-# Optional: OUT, M5_MUTATIONS (subset, default all three), M5_MUTATION_NODES
-# (default "t4d t7"), M5_BASELINE=1 (also run both nodes unmutated, must PASS).
+# Required env: as m5_window.sh. Optional: OUT, M5_MUTATIONS (subset),
+# M5_MUTATION_NODES (default "t4d t7"), M5_BASELINE=1.
 set -uo pipefail
 
-# Deterministic kernel choice (Quinn/Astro, Nov 6): TurboMind's small-shape
-# autotune times kernels at engine start, so each instance may pick different
-# kernels (Bea: 7/8 prompts split between two eager instances; identical with
-# tuning off). Until Kai's persisted tuning table lands, every M5 gate runs
-# with it off, on both stacks. M5_ALLOW_TUNING=1 opts out (diagnostics only).
+# TurboMind's small-shape autotune picks kernels per engine start, so engine
+# instances can differ; the gates run with it off unless M5_ALLOW_TUNING=1.
 if [[ "${M5_ALLOW_TUNING:-0}" != 1 ]]; then
   for q in NVFP4 FP8 AWQ MXFP4; do export "VLLM_SM70_${q}_TUNE_SMALL_SHAPES=0"; done
 fi
-# Quinn (Nov 7, after #87): a gate may run with tuning on only against a
-# persisted TurboMind LUT in strict mode, so a missing or stale LUT fails
-# instead of silently re-tuning per engine.
+# Tuning on is allowed only with a persisted TurboMind LUT in strict mode, so
+# a missing or stale LUT fails instead of re-tuning per engine.
 if [[ "${M5_ALLOW_TUNING:-0}" == 1 && -n "${VLLM_SM70_GEMM_LUT_PATH:-}" \
       && "${VLLM_SM70_GEMM_LUT_STRICT:-}" != 1 ]]; then
   echo "M5_ALLOW_TUNING=1 with VLLM_SM70_GEMM_LUT_PATH set needs VLLM_SM70_GEMM_LUT_STRICT=1"
@@ -58,7 +37,7 @@ F=sm70/tests/models/test_m5_flint_sm70.py
 MUT_DIR=sm70/tests/models/m5_mutations
 [[ -f "$F" && -f "$MUT_DIR/sitecustomize.py" ]] || { echo "run from the repo root"; exit 2; }
 MUT_DIR="$(cd "$MUT_DIR" && pwd)"
-OUT="${OUT:-$HOME/vllm-sm70-work/bea/m5-mutation/$(date +%Y%m%dT%H%M)}"
+OUT="${OUT:-./out/m5-mutation/$(date +%Y%m%dT%H%M)}"
 mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 2; }
 
 declare -A NODE=(
@@ -78,7 +57,7 @@ read -r -a NODES <<< "${M5_MUTATION_NODES:-t4d t7}"
 
 used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; }
 if used_mib | awk '$1 > 1024 {busy=1} END {exit !busy}'; then
-  echo "a GPU has >1 GiB in use (is prod still up?):"; used_mib; exit 2
+  echo "a GPU has >1 GiB in use (is a server still running?):"; used_mib; exit 2
 fi
 
 junit_counts() {  # XML -> "tests failures errors skipped first-failure-message"
@@ -149,8 +128,8 @@ for mut in "${MUTS[@]}"; do
       need=3
     fi
     tag=""; [[ $info -eq 1 ]] && tag="INFO "
-    # Fired, not just installed (Quinn): the wrapper prints "fired" the first
-    # time it changes a call in a process; the TP workers run the op.
+    # Fired, not just installed: the wrapper prints "fired" the first time it
+    # changes a call in a process; the TP workers run the op.
     fired=1
     if [[ $mut != rope_theta_1p01 ]]; then
       fired=$(grep -oE "M5_MUTATION $mut fired in pid [0-9]+" "$log" | sort -u | wc -l)
@@ -169,7 +148,7 @@ for mut in "${MUTS[@]}"; do
       VERDICT[$name.$mut]="${tag}NOT CAUGHT (rc $RUN_RC, tests=$n failures=$f errors=$e skipped=$k): $msg"
     fi
     # The INFO probe moe_decode_scale_half need not be caught, but must still
-    # be applied and fire: more evidence that K12 decode runs in this build.
+    # be applied and fire: evidence that the M<=2 MoE decode path runs.
     v=${VERDICT[$name.$mut]}
     if [[ $mut == moe_decode_scale_half && ( $v == *"NOT APPLIED"* || $v == *"NOT FIRED"* ) ]]; then
       rc=1

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Flash-V100 attention backend (K06) over the K05 `_sm70_C::fv100_*` ops.
+"""Flash-V100 attention backend over the `_sm70_C::fv100_*` ops.
 
   backend.py   FlashAttnV100Backend (class flags, KV layout, block sizes)
   metadata.py  FlashAttnV100Metadata(+Builder): decode/prefill split, groups

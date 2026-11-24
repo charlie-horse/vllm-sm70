@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""U1 (patches/0001): platform GEMM and warmup hooks in upstream vLLM."""
+"""patches/0001: platform GEMM and warmup hooks in upstream vLLM."""
 
 import inspect
 

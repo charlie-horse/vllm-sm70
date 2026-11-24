@@ -222,7 +222,7 @@ recorded.
 ## Greedy identity
 
 Sends fixed prompts greedily and checks the answers match a base recorded
-on a gated build (e.g. `scripts/checks/greedy/base-prod-cef0f9e.json`).
+on a gated build.
 
 ```sh
 G=scripts/checks/greedy

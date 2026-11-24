@@ -4,7 +4,7 @@
 # P instances in parallel (default 2, or env P); resumable (skips done_
 # markers); up to 3 passes so instances killed by the memory watchdog are
 # re-run after the others.
-# Env knobs (unset = previous behavior; also read by run_one.sh/watchdog.sh):
+# Env knobs (unset = default; also read by run_one.sh/watchdog.sh):
 #   RUN_DIR=$R/runs  run root (attA/ and driver.log live here)
 #   P=2              parallel instances
 #   CPUSET=0-15      pin driver, agents and the podman service (taskset -c)
@@ -22,7 +22,7 @@ if [ "${_FLINT_RUN_ALL_CHILD:-}" != 1 ]; then
   echo "driver started (pid $!), log: $RUN_DIR/driver.log"
   exit 0
 fi
-# lock per run dir; the default run dir keeps the old lock name
+# lock per run dir; the default run dir uses driver_attA.lock
 LOCK=$ST/driver_att$A.lock
 if [ "$RUN_DIR" != "$R/runs" ]; then
   LOCK=$ST/driver_$(echo "${RUN_DIR#"$R"/}" | tr / _)_att$A.lock

@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 small decode kernels (inkling2_sm70/ops/small_ops.py) and
-the route of fused_small.py, on CPU.
+"""Inkling 2 small decode kernels (inkling2_sm70/ops/small_ops.py) and the
+route of fused_small.py, on CPU.
 
 - the kill switch VLLM_SM70_INKLING_FUSED_SMALL_OPS and the route choice:
   decode-only batches only, tensors off the GPU, only "0" turns it off;
-- through Triton's interpreter, each against the torch ops it replaces:
-  - ``query_rel`` (q and r clips, tau, r @ rel_proj, padding rows) at the
-    Inkling 2 Mini sizes and through ``prologue.attention_prologue`` with
-    the paged caches of tests/ops/_inkling2_sconv.py;
-  - ``gate`` and the gate of ``attention_torch.attention_with_metadata``
-    with and without the output projection;
-  - the TurboMind SwiGLU of moe_tm.py (pure-torch tm of
-    tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py) and the module forward
-    of a decode-only batch;
-  - the short conv without its padding mask on inputs that are zero there;
-  - padding rows zero in every output.
+- through Triton's interpreter, against the torch ops they replace:
+  ``query_rel`` (also through ``prologue.attention_prologue`` on paged
+  caches), ``gate`` with and without the output projection, the TurboMind
+  SwiGLU of moe_tm.py and the module forward of a decode-only batch, the
+  short conv without its padding mask, padding rows zero in every output.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite). The AOT compile check is

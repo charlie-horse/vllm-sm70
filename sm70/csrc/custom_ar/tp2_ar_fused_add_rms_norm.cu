@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// K17 (C6): TP2 custom all-reduce with fused_add_rms_norm as its epilogue,
-// built into _sm70_C against upstream vLLM's own custom all-reduce headers.
-//
-// Ported from fork cf9492a csrc/custom_all_reduce.cu: kernel L505-651
-// (sm70_tp2_cross_device_reduce_fused_add_rms_norm), host L1011-1095
-// (tp2_all_reduce_fused_add_rms_norm), fork commits 45896b591 and 9f175fc6e.
-// See PROVENANCE.md for the function map and what changed.
+// TP2 custom all-reduce with fused_add_rms_norm as its epilogue, built into
+// _sm70_C against upstream vLLM's own custom all-reduce headers. Source:
+// PROVENANCE.md.
 //
 // Upstream's CustomAllreduce lives in vLLM's _C_custom_ar .so. This file gets
 // its handle and reads it through the pinned upstream headers; the ABI pins
 // and the staged start barrier are in custom_ar_common.cuh, shared with the
-// F12 top-1 exchange (top1_custom_ar.cu).
+// top-1 exchange (top1_custom_ar.cu).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -53,16 +49,14 @@ static_assert((kMaxRows + kRowsPerCta - 1) / kRowsPerCta <= vllm::kMaxBlocks);
 //   - rsqrtf(variance / hidden_size + epsilon), out = fp16(x * inv * w).
 // With Sum2 each rank first adds its two inputs in FP16 (__hadd), as the
 // elementwise add that would otherwise feed the collective does.
-//
-// R5 fix (fork 9f175fc6e): the peer never reads the caller's tensors. Each
-// rank stores its (summed) input into its own staging buffer, the
-// communicator's eager buffer IPC-registered at init (buffers_), and reads
-// the peer's staging copy after the start barrier. Nothing goes into
-// graph_unreg_buffers_, so operands may live anywhere (expandable segments,
-// cuMem pools, static buffers) and the op is the same eagerly, in capture
-// warmup and under FULL or PIECEWISE capture. The end flag is published once
-// the peer data is consumed and awaited after the norm, so a rank cannot
-// rewrite its staging buffer while the peer still reads it.
+
+// Each rank stores its (summed) input into its own staging buffer (buffers_,
+// IPC-registered at init) and reads the peer's staging copy after the start
+// barrier; nothing goes into graph_unreg_buffers_. So operands may live
+// anywhere and the op is the same eagerly and under FULL or PIECEWISE
+// capture. The end flag is published once the peer data is consumed and
+// awaited after the norm, so no rank rewrites its staging buffer while the
+// peer still reads it.
 template <bool Sum2>
 __global__ void __launch_bounds__(kRowThreads* kRowsPerCta, 1)
     tp2_cross_device_reduce_fused_add_rms_norm(
@@ -268,8 +262,6 @@ void tp2_all_reduce_fused_add_rms_norm(
 }  // namespace vllm_sm70::custom_ar
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp (45896b591) custom_ar.def, same schema with
-  // the outputs marked as distinct aliases.
   m.def(
       "tp2_all_reduce_fused_add_rms_norm(int fa, Tensor inp, Tensor? inp_b, "
       "Tensor residual, Tensor weight, Tensor(a!) normalized_out, "

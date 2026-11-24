@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""G2c: the M4 compact slot route (#97) on vs off, teacher-forced, at TP2.
+"""The compact MoE slot route (VLLM_SM70_FLINT_MOE_COMPACT) on vs off,
+teacher-forced, at TP2: the correctness gate for that route.
 
-Written by Bea for the #97 A/B (a3dc3b2, build l56dj370). It is the
-correctness gate for the VLLM_SM70_FLINT_MOE_COMPACT route; this file
-commits it so the gate can be reproduced (Quinn).
-
-Same harness and limits as M10a's G2 (test_m10_flint_router.py) and M5's
-T4a: teacher-forced decode logprobs (sm70/scripts/m5_teacher_forced.py) of
-"on" vs "off" within 1.5x the fork's eager_vs_graphs anchor per set (mean
-and max). The difference is batching: max_num_seqs 4 with the forced
-sequences decoding together, so decode steps at M = 3..4 give M*top_k = 18..24
-slots and take the compact route (M <= 2 stays on K12). G2 uses
-max_num_seqs 1, which never reaches it.
-
-Free-running greedy equality is not gated (Quinn, #86 and #97): compact
-changes the grouping, not the math, but near-tie top-6 flips still diverge
+Same harness and limits as test_m10_flint_router.py and T4a in
+test_m5_flint_sm70.py: teacher-forced decode logprobs
+(sm70/scripts/m5_teacher_forced.py) of "on" vs "off" within 1.5x the fork's
+eager_vs_graphs anchor per set (mean and max). max_num_seqs 4 makes decode
+steps at M = 3..4 (M*top_k = 18..24 slots) take the compact route; M <= 2
+stays on the MoE decode kernel. Free-running greedy equality is not gated:
+compact changes the grouping, not the math, but near-tie flips diverge
 free runs.
 
-Needs 2 V100s, FLINT_SM70_CHECKPOINT, FLINT_SM70_T4_SEQS_DIR and
+Needs 2 GPUs, FLINT_SM70_CHECKPOINT, FLINT_SM70_T4_SEQS_DIR and
 FLINT_SM70_T4_ENVELOPE. Otherwise it is skipped.
 """
 
@@ -60,7 +54,7 @@ T4_READY = bool(
 
 @functools.cache
 def _m5_tests():
-    """M5's test module (T4 harness helpers: sequence sets, fork envelope,
+    """test_m5_flint_sm70.py (T4 harness helpers: sequence sets, fork envelope,
     scoring LLM, per-set gate), loaded by path under a private name."""
     path = pathlib.Path(__file__).with_name("test_m5_flint_sm70.py")
     spec = importlib.util.spec_from_file_location("_m5_t4_harness", path)
@@ -77,7 +71,7 @@ def _m5_tests():
     reason="set FLINT_SM70_T4_SEQS_DIR and FLINT_SM70_T4_ENVELOPE (fork calibration)",
 )
 def test_g2c_ckpt_tp2_compact_on_off_within_envelope(monkeypatch, capfd):
-    """Teacher-forced decode, M4 compact on vs off, batched (max_num_seqs 4),
+    """Teacher-forced decode, compact route on vs off, batched (max_num_seqs 4),
     within 1.5x the fork's eager_vs_graphs anchor per set. Each arm's worker
     log must show its route decision (enabled / DISABLED)."""
     m5 = _m5_tests()

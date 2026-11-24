@@ -1,25 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: decode-only batches are ready for a FULL CUDA graph.
+"""Inkling 2: decode-only batches are ready for a FULL CUDA graph.
 
-On the tiny checkpoint (fixtures/inkling2_tiny), driven by the paged engine
-harness under FULL_DECODE_ONLY with the metadata a FULL graph gets (padded
-slot mapping, padded requests):
-
-- at one padded size the real rows of a decode step do not depend on the
-  padding or on the other requests: bit-identical whether the step pads
-  one request or holds two; against the same step unpadded they differ only
-  by the GEMM rounding of another row count (CPU: <= 1.5e-6 in fp32, one
-  fp16 ulp in fp16);
-- a padded decode step has no host sync and its op trace (every op with the
-  shapes and dtypes of its outputs, ``inkling2_sync_guard``) depends on the
-  padded batch size and the block-table width alone: steps at other
-  positions and with another number of real requests launch the same ops
-  on the same allocation sizes, as a replayed graph does;
-- VLLM_SM70_INKLING_DECODE_GRAPH=0 takes the ops of mixed batches again;
+Tiny checkpoint, paged engine harness under FULL_DECODE_ONLY with FULL-graph
+metadata (padded slot mapping, padded requests):
+- at one padded size a decode step's real rows do not depend on the padding
+  or the other requests (bit-identical); unpadded they differ only by GEMM
+  rounding of another row count;
+- a padded decode step has no host sync, and its op trace
+  (``inkling2_sync_guard``) depends only on the padded batch size and the
+  block-table width, as a replayed graph needs;
+- VLLM_SM70_INKLING_DECODE_GRAPH=0 takes the ops of mixed batches;
 - the TurboMind workspace refuses to grow inside a capture.
-
-The engine-config hook's mode selection is in
-test_m12_inkling2_config_cpu.py; capture and replay on a GPU in
+Mode selection: test_m12_inkling2_config_cpu.py; GPU capture and replay:
 test_m12_inkling2_decode_graph_gpu.py.
 """
 

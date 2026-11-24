@@ -20,7 +20,7 @@ patterns = [
   '''(?i)tp4''',                  # TP4 paths dropped
   '''(?i)1cat|onecat''',          # 1Cat env/policy indirection
   '''(?i)native_policy''',
-  '''^_SHAPES$''',                # M9a: fork sm70_dflash2_fp8.py TP4 shape->split table, replaced by split_for(k)
+  '''^_SHAPES$''',                # TP4 shape->split table in sm70_dflash2_fp8.py; the port uses split_for(k)
 ]
 
 # Port names that are expected to be new (no fork counterpart).
@@ -75,12 +75,10 @@ name = "ns: namespace vllm -> namespace vllm_sm70"
 lang = "cpp"
 pattern = '''\bnamespace\s+vllm\b'''
 repl = "namespace vllm_sm70"
-# Exemption (PR #12, K02): the vendored TurboMind tree keeps the fork's C++
-# namespaces (vllm::sm70, vllm::awq_sm70) verbatim so 106 files stay
-# byte-identical to cf9492a. Safe: upstream v0.33.0 csrc/ defines no
-# vllm::sm70 / vllm::awq_sm70 / turbomind namespace, so no symbol in
-# _sm70_C can collide with upstream _C. Covers the whole tree (ops/ keeps
-# the namespaces too), not only lmdeploy/**.
+# Exempt: the vendored TurboMind tree (ops/ included) keeps its C++
+# namespaces (vllm::sm70, vllm::awq_sm70) so its files stay byte-identical
+# to the source. Upstream csrc/ defines none of these namespaces, so no
+# symbol in _sm70_C collides with upstream _C.
 exclude_paths = ["*/sm70/csrc/turbomind/*", "*/csrc/sm70_turbomind/*", "*/csrc/sm70_policy.h"]  # fork sm70_policy.h -> turbomind/ops/tm_config.h
 
 [[rule]]
@@ -88,12 +86,10 @@ name = "ns: vllm:: -> vllm_sm70::"
 lang = "cpp"
 pattern = '''(?<![\w:])vllm::'''
 repl = "vllm_sm70::"
-# Exemption (PR #12, K02): the vendored TurboMind tree keeps the fork's C++
-# namespaces (vllm::sm70, vllm::awq_sm70) verbatim so 106 files stay
-# byte-identical to cf9492a. Safe: upstream v0.33.0 csrc/ defines no
-# vllm::sm70 / vllm::awq_sm70 / turbomind namespace, so no symbol in
-# _sm70_C can collide with upstream _C. Covers the whole tree (ops/ keeps
-# the namespaces too), not only lmdeploy/**.
+# Exempt: the vendored TurboMind tree (ops/ included) keeps its C++
+# namespaces (vllm::sm70, vllm::awq_sm70) so its files stay byte-identical
+# to the source. Upstream csrc/ defines none of these namespaces, so no
+# symbol in _sm70_C collides with upstream _C.
 exclude_paths = ["*/sm70/csrc/turbomind/*", "*/csrc/sm70_turbomind/*", "*/csrc/sm70_policy.h"]  # fork sm70_policy.h -> turbomind/ops/tm_config.h
 
 # --- native_policy argument removed ----------------------------------------
@@ -122,7 +118,7 @@ lang = "all"
 pattern = ''',\s*(native_policy\s*=\s*)?native_policy\b'''
 repl = ""
 
-# --- M9a (PR #92): fork quantization/sm70_dflash2_fp8.py -> vllm_sm70/ops/dflash2_fp8.py ---
+# --- quantization/sm70_dflash2_fp8.py -> vllm_sm70/ops/dflash2_fp8.py ---
 
 [[rule]]
 name = "M9a: _fp8_rows -> fp8_rows (public: the U1 dispatcher and tests use it)"

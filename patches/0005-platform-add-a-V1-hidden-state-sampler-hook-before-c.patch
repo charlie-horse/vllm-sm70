@@ -10,8 +10,8 @@ What: Adds Platform.get_hidden_state_sampler() (default None). Before
   uses it. None keeps compute_logits and the upstream Sampler. Spec
   decode and structured output batches never reach the hook.
 Why: Out-of-tree platforms (the vllm-sm70 plugin) need to sample from TP-
-  local top-k candidates without a full-vocab lm_head (Flint sampler,
-  K16); logits are built at vllm/v1/worker/gpu_model_runner.py:4208 and
+  local top-k candidates without a full-vocab lm_head (Flint sampler);
+  logits are built at vllm/v1/worker/gpu_model_runner.py:4208 and
   consumed by _sample at :4306.
 Upstream-files: vllm/platforms/interface.py, vllm/v1/worker/gpu_model_runner.py
 Kill-switch: hook returns None -> upstream (no plugin, or VLLM_SM70_FLINT_SAMPLER=0)

@@ -1,24 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 on SM70: the packed routed-expert tensors of one TP rank.
 
-Checkpoint layout per layer, under ``model.llm.layers.N.mlp.experts.``
-(E experts, H hidden, I intermediate):
-
-- ``w13_weight`` [E, 2I, H] values: row ``2i`` is gate ``i``, row ``2i + 1``
-  is up ``i``. ``w2_weight`` [E, H, I] values.
-- NVFP4: uint8, two E2M1 codes per byte along the last axis (even element in
-  the low nibble); ``_scale`` e4m3, one per 16 values along the last axis;
-  ``_amax`` [E] and ``_outer_scale_denominator`` [1] fp32.
-  value = E2M1[code] * scale * (amax[e] / denominator).
-- MXFP8: e4m3 values; ``_scale`` uint8, one per 32 values along the last
-  axis. value = weight * 2 ** (scale - 127).
-
-A rank keeps intermediate units ``[I/tp * rank, I/tp * (rank + 1))``: those
-gate/up row pairs of ``w13`` and those columns of ``w2``. Everything returned
-is gate-first: ``w13`` rows are the local gates, then the local ups.
-
-``Inkling2ExpertLoader`` is the ``expert_loader`` callback of weights.py; it
-hands each complete layer to a sink as an ``ExpertLayer``.
+Checkpoint layout under ``model.llm.layers.N.mlp.experts.`` (E experts, H
+hidden, I intermediate): ``w13_weight`` [E, 2I, H] (row 2i gate i, row 2i + 1
+up i) and ``w2_weight`` [E, H, I].
+- NVFP4: uint8, two E2M1 codes per byte (even element in the low nibble);
+  ``_scale`` e4m3 per 16 values; ``_amax`` [E] and
+  ``_outer_scale_denominator`` [1] fp32. value = E2M1[code] * scale *
+  (amax[e] / denominator).
+- MXFP8: e4m3 values; ``_scale`` uint8 per 32 values.
+  value = weight * 2 ** (scale - 127).
+A rank keeps intermediate units [I/tp * rank, I/tp * (rank + 1)). Everything
+returned is gate-first. ``Inkling2ExpertLoader`` is the ``expert_loader`` of
+weights.py; it hands each complete layer to a sink as an ``ExpertLayer``.
 """
 
 from __future__ import annotations

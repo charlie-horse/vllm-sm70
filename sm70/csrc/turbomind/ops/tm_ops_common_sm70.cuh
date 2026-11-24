@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Shared includes and fp16 SiLU helpers for the TurboMind op files (K03).
-// Moved verbatim from fork cf9492a csrc/sm70_turbomind/ops/awq_sm70_gemm.cu;
-// see ../PROVENANCE.md for the fork line range of every function.
+// Shared includes and fp16 SiLU helpers for the TurboMind op files.
+// Source: ../PROVENANCE.md.
 #pragma once
 
-// fork awq_sm70_gemm.cu:1-37, adapted: tm_config.h replaces the fork's
-// sm70_policy.h; custom_all_reduce.cuh (only for the dropped
-// awq_gemm_sm70_out_tile_reduce) and <cutlass/half.h> (unused) are gone.
 #include "tm_config.h"
 #include "gemm_runtime.h"
 #include "packed_gemm.h"

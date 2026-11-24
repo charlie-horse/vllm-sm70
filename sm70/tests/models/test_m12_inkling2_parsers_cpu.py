@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the M12 Inkling 2 parsers (vllm_sm70/models/inkling2_sm70/parsers.py).
+"""Tests for the Inkling 2 parsers (vllm_sm70/models/inkling2_sm70/parsers.py).
 
 CPU only: upstream's Inkling 2 parser cases with a mock one-id-per-char
 tokenizer, in streaming and non-streaming, the JSON response-format

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""References and paged-KV builders for the K05 Flash-V100 GPU tests."""
+"""References and paged-KV builders for the Flash-V100 GPU tests."""
 
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ def paged_kv(
 ):
     """fp16 K/V in shuffled physical blocks plus a per-row block table.
 
-    layout="separate": two contiguous [blocks, block_size, H_kv, D] tensors
-    (the fork's layout). layout="lbnhc": one upstream v0.33.0 cache, logical
-    (blocks, H_kv, block_size, 2D) stored as [blocks, block_size, H_kv, 2D],
-    split with fv100.split_lbnhc_kv_cache (K and V interleaved per head).
+    layout="separate": two contiguous [blocks, block_size, H_kv, D] tensors.
+    layout="lbnhc": one upstream cache, logical (blocks, H_kv, block_size, 2D)
+    stored as [blocks, block_size, H_kv, 2D], split with
+    fv100.split_lbnhc_kv_cache (K and V interleaved per head).
     Unused blocks hold finite garbage that must never reach the output.
     """
     gen = torch.Generator().manual_seed(seed)

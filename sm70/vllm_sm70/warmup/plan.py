@@ -6,10 +6,10 @@ Pure Python (no CUDA, no vLLM import), so the CPU tests cover it directly.
 Three inputs decide the plan:
 - the M values a decode step can run (``decode_m_values``): every CUDA graph
   capture size, the spec-decode verify M, every M that runs eagerly because it
-  is above the largest capture size (or because graphs are off), and the
-  fork's power-of-two set;
+  is above the largest capture size (or because graphs are off), and a
+  fixed power-of-two set;
 - the TurboMind layers the model holds (``discover``), one per distinct
-  shape, found by the attributes our M3/M4/M6/M8 methods set at load;
+  shape, found by the attributes the SM70 quant methods set at load;
 - the C++ tuning limits (``limits``), mirrored from
   csrc/turbomind/ops/gemm_runtime.cpp. Above a limit the dispatch policy is
   kDefault in eager and in capture alike, so there is nothing to warm.
@@ -25,18 +25,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # Kinds, in execution order.
-NVFP4_DENSE = "nvfp4_dense"  # M3: ModelOpt W4A16 NVFP4 linear (TM GEMM, K11 GEMV)
-FP8_DENSE = "fp8_dense"  # M6: block-FP8 linear on TurboMind
-FP8_QPN8_TM = "fp8_qpn8_tm"  # M8: QPN8 linear's TurboMind copy (M > QPN8 max)
-NVFP4_MOE = "nvfp4_moe"  # M4: NVFP4 routed experts (dense stage; K12 M<=2)
-FP8_MOE = "fp8_moe"  # M6: FP8 routed experts (batched; compact M == 1)
+NVFP4_DENSE = "nvfp4_dense"  # ModelOpt W4A16 NVFP4 linear (TM GEMM, M<=2 GEMV)
+FP8_DENSE = "fp8_dense"  # block-FP8 linear on TurboMind
+FP8_QPN8_TM = "fp8_qpn8_tm"  # QPN8 linear's TurboMind copy (M > QPN8 max)
+NVFP4_MOE = "nvfp4_moe"  # NVFP4 routed experts (dense stage; M<=2 decode)
+FP8_MOE = "fp8_moe"  # FP8 routed experts (batched; compact M == 1)
 KINDS = (NVFP4_DENSE, FP8_DENSE, FP8_QPN8_TM, NVFP4_MOE, FP8_MOE)
 MOE_KINDS = frozenset({NVFP4_MOE, FP8_MOE})
 
-# Fork set: {1, 2, 4, 8} and powers of two up to awq_warmup_max_m, which the
-# fork's c4130 runtime defaults raised to 64 (FORK awq_sm70_warmup.py:313-333,
-# platforms/runtime_defaults.py:36-44; recorded as kAwqWarmupMaxMDefault in
-# csrc/turbomind/ops/tm_config.h).
+# Powers of two up to kAwqWarmupMaxMDefault (csrc/turbomind/ops/tm_config.h).
 FORK_M_VALUES = (1, 2, 4, 8, 16, 32, 64)
 NVFP4_GROUP_SIZE = 16
 FP8_BLOCK = 128
@@ -59,9 +56,9 @@ def _atoi(raw: str) -> int:
 
 
 # The C++ default of the three *_TUNE_SMALL_SHAPES knobs (gemm_runtime.cpp
-# tune_small_shapes_enabled and friends): 0 since #77. Keep in step with C++.
+# tune_small_shapes_enabled and friends): 0. Keep in step with C++.
 # With the default, the warmup has nothing to tune and every call is kDefault
-# (deterministic, no LUT needed). Prod's tuned mode sets
+# (deterministic, no LUT needed). Tuned mode sets
 # VLLM_SM70_{NVFP4,FP8}_TUNE_SMALL_SHAPES=1 together with a LUT.
 TUNE_SMALL_SHAPES_DEFAULT = 0
 
@@ -84,16 +81,16 @@ class Limit:
 def limits() -> dict[str, Limit]:
     """Per-kind tuning limits, mirroring gemm_runtime.cpp.
 
-    - NVFP4 dense: select_nvfp4_dense_dispatch_policy (:525-535),
-      nvfp4_tune_small_shapes (default 0 since #77), nvfp4_dense_tune_max_m (64).
-    - FP8 dense (TM and the QPN8 TM copy): select_fp8_dense_dispatch_policy
-      (:509-523), fp8_tune_small_shapes (default 0 since #77) and fp8_dense_tune_max_m (64);
+    - NVFP4 dense: select_nvfp4_dense_dispatch_policy,
+      nvfp4_tune_small_shapes (default 0), nvfp4_dense_tune_max_m (64).
+    - FP8 dense (TM and the QPN8 TM copy): select_fp8_dense_dispatch_policy,
+      fp8_tune_small_shapes (default 0) and fp8_dense_tune_max_m (64);
       with VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR=1 the generic gate instead
       (awq_tune_small_shapes 1, f16_dense_tune_max_m 16).
-    - NVFP4 MoE: select_nvfp4_moe_dispatch_policy (:592-599),
-      nvfp4_tune_small_shapes (default 0 since #77), nvfp4_moe_tune_max_tokens (128 slots).
-    - FP8 MoE: select_fp8_moe_dispatch_policy (:578-590),
-      fp8_tune_small_shapes (default 0 since #77), awq_moe_tune_max_tokens (128 slots).
+    - NVFP4 MoE: select_nvfp4_moe_dispatch_policy,
+      nvfp4_tune_small_shapes (default 0), nvfp4_moe_tune_max_tokens (128 slots).
+    - FP8 MoE: select_fp8_moe_dispatch_policy,
+      fp8_tune_small_shapes (default 0), awq_moe_tune_max_tokens (128 slots).
     """
     nvfp4_on = knob("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
     fp8_on = knob("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", TUNE_SMALL_SHAPES_DEFAULT) != 0
@@ -155,7 +152,7 @@ def decode_m_values(vllm_config: Any) -> MValues:
       max_num_seqs * (num_speculative_tokens + 1), since those batches run
       without a graph. With graphs off (enforce_eager, cudagraph_mode NONE)
       or a NONE mixed mode (mixed batches run eagerly), every M from 1 up;
-    - FORK_M_VALUES, as the fork warmed.
+    - FORK_M_VALUES.
     Everything is capped at max_num_batched_tokens. Each kind then drops the
     M values above its own tuning limit (``limits``).
     """
@@ -235,7 +232,7 @@ class Plan:
 
 
 def _qpn8_max_m() -> int:
-    """K09's block-scaled QPN8 GEMV bound (8; 32 with VLLM_SM70_FP8_QPN8_M32=1)."""
+    """The block-scaled QPN8 GEMV bound (8; 32 with VLLM_SM70_FP8_QPN8_M32=1)."""
     try:
         from vllm_sm70.ops import qpn8
 
@@ -250,20 +247,20 @@ def _classify(layer: Any) -> tuple[str, tuple] | None:
     Keys hold every value the dispatch key depends on, so two layers with
     one key make the same TurboMind calls.
     """
-    state = getattr(layer, "_sm70_turbomind_linear", None)  # M3 STATE_ATTR
+    state = getattr(layer, "_sm70_turbomind_linear", None)  # nvfp4_linear STATE_ATTR
     if state is not None:
         k = int(state.weight.shape[0])
         n = int(state.weight.shape[1]) * 8  # tm_weight i32 [K, N/8]
         return NVFP4_DENSE, (k, n, int(state.group_size), bool(state.tm_gemv))
-    if getattr(layer, "sm70_fp8_turbomind", False):  # M6 dense
+    if getattr(layer, "sm70_fp8_turbomind", False):  # FP8 dense
         k = int(layer.weight.shape[0])  # tm_weight u8 [K, N]
         return FP8_DENSE, (k, int(layer.output_size_per_partition))
-    if getattr(layer, "sm70_fp8_qpn8", False):  # M8
+    if getattr(layer, "sm70_fp8_qpn8", False):  # block QPN8
         tm_weight = getattr(layer, "sm70_qpn8_tm_weight", None)
         if tm_weight is None:
             return None  # no TurboMind copy: dequantize + mm above the QPN8 bound
         return FP8_QPN8_TM, (int(tm_weight.shape[0]), int(tm_weight.shape[1]))
-    if hasattr(layer, "sm70_nvfp4_num_experts"):  # M4
+    if hasattr(layer, "sm70_nvfp4_num_experts"):  # NVFP4 MoE
         return NVFP4_MOE, (
             int(layer.sm70_nvfp4_num_experts),
             int(layer.sm70_nvfp4_hidden_size),
@@ -272,7 +269,7 @@ def _classify(layer: Any) -> tuple[str, tuple] | None:
             getattr(layer, "sm70_nvfp4_decode_plan", None) is not None,
         )
     if hasattr(layer, "sm70_fp8_moe_compact") and hasattr(layer, "sm70_num_experts"):
-        return FP8_MOE, (  # M6 MoE
+        return FP8_MOE, (  # FP8 MoE
             int(layer.sm70_num_experts),
             int(layer.sm70_hidden_size),
             int(layer.sm70_intermediate_size),
@@ -291,7 +288,7 @@ def item_ms(kind: str, key: tuple, ms: Iterable[int], limit: Limit) -> tuple[int
     out = []
     for m in ms:
         if kind == NVFP4_DENSE:
-            # K11 GEMV serves M <= 2 of admitted layers; TurboMind above.
+            # The GEMV serves M <= 2 of admitted layers; TurboMind above.
             if key[3] and m <= 2:
                 continue
             if m > limit.max_m:
@@ -307,7 +304,7 @@ def item_ms(kind: str, key: tuple, ms: Iterable[int], limit: Limit) -> tuple[int
             if m * top_k > limit.max_m:  # the MoE gate counts routed slots
                 continue
             if kind == NVFP4_MOE and key[4] and m <= K12_MAX_TOKENS:
-                continue  # K12 two-kernel decode, no TurboMind
+                continue  # two-kernel decode, no TurboMind
         out.append(m)
     return tuple(out)
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2: no host sync in a decode step.
+"""Inkling 2: no host sync in a decode step.
 
 A one-token decode step of the tiny checkpoint (fixtures/inkling2_tiny) runs
 under ``inkling2_sync_guard.no_host_sync``, the CPU stand-in for

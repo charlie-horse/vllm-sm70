@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 merged projections (weights.py packs, layers.py), on CPU.
+"""Inkling 2 merged projections (weights.py packs, layers.py), on CPU.
 
 The weight map's packs, ``rows_view`` and ``pack_parameters``; the packed
 projections and message gates against the per-projection ops; the loaded
@@ -238,7 +238,7 @@ def test_query_states_out_matches_the_rounded_result():
     scale = torch.randn(4, 8, generator=gen).half()
     tau = 1 + torch.rand(5, generator=gen)
     for t in (None, tau):
-        # The former formula: cast, then scale, clip, round, tau, round.
+        # The unfused formula: cast, then scale, clip, round, tau, round.
         y = x.unflatten(-1, (4, 8)).float() * scale.float()
         norm = torch.linalg.vector_norm(y, dim=-1, keepdim=True)
         want = (y * (2.0 / (norm + 1e-6)).clamp(max=1.0)).half()

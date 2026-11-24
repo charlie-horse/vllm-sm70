@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // TurboMind MoE: strided pointer tables, grouped GEMM core, FP8 and NVFP4 MoE stages,
-// single-token decode. AWQ-only MoE ops are compiled with VLLM_SM70_TM_AWQ (K04).
-// Moved verbatim from fork cf9492a csrc/sm70_turbomind/ops/awq_sm70_gemm.cu;
-// see ../PROVENANCE.md for the fork line range of every function.
+// single-token decode. AWQ-only MoE ops are compiled with VLLM_SM70_TM_AWQ.
+// Source: ../PROVENANCE.md.
 #include "tm_ops_common_sm70.cuh"
 
 #include <torch/library.h>
@@ -325,7 +324,7 @@ void awq_moe_single_token_exact_layout_prepare(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops (K04)
+#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops
 
 void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
                            torch::Tensor expert_offsets,
@@ -757,7 +756,7 @@ void fp8_moe_w2_direct_reduce_sm70_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops (K04)
+#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops
 
 void awq_moe_single_token_sm70_out(
     torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights,
@@ -1127,7 +1126,7 @@ void awq_moe_gemm_sm70_out_impl(
               ").");
 }
 
-#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops (K04)
+#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops
 
 void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
                            torch::Tensor expert_offsets,
@@ -1527,7 +1526,7 @@ void awq_moe_chunked_w2_sm70_out(
   const int range_blocks =
       static_cast<int>((num_experts + kThreads - 1) / kThreads);
 
-  // The production permutation is a stable expert-major sort, so source route
+  // The MoE permutation is a stable expert-major sort, so source route
   // indices remain ascending inside each expert segment. Intersecting every
   // segment with a contiguous source-route interval therefore keeps the GEMM
   // expert-major while allowing the final reduction to replay route 0..top_k-1
@@ -1581,7 +1580,7 @@ void awq_moe_chunked_w2_sm70_out(
   }
 }
 
-#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops (K04)
+#ifdef VLLM_SM70_TM_AWQ  // AWQ/int4 MoE ops
 
 void awq_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
@@ -2438,7 +2437,7 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
-  // Cover the validated top-k8 B10 verifier bound. Duplicate expert selections
+  // Cover the top-k8 verifier bound. Duplicate expert selections
   // remain separate one-row groups, so this is a routed-slot bound rather
   // than an active-expert bound. Keep the dense-grouped cutoff independent:
   // a disabled compact route above 64 rows must not fall back per expert.
@@ -3224,15 +3223,13 @@ void fp8_moe_single_token_sm70_out(
 }
 
 // ---------------------------------------------------------------------------
-// Op registration (K03). Schemas are the fork's minus `str? native_policy`.
+// Op registration.
 // ---------------------------------------------------------------------------
 
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:1167
   m.def(
       "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "
       "int k_ld, int q_ld, int num_experts) -> Tensor[]");
-  // fork csrc/torch_bindings.cpp:1221
   m.def(
       "awq_moe_chunked_w2_sm70_out(Tensor(a!) out, Tensor(b!) "
       "chunk_output, Tensor input, Tensor expert_offsets, Tensor "
@@ -3242,46 +3239,38 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, int "
       "num_tokens, int top_k, int num_experts, int k, int n, int "
       "hidden_logical_size, int group_size, int chunk_tokens) -> ()");
-  // fork csrc/torch_bindings.cpp:1287
   m.def(
       "awq_moe_single_token_exact_layout_prepare(Tensor topk_ids, Tensor "
       "x, Tensor(a!) compact_input, Tensor(b!) expert_offsets, Tensor(c!)"
       " expert_offsets64, Tensor(d!) inv_permuted_idx, int num_experts) "
       "-> ()");
-  // fork csrc/torch_bindings.cpp:1297
   m.def(
       "awq_moe_single_token_weighted_reduce_out(Tensor sorted_output, "
       "Tensor topk_weights, Tensor inv_permuted_idx, Tensor(a!) out, int "
       "top_k, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1327
   m.def(
       "fp8_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, Tensor "
       "expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, int "
       "num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
-  // fork csrc/torch_bindings.cpp:1335
   m.def(
       "fp8_moe_gemm_sm70_per_expert_dispatch_out(Tensor(a!) out, Tensor "
       "sorted_input, Tensor expert_offsets, Tensor strided_ptrs_w, Tensor"
       " strided_ptrs_s, int num_experts, int k, int n, int group_size, "
       "bool gated_silu) -> ()");
-  // fork csrc/torch_bindings.cpp:1345
   m.def(
       "fp8_moe_dense_stage_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, Tensor "
       "ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1531
   m.def(
       "fp8_moe_single_token_dense_stage_sm70_out(Tensor(a!) out, Tensor "
       "input, Tensor expert_offsets, Tensor sorted_expert_ids, Tensor "
       "ptrs_w, Tensor ptrs_s, int top_k, int k, int n, int group_size) ->"
       " ()");
-  // fork csrc/torch_bindings.cpp:1539
   m.def(
       "fp8_moe_single_token_indexed_dense_stage_sm70_out(Tensor(a!) out, "
       "Tensor input, Tensor expert_offsets, Tensor sorted_expert_ids, "
       "Tensor ptrs_w, Tensor ptrs_s, int top_k, int k, int n, int "
       "group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1548
   m.def(
       "fp8_moe_single_token_dense_w13_sm70_out(Tensor(a!) gate_up, "
       "Tensor(b!) compact_input, Tensor x, Tensor topk_ids, Tensor "
@@ -3289,7 +3278,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "Tensor(d!) expert_offsets64, Tensor(e!) inv_permuted_idx, "
       "Tensor(f!) sorted_expert_ids, int w13_k, int w13_n, int "
       "group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1559
   m.def(
       "fp8_moe_single_token_indexed_dense_w13_sm70_out(Tensor(a!) "
       "gate_up, Tensor(b!) compact_input, Tensor x, Tensor topk_ids, "
@@ -3297,7 +3285,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "Tensor(d!) expert_offsets64, Tensor(e!) inv_permuted_idx, "
       "Tensor(f!) sorted_expert_ids, int w13_k, int w13_n, int "
       "group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1571
   m.def(
       "fp8_moe_single_token_compact_dense_w13_sm70_out(Tensor(a!) "
       "gate_up, Tensor(b!) compact_input, Tensor x, Tensor topk_ids, "
@@ -3306,7 +3293,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "expert_offsets, Tensor(f!) expert_offsets64, Tensor(g!) "
       "inv_permuted_idx, Tensor(h!) sorted_expert_ids, int w13_k, int "
       "w13_n, int group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1584
   m.def(
       "fp8_moe_single_token_sm70_out(Tensor(a!) out, Tensor x, Tensor "
       "topk_weights, Tensor topk_ids, Tensor src_w13_ptrs_w_rows, Tensor "
@@ -3323,7 +3309,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "fused_weighted_reduce, bool broadcast_input, bool "
       "w2_direct_reduce, bool indexed_expert_ptrs, bool exact_per_route) "
       "-> ()");
-  // fork csrc/torch_bindings.cpp:1491
   m.def(
       "nvfp4_moe_dense_stage_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
@@ -3350,41 +3335,34 @@ TORCH_LIBRARY_IMPL(_sm70_C, CUDA, m) {
 
 #ifdef VLLM_SM70_TM_AWQ
 TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
-  // fork csrc/torch_bindings.cpp:1174
   m.def(
       "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, Tensor "
       "expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, int "
       "num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
-  // fork csrc/torch_bindings.cpp:1182
   m.def(
       "awq_moe_gemm_sm70_per_expert_dispatch_out(Tensor(a!) out, Tensor "
       "sorted_input, Tensor expert_offsets, Tensor strided_ptrs_w, Tensor"
       " strided_ptrs_s, int num_experts, int k, int n, int group_size, "
       "bool gated_silu) -> ()");
-  // fork csrc/torch_bindings.cpp:1192
   m.def(
       "awq_moe_dense_stage_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, Tensor "
       "ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1211
   m.def(
       "awq_moe_active_dense_stage_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor permuted_experts_id, Tensor(b!) active_expert_offsets, "
       "Tensor(c!) active_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int "
       "total_slots, int k, int n, int group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1234
   m.def(
       "awq_moe_single_token_dense_stage_sm70_out(Tensor(a!) out, Tensor "
       "input, Tensor expert_offsets, Tensor sorted_expert_ids, Tensor "
       "ptrs_w, Tensor ptrs_s, int top_k, int k, int n, int group_size) ->"
       " ()");
-  // fork csrc/torch_bindings.cpp:1242
   m.def(
       "awq_moe_single_token_indexed_dense_stage_sm70_out(Tensor(a!) out, "
       "Tensor input, Tensor expert_offsets, Tensor sorted_expert_ids, "
       "Tensor ptrs_w, Tensor ptrs_s, int top_k, int k, int n, int "
       "group_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1251
   m.def(
       "awq_moe_single_token_dense_w13_sm70_out(Tensor(a!) gate_up, "
       "Tensor(b!) compact_input, Tensor x, Tensor topk_ids, Tensor "
@@ -3392,7 +3370,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "Tensor(d!) expert_offsets64, Tensor(e!) inv_permuted_idx, "
       "Tensor(f!) sorted_expert_ids, int w13_k, int w13_n, int "
       "group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1262
   m.def(
       "awq_moe_single_token_indexed_dense_w13_sm70_out(Tensor(a!) "
       "gate_up, Tensor(b!) compact_input, Tensor x, Tensor topk_ids, "
@@ -3400,7 +3377,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "Tensor(d!) expert_offsets64, Tensor(e!) inv_permuted_idx, "
       "Tensor(f!) sorted_expert_ids, int w13_k, int w13_n, int "
       "group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1274
   m.def(
       "awq_moe_single_token_compact_dense_w13_sm70_out(Tensor(a!) "
       "gate_up, Tensor(b!) compact_input, Tensor x, Tensor topk_ids, "
@@ -3409,7 +3385,6 @@ TORCH_LIBRARY_FRAGMENT(_sm70_C, m) {
       "expert_offsets, Tensor(f!) expert_offsets64, Tensor(g!) "
       "inv_permuted_idx, Tensor(h!) sorted_expert_ids, int w13_k, int "
       "w13_n, int group_size, int hidden_logical_size) -> ()");
-  // fork csrc/torch_bindings.cpp:1305
   m.def(
       "awq_moe_single_token_sm70_out(Tensor(a!) out, Tensor x, Tensor "
       "topk_weights, Tensor topk_ids, Tensor src_w13_ptrs_w_rows, Tensor "

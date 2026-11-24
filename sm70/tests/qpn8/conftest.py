@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixtures for the K09 QPN8 tests.
+"""Fixtures for the QPN8 tests.
 
 GPU tests are marked `gpu` and need an SM70 device plus a built
-vllm_sm70._sm70_C with the K09 QPN8 ops (and K03 TurboMind FP8 for the
-M>8 fallback). Run them from the repo root with:
+vllm_sm70._sm70_C with the QPN8 ops (and TurboMind FP8 for the M>8
+fallback). Run them from the repo root with:
 
     pytest -m gpu sm70/tests/qpn8
 """
@@ -49,7 +49,7 @@ def qpn8_gpu():
     """vllm_sm70.ops.qpn8 on a real SM70 GPU with _sm70_C loaded, else skip.
 
     On an SM70 GPU a missing extension or missing QPN8 ops fails the test,
-    so a nightly run cannot pass on stubs.
+    so a run cannot pass on stubs.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):

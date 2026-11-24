@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers shared by the K18 tests (not a conftest: other test dirs have one
-with the same module name)."""
+"""Helpers shared by the DFlash2 FP16 GEMM tests (not a conftest: other test
+dirs have one with the same module name)."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ def dflash2_schemas() -> dict[str, str]:
 
 
 def qwen_vllm_config(*, arch="Qwen3_5ForConditionalGeneration", k=7, sm70=None):
-    """A getattr-only VllmConfig stand-in. The defaults are the fork's Qwen3.8
-    DFlash2 verifier contract (M1 dflash2_verifier_qualified): Qwen3_5 arch,
-    fp16, hidden 5120, heads 24/4 x 256, dflash k=7, selector_top_k 16, PP1.
+    """A getattr-only VllmConfig stand-in. The defaults are the qualified
+    Qwen3.8 DFlash2 verifier contract: Qwen3_5 arch, fp16, hidden 5120, heads
+    24/4 x 256, dflash k=7, selector_top_k 16, PP1.
     ``arch="Qwen3_5MoeForConditionalGeneration"`` is Qwen3.6 (not qualified).
     """
     from types import SimpleNamespace

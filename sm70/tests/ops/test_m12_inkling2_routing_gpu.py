@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M12 Inkling 2 routing kernels (inkling2_sm70/ops/routing.py) on an SM70 GPU.
+"""Inkling 2 routing kernels (inkling2_sm70/ops/routing.py) on an SM70 GPU.
 
 At the Inkling 2 Mini sizes (hidden 2304, 128 experts, top-8, route scale 8)
 and decode batches of 1 to 8 tokens:
 - the router GEMV against cuBLAS F.linear in fp32;
-- ``route`` from the same logits against the torch routing on CUDA
-  (torch_ref.router, so torch.topk's CUDA kernel), identical ids and weights
-  within 1e-6, also on tied logits, where both keep the lowest expert id;
-- the slot sort, offsets and row gather against moe_tm.py's torch sort, and
-  ``combine`` against its index_add_ sum;
+- ``route`` against the torch routing on CUDA (torch.topk's CUDA kernel),
+  identical ids and weights within 1e-6, also on tied logits;
+- the slot sort, offsets, row gather and ``combine`` against moe_tm.py;
 - the grouped and the TurboMind module routes against the switch-off
   forward, and a CUDA graph of the fused routing captured with
   ``torch.cuda.set_sync_debug_mode("error")`` and replayed on new inputs.
-The CPU cases (Triton's interpreter) are test_m12_inkling2_routing_cpu.py.
+CPU cases: test_m12_inkling2_routing_cpu.py.
 
     pytest -m gpu sm70/tests/ops/test_m12_inkling2_routing_gpu.py
 """

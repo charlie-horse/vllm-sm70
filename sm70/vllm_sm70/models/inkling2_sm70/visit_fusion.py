@@ -2,26 +2,17 @@
 """Inkling 2 on SM70: fewer, larger kernels per layer visit of a decode-only
 batch (ops/visit.py, ops/routing.py).
 
-    norms.py      a short conv, the residual it feeds and the AttnRes mix of
-                  the next sublayer input: the attention output conv with
-                  the MLP input mix, and the MLP output conv and residual
-                  add with the next visit's attention input mix (or the
-                  final norm); a layer output no mix takes runs its conv
-                  and add as one launch         visit.conv_mix, conv_residual
-    norms.py      the three launches of the message gates (gate_down,
-                  gate_up, blend_rms_norm)     visit.gate_blend
-    prologue.py   query_rel and key_value_conv  visit.prologue
-    moe.py        router_logits and route       routing.route(RouterInput)
+    norms.py      a short conv, the residual it feeds and the   visit.conv_mix,
+                  next AttnRes mix (or a lone conv and add)     conv_residual
+    norms.py      the three message-gate launches               visit.gate_blend
+    prologue.py   query_rel and key_value_conv                  visit.prologue
+    moe.py        router_logits and route              routing.route(RouterInput)
 
-The convs fuse where they run one kernel today: a decode-only batch on the
-kernel routes of norms.py, sconv.py and fused_small.py (``on_visit``). The
-router, the prologue and the gates need the decode-only batch, this switch
-and the routes of their own callers. VLLM_SM70_INKLING_VISIT_FUSION=0 puts
-every visit back on today's kernels. The switch is read on every eager call;
-a replayed CUDA graph keeps the route it was captured with.
-
-A layer visit on this route returns a ``Pending`` output (``defer``): its
-MLP conv and residual add run inside the next mix, or in ``value()``.
+The convs fuse on a decode-only batch on the kernel routes of norms.py,
+sconv.py and fused_small.py (``on_visit``). VLLM_SM70_INKLING_VISIT_FUSION=0
+turns the route off; it is read on every eager call. A layer visit on this
+route returns a ``Pending`` output (``defer``): its MLP conv and residual add
+run inside the next mix, or in ``value()``.
 """
 
 from __future__ import annotations

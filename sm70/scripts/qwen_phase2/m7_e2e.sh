@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# M7 DFlash2 GPU tests on c4130 (header of sm70/tests/models/test_m7_dflash_sm70.py).
-#
-#   m7_e2e.sh
-#
-# Runs, by exact node ID (no -k):
-#   1. test_triton_matches_reference_gpu   (all 3 params, GPU0 only)
-#   2. test_e2e_real_draft_gpu             (TP2, real Qwen3.8-27B-FP8 + DFlash2)
-# A skipped test counts as a failure (e.g. DFLASH2_E2E_* not picked up).
-#
-# The M7 A/B (VLLM_SM70_DFLASH2_EMULATION=0) is NOT run here: the test file's
-# autouse fixture deletes that variable and the e2e test asserts m7.register()
-# is True, which is False with the switch off. Use qwen_matrix.sh 4 vs 4-noemu.
-#
+# DFlash2 GPU tests of sm70/tests/models/test_m7_dflash_sm70.py, by exact
+# node ID: test_triton_matches_reference_gpu (GPU0 only) and
+# test_e2e_real_draft_gpu (TP2, Qwen3.8-27B-FP8 + DFlash2). A skip fails.
+# The emulation-off A/B (VLLM_SM70_DFLASH2_EMULATION=0) cannot run here (the
+# test's autouse fixture clears it); use qwen_matrix.sh 4 vs 4-noemu.
 # Env: VLLM_PY (required; needs pytest), QWEN_STAGE, OUT,
 #      DFLASH2_E2E_TARGET (default $QWEN_STAGE/Qwen3.8-27B-FP8),
 #      DFLASH2_E2E_DRAFT  (default $QWEN_STAGE/Qwen3.8-27B-DFlash2).
