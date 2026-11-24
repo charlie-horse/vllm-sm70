@@ -83,6 +83,64 @@ let
     ) "the default flint unit sets a VLLM_SM70_* variable";
     unitsOf "flint" tmOptions;
 
+  # inkling-2-mini: the serve flags, the V2 runner, the draft staging and the
+  # LMCache settings reach the rendered units.
+  inklingUnit =
+    let
+      cfg = (evalHost "inkling-2-mini" { }).config;
+      svc = cfg.systemd.services.vllm;
+      exec = svc.serviceConfig.ExecStart;
+      m = cfg.services.vllm-sm70.models."inkling-2-mini";
+      want = [
+        [ "--tensor-parallel-size" "2" ]
+        [ "--dtype" "half" ]
+        [ "--max-model-len" (toString m.maxModelLen) ]
+        [ "--max-num-seqs" (toString m.maxNumSeqs) ]
+        [ "--max-num-batched-tokens" (toString m.maxNumBatchedTokens) ]
+        [ "--gpu-memory-utilization" (toString m.gpuMemoryUtilization) ]
+        [ "--enable-prefix-caching" "--enable-auto-tool-choice" ]
+        [
+          "--hf-overrides"
+          (builtins.toJSON { architectures = [ "Inkling2LoopSm70ForConditionalGeneration" ]; })
+        ]
+        [ "--tokenizer-mode" "inkling2_sm70" ]
+        [ "--reasoning-parser" "inkling2_sm70" ]
+        [ "--tool-call-parser" "inkling2_sm70" ]
+        [ "--block-size" "32" ]
+        [ "--limit-mm-per-prompt" (builtins.toJSON { image = 2; }) ]
+        [ "--enable-prompt-tokens-details" ]
+        [
+          "--speculative-config"
+          (builtins.toJSON {
+            method = "dspark";
+            model = "/var/lib/vllm/models/Inkling-2-Mini-DSpark";
+            num_speculative_tokens = 7;
+          })
+        ]
+      ];
+      missing = lib.filter (a: !(lib.hasInfix (lib.escapeShellArgs a) exec)) want;
+    in
+    assert lib.assertMsg (missing == [ ]) "inkling-2-mini ExecStart lacks: ${builtins.toJSON missing}";
+    assert lib.assertMsg (
+      lib.hasInfix "--no-async-scheduling" exec == !m.asyncScheduling
+    ) "inkling-2-mini async scheduling does not reach ExecStart";
+    assert lib.assertMsg (lib.hasInfix "--kv-transfer-config" exec == m.lmcache)
+      "inkling-2-mini LMCache connector does not follow its lmcache field";
+    assert lib.assertMsg (cfg.services.lmcache-sm70.enable == m.lmcache)
+      "inkling-2-mini vllm-lmcache does not follow its lmcache field";
+    assert lib.assertMsg (
+      !m.lmcache || cfg.services.lmcache-sm70.chunkSize == m.lmcacheChunkSize
+    ) "inkling-2-mini LMCache chunk size does not reach vllm-lmcache";
+    assert lib.assertMsg (
+      (svc.environment.VLLM_USE_BREAKABLE_CUDAGRAPH or null) == "1"
+    ) "inkling-2-mini does not set VLLM_USE_BREAKABLE_CUDAGRAPH";
+    assert lib.assertMsg (
+      (svc.environment.VLLM_USE_V2_MODEL_RUNNER or null) == "1"
+    ) "inkling-2-mini does not run the V2 model runner";
+    assert lib.assertMsg (lib.hasInfix "vllm_sm70.models.inkling2_sm70.draft" svc.preStart)
+      "inkling-2-mini does not stage its DSpark draft";
+    unitsOf "inkling-2-mini" { };
+
   # The LMCache sdist the build itself uses (nix/lmcache-build.nix), so the
   # check tests exactly what ships. Building this check fetches the sdist
   # (~MBs); no compiling.
@@ -102,6 +160,7 @@ in
   '';
 
   module-eval-flint-turbomind-lut = tmUnit;
+  module-eval-inkling-2-mini = inklingUnit;
 
   flint-checkpoint-outpath =
     assert lib.assertMsg (ckpt.flintCheckpoint.outPath == ckpt.expectedOutPath) ''
