@@ -64,7 +64,7 @@ Dropped:
 
 ## Admitted shape set (Flint TP2 audit)
 
-Flint has 32 query heads, 4 KV heads and head dim 128 (FORK `docs/design/sm70_flint_tp2_pcie.md:34`; copy: `docs/history/sm70_flint_tp2_pcie.md`). At **TP2 each rank has Hq = 16 and Hkv = 2**; TP1 has 32 and 4.
+Flint has 32 query heads, 4 KV heads and head dim 128 (FORK `docs/design/sm70_flint_tp2_pcie.md:34`). At **TP2 each rank has Hq = 16 and Hkv = 2**; TP1 has 32 and 4.
 
 | guard | where | admits |
 |---|---|---|

@@ -538,7 +538,7 @@ def effective_anchor(env: dict, pair: str, metric: str, scores_dir=None) -> dict
             gone = [str(d / f"{n}.json") for d in sets for n in (a, b)
                     if not (d / f"{n}.json").is_file()]
             msg += f"; missing: {', '.join(gone) or 'none (envelope is stale)'}"
-        raise EnvelopeError(f"{msg}. Score them (docs/m5-calibration-nov7.md), then "
+        raise EnvelopeError(f"{msg}. Score them (docs/checks.md#gpu-gate), then "
                             + REBUILD_HINT)
     if metric not in by_metric:
         raise EnvelopeError(f"the envelope's {pair!r} pair has no {metric!r} metric "

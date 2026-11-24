@@ -15,7 +15,7 @@ GPU (``-m gpu``): GPU test plan T1-T8. Tests marked "2 GPUs" need both V100s
                            ~/vllm-sm70-work/bea/golden/flint_cf9492a_greedy64.json
     FLINT_SM70_T4_SEQS_DIR, FLINT_SM70_T4_ENVELOPE, FLINT_SM70_FORK_SCORES_DIR,
     FLINT_SM70_OURS_NOISE  teacher-forced T4a-T4e/T7 inputs (see the T4 section
-                           and docs/m5-calibration-nov7.md)
+                           and docs/checks.md#gpu-gate)
     FLINT_SM70_T5_FORK_GOLDEN_SCORES
                            the fork's forced-decode scores of the golden
                            sequences (T5 near-tie rule)
@@ -1179,7 +1179,7 @@ def test_t3_checkpoint_loads(capfd, monkeypatch, tmp_path):
 # ceil(1.5x the pair's anchor count over both metrics)). An envelope built
 # before Nov 7 (no over_1_0) fails closed: rebuild it (`envelope`, CPU only).
 # Each line also shows count > 0.1 nats, our own eager-vs-eager instance
-# noise, the fork's, and the effective limits. docs/m5-calibration-nov7.md
+# noise, the fork's, and the effective limits. docs/checks.md#gpu-gate
 # has the commands.
 T4_SEQS_DIR = os.environ.get("FLINT_SM70_T4_SEQS_DIR")
 T4_ENVELOPE = os.environ.get("FLINT_SM70_T4_ENVELOPE")
@@ -2396,7 +2396,7 @@ T5_FORK_HOWTO = (
     "G/set9.json --out-dir G/fork --name fork_graphs --mode graphs --decode "
     "--llm-kwargs \"$FORK_KW\"`, and set "
     "FLINT_SM70_T5_FORK_GOLDEN_SCORES=G/fork/set9/fork_graphs.json "
-    "(docs/m5-calibration-nov7.md)"
+    "(docs/checks.md#gpu-gate)"
 )
 
 

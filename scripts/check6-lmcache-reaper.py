@@ -5,12 +5,12 @@ Guards nix/patches/lmcache/0001-mp-worker-heartbeat-from-registration.patch.
 Without it, a vLLM worker that sees no prompt of at least one 256-token chunk
 within --worker-registration-grace-seconds (3600 s) of registering is reaped
 by the LMCache MP server while alive and never re-registers, so every later
-STORE is rejected (docs/upstream/lmcache-heartbeat-issue.md).
+STORE is rejected.
 
 Procedure (docs/checks.md has the operator steps):
 
   start   Run right after the operator's restart,
-          `sudo -S -p '' systemctl restart vllm <<<"$SERVER_PASSWORD"`
+          `sudo systemctl restart vllm`
           (this script never uses sudo). Waits until the API is up and both GPU
           instances are registered, records the anchor (the last
           "Registered KV cache" journal line, else the moment registration was
@@ -557,8 +557,8 @@ def print_journal_hint(cfg, since: float) -> None:
     cmd = " ".join(journal_cmd(cfg.lmcache_unit, since))
     print(
         "  The LMCache journal is not readable as this user. Have the operator run\n"
-        "  (password on stdin from $SERVER_PASSWORD, never typed on the command line):\n"
-        f"    sudo -S -p '' {cmd} <<<\"$SERVER_PASSWORD\" > ~/check6-lmcache.journal\n"
+        "  (with sudo):\n"
+        f"    sudo {cmd} > ~/check6-lmcache.journal\n"
         "  then:\n"
         f"    python3 {sys.argv[0]} judge --state {cfg.state} "
         "--journal-file ~/check6-lmcache.journal",
@@ -624,8 +624,8 @@ def phase_start(cfg) -> dict:
     if long0:
         msg = (f"vLLM already served {int(long0)} prompt(s) over "
                f"{QUIET_MAX_PROMPT} tokens since it started; the quiet period is "
-               "broken. Restart vllm (operator: sudo -S -p '' systemctl restart "
-               "vllm <<<\"$SERVER_PASSWORD\") and run `start` again.")
+               "broken. Restart vllm (operator: sudo systemctl restart "
+               "vllm) and run `start` again.")
         if not cfg.dry_run:
             sys.exit(msg)
         log("dry run, continuing anyway: " + msg)

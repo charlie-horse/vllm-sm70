@@ -14,7 +14,6 @@ Why: the 1Cat fork (charlie-horse/vLLM cf9492a) resolved about 300 env knobs
   service ran with: fork defaults, plus the cc=7.0 platform overrides in
   vllm/platforms/runtime_defaults.py, with no VLLM_SM70_* env on the unit
   (FORK nix/module.nix:198-207, :329; HOST hosts/c4130/vllm/default.nix).
-  The evidence chain is in docs/models/sm70-effective-defaults.md (repo root).
 Kill-switch: VLLM_SM70_<THING>=0, registered in the "quant" and "models"
   sections of vllm_sm70/envs.py (VLLM_SM70_GREEDY_TOKEN_FASTPATH: in
   "sampler") (K01 ``kill_switch``; only "0" acts) and read
@@ -176,7 +175,7 @@ class Sm70Config(BaseModel):
     and its can_implement (kernels/linear/qpn/fp8_block.py:160-195) gates
     only on this flag, fp16 in/out, static 128x128 block weights, rank 2,
     N,K % 128 and the native ops. So it is on for both Qwen3.6-35B-A3B and
-    Qwen3.8-27B (docs/models/sm70-effective-defaults.md). No override
+    Qwen3.8-27B. No override
     applies. Kill: VLLM_SM70_FP8_BLOCK_QPN8=0.
 
     The flag alone does not admit a layer; fp8_block_qpn8_turbomind_copy
@@ -430,7 +429,6 @@ CONSTANTS: dict[str, Any] = {
     # Dense GEMM / native TurboMind tuning (F16_DENSE_MAX_M, FP8/NVFP4_DENSE_
     # TUNE_MAX_M=64, BATCH_GEMM_LAYOUTS=1, QPN8 tile choices, workspace bytes,
     # ...) is owned by the ops: csrc/turbomind/ops/tm_config.h (K02/K03).
-    # Effective values: docs/models/sm70-effective-defaults.md.
     # FP8 MoE stage modes (sm70_moe.py:16-71)
     "FP8_MOE_BATCHED_GEMM": True,  # envs.py:8857
     "FP8_MOE_W13_PER_EXPERT": False,
