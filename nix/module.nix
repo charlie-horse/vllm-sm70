@@ -51,9 +51,9 @@ let
       enforce_eager = false;
     };
 
-  # Environment of the Qwen DFlash2 entries: Flint's (see there). The V2
-  # model runner is the separate `v2ModelRunner` field, so a host that
-  # replaces `env` (e.g. to set a kill switch) keeps it.
+  # Environment of the Qwen DFlash2 and Inkling 2 entries: Flint's (see
+  # there). The V2 model runner is the separate `v2ModelRunner` field, so a
+  # host that replaces `env` (e.g. to set a kill switch) keeps it.
   qwenEnv = {
     CUDA_DEVICE_ORDER = "PCI_BUS_ID";
     VLLM_SKIP_P2P_CHECK = "0";
@@ -192,6 +192,50 @@ let
           "--speculative-config" (dflashConfig draftDir)
         ];
       };
+
+    # Inkling 2 Mini (plugin arch, docs/nix.md#inkling-2) with its DSpark
+    # draft, staged from the target's mtp.safetensors at every start.
+    "inkling-2-mini" =
+      let
+        targetDir = "${modelsDir}/Inkling-2-Mini";
+        draftDir = "${modelsDir}/Inkling-2-Mini-DSpark";
+      in
+      {
+        downloads = [
+          {
+            repo = "thinkingmachines/Inkling-2-Mini";
+            revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7";
+            dir = targetDir;
+          }
+        ];
+        maxModelLen = 262144;
+        maxNumSeqs = 4;
+        maxNumBatchedTokens = 512;
+        gpuMemoryUtilization = 0.90;
+        asyncScheduling = true;
+        lmcache = false;
+        # DSpark drafts need the V2 model runner.
+        v2ModelRunner = true;
+        env = qwenEnv;
+        preStart = ''
+          python -m vllm_sm70.models.inkling2_sm70.draft ${targetDir} ${draftDir}
+        '';
+        args = [
+          "--hf-overrides" (builtins.toJSON { architectures = [ "Inkling2LoopSm70ForConditionalGeneration" ]; })
+          "--tokenizer-mode" "inkling2_sm70"
+          "--reasoning-parser" "inkling2_sm70"
+          "--tool-call-parser" "inkling2_sm70"
+          "--block-size" "32"
+          "--limit-mm-per-prompt" (builtins.toJSON { image = 2; })
+          "--enable-prompt-tokens-details"
+          "--speculative-config"
+          (builtins.toJSON {
+            method = "dspark";
+            model = draftDir;
+            num_speculative_tokens = 7;
+          })
+        ];
+      };
   };
 
   active = cfg.activeModel;
@@ -297,12 +341,15 @@ in
     # (a host value replaces the built-in one as a whole); `v2ModelRunner`
     # (default false: sets VLLM_USE_V2_MODEL_RUNNER=1, kept when `env` is
     # replaced; an explicit `env` value still wins); `asyncScheduling`
-    # (default false); and model-specific `vllm serve` `args`.
+    # (default false); `preStart` (shell commands run as the vllm user before
+    # every start, with the model's `package` first on PATH); and
+    # model-specific `vllm serve` `args`.
     models = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf lib.types.raw);
       description = ''
-        Models vllm.service can serve. Built-in: flint, qwen3.6-35b-a3b and
-        qwen3.8-27b. Add entries, or override single fields of a built-in one.
+        Models vllm.service can serve. Built-in: flint, qwen3.6-35b-a3b,
+        qwen3.8-27b and inkling-2-mini. Add entries, or override single
+        fields of a built-in one.
       '';
     };
 
@@ -464,6 +511,8 @@ in
         // lib.optionalAttrs (model.v2ModelRunner or false) { VLLM_USE_V2_MODEL_RUNNER = "1"; }
         // tmEnv
         // (model.env or { });
+      path = lib.mkIf (model ? preStart) [ package ];
+      preStart = lib.mkIf (model ? preStart) model.preStart;
       serviceConfig = {
         User = "vllm";
         Group = "vllm";
