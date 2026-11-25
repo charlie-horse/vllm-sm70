@@ -95,6 +95,9 @@ let
         "--block-size" "32"
         "--limit-mm-per-prompt" (builtins.toJSON { image = 2; })
         "--enable-prompt-tokens-details"
+        # While requests are generating, read prompt chunks only every 4th
+        # step, so a long prompt does not stall them.
+        "--prefill-schedule-interval" "4"
         "--speculative-config"
         (builtins.toJSON {
           method = "dspark";
