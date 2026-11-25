@@ -28,7 +28,7 @@ from typing import Any, TypeAlias
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers.feature_extraction_utils import BatchFeature
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.inputs import MultiModalDataDict
@@ -83,7 +83,13 @@ def _composite_on_checkerboard(rgba: np.ndarray) -> np.ndarray:
     return (blended // 255).astype(np.uint8)
 
 
+EXIF_SWITCH = "VLLM_SM70_INKLING_IMAGE_EXIF"
+
+
 def _pil_to_rgb(image: Image.Image) -> np.ndarray:
+    # Turn the pixels upright as the EXIF Orientation tag says (phone photos).
+    if envs.environment_variables()[EXIF_SWITCH]():
+        image = ImageOps.exif_transpose(image)
     if not image.has_transparency_data:
         return np.array(image.convert("RGB"), dtype=np.uint8)
     return _composite_on_checkerboard(np.array(image.convert("RGBA")))
@@ -102,8 +108,9 @@ def decode_image(image: ImageInput) -> np.ndarray:
     """Decode an image to HWC uint8 RGB, compositing alpha on a checkerboard.
 
     Encoded bytes (including `MediaWithBytes.original_bytes`) are preferred
-    over decoded media, so no vLLM-side mode conversion or EXIF handling
-    leaks into the pixels.
+    over decoded media, so no vLLM-side mode conversion leaks into the
+    pixels. The EXIF Orientation tag is applied (kill switch
+    `VLLM_SM70_INKLING_IMAGE_EXIF`).
     """
     if isinstance(image, Inkling2DecodedImage):
         return np.array(image.media, dtype=np.uint8)
