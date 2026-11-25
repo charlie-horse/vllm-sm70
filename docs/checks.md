@@ -69,6 +69,59 @@ from that commit. All of these must pass:
 
 Keep every log of the run together with the commit.
 
+## Inkling 2 gate
+
+A commit that changes Inkling 2 (its model code
+`sm70/vllm_sm70/models/inkling2_sm70/`, its tests or its `nix/module.nix`
+entry) must pass this gate as well as the [GPU gate](#gpu-gate). Run it on
+the [test server](#test-server) with the `inkling-2-mini` entry and LMCache
+on, at max-model-len 262144, 8 sequences (`--max-num-seqs`), 512 max batched
+tokens and GPU memory utilization 0.88.
+
+**Parity rule.** The server scores a fixed reference output token by token
+([teacher-forced](#m5-gates)). Its top token must match the reference's at
+99% of positions or more, every mismatch must be a near tie (the
+reference's top two logprobs differ by less than 0.5), and no logprob is NaN
+or infinite. `scripts/checks/inkling2/first_light.py --min-agreement 0.99`
+checks it on short prompts.
+
+All of these must pass:
+
+1. **Serving.** The server starts and admits one request of 262144 tokens.
+   - Needles: a fact hidden at 10%, 50% and 90% of a 2K, 8K and 32K-token
+     prompt, and at 50% of a prompt near 262144 tokens, is found every time.
+   - Two images: two requests with the same text and different images of
+     the same size get different, correct answers.
+   - Parity: cold and prefix-cached answers each meet the parity rule.
+2. **LMCache.**
+   - Store and retrieve: part 1 of [LMCache reuse](#lmcache-reuse).
+   - Restore across a vLLM restart (part 2 of [LMCache reuse](#lmcache-reuse)),
+     with a text and an image prompt: the restored scores meet the parity
+     rule against the cold ones (99% top-token agreement or more).
+3. **Chat API.** All 18 cases below pass through `/v1/chat/completions`,
+   greedy. No content or reasoning holds markup (`<|`, `<tool`, `<think`),
+   and no answer reaches `max_tokens`.
+
+   | cases | request | pass |
+   |---|---|---|
+   | 6 tools | `tool_choice` auto, `"required"`, named; each streamed and not | the right function, valid JSON arguments |
+   | 4 reasoning | no effort, `"high"`, `"low"` streamed, effort 0.5 in `chat_template_kwargs` | reasoning in `reasoning`, not repeated in content; answer correct |
+   | 1 bad effort | effort 1.5 in `chat_template_kwargs` | HTTP 400 |
+   | 2 JSON | `json_object`; strict `json_schema` | content parses and matches the schema |
+   | 2 EOS | short reply, streamed and not | finish `stop`, one end-of-sequence token, last |
+   | 3 images | one image, two images, one image streamed | each image described correctly |
+
+4. **GPU pytest** for the Inkling 2 files, one process per file; every file
+   passes:
+   ```sh
+   git ls-files 'sm70/tests/*inkling2*_gpu.py' > gpu-files
+   while read -r f; do $GT/bin/pytest -q -p no:cacheprovider -m gpu "$f" || echo "FAIL $f"; done < gpu-files 2>&1 | tee pytest-inkling2.log
+   ```
+
+Not in the gate (run them separately; they don't block `latest`): the
+[1 h LMCache idle check](#check-6-lmcache-after-1-h-idle), soak runs,
+benchmarks and speed floors, long generations, and the kill-switch sweep.
+
 ## GPU pytest
 
 Run one pytest process per test file, never one process for the whole tree.
