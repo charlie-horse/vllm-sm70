@@ -9,7 +9,8 @@ at commits that passed every test, including the GPU tests.
 `main`, once all of these hold for **that exact commit**:
 
 1. CI on `main` is green for it.
-2. The [GPU gate](checks.md#gpu-gate) passes on it.
+2. The [GPU gate](checks.md#gpu-gate) passes on it. A commit that changes
+   Inkling 2 also passes the [Inkling 2 gate](checks.md#inkling-2-gate).
 3. The repo owner approves the move.
 
 A test run on any other commit doesn't count, even if only docs changed in
