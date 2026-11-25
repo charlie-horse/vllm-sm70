@@ -377,6 +377,31 @@ def test_resize_feeds_the_prompt_and_the_pixels(monkeypatch):
     assert len(out["prompt_token_ids"]) == 2 + 4 + grids[1][1] * grids[1][2]
 
 
+@pytest.mark.parametrize("orientation", [1, 3, 6, 8])
+def test_exif_orientation_turns_the_pixels_upright(monkeypatch, orientation):
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from vllm_sm70.models.inkling2_sm70.processing import decode_image
+
+    monkeypatch.delenv("VLLM_SM70_INKLING_IMAGE_EXIF", raising=False)
+    # Upright view: a red left half and a blue right half, 16 x 8 pixels.
+    upright = np.zeros((8, 16, 3), np.uint8)
+    upright[:, :8] = (255, 0, 0)
+    upright[:, 8:] = (0, 0, 255)
+    undo = {1: 0, 3: 2, 6: 1, 8: 3}[orientation]  # quarter turns that store it
+    stored = Image.fromarray(np.ascontiguousarray(np.rot90(upright, undo)))
+    exif = stored.getexif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    stored.save(buf, "PNG", exif=exif)
+    out = decode_image(buf.getvalue())
+    assert out.shape == upright.shape
+    assert (out == upright).all()
+
+
 @pytest.mark.parametrize("mode", [None, "hf"])
 def test_profiling_image_has_the_cap_size(mode):
     from vllm.multimodal.processing import TimingContext

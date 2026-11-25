@@ -86,6 +86,9 @@ Client rules:
 - An image larger than `max_image_encoder_tokens` allows is scaled down,
   keeping its shape, until it fits. With `VLLM_SM70_INKLING_IMAGE_RESIZE=0`
   it is rejected instead.
+- A photo whose EXIF Orientation tag says to turn it is turned upright
+  before the model sees it. With `VLLM_SM70_INKLING_IMAGE_EXIF=0` the
+  pixels are used as stored.
 
 ### DSpark draft
 

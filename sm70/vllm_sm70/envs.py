@@ -461,6 +461,11 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_IMAGE_RESIZE": kill_switch(
             "VLLM_SM70_INKLING_IMAGE_RESIZE"
         ),
+        # "0": Inkling 2 image pixels are used as stored, ignoring the EXIF
+        # Orientation tag, so a phone photo can reach the model sideways.
+        # Otherwise they are turned upright first (inkling2_sm70/
+        # processing.py). Env-only (no Sm70Config field), read for each image.
+        "VLLM_SM70_INKLING_IMAGE_EXIF": kill_switch("VLLM_SM70_INKLING_IMAGE_EXIF"),
     },
     # Flint top-k candidate sampler.
     "sampler": {

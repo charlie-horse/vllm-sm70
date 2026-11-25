@@ -195,6 +195,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_MERGED_PROJ",
         "VLLM_SM70_INKLING_GREEDY_TOP1",
         "VLLM_SM70_INKLING_IMAGE_RESIZE",
+        "VLLM_SM70_INKLING_IMAGE_EXIF",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -536,6 +537,25 @@ def _inkling_image_resize_off(name):
         proc.preprocess([Image.new("RGB", (8, 4))])
 
 
+def _inkling_image_exif_off(name):
+    """A photo tagged to be turned keeps its stored pixel layout; the
+    turned layout is checked in tests/models/test_m12_inkling2_multimodal_cpu.py."""
+    pytest.importorskip("vllm")
+    import io
+
+    from PIL import Image
+
+    from vllm_sm70.models.inkling2_sm70 import processing
+
+    assert processing.EXIF_SWITCH == name
+    image = Image.new("RGB", (8, 4))
+    exif = image.getexif()
+    exif[0x0112] = 6  # Orientation: turn 90 degrees clockwise to view
+    buf = io.BytesIO()
+    image.save(buf, "JPEG", exif=exif)
+    assert processing.decode_image(buf.getvalue()).shape == (4, 8, 3)
+
+
 def _inkling_visit_fusion_off(name):
     """A decode-only GPU batch keeps the kernels of each op of a layer
     visit (inkling2_sm70/visit_fusion.py); the fused kernels' own checks are
@@ -847,6 +867,8 @@ def _path_off(name):
         _inkling_visit_fusion_off(name)
     elif name == "VLLM_SM70_INKLING_IMAGE_RESIZE":
         _inkling_image_resize_off(name)
+    elif name == "VLLM_SM70_INKLING_IMAGE_EXIF":
+        _inkling_image_exif_off(name)
     elif name == "VLLM_SM70_INKLING_SMALL_M_GEMV":
         _inkling_small_m_gemv_off(name)
     elif name == "VLLM_SM70_INKLING_NVFP4_GEMV":
