@@ -13,7 +13,9 @@ pixels, the cell size from ``vision_config``, a prompt target per renderer:
   ``<|content_image|><|unused_200054|>``; only the pad is replaced, by
   ``rows * cols`` pads. A pad count other than the image count is rejected.
 Only the pad positions receive vision embeddings. An image over
-``Inkling2ProcessingInfo.max_image_tokens`` raises ValueError; nothing is resized.
+``Inkling2ProcessingInfo.max_image_tokens`` is scaled down to fit, keeping
+its shape (kill switch ``VLLM_SM70_INKLING_IMAGE_RESIZE``; off, it raises
+ValueError).
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 
+from vllm_sm70 import envs
 from vllm_sm70.config import Inkling2Config
 
 from .sm70_configs import IMAGE_ENCODER_TOKEN_CAP_ATTR
@@ -130,13 +133,17 @@ def _reference_item(item: Any) -> Any:
     return Inkling2DecodedImage(rgb, item.original_bytes)
 
 
+RESIZE_SWITCH = "VLLM_SM70_INKLING_IMAGE_RESIZE"
+
+
 class Inkling2ImageProcessor:
     """Pads each image to a `patch_size` grid and emits one patch per cell.
 
     Returns `vision_pixels` (fp16 `[sum(rows*cols), P, P, 3]` raw RGB
     values, padding pixels at -1; the encoder normalizes them) and
-    `vision_grid_thw`. With `max_tokens`, an image of more cells raises
-    ValueError.
+    `vision_grid_thw`. With `max_tokens`, an image of more cells is scaled
+    down (Lanczos filter, same shape) until it fits; with the kill switch
+    `VLLM_SM70_INKLING_IMAGE_RESIZE` at "0" it raises ValueError instead.
     """
 
     def __init__(
@@ -160,6 +167,32 @@ class Inkling2ImageProcessor:
                 "per image. Images are not resized; send a smaller one."
             )
 
+    def fit_size(self, width: int, height: int) -> tuple[int, int]:
+        """The largest size of the same shape whose grid fits `max_tokens`."""
+        rows, cols = self.get_grid(width, height)
+        if self.max_tokens is None or rows * cols <= self.max_tokens:
+            return width, height
+        area = self.max_tokens * self.patch_size**2
+        scale = min(1.0, math.sqrt(area / (width * height)))
+        while True:
+            new_w = max(1, math.floor(width * scale))
+            new_h = max(1, math.floor(height * scale))
+            rows, cols = self.get_grid(new_w, new_h)
+            if rows * cols <= self.max_tokens:
+                return new_w, new_h
+            scale *= 0.99
+
+    def fit(self, pixels: np.ndarray) -> np.ndarray:
+        """`pixels` (HWC uint8) scaled down to fit `max_tokens` if needed."""
+        height, width = pixels.shape[:2]
+        new_w, new_h = self.fit_size(width, height)
+        if (new_w, new_h) == (width, height):
+            return pixels
+        if not envs.environment_variables()[RESIZE_SWITCH]():
+            self.check_size(width, height)
+        image = Image.fromarray(pixels, "RGB")
+        return np.array(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
+
     def get_grid(self, width: int, height: int) -> tuple[int, int]:
         return math.ceil(height / self.patch_size), math.ceil(width / self.patch_size)
 
@@ -167,7 +200,7 @@ class Inkling2ImageProcessor:
         patch = self.patch_size
         decoded = []
         for image in images:
-            pixels = torch.from_numpy(decode_image(image))
+            pixels = torch.from_numpy(self.fit(decode_image(image)))
             self.check_size(pixels.shape[1], pixels.shape[0])
             decoded.append(pixels)
         grids = [self.get_grid(pixels.shape[1], pixels.shape[0]) for pixels in decoded]

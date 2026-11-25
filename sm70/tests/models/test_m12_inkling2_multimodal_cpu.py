@@ -312,8 +312,10 @@ def test_default_cap_is_the_measured_encoder_sequence():
             info.image_processor.check_size(width, height)
 
 
-def test_over_cap_image_is_rejected_with_a_clear_error():
+def test_over_cap_image_is_rejected_with_a_clear_error(monkeypatch):
     from PIL import Image
+
+    monkeypatch.setenv("VLLM_SM70_INKLING_IMAGE_RESIZE", "0")
 
     # 17 encoder tokens: 4 cells of 2 x 2 patches plus the class token.
     vision = {"native_patch_size": 4, "adapter_merge_size": MERGE}
@@ -334,6 +336,45 @@ def test_over_cap_image_is_rejected_with_a_clear_error():
     assert "not resized" in message
     with pytest.raises(ValueError, match="no room"):
         _ = _processor(vision, cap=4).info.max_image_tokens
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(2081, 2080), (4000, 3000), (3000, 4000), (200000, 41), (41, 200000), (1, 10**6)],
+)
+def test_over_cap_image_is_scaled_down_to_fit(monkeypatch, width, height):
+    monkeypatch.delenv("VLLM_SM70_INKLING_IMAGE_RESIZE", raising=False)
+    proc = _processor().info.image_processor
+    new_w, new_h = proc.fit_size(width, height)
+    rows, cols = proc.get_grid(new_w, new_h)
+    assert rows * cols <= MINI_CAP_TOKENS
+    assert 1 <= new_w <= width and 1 <= new_h <= height
+    # Close to the cap and to the original shape.
+    assert rows * cols > 0.9 * MINI_CAP_TOKENS
+    if min(new_w, new_h) > proc.patch_size:
+        assert new_w / new_h == pytest.approx(width / height, rel=0.02)
+    assert proc.fit_size(new_w, new_h) == (new_w, new_h)
+
+
+def test_resize_feeds_the_prompt_and_the_pixels(monkeypatch):
+    from PIL import Image
+
+    monkeypatch.delenv("VLLM_SM70_INKLING_IMAGE_RESIZE", raising=False)
+    vision = {"native_patch_size": 4, "adapter_merge_size": MERGE}
+    processor = _processor(vision, cap=17)
+    small = Image.new("RGB", (2 * TILE, 2 * TILE), (9, 9, 9))
+    wide = Image.new("RGB", (8 * TILE, TILE), (200, 100, 50))
+    out = _apply(processor, [small, wide])
+    data = out["mm_kwargs"].get_data()
+    grids = data["vision_grid_thw"].tolist()
+    assert grids[0] == [1, 2, 2]
+    assert grids[1][1] * grids[1][2] <= 4 and grids[1][2] > grids[1][1]
+    assert data["vision_pixels"].shape[0] == 4 + grids[1][1] * grids[1][2]
+    # A flat colour stays that colour; padding stays -1.
+    cells = data["vision_pixels"][4:]
+    kept = cells[cells[..., 0] >= 0]
+    assert kept.numel() and (kept == kept.new_tensor([200, 100, 50])).all()
+    assert len(out["prompt_token_ids"]) == 2 + 4 + grids[1][1] * grids[1][2]
 
 
 @pytest.mark.parametrize("mode", [None, "hf"])

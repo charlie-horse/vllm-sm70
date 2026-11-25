@@ -83,8 +83,9 @@ Client rules:
   first call.
 - Without `--tokenizer-mode inkling2_sm70`, request text must not contain
   `<|unused_200054|>` when the request has images.
-- An image larger than `max_image_encoder_tokens` is rejected, never
-  resized.
+- An image larger than `max_image_encoder_tokens` allows is scaled down,
+  keeping its shape, until it fits. With `VLLM_SM70_INKLING_IMAGE_RESIZE=0`
+  it is rejected instead.
 
 ### DSpark draft
 
