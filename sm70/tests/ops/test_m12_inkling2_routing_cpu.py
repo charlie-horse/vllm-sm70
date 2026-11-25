@@ -6,7 +6,9 @@ routing of moe.py, on CPU.
 - through Triton's interpreter: the router GEMV against F.linear in fp32;
   ``route`` against the torch routing (identical ids, weights within 1e-6,
   padding rows, the lowest-id tie rule, the tiny checkpoint's recorded
-  router); the slot sort, group offsets, row gather and ``combine`` against
+  router); ``route_blocks`` and the module route of a large batch that is
+  not decode-only against the torch routing (VLLM_SM70_INKLING_MIXED_SMALL_OPS);
+  the slot sort, group offsets, row gather and ``combine`` against
   moe_tm.py; the module forward on the grouped and the TurboMind route
   against the switch-off forward, padding rows zero, without a host sync.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
@@ -50,6 +52,7 @@ from inkling2_sync_guard import allowed, no_host_sync
 OPS = HERE.parents[1] / "vllm_sm70" / "models" / "inkling2_sm70" / "ops"
 TINY = HERE.parent / "models" / "fixtures" / "inkling2_tiny"
 SWITCH = "VLLM_SM70_INKLING_FUSED_ROUTING"
+MIXED_SWITCH = "VLLM_SM70_INKLING_MIXED_SMALL_OPS"
 INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1"
 interpreted = pytest.mark.skipif(not INTERPRETED, reason="interpreted child run only")
 # Inkling 2 Mini: hidden 2304, 128 experts, top-8, route scale 8.
@@ -227,6 +230,72 @@ def test_interpreted_tiny_checkpoint_router_end_to_end():
     choice = (torch.sigmoid(ops["router.0.out.0"]) + bias).sort(1, descending=True)
     gap = choice.values[:, top_k - 1] - choice.values[:, top_k]
     assert float(gap.min()) > 1e-4
+
+
+# --- interpreted: route_blocks ---------------------------------------------------------
+
+
+@interpreted
+@pytest.mark.parametrize("tokens", [1, 15, 16, 17, 40])
+@pytest.mark.parametrize("size", [SMALL, MINI], ids=["small", "mini"])
+def test_interpreted_route_blocks_match_the_torch_routing(tokens, size):
+    _, experts, top_k, scale = size
+    x, weight, bias = inputs(tokens, size, 20 + tokens)
+    logits = torch.nn.functional.linear(x.float(), weight)
+    rows = [0, tokens // 2, tokens - 1] if tokens > 2 else []
+    flags = padding(tokens, rows)
+    for pad in (flags, None):
+        weights, ids = _routing().route_blocks(
+            logits, bias, top_k, scale, pad, pad_id=experts
+        )
+        assert ids.dtype == torch.int64 and weights.dtype == torch.float32
+        want_ids, want_weights = cases.torch_route(logits, bias, top_k, scale, pad)
+        assert torch.equal(ids, want_ids)
+        assert float((weights - want_weights).abs().max()) <= cases.WEIGHT_TOL
+    weights, ids = _routing().route_blocks(
+        logits, bias, top_k, scale, flags, pad_id=experts
+    )
+    assert bool((ids[rows] == experts).all()) and bool((weights[rows] == 0).all())
+
+
+@interpreted
+def test_interpreted_route_blocks_ties_keep_the_lowest_expert_id():
+    _, experts, top_k, scale = SMALL
+    logits = cases.tie_logits(33, experts, 3)
+    bias = torch.zeros(experts)
+    weights, ids = _routing().route_blocks(logits, bias, top_k, scale, None, pad_id=-1)
+    want_ids, want_weights = cases.lowest_id_route(logits, bias, top_k, scale)
+    assert torch.equal(ids, want_ids)
+    assert float((weights - want_weights).abs().max()) <= cases.WEIGHT_TOL
+
+
+@interpreted
+@pytest.mark.parametrize("decode_only", [False, True], ids=["mixed", "decode_only"])
+def test_interpreted_module_route_of_a_large_batch(monkeypatch, decode_only):
+    """Above the slot bound, a batch that is not decode-only routes through
+    route_blocks; VLLM_SM70_INKLING_MIXED_SMALL_OPS=0 and a decode-only
+    batch keep the torch router. Same ids, weights within the tolerance."""
+    module = grouped_module(torch.float32)
+    tokens = 40
+    x = inputs(tokens, (HIDDEN, EXPERTS, TOP_K, 2.0), 7)[0]
+    flags = padding(tokens, [3, tokens - 1])
+    calls = []
+    launch = _routing().route_blocks
+    monkeypatch.setattr(
+        _routing(), "route_blocks", lambda *a, **k: calls.append(1) or launch(*a, **k)
+    )
+    monkeypatch.delenv(MIXED_SWITCH, raising=False)
+    logits, weights, ids = module.route(x, flags, decode_only)
+    assert len(calls) == (0 if decode_only else 1)
+    monkeypatch.setenv(MIXED_SWITCH, "0")
+    want_logits, want_weights, want_ids = module.route(x, flags, decode_only)
+    assert len(calls) == (0 if decode_only else 1)
+    assert torch.equal(logits, want_logits)
+    ids, weights = cases.by_id(ids, weights)
+    assert torch.equal(ids, cases.by_id(want_ids, want_weights)[0])
+    want = cases.by_id(want_ids, want_weights)[1]
+    assert float((weights - want).abs().max()) <= cases.WEIGHT_TOL
+    assert bool((ids[[3, tokens - 1]] == EXPERTS).all())
 
 
 # --- interpreted: dispatch and combine ------------------------------------------------
@@ -444,7 +513,7 @@ def test_interpreted_suite():
     if INTERPRETED:
         pytest.skip("this is the interpreted child run")
     env = dict(os.environ, TRITON_INTERPRET="1")
-    for name in (SWITCH, "VLLM_SM70_INKLING_GROUPED_MOE"):
+    for name in (SWITCH, MIXED_SWITCH, "VLLM_SM70_INKLING_GROUPED_MOE"):
         env.pop(name, None)
     proc = subprocess.run(
         [
@@ -458,4 +527,4 @@ def test_interpreted_suite():
     assert proc.returncode == 0, tail
     summary = proc.stdout.strip().splitlines()[-1]
     passed = re.search(r"(\d+) passed", summary)
-    assert passed and int(passed.group(1)) >= 40, summary
+    assert passed and int(passed.group(1)) >= 53, summary

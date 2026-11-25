@@ -6,7 +6,8 @@ One ``Nvfp4TmExperts`` per NVFP4 layer and TP rank holds the two packed banks
 routed slots by expert, runs W13, the soft-capped SwiGLU in fp32 and W2, and
 sums a token's experts in fp32, as moe.py's torch path does. Slots run in
 chunks of at most ``CHUNK_ROWS``; small batches run one-row compact groups
-(``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off). Every slot runs, so
+(``VLLM_SM70_FLINT_MOE_COMPACT=0`` turns this off), larger ones the prefill
+kernels and tile (``PREFILL_FUSED``, ``PREFILL_TILE``). Every slot runs, so
 nothing is read back to the host: a padding slot is computed on expert E - 1
 and zeroed. ``routed_expert_sum`` routes from the router logits via
 ops/routing.py. On the route of gemv.py compact slots take the NVFP4 GEMV
@@ -27,7 +28,7 @@ from vllm_sm70.fused_moe.method import COMPACT_MAX_SLOTS
 
 from . import gemv
 from .expert_weights import NVFP4_BLOCK, Nvfp4Codes, RangeCheck
-from .ops import routing, torch_ref
+from .ops import _compat, routing, torch_ref
 from .ops.activation import softcapped_swiglu_out
 from .ops.nvfp4_gemv import TILE_N, nvfp4_slot_gemv
 
@@ -35,6 +36,8 @@ logger = init_logger("vllm.sm70.models.inkling2.moe_tm")
 
 SWITCH: Final = "VLLM_SM70_INKLING_NVFP4_TM"
 SWITCHED_OFF: Final = f"{SWITCH}=0"
+PREFILL_FUSED: Final = "VLLM_SM70_INKLING_TM_PREFILL_FUSED"
+PREFILL_TILE: Final = "VLLM_SM70_INKLING_TM_PREFILL_TILE"
 REQUIRED_OPS: Final = (
     "nvfp4_sm70_prepare",
     "awq_moe_build_strided_ptrs",
@@ -56,6 +59,16 @@ CHUNK_ROWS: Final = 4096
 # 128 launches per stage call at any batch size. The bound covers the largest
 # captured verify step: 8 requests of 8 tokens at top-k 8 is 512 slots.
 COMPACT_BATCH_MAX_SLOTS: Final = 8 * COMPACT_MAX_SLOTS
+# With PREFILL_TILE the dense stages of a chunk run on all CHUNK_ROWS
+# workspace rows (the expert offsets bound the rows they touch), so every
+# prefill stage has one TurboMind shape, and its W13 stage takes this tile
+# (CTA rows x cols x depth : splits : swizzle : grouped @ kernel name part).
+PREFILL_W13_DESC: Final = f"sm70_f16_e2m1k16_f16_tnt_bbb_{CHUNK_ROWS}x1152x2304_128"
+PREFILL_W13_TILE: Final = "32x128x32:1:2:1@c32x128_a1x1x32_01"
+# (experts, K, N) of that W13 stage.
+PREFILL_W13_SHAPE: Final = (128, 2304, 1152)
+# The TurboMind knob that names a fixed tile per GEMM shape.
+GEMM_TARGETS: Final = "VLLM_SM70_AWQ_TP2_FAST_TARGETS"
 
 Contract = tuple[int, int, int, int]
 
@@ -67,6 +80,28 @@ class Rejected(ValueError):
 def enabled() -> bool:
     """False only when VLLM_SM70_INKLING_NVFP4_TM=0."""
     return bool(envs.VLLM_SM70_INKLING_NVFP4_TM)
+
+
+def prefill_fused(x: torch.Tensor) -> bool:
+    """Whether a dense-form batch on `x` runs the prefill kernels."""
+    if not (_compat.INTERPRET or (x.is_cuda and _compat.AVAILABLE)):
+        return False
+    return bool(envs.VLLM_SM70_INKLING_TM_PREFILL_FUSED)
+
+
+def prefill_tile() -> bool:
+    """False only when VLLM_SM70_INKLING_TM_PREFILL_TILE=0."""
+    return bool(envs.VLLM_SM70_INKLING_TM_PREFILL_TILE)
+
+
+def gemm_targets(current: str | None) -> str:
+    """`current` (the GEMM_TARGETS value) with the prefill W13 tile added,
+    unless `current` already names a tile for that shape."""
+    entry = f"{PREFILL_W13_DESC}|{PREFILL_W13_TILE}"
+    if not current:
+        return entry
+    named = {part.split("|", 1)[0] for part in current.split(";")}
+    return current if PREFILL_W13_DESC in named else f"{current};{entry}"
 
 
 def turbomind() -> Any | None:
@@ -329,7 +364,12 @@ class Nvfp4TmExperts:
         )
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         self.workspace = Workspace.get(device, self.num_experts, hidden, local)
-        self.workspace.reserve(max_slots)
+        # Dense stages at a fixed row count, the shape of PREFILL_W13_DESC.
+        self.pin_rows = (
+            prefill_tile()
+            and (self.num_experts, hidden, 2 * local) == PREFILL_W13_SHAPE
+        )
+        self.workspace.reserve(CHUNK_ROWS if self.pin_rows else max_slots)
 
     def nbytes(self) -> int:
         return self.w13.nbytes() + self.w2.nbytes()
@@ -382,10 +422,16 @@ class Nvfp4TmExperts:
         sorted_ids, order = torch.sort(flat, stable=True)
         skip = sorted_ids == none
         sorted_ids = sorted_ids.clamp(max=none - 1)
+        self.workspace.reserve(slots)
+        dense = not (self.compact and slots <= COMPACT_BATCH_MAX_SLOTS)
+        fused_act = fused_act or (dense and prefill_fused(x))
+        if dense and slots <= CHUNK_ROWS and prefill_fused(x):
+            self._dense_sum(x, top_k_index, top_k_weights, sorted_ids, order,
+                            output, act_quant)  # fmt: skip
+            return
         tokens = order // top_k
         weights = top_k_weights.reshape(-1)[order].float()
         total = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-        self.workspace.reserve(slots)
         step = CHUNK_ROWS
         if self.compact and COMPACT_MAX_SLOTS < slots <= COMPACT_BATCH_MAX_SLOTS:
             step = min(step, COMPACT_MAX_SLOTS)
@@ -396,6 +442,44 @@ class Nvfp4TmExperts:
                 act_quant, fused_act,
             )  # fmt: skip
         output.copy_(total)
+
+    def _dense_sum(
+        self,
+        x: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        order: torch.Tensor,
+        output: torch.Tensor,
+        act_quant: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> None:
+        """`expert_sum` of one chunk on the dense form with the prefill
+        kernels: the fused SwiGLU, then routing.combine sums each token's
+        expert rows in fp32 in slot order, through `order`'s inverse."""
+        slots = order.numel()
+        rows, gate_up, act, sorted_out = self._buffers(slots, dense=True)
+        torch.index_select(x, 0, order // top_k_index.shape[-1], out=rows[:slots])
+        offsets, expert_ids, groups = self.stage_groups(sorted_ids)
+        self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
+                     act_quant, True, slots=slots)  # fmt: skip
+        pos = torch.empty_like(order)
+        pos[order] = torch.arange(slots, device=order.device, dtype=order.dtype)
+        routed = routing.Routed(
+            top_k_index.contiguous(),
+            top_k_weights.float().contiguous(),
+            pos.view(top_k_index.shape),
+        )
+        routing.combine(sorted_out, routed, self.num_experts, output)
+
+    def _buffers(
+        self, slots: int, dense: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(rows, gate_up, act, sorted_out) scratch for `slots` slots: all
+        CHUNK_ROWS rows for the dense form with ``pin_rows``."""
+        ws = self.workspace
+        if dense and self.pin_rows and ws.rows == CHUNK_ROWS:
+            slots = CHUNK_ROWS
+        return tuple(ws.buffers[name][:slots] for name in ws.widths)  # type: ignore[return-value]
 
     def _chunk(
         self,
@@ -411,17 +495,14 @@ class Nvfp4TmExperts:
         """Add the weighted expert outputs of up to CHUNK_ROWS slots, sorted
         by expert, into the fp32 `total` [M, H]; slots where the bool `skip`
         is set add zero."""
-        ws = self.workspace
         slots = tokens.numel()
-        rows, gate_up, act, sorted_out = (
-            ws.buffers[name][:slots] for name in ws.widths
-        )
-        torch.index_select(x, 0, tokens, out=rows)
+        compact = self.compact and slots <= COMPACT_MAX_SLOTS
+        rows, gate_up, act, sorted_out = self._buffers(slots, dense=not compact)
+        torch.index_select(x, 0, tokens, out=rows[:slots])
         offsets, expert_ids, groups = self.stage_groups(sorted_ids)
         self._stages(rows, gate_up, act, sorted_out, offsets, expert_ids, groups,
-                     act_quant, fused_act,
-                     compact=self.compact and slots <= COMPACT_MAX_SLOTS)  # fmt: skip
-        weighted = sorted_out.float() * weights[:, None]
+                     act_quant, fused_act, compact=compact, slots=slots)  # fmt: skip
+        weighted = sorted_out[:slots].float() * weights[:, None]
         total.index_add_(0, tokens, weighted.masked_fill_(skip[:, None], 0.0))
 
     def _stages(
@@ -436,11 +517,13 @@ class Nvfp4TmExperts:
         act_quant: Callable[[torch.Tensor], torch.Tensor] | None,
         fused_act: bool = False,
         compact: bool = False,
+        slots: int | None = None,
     ) -> None:
         """W13, the soft-capped SwiGLU in fp32 (one kernel with `fused_act`)
         and W2 of the expert-sorted `rows` into `sorted_out`, through the
         scratch `gate_up` and `act`. `compact`: row s is a group of its own,
-        of expert expert_ids[s], and may take the NVFP4 GEMV."""
+        of expert expert_ids[s], and may take the NVFP4 GEMV. `slots`: the
+        rows that hold slots (default all); the stages may span more."""
         if compact and self.slot_gemv and gemv.on_nvfp4(rows):
             caps = (self.gate_cap, self.up_cap)
             w13, w2 = self.w13, self.w2
@@ -455,17 +538,19 @@ class Nvfp4TmExperts:
             self.w13.ptrs_w, self.w13.ptrs_s,
             groups, self.hidden_size, 2 * self.local_intermediate, NVFP4_BLOCK,
         )  # fmt: skip
+        used = rows.shape[0] if slots is None else slots
+        gate_up_used, act_used = gate_up[:used], act[:used]
         if fused_act:
-            softcapped_swiglu_out(gate_up, act, self.gate_cap, self.up_cap)
+            softcapped_swiglu_out(gate_up_used, act_used, self.gate_cap, self.up_cap)
         else:
-            gate, up = gate_up.float().chunk(2, dim=-1)
-            act.copy_(
+            gate, up = gate_up_used.float().chunk(2, dim=-1)
+            act_used.copy_(
                 torch_ref.softcap(gate, self.gate_cap)
                 * torch.sigmoid(gate)
                 * torch_ref.softcap(up, self.up_cap)
             )
         if act_quant is not None:
-            act.copy_(act_quant(act))
+            act_used.copy_(act_quant(act_used))
         stage(
             sorted_out, act, offsets, expert_ids,
             self.w2.ptrs_w, self.w2.ptrs_s,

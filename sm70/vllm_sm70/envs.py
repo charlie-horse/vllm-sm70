@@ -333,10 +333,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN": kill_switch(
             "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
         ),
-        # "0": the query rows of an Inkling 2 request with 2 to
-        # SHORT_QUERY_LEN query tokens in an eager batch take the torch
-        # attention over shared key chunks instead of the decode-attention
-        # kernel. Env-only (no Sm70Config field), read per eager call
+        # "0": the query rows of an Inkling 2 request with 2 or more query
+        # tokens (up to SHORT_QUERY_LEN when it is set) in an eager batch
+        # take the torch attention over shared key chunks instead of the
+        # decode-attention kernel. Env-only (no Sm70Config field), read per eager call
         # (inkling2_sm70/attention_torch.py); only where that kernel runs.
         "VLLM_SM70_INKLING_SHORT_QUERY_ATTN": kill_switch(
             "VLLM_SM70_INKLING_SHORT_QUERY_ATTN"
@@ -375,6 +375,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are tuned in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "0": Inkling 2 prefill batches on the TurboMind expert route (more
+        # routed slots than the compact groups, one slot chunk) run the
+        # soft-capped SwiGLU in torch and sum each token's experts with an
+        # fp32 index_add. Otherwise one Triton kernel does each (inkling2_sm70/
+        # moe_tm.py). Env-only, read per eager call.
+        "VLLM_SM70_INKLING_TM_PREFILL_FUSED": kill_switch(
+            "VLLM_SM70_INKLING_TM_PREFILL_FUSED"
+        ),
+        # "0": the Inkling 2 TurboMind expert stages of prefill batches take
+        # TurboMind's default tile. Otherwise they run at a fixed row count
+        # and the config hook names their W13 tile for the workers
+        # (inkling2_sm70/moe_tm.py, config.py). Env-only, read once per
+        # engine config and when a layer is loaded.
+        "VLLM_SM70_INKLING_TM_PREFILL_TILE": kill_switch(
+            "VLLM_SM70_INKLING_TM_PREFILL_TILE"
+        ),
         # "0": the Inkling 2 config hook refuses every --speculative-config
         # and Sm70CudaPlatform.get_speculator_cls returns None
         # (inkling2_sm70/draft.py). Env-only, read once per engine config.
@@ -432,6 +448,17 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # and tensors off the GPU always take the torch ops.
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
             "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
+        ),
+        # "0": Inkling 2 batches that are not decode-only (prefill and mixed
+        # steps) run the prologue's q/r clips and relative projection, the
+        # attention output gate and the expert router on torch ops instead
+        # of the kernels of inkling2_sm70/fused_small.py and ops/routing.py.
+        # Env-only (no Sm70Config field), read per eager call; these ops run
+        # outside the piecewise graphs. Needs
+        # VLLM_SM70_INKLING_FUSED_SMALL_OPS on; tensors off the GPU always
+        # take the torch ops.
+        "VLLM_SM70_INKLING_MIXED_SMALL_OPS": kill_switch(
+            "VLLM_SM70_INKLING_MIXED_SMALL_OPS"
         ),
         # "0": Inkling 2 decode-only batches run one kernel per op of a layer
         # visit instead of the merged kernels of inkling2_sm70/

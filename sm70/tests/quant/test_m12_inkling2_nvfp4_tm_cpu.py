@@ -804,3 +804,53 @@ def test_workspace_is_shared_and_grows(tm, config):
     assert fresh.rows == moe_tm.COMPACT_MAX_SLOTS
     fresh.reserve(100)
     assert fresh.rows == 100 and fresh.nbytes() == 100 * 224 * 2
+
+
+def _torch_combine(y, routed, experts, out):
+    """routing.combine's contract in torch: fp32 sum in slot order."""
+    ids, weights, pos = routed
+    total = torch.zeros(out.shape, dtype=torch.float32)
+    for j in range(ids.shape[1]):
+        valid = ((ids[:, j] >= 0) & (ids[:, j] < experts)).float()[:, None]
+        total += y[pos[:, j].long()].float() * weights[:, j : j + 1] * valid
+    return out.copy_(total)
+
+
+@pytest.mark.parametrize("compact", [True, False])
+@pytest.mark.parametrize("m", [5, 400, 2100])
+def test_prefill_kernels_match_the_chunk_path(tm, monkeypatch, compact, m):
+    """With VLLM_SM70_INKLING_TM_PREFILL_FUSED a dense single-chunk batch
+    runs the fused SwiGLU and routing.combine through the inverse of the
+    slot sort, a longer one the fused SwiGLU per chunk; the sum equals the
+    torch path's index_add, padded ids too."""
+    x, indices, weights = random_batch(m)
+    indices[::7, 1] = 8  # no expert
+    want = torch.full_like(x, float("nan"))
+    random_route(tm, max_slots=2 * m, compact=compact).expert_sum(
+        x, indices, weights, want
+    )
+    calls = []
+    monkeypatch.setattr(moe_tm, "prefill_fused", lambda x: True)
+    monkeypatch.setattr(
+        moe_tm, "softcapped_swiglu_out",
+        lambda g, a, gc, uc: calls.append("act") or softcapped(g, a, gc, uc),
+    )  # fmt: skip
+    monkeypatch.setattr(
+        moe_tm.routing, "combine",
+        lambda *a: calls.append("combine") or _torch_combine(*a),
+    )  # fmt: skip
+    got = torch.full_like(x, float("nan"))
+    random_route(tm, max_slots=2 * m, compact=compact).expert_sum(
+        x, indices, weights, got
+    )
+    dense = not compact or 2 * m > moe_tm.COMPACT_BATCH_MAX_SLOTS
+    chunks = -(-2 * m // moe_tm.CHUNK_ROWS)
+    want_calls = ["act", "combine"] if chunks == 1 else ["act"] * chunks
+    assert calls == (want_calls if dense else [])
+    assert torch.allclose(got, want, rtol=0, atol=2e-3)
+
+
+def softcapped(gate_up, act, gate_cap, up_cap):
+    from vllm_sm70.models.inkling2_sm70.ops.activation import softcapped_swiglu_out
+
+    return softcapped_swiglu_out(gate_up, act, gate_cap, up_cap, kernel=False)

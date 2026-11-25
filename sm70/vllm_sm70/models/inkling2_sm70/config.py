@@ -12,9 +12,9 @@
   refused; capture sizes are capped at q x ``DECODE_GRAPH_MAX_BATCH``. With
   breakable graphs, an unset mode becomes FULL_AND_PIECEWISE instead and
   ``mixed_capture_sizes`` are added (VLLM_SM70_INKLING_MIXED_GRAPH=0: off).
-* Copies ``max_image_encoder_tokens`` onto ``hf_config`` and, unless they are
-  set or VLLM_SM70_INKLING_TM_TUNE=0, sets the TurboMind tuning knobs for
-  the workers (``tm_tuning_env``). Logs the routes once per process.
+* Copies ``max_image_encoder_tokens`` onto ``hf_config``; sets the TurboMind
+  tuning knobs (``tm_tuning_env``) and prefill W13 tile
+  (``prefill_gemm_targets``) for the workers. Logs the routes once.
 """
 
 import os
@@ -184,6 +184,18 @@ def tm_tuning_env(
     return dict(zip(TM_TUNE_KNOBS, ("1", str(slots), "0"), strict=True))
 
 
+def prefill_gemm_targets() -> dict[str, str]:
+    """The GEMM_TARGETS value that names the prefill W13 tile for the
+    workers ({} when the route or VLLM_SM70_INKLING_TM_PREFILL_TILE is off)."""
+    from . import moe_tm
+
+    if not moe_tm.enabled() or not moe_tm.prefill_tile():
+        return {}
+    current = os.environ.get(moe_tm.GEMM_TARGETS)
+    merged = moe_tm.gemm_targets(current)
+    return {} if merged == current else {moe_tm.GEMM_TARGETS: merged}
+
+
 class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -328,6 +340,14 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
                 "routed slots (%s); VLLM_SM70_INKLING_TM_TUNE=0 turns it off.",
                 tuning[TM_TUNE_KNOBS[1]],
                 ", ".join(f"{k}={v}" for k, v in tuning.items()),
+            )
+        targets = prefill_gemm_targets()
+        if targets:
+            os.environ.update(targets)
+            logger.info(
+                "Inkling 2 SM70: TurboMind prefill W13 tile %s; "
+                "VLLM_SM70_INKLING_TM_PREFILL_TILE=0 turns it off.",
+                targets,
             )
         if hf_config is not None:
             setattr(

@@ -184,6 +184,8 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_TM_PREFILL_FUSED",
+        "VLLM_SM70_INKLING_TM_PREFILL_TILE",
         "VLLM_SM70_INKLING_DSPARK",
         "VLLM_SM70_INKLING_DSPARK_AUTO",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
@@ -192,6 +194,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_SHARDED_EMBED",
         "VLLM_SM70_INKLING_MXFP8_EXPERTS",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
+        "VLLM_SM70_INKLING_MIXED_SMALL_OPS",
         "VLLM_SM70_INKLING_VISIT_FUSION",
         "VLLM_SM70_INKLING_SMALL_M_GEMV",
         "VLLM_SM70_INKLING_NVFP4_GEMV",
@@ -528,6 +531,23 @@ def _inkling_fused_small_ops_off(name):
         assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
 
 
+def _inkling_mixed_small_ops_off(name):
+    """A GPU batch that is not decode-only keeps the torch q/r clips, gate and
+    router (inkling2_sm70/fused_small.py); the kernels' own checks are
+    tests/ops/test_m12_inkling2_fused_small_cpu.py and
+    tests/ops/test_m12_inkling2_routing_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import fused_small
+
+    assert fused_small.MIXED_SWITCH == name
+    gpu = SimpleNamespace(is_cuda=True)
+    with mock.patch.object(fused_small._compat, "AVAILABLE", True):
+        assert fused_small.on_mixed(gpu) is False
+        assert fused_small.on_small(gpu, False) is False
+
+
 def _inkling_greedy_top1_off(name):
     """The Inkling 2 model does not opt in to the V1 sampler hook; the
     kernels are checked in tests/sampler/test_m12_inkling2_greedy_top1_cpu.py."""
@@ -625,6 +645,32 @@ def _inkling_tm_tune_off(name):
     from vllm_sm70.models.inkling2_sm70 import config as icfg
 
     assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
+
+
+def _inkling_tm_prefill_fused_off(name):
+    """A dense batch on the GPU keeps the torch SwiGLU and index_add; the
+    kernels' path is in tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    assert moe_tm.PREFILL_FUSED == name
+    with mock.patch.object(moe_tm._compat, "AVAILABLE", True):
+        assert moe_tm.prefill_fused(SimpleNamespace(is_cuda=True)) is False
+
+
+def _inkling_tm_prefill_tile_off(name):
+    """The Inkling 2 hook names no prefill tile and the stages keep their
+    slot rows; the on case is in
+    tests/quant/test_m12_inkling2_grouped_prefill_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    assert moe_tm.PREFILL_TILE == name
+    assert moe_tm.prefill_tile() is False
+    assert icfg.prefill_gemm_targets() == {}
 
 
 def _inkling_dspark_off(name):
@@ -910,6 +956,10 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_PREFILL_FUSED":
+        _inkling_tm_prefill_fused_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_PREFILL_TILE":
+        _inkling_tm_prefill_tile_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK":
         _inkling_dspark_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK_AUTO":
@@ -926,6 +976,8 @@ def _path_off(name):
         _inkling_mxfp8_experts_off(name)
     elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
         _inkling_fused_small_ops_off(name)
+    elif name == "VLLM_SM70_INKLING_MIXED_SMALL_OPS":
+        _inkling_mixed_small_ops_off(name)
     elif name == "VLLM_SM70_INKLING_GREEDY_TOP1":
         _inkling_greedy_top1_off(name)
     elif name == "VLLM_SM70_INKLING_VISIT_FUSION":

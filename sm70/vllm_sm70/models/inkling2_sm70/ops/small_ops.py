@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 decode kernels for the small torch chains of a layer visit
-(sm_70: no tl.dot, libdevice exp and log, no tanh.approx).
+"""Inkling 2 kernels for the small torch chains of a layer visit (route:
+fused_small.py; sm_70: no tl.dot, libdevice exp and log, no tanh.approx).
 
     query_rel   the q and r clips of the attention prologue, tau of a global
                 layer, r @ rel_proj and zeroed padding rows, in one launch

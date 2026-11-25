@@ -12,8 +12,8 @@ decode-only batch reads no host data. Rows with a negative slot are zero.
 One-query rows run ops/paged_attention.py (split-KV unless
 VLLM_SM70_INKLING_SPLIT_KV_ATTN=0) unless VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0
 or `hf_rounding` (debug: softmax weights rounded as the reference). So do
-the rows of a request with at most SHORT_QUERY_LEN query tokens, each over
-its own keys, unless VLLM_SM70_INKLING_SHORT_QUERY_ATTN=0.
+the rows of every request (of at most SHORT_QUERY_LEN query tokens when it is
+set), each over its own keys, unless VLLM_SM70_INKLING_SHORT_QUERY_ATTN=0.
 Shapes: P padded batch tokens, T real tokens, R requests, D head dim.
 """
 
@@ -29,7 +29,7 @@ from vllm_sm70 import envs
 
 from . import gemv
 from .backend import is_decode_only
-from .fused_small import on_fused
+from .fused_small import on_small
 from .ops import _compat, small_ops
 from .ops.paged_attention import decode_attention
 
@@ -66,8 +66,9 @@ DEFAULT_QUERY_CHUNK = 256
 DEFAULT_KEY_CHUNK = 1024
 # Single-query requests gather this many key chunks per step between them.
 OWN_KEY_STEPS = 8
-# Most query tokens of a request whose rows run the one-query kernel.
-SHORT_QUERY_LEN = 64
+# Most query tokens of a request whose rows run the one-query kernel (None:
+# every request).
+SHORT_QUERY_LEN: int | None = None
 # Key chunk of `hf_rounding`: every key in one step.
 _ALL_KEYS = 1 << 62
 
@@ -386,7 +387,9 @@ def gather_attention(
     seq_lens = np.asarray(md.seq_lens_cpu[: md.num_reqs])
     starts = np.concatenate(([0], np.cumsum(query_lens)))
     kernel = not hf_rounding and on_triton(query)
-    own_len = SHORT_QUERY_LEN if kernel and on_short_query() else 1
+    own_len = 1
+    if kernel and on_short_query():
+        own_len = int(query_lens.max()) if SHORT_QUERY_LEN is None else SHORT_QUERY_LEN
     single = np.flatnonzero((query_lens >= 1) & (query_lens <= own_len))
     if single.size:
         if single[-1] == single.size - 1 and int(starts[single.size]) == single.size:
@@ -491,7 +494,7 @@ def attention_with_metadata(
         key_chunk=key_chunk,
         hf_rounding=hf_rounding,
     )
-    if on_fused(attn_output, is_decode_only(md)):
+    if on_small(attn_output, is_decode_only(md)):
         rows = min(output.shape[0], md.slot_mapping.shape[0])
         if out_weight is None and output.dtype == attn_output.dtype:
             return small_ops.gate(attn_output, gate, md.slot_mapping, rows, output)

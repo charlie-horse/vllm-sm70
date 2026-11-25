@@ -78,6 +78,9 @@ Serve rules:
 - With `VLLM_SM70_INKLING_ASYNC_SCHED=0`, don't pass `--async-scheduling`.
 - `sm70.inkling2` fields are set only through `--additional-config`
   (`'{"sm70":{"inkling2":{...}}}'`); they have no env variable.
+- The engine adds the expert prefill tile to
+  `VLLM_SM70_AWQ_TP2_FAST_TARGETS` (TurboMind's list of fixed kernels per
+  GEMM shape). An entry you set there for the same shape wins.
 
 Client rules:
 

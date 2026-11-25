@@ -607,6 +607,29 @@ def test_route_kernel(tokens, has_pad, dispatch):
     )
 
 
+@pytest.mark.parametrize("has_pad", [False, True], ids=["no_pad", "pad"])
+def test_route_blocks_kernel(has_pad):
+    routing = _ops("routing")
+    _check(
+        routing._route_blocks_kernel,
+        {
+            "logits_ptr": "*fp32",
+            "bias_ptr": "*fp32",
+            "pad_ptr": "*i1" if has_pad else "*i64",
+            "ids_ptr": "*i64",
+            "weights_ptr": "*fp32",
+            **_i32("tokens", "experts", "stride_l", "pad_id"),
+            "route_scale": "fp32",
+            "TOP_K": TOP_K,
+            "BLOCK_M": routing.ROUTE_BLOCK_M,
+            "BLOCK_E": EXPERTS,
+            "BLOCK_TOP": TOP_K,
+            "HAS_PAD": has_pad,
+        },
+        enable_fp_fusion=False,
+    )
+
+
 @pytest.mark.parametrize("has_pos", [False, True], ids=["by_token", "sorted"])
 def test_combine_kernel(has_pos):
     routing = _ops("routing")
