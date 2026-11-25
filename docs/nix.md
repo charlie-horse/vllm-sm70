@@ -89,8 +89,9 @@ Client rules:
 
 ### DSpark draft
 
-The built-in `inkling-2-mini` entry stages its draft in `preStart` at every
-start and serves it with DSpark. To serve it without DSpark (or with
+The built-in `inkling-2-mini` and `inkling-2-mini-uncensored` entries each
+stage their draft in `preStart` at every
+start and serve it with DSpark. To serve one without DSpark (or with
 `VLLM_SM70_INKLING_DSPARK=0`), override its `args` without
 `--speculative-config`. For a hand-run server:
 
