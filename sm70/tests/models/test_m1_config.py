@@ -184,6 +184,8 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
+        "VLLM_SM70_INKLING_TM_PREFILL_FUSED",
+        "VLLM_SM70_INKLING_TM_PREFILL_TILE",
         "VLLM_SM70_INKLING_DSPARK",
         "VLLM_SM70_INKLING_DSPARK_AUTO",
         "VLLM_SM70_INKLING_DSPARK_KERNELS",
@@ -627,6 +629,32 @@ def _inkling_tm_tune_off(name):
     assert icfg.tm_tuning_env(SimpleNamespace(), SimpleNamespace()) == {}
 
 
+def _inkling_tm_prefill_fused_off(name):
+    """A dense batch on the GPU keeps the torch SwiGLU and index_add; the
+    kernels' path is in tests/quant/test_m12_inkling2_nvfp4_tm_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    assert moe_tm.PREFILL_FUSED == name
+    with mock.patch.object(moe_tm._compat, "AVAILABLE", True):
+        assert moe_tm.prefill_fused(SimpleNamespace(is_cuda=True)) is False
+
+
+def _inkling_tm_prefill_tile_off(name):
+    """The Inkling 2 hook names no prefill tile and the stages keep their
+    slot rows; the on case is in
+    tests/quant/test_m12_inkling2_grouped_prefill_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+    from vllm_sm70.models.inkling2_sm70 import moe_tm
+
+    assert moe_tm.PREFILL_TILE == name
+    assert moe_tm.prefill_tile() is False
+    assert icfg.prefill_gemm_targets() == {}
+
+
 def _inkling_dspark_off(name):
     """The Inkling 2 hook refuses a staged DSpark draft and the speculator
     hook has none; the accepted case is in
@@ -910,6 +938,10 @@ def _path_off(name):
         _inkling_fused_routing_off(name)
     elif name == "VLLM_SM70_INKLING_TM_TUNE":
         _inkling_tm_tune_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_PREFILL_FUSED":
+        _inkling_tm_prefill_fused_off(name)
+    elif name == "VLLM_SM70_INKLING_TM_PREFILL_TILE":
+        _inkling_tm_prefill_tile_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK":
         _inkling_dspark_off(name)
     elif name == "VLLM_SM70_INKLING_DSPARK_AUTO":
