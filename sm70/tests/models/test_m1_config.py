@@ -194,6 +194,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_NVFP4_GEMV",
         "VLLM_SM70_INKLING_MERGED_PROJ",
         "VLLM_SM70_INKLING_GREEDY_TOP1",
+        "VLLM_SM70_INKLING_IMAGE_RESIZE",
     }
     # one kill per field, except quant_backend (env-only refusal) and the
     # TurboMind copy policy (a policy, not a feature)
@@ -521,6 +522,20 @@ def _inkling_greedy_top1_off(name):
     assert greedy.SWITCH == name and not greedy.enabled()
 
 
+def _inkling_image_resize_off(name):
+    """An image over the cap is refused, not scaled down; the resize itself
+    is checked in tests/models/test_m12_inkling2_multimodal_cpu.py."""
+    pytest.importorskip("vllm")
+    from PIL import Image
+
+    from vllm_sm70.models.inkling2_sm70 import processing
+
+    assert processing.RESIZE_SWITCH == name
+    proc = processing.Inkling2ImageProcessor(patch_size=4, max_tokens=1)
+    with pytest.raises(ValueError, match="not resized"):
+        proc.preprocess([Image.new("RGB", (8, 4))])
+
+
 def _inkling_visit_fusion_off(name):
     """A decode-only GPU batch keeps the kernels of each op of a layer
     visit (inkling2_sm70/visit_fusion.py); the fused kernels' own checks are
@@ -830,6 +845,8 @@ def _path_off(name):
         _inkling_greedy_top1_off(name)
     elif name == "VLLM_SM70_INKLING_VISIT_FUSION":
         _inkling_visit_fusion_off(name)
+    elif name == "VLLM_SM70_INKLING_IMAGE_RESIZE":
+        _inkling_image_resize_off(name)
     elif name == "VLLM_SM70_INKLING_SMALL_M_GEMV":
         _inkling_small_m_gemv_off(name)
     elif name == "VLLM_SM70_INKLING_NVFP4_GEMV":

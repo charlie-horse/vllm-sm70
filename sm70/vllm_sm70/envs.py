@@ -454,6 +454,13 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # top-1 kernels and a (value, id) pair all-gather (inkling2_sm70/
         # greedy.py). Env-only (no Sm70Config field), read on every step.
         "VLLM_SM70_INKLING_GREEDY_TOP1": kill_switch("VLLM_SM70_INKLING_GREEDY_TOP1"),
+        # "0": an Inkling 2 image larger than max_image_encoder_tokens allows
+        # is refused with an error. Otherwise it is scaled down, keeping its
+        # shape, until it fits (inkling2_sm70/processing.py). Env-only (no
+        # Sm70Config field), read for each image.
+        "VLLM_SM70_INKLING_IMAGE_RESIZE": kill_switch(
+            "VLLM_SM70_INKLING_IMAGE_RESIZE"
+        ),
     },
     # Flint top-k candidate sampler.
     "sampler": {
