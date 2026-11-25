@@ -110,6 +110,7 @@ let
         [ "--block-size" "32" ]
         [ "--limit-mm-per-prompt" (builtins.toJSON { image = 2; }) ]
         [ "--enable-prompt-tokens-details" ]
+        [ "--prefill-schedule-interval" "4" ]
         [
           "--speculative-config"
           (builtins.toJSON {
