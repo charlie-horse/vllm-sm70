@@ -432,6 +432,7 @@ def test_interpreted_suite():
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
+        "VLLM_SM70_INKLING_SHORT_QUERY_ATTN",
     ):
         env.pop(name, None)
     # The small-op kernels on their own; test_m12_inkling2_visit_fusion_cpu.py
