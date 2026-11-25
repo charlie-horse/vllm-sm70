@@ -2,13 +2,16 @@
 """Inkling 2 small decode kernels (inkling2_sm70/ops/small_ops.py) and the
 route of fused_small.py, on CPU.
 
-- the kill switch VLLM_SM70_INKLING_FUSED_SMALL_OPS and the route choice:
-  decode-only batches only, tensors off the GPU, only "0" turns it off;
+- the kill switches VLLM_SM70_INKLING_FUSED_SMALL_OPS and
+  VLLM_SM70_INKLING_MIXED_SMALL_OPS and the route choice: decode-only
+  batches, other batches for query_rel and the gate, tensors off the GPU,
+  only "0" turns a switch off;
 - through Triton's interpreter, against the torch ops they replace:
   ``query_rel`` (also through ``prologue.attention_prologue`` on paged
   caches), ``gate`` with and without the output projection, the TurboMind
   SwiGLU of moe_tm.py and the module forward of a decode-only batch, the
-  short conv without its padding mask, padding rows zero in every output.
+  short conv without its padding mask, padding rows zero in every output;
+  ``query_rel`` and ``gate`` in prefill and mixed batches.
 
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite). The AOT compile check is
@@ -49,6 +52,7 @@ import _inkling2_sconv as sconv_cases
 OPS = HERE.parents[1] / "vllm_sm70" / "models" / "inkling2_sm70" / "ops"
 TINY = HERE.parent / "models" / "fixtures" / "inkling2_tiny"
 SWITCH = "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
+MIXED_SWITCH = "VLLM_SM70_INKLING_MIXED_SMALL_OPS"
 INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1"
 interpreted = pytest.mark.skipif(not INTERPRETED, reason="interpreted child run only")
 # Inkling 2 Mini per rank at TP2: 12 query heads of 128, d_rel 16, extent 1024.
@@ -110,8 +114,32 @@ def test_kill_switch_only_zero_turns_the_route_off(monkeypatch, value, enabled):
 def test_tensors_off_the_gpu_take_torch_outside_the_interpreter(monkeypatch):
     route = _route()
     monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.delenv(MIXED_SWITCH, raising=False)
     monkeypatch.setattr(route._compat, "INTERPRET", False)
     assert route.on_fused(torch.zeros(1), True) is False
+    assert route.on_mixed(torch.zeros(1)) is False
+
+
+@pytest.mark.parametrize("fused", [None, "0"])
+@pytest.mark.parametrize("mixed", [None, "1", "0", "off"])
+def test_mixed_switch_needs_the_fused_switch(monkeypatch, fused, mixed):
+    from vllm_sm70 import envs
+
+    route = _route()
+    assert MIXED_SWITCH in envs._SECTIONS["models"]
+    assert route.MIXED_SWITCH == MIXED_SWITCH
+    for name, value in ((SWITCH, fused), (MIXED_SWITCH, mixed)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    gpu = SimpleNamespace(is_cuda=True)
+    monkeypatch.setattr(route._compat, "AVAILABLE", True)
+    on = fused is None and mixed != "0"
+    assert route.on_mixed(gpu) is on
+    assert route.on_small(gpu, False) is on
+    assert route.on_small(gpu, True) is (fused is None)
+    assert route.on_fused(gpu, False) is False
 
 
 # --- query_rel ------------------------------------------------------------------------
@@ -235,20 +263,41 @@ def test_interpreted_attention_gate_route(monkeypatch, project, pad):
 
 
 @interpreted
-def test_interpreted_mixed_batch_keeps_the_torch_gate(monkeypatch):
+@pytest.mark.parametrize("project", [False, True], ids=["gated", "projected"])
+@pytest.mark.parametrize("pad", [0, 2])
+def test_interpreted_mixed_batch_gate_route(monkeypatch, project, pad):
     attention = attn_cases.attention_module()
     case = attn_cases.Case(
-        torch.float16, 64, 64, [70, 5], decode_only=False, query_lens=[1, 3]
+        torch.float16, 64, 64, [70, 5], decode_only=False, query_lens=[1, 3], pad=pad
     )
+    rows = case.query.shape[0]
+    channels = attn_cases.HEADS * attn_cases.HEAD_DIM
+    g = torch.Generator().manual_seed(2)
+    gate = torch.randn(rows, channels, generator=g).half()
+    weight = (torch.randn(40, channels, generator=g) / channels**0.5).half()
+    calls = []
+    launch = _small_ops().gate
+    monkeypatch.setattr(_small_ops(), "gate", lambda *a: calls.append(1) or launch(*a))
+
+    def run():
+        out = torch.full((rows, 40 if project else channels), float("nan")).half()
+        return attention.attention_with_metadata(
+            case.query, case.rel, case.sinks, gate, case.cache, case.md, out,
+            weight if project else None,
+        )  # fmt: skip
+
     monkeypatch.delenv(SWITCH, raising=False)
-    monkeypatch.setattr(_small_ops(), "gate", None)
-    rows, channels = case.query.shape[0], attn_cases.HEADS * attn_cases.HEAD_DIM
-    gate = torch.zeros(rows, channels).half()
-    out = torch.empty(rows, channels).half()
-    attention.attention_with_metadata(
-        case.query, case.rel, case.sinks, gate, case.cache, case.md, out
-    )
-    assert not out.isnan().any()
+    monkeypatch.delenv(MIXED_SWITCH, raising=False)
+    got = run()
+    assert calls == [1]
+    monkeypatch.setenv(MIXED_SWITCH, "0")
+    want = run()
+    assert calls == [1]
+    assert not got.isnan().any()
+    real = rows - pad
+    assert max_abs_rel(got[:real], want[:real]) <= 2e-3
+    if pad:
+        assert bool((got[-pad:] == 0).all())
 
 
 # --- the prologue through the paged caches --------------------------------------------
@@ -286,6 +335,38 @@ def test_interpreted_prologue_matches_the_torch_route(monkeypatch, dynamic, pad)
     for index, (a, b) in enumerate(zip(got, want, strict=True)):
         assert sconv_cases.rel_err(a, b) <= 1e-3, index
     for q_out, rel_out in zip(got[0:-2:4], got[1:-2:4]):
+        if pad:
+            assert bool((q_out[-pad:] == 0).all()) and bool((rel_out[-pad:] == 0).all())
+
+
+@interpreted
+@pytest.mark.parametrize("scenario", ["prefill", "mixed"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["sliding", "global"])
+@pytest.mark.parametrize("pad", [0, 2])
+def test_interpreted_mixed_prologue_matches_the_torch_route(
+    monkeypatch, scenario, dynamic, pad
+):
+    steps = sconv_cases.SCENARIOS[scenario]
+    calls = []
+    launch = _small_ops().query_rel
+    monkeypatch.setattr(
+        _small_ops(), "query_rel", lambda *a, **k: calls.append(1) or launch(*a, **k)
+    )
+    monkeypatch.delenv(SWITCH, raising=False)
+    monkeypatch.delenv(MIXED_SWITCH, raising=False)
+    got = sconv_cases.run(
+        sconv_cases.Weights("cpu", torch.float16, dynamic), steps, pad=pad
+    )
+    assert len(calls) == len(steps)
+    monkeypatch.setenv(MIXED_SWITCH, "0")
+    want = sconv_cases.run(
+        sconv_cases.Weights("cpu", torch.float16, dynamic), steps, pad=pad
+    )
+    assert len(calls) == len(steps)
+    for index, (a, b) in enumerate(zip(got, want, strict=True)):
+        assert sconv_cases.rel_err(a, b) <= 1e-3, index
+    for q_out, rel_out in zip(got[0:-2:4], got[1:-2:4]):
+        assert not q_out.isnan().any() and not rel_out.isnan().any()
         if pad:
             assert bool((q_out[-pad:] == 0).all()) and bool((rel_out[-pad:] == 0).all())
 
@@ -428,6 +509,7 @@ def test_interpreted_suite():
     env = dict(os.environ, TRITON_INTERPRET="1")
     for name in (
         SWITCH,
+        MIXED_SWITCH,
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
@@ -450,5 +532,5 @@ def test_interpreted_suite():
     assert proc.returncode == 0, tail
     summary = proc.stdout.strip().splitlines()[-1]
     passed = re.search(r"(\d+) passed", summary)
-    assert passed and int(passed.group(1)) >= 28, summary
+    assert passed and int(passed.group(1)) >= 39, summary
     assert "skipped" not in summary, summary

@@ -6,13 +6,16 @@ kernels (sm_70: no tl.dot, libdevice exp).
     route           top-k of sigmoid(logits) + bias, the routing weights and,
                     with ``dispatch``, the expert-sorted slot order, group
                     tables and gathered input rows, in one launch
+    route_blocks    the top-k and weights of ``route`` for a batch of any
+                    size, each program on its own block of tokens
     combine         each token's weighted expert outputs summed in fp32
 
 Router math as torch_ref.router. Top-k ties keep the lowest expert id, as
 torch.topk on CUDA; logits must be finite. A row flagged in `is_padding` gets
 `pad_id` and weight 0. ``dispatch`` sorts the slots by expert id, stable in
 token order, padding last. Every launch has a static grid, reads nothing back
-to the host and allocates only its outputs. Callers keep M * k <= ``MAX_SLOTS``.
+to the host and allocates only its outputs. Callers of ``route`` keep
+M * k <= ``MAX_SLOTS``.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ __all__ = [
     "RouterInput",
     "combine",
     "route",
+    "route_blocks",
     "router_logits",
 ]
 
@@ -286,6 +290,42 @@ def _route_kernel(
 
 
 @triton.jit
+def _route_blocks_kernel(
+    logits_ptr,
+    bias_ptr,
+    pad_ptr,
+    ids_ptr,
+    weights_ptr,
+    tokens,
+    experts,
+    stride_l,
+    pad_id,
+    route_scale,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_TOP: tl.constexpr,
+    HAS_PAD: tl.constexpr,
+):
+    # Program p routes tokens [p * BLOCK_M, (p + 1) * BLOCK_M) on their own.
+    first = tl.program_id(0).to(tl.int64) * BLOCK_M
+    left = tokens - first
+    ids, weights, pos, upto = _route_plan(
+        logits_ptr + first * stride_l, bias_ptr, pad_ptr + first, left, experts,
+        stride_l, route_scale,
+        TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+        HAS_PAD=HAS_PAD,
+    )  # fmt: skip
+    _route_store(
+        ids, weights, pos, upto, ids_ptr + first * TOP_K,
+        weights_ptr + first * TOP_K, ids_ptr, ids_ptr, ids_ptr, left, experts,
+        pad_id,
+        TOP_K=TOP_K, BLOCK_M=BLOCK_M, BLOCK_E=BLOCK_E, BLOCK_TOP=BLOCK_TOP,
+        DISPATCH=False,
+    )  # fmt: skip
+
+
+@triton.jit
 def _router_route_kernel(
     x_ptr,
     w_ptr,
@@ -507,6 +547,40 @@ def route(
         pad_id, float(route_scale), **meta,
     )  # fmt: skip
     return Routed(ids, weights, pos)
+
+
+# Tokens per program of route_blocks.
+ROUTE_BLOCK_M: Final = 16
+
+
+def route_blocks(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+    route_scale: float,
+    is_padding: torch.Tensor | None,
+    *,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(weights fp32 [M, k], ids int64 [M, k]) of ``route`` on the rows of
+    fp32 `logits` [M, E], for any M; ids ascend per token."""
+    tokens, experts = logits.shape
+    assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+    assert bias.dtype == torch.float32 and bias.shape == (experts,)
+    assert 0 < top_k <= experts and not 0 <= pad_id < experts
+    ids = torch.empty(tokens, top_k, dtype=torch.int64, device=logits.device)
+    weights = torch.empty(tokens, top_k, dtype=torch.float32, device=logits.device)
+    if tokens == 0:
+        return weights, ids
+    _route_blocks_kernel[(triton.cdiv(tokens, ROUTE_BLOCK_M),)](
+        logits, bias, is_padding if is_padding is not None else ids, ids, weights,
+        tokens, experts, logits.stride(0), pad_id, float(route_scale),
+        TOP_K=top_k, BLOCK_M=ROUTE_BLOCK_M,
+        BLOCK_E=max(2, triton.next_power_of_2(experts)),
+        BLOCK_TOP=max(2, triton.next_power_of_2(top_k)),
+        HAS_PAD=is_padding is not None, num_warps=4, enable_fp_fusion=False,
+    )  # fmt: skip
+    return weights, ids
 
 
 def _fused_block_k(block_m: int) -> int:

@@ -192,6 +192,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_SHARDED_EMBED",
         "VLLM_SM70_INKLING_MXFP8_EXPERTS",
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS",
+        "VLLM_SM70_INKLING_MIXED_SMALL_OPS",
         "VLLM_SM70_INKLING_VISIT_FUSION",
         "VLLM_SM70_INKLING_SMALL_M_GEMV",
         "VLLM_SM70_INKLING_NVFP4_GEMV",
@@ -526,6 +527,23 @@ def _inkling_fused_small_ops_off(name):
     assert fused_small.SWITCH == name
     with mock.patch.object(fused_small._compat, "AVAILABLE", True):
         assert fused_small.on_fused(SimpleNamespace(is_cuda=True), True) is False
+
+
+def _inkling_mixed_small_ops_off(name):
+    """A GPU batch that is not decode-only keeps the torch q/r clips, gate and
+    router (inkling2_sm70/fused_small.py); the kernels' own checks are
+    tests/ops/test_m12_inkling2_fused_small_cpu.py and
+    tests/ops/test_m12_inkling2_routing_cpu.py."""
+    pytest.importorskip("vllm")
+    from unittest import mock
+
+    from vllm_sm70.models.inkling2_sm70 import fused_small
+
+    assert fused_small.MIXED_SWITCH == name
+    gpu = SimpleNamespace(is_cuda=True)
+    with mock.patch.object(fused_small._compat, "AVAILABLE", True):
+        assert fused_small.on_mixed(gpu) is False
+        assert fused_small.on_small(gpu, False) is False
 
 
 def _inkling_greedy_top1_off(name):
@@ -926,6 +944,8 @@ def _path_off(name):
         _inkling_mxfp8_experts_off(name)
     elif name == "VLLM_SM70_INKLING_FUSED_SMALL_OPS":
         _inkling_fused_small_ops_off(name)
+    elif name == "VLLM_SM70_INKLING_MIXED_SMALL_OPS":
+        _inkling_mixed_small_ops_off(name)
     elif name == "VLLM_SM70_INKLING_GREEDY_TOP1":
         _inkling_greedy_top1_off(name)
     elif name == "VLLM_SM70_INKLING_VISIT_FUSION":

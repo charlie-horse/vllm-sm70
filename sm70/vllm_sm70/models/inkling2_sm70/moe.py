@@ -10,8 +10,10 @@ VLLM_SM70_INKLING_NVFP4_TM=0 keeps NVFP4 layers off TurboMind (moe_tm.py);
 VLLM_SM70_INKLING_GROUPED_MOE=0 sends model-dtype layers from
 ops/grouped_gemm.py back to the torch sum; VLLM_SM70_INKLING_FUSED_ROUTING=0
 keeps the torch router and sort instead of ops/routing.py for batches of at
-most ``routing.MAX_SLOTS`` slots. VLLM_SM70_INKLING_MXFP8_EXPERTS=0, read at
-load, dequantizes MXFP8 layers instead of keeping their e4m3 codes.
+most ``routing.MAX_SLOTS`` slots; larger batches that are not decode-only
+take ``routing.route_blocks`` on the route of fused_small.py (``on_mixed``).
+VLLM_SM70_INKLING_MXFP8_EXPERTS=0, read at load, dequantizes MXFP8 layers
+instead of keeping their e4m3 codes.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from vllm_sm70 import envs
 
 from . import act_quant, moe_tm
 from .expert_weights import MXFP8, NVFP4, ExpertLayer, RangeCheck, check_cast_range
-from .fused_small import on_fused
+from .fused_small import on_fused, on_mixed
 from .ops import _compat, grouped_gemm, routing, torch_ref
 from .visit_fusion import on_decode
 
@@ -276,14 +278,28 @@ class Inkling2Sm70Experts(nn.Module):
         return None
 
     def route(
-        self, x: torch.Tensor, is_padding: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        is_padding: torch.Tensor | None = None,
+        decode_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """fp32 (logits [M, E], weights [M, k], indices [M, k]) of x [M, H].
 
         Rows where the bool `is_padding` [M] is set get the expert id E (no
-        expert) and weight 0.
+        expert) and weight 0. A batch that is not `decode_only` routes its
+        logits in one launch on the route of fused_small.py.
         """
-        logits, weights, indices = self.gate(x)
+        gate = self.gate
+        if not decode_only and on_mixed(x):
+            weight = gate.weight.float()
+            logits = F.linear(x.float().reshape(-1, weight.shape[-1]), weight)
+            pad = None if is_padding is None else is_padding.reshape(-1).bool()
+            weights, indices = routing.route_blocks(
+                logits, gate.bias, self.top_k, gate.route_scale, pad,
+                pad_id=self.num_experts,
+            )  # fmt: skip
+            return logits, weights, indices
+        logits, weights, indices = gate(x)
         if is_padding is not None:
             pad = is_padding.reshape(-1, 1).bool()
             indices = indices.masked_fill(pad, self.num_experts)
@@ -425,7 +441,7 @@ class Inkling2Sm70Experts(nn.Module):
         if self._fused_routing(x):
             self.fused_forward(x, output, is_padding, rowwise)
             return
-        _, weights, indices = self.route(x, is_padding)
+        _, weights, indices = self.route(x, is_padding, rowwise)
         self.expert_sum(x, indices, weights, output, rowwise)
 
     def _fused_routing(self, x: torch.Tensor) -> bool:

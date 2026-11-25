@@ -27,7 +27,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from . import gemv
 from .backend import cache_metadata, is_decode_only
 from .cache import STREAM_K, STREAM_V
-from .fused_small import on_fused
+from .fused_small import on_small
 from .ops import paged_conv, small_ops
 from .ops import visit as visit_ops
 from .ops.torch_ref import l2_clip, log_scale_tau, rms_norm
@@ -284,7 +284,7 @@ def attention_prologue(
             f"tokens, the metadata has block size {attn_metadata.block_size}."
         )
     decode_only = is_decode_only(attn_metadata)
-    fused = on_fused(q, decode_only)
+    fused = on_small(q, decode_only)
     if (
         fused
         and conv_metadata is not None
