@@ -59,6 +59,51 @@ let
     VLLM_SKIP_P2P_CHECK = "0";
   };
 
+  # Inkling 2 Mini serve settings for a checkpoint `repo` at `revision`,
+  # stored in `modelsDir/<dir>` with its DSpark draft in `<dir>-DSpark`.
+  inkling =
+    { repo, revision, dir }:
+    let
+      targetDir = "${modelsDir}/${dir}";
+      draftDir = "${modelsDir}/${dir}-DSpark";
+    in
+    {
+      downloads = [
+        {
+          inherit repo revision;
+          dir = targetDir;
+        }
+      ];
+      maxModelLen = 262144;
+      maxNumSeqs = 8;
+      maxNumBatchedTokens = 512;
+      gpuMemoryUtilization = 0.88;
+      asyncScheduling = true;
+      lmcache = true;
+      lmcacheChunkSize = 256;
+      # DSpark drafts need the V2 model runner.
+      v2ModelRunner = true;
+      env = qwenEnv // { VLLM_USE_BREAKABLE_CUDAGRAPH = "1"; };
+      preStart = ''
+        python -m vllm_sm70.models.inkling2_sm70.draft ${targetDir} ${draftDir}
+      '';
+      args = [
+        "--hf-overrides" (builtins.toJSON { architectures = [ "Inkling2LoopSm70ForConditionalGeneration" ]; })
+        "--tokenizer-mode" "inkling2_sm70"
+        "--reasoning-parser" "inkling2_sm70"
+        "--tool-call-parser" "inkling2_sm70"
+        "--block-size" "32"
+        "--limit-mm-per-prompt" (builtins.toJSON { image = 2; })
+        "--enable-prompt-tokens-details"
+        "--speculative-config"
+        (builtins.toJSON {
+          method = "dspark";
+          model = draftDir;
+          num_speculative_tokens = 7;
+        })
+      ];
+    };
+
   # Built-in models (see the `models` option for the fields). The Qwen entries
   # run async scheduling, the V2 runner and Flash-V100 attention. Each
   # built-in field is a mkDefault, so a host overrides one field, e.g.
@@ -195,48 +240,19 @@ let
 
     # Inkling 2 Mini (plugin arch, docs/nix.md#inkling-2) with its DSpark
     # draft, staged from the target's mtp.safetensors at every start.
-    "inkling-2-mini" =
-      let
-        targetDir = "${modelsDir}/Inkling-2-Mini";
-        draftDir = "${modelsDir}/Inkling-2-Mini-DSpark";
-      in
-      {
-        downloads = [
-          {
-            repo = "thinkingmachines/Inkling-2-Mini";
-            revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7";
-            dir = targetDir;
-          }
-        ];
-        maxModelLen = 262144;
-        maxNumSeqs = 8;
-        maxNumBatchedTokens = 512;
-        gpuMemoryUtilization = 0.88;
-        asyncScheduling = true;
-        lmcache = true;
-        lmcacheChunkSize = 256;
-        # DSpark drafts need the V2 model runner.
-        v2ModelRunner = true;
-        env = qwenEnv // { VLLM_USE_BREAKABLE_CUDAGRAPH = "1"; };
-        preStart = ''
-          python -m vllm_sm70.models.inkling2_sm70.draft ${targetDir} ${draftDir}
-        '';
-        args = [
-          "--hf-overrides" (builtins.toJSON { architectures = [ "Inkling2LoopSm70ForConditionalGeneration" ]; })
-          "--tokenizer-mode" "inkling2_sm70"
-          "--reasoning-parser" "inkling2_sm70"
-          "--tool-call-parser" "inkling2_sm70"
-          "--block-size" "32"
-          "--limit-mm-per-prompt" (builtins.toJSON { image = 2; })
-          "--enable-prompt-tokens-details"
-          "--speculative-config"
-          (builtins.toJSON {
-            method = "dspark";
-            model = draftDir;
-            num_speculative_tokens = 7;
-          })
-        ];
-      };
+    "inkling-2-mini" = inkling {
+      repo = "thinkingmachines/Inkling-2-Mini";
+      revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7";
+      dir = "Inkling-2-Mini";
+    };
+
+    # Inkling 2 Mini with a rank-2 edit to the attention output projections
+    # of layers 4 to 23 that removes refusals. Same serve settings.
+    "inkling-2-mini-uncensored" = inkling {
+      repo = "OpenUncensored/Inkling-2-Mini-Uncensored";
+      revision = "4e5f06d72b5a70c9dcd5e8046aea576eb3ee8487";
+      dir = "Inkling-2-Mini-Uncensored";
+    };
   };
 
   active = cfg.activeModel;

@@ -83,14 +83,15 @@ let
     ) "the default flint unit sets a VLLM_SM70_* variable";
     unitsOf "flint" tmOptions;
 
-  # inkling-2-mini: the serve flags, the V2 runner, the draft staging and the
-  # LMCache settings reach the rendered units.
+  # An Inkling 2 entry: the serve flags, the V2 runner, the draft staging and
+  # the LMCache settings reach the rendered units.
   inklingUnit =
+    name: dir:
     let
-      cfg = (evalHost "inkling-2-mini" { }).config;
+      cfg = (evalHost name { }).config;
       svc = cfg.systemd.services.vllm;
       exec = svc.serviceConfig.ExecStart;
-      m = cfg.services.vllm-sm70.models."inkling-2-mini";
+      m = cfg.services.vllm-sm70.models.${name};
       want = [
         [ "--tensor-parallel-size" "2" ]
         [ "--dtype" "half" ]
@@ -113,33 +114,35 @@ let
           "--speculative-config"
           (builtins.toJSON {
             method = "dspark";
-            model = "/var/lib/vllm/models/Inkling-2-Mini-DSpark";
+            model = "/var/lib/vllm/models/${dir}-DSpark";
             num_speculative_tokens = 7;
           })
         ]
       ];
       missing = lib.filter (a: !(lib.hasInfix (lib.escapeShellArgs a) exec)) want;
     in
-    assert lib.assertMsg (missing == [ ]) "inkling-2-mini ExecStart lacks: ${builtins.toJSON missing}";
+    assert lib.assertMsg (missing == [ ]) "${name} ExecStart lacks: ${builtins.toJSON missing}";
     assert lib.assertMsg (
       lib.hasInfix "--no-async-scheduling" exec == !m.asyncScheduling
-    ) "inkling-2-mini async scheduling does not reach ExecStart";
+    ) "${name} async scheduling does not reach ExecStart";
     assert lib.assertMsg (lib.hasInfix "--kv-transfer-config" exec == m.lmcache)
-      "inkling-2-mini LMCache connector does not follow its lmcache field";
+      "${name} LMCache connector does not follow its lmcache field";
     assert lib.assertMsg (cfg.services.lmcache-sm70.enable == m.lmcache)
-      "inkling-2-mini vllm-lmcache does not follow its lmcache field";
+      "${name} vllm-lmcache does not follow its lmcache field";
     assert lib.assertMsg (
       !m.lmcache || cfg.services.lmcache-sm70.chunkSize == m.lmcacheChunkSize
-    ) "inkling-2-mini LMCache chunk size does not reach vllm-lmcache";
+    ) "${name} LMCache chunk size does not reach vllm-lmcache";
     assert lib.assertMsg (
       (svc.environment.VLLM_USE_BREAKABLE_CUDAGRAPH or null) == "1"
-    ) "inkling-2-mini does not set VLLM_USE_BREAKABLE_CUDAGRAPH";
+    ) "${name} does not set VLLM_USE_BREAKABLE_CUDAGRAPH";
     assert lib.assertMsg (
       (svc.environment.VLLM_USE_V2_MODEL_RUNNER or null) == "1"
-    ) "inkling-2-mini does not run the V2 model runner";
+    ) "${name} does not run the V2 model runner";
     assert lib.assertMsg (lib.hasInfix "vllm_sm70.models.inkling2_sm70.draft" svc.preStart)
-      "inkling-2-mini does not stage its DSpark draft";
-    unitsOf "inkling-2-mini" { };
+      "${name} does not stage its DSpark draft";
+    assert lib.assertMsg (lib.hasInfix "/var/lib/vllm/models/${dir} " exec)
+      "${name} does not serve ${dir}";
+    unitsOf name { };
 
   # The LMCache sdist the build itself uses (nix/lmcache-build.nix), so the
   # check tests exactly what ships. Building this check fetches the sdist
@@ -160,7 +163,9 @@ in
   '';
 
   module-eval-flint-turbomind-lut = tmUnit;
-  module-eval-inkling-2-mini = inklingUnit;
+  module-eval-inkling-2-mini = inklingUnit "inkling-2-mini" "Inkling-2-Mini";
+  module-eval-inkling-2-mini-uncensored =
+    inklingUnit "inkling-2-mini-uncensored" "Inkling-2-Mini-Uncensored";
 
   flint-checkpoint-outpath =
     assert lib.assertMsg (ckpt.flintCheckpoint.outPath == ckpt.expectedOutPath) ''
