@@ -60,6 +60,8 @@ def _run(tmp_path, runner, **options):
     env = dict(
         os.environ,
         VLLM_USE_BREAKABLE_CUDAGRAPH="1",
+        # The stub syncs on the host; a FULL decode graph cannot capture it.
+        VLLM_SM70_INKLING_DECODE_GRAPH="0",
         VLLM_USE_V2_MODEL_RUNNER="1" if runner == "v2" else "0",
     )
     env["PYTHONPATH"] = os.pathsep.join(

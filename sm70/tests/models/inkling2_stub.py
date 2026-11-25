@@ -753,7 +753,8 @@ def run_scenarios(options: dict[str, Any]) -> dict[str, Any]:
             text=True,
             check=True,
         )
-        groups = json.loads(plan.stdout.rsplit("RESULT ", 1)[1])["groups"]
+        result = plan.stdout.rsplit("RESULT ", 1)[1].splitlines()[0]
+        groups = json.loads(result)["groups"]
         num_blocks, max_tokens = _pool_for_preemption(groups, prompt_len, batched)
         llm = _start(options, str(model_dir), num_blocks)
         probe = _Probe(scheduler_of(llm))
