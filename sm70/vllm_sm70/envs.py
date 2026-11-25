@@ -333,10 +333,10 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN": kill_switch(
             "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
         ),
-        # "0": the query rows of an Inkling 2 request with 2 to
-        # SHORT_QUERY_LEN query tokens in an eager batch take the torch
-        # attention over shared key chunks instead of the decode-attention
-        # kernel. Env-only (no Sm70Config field), read per eager call
+        # "0": the query rows of an Inkling 2 request with 2 or more query
+        # tokens (up to SHORT_QUERY_LEN when it is set) in an eager batch
+        # take the torch attention over shared key chunks instead of the
+        # decode-attention kernel. Env-only (no Sm70Config field), read per eager call
         # (inkling2_sm70/attention_torch.py); only where that kernel runs.
         "VLLM_SM70_INKLING_SHORT_QUERY_ATTN": kill_switch(
             "VLLM_SM70_INKLING_SHORT_QUERY_ATTN"
