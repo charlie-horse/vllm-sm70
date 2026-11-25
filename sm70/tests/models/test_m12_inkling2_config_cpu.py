@@ -333,6 +333,7 @@ def test_hook_sets_the_turbomind_tuning_knobs(device, route_log, monkeypatch):
 
 BREAKABLE = "VLLM_USE_BREAKABLE_CUDAGRAPH"
 DECODE_GRAPH = "VLLM_SM70_INKLING_DECODE_GRAPH"
+MIXED_GRAPH = "VLLM_SM70_INKLING_MIXED_GRAPH"
 
 
 def _set_env(monkeypatch, name, value):
@@ -346,7 +347,7 @@ def _set_env(monkeypatch, name, value):
     "switch, breakable, given, want",
     [
         (None, None, None, "FULL_DECODE_ONLY"),
-        (None, "1", None, "FULL_DECODE_ONLY"),
+        (None, "1", None, "FULL_AND_PIECEWISE"),
         ("1", None, None, "FULL_DECODE_ONLY"),
         ("0", "1", None, "PIECEWISE"),
         ("0", None, None, "NONE"),
@@ -364,10 +365,12 @@ def _set_env(monkeypatch, name, value):
 def test_hook_picks_the_cuda_graph_mode(
     device, route_log, monkeypatch, switch, breakable, given, want
 ):
-    """Decode-only FULL graphs by default; the kill switch restores the
+    """Decode-only FULL graphs by default, with breakable PIECEWISE graphs
+    of mixed batches under breakable graphs; the kill switch restores the
     breakable PIECEWISE or NONE default."""
     from vllm.config.compilation import CUDAGraphMode
 
+    _set_env(monkeypatch, MIXED_GRAPH, None)
     _set_env(monkeypatch, DECODE_GRAPH, switch)
     _set_env(monkeypatch, BREAKABLE, breakable)
     device(7, 0)
@@ -411,6 +414,7 @@ def test_hook_caps_the_decode_graph_batch(
     from vllm.config.compilation import CUDAGraphMode
 
     _set_env(monkeypatch, DECODE_GRAPH, None)
+    _set_env(monkeypatch, MIXED_GRAPH, "0")
     _set_env(monkeypatch, BREAKABLE, "1")
     device(7, 0)
     cfg = _vllm_config(cudagraph_mode=given and CUDAGraphMode[given])
@@ -421,6 +425,86 @@ def test_hook_caps_the_decode_graph_batch(
     assert icfg.DECODE_GRAPH_MAX_BATCH == 8
     assert cfg.compilation_config.max_cudagraph_capture_size == want_max
     assert cfg.compilation_config.cudagraph_capture_sizes == sizes
+
+
+@pytest.mark.parametrize(
+    "q, tokens, want",
+    [
+        (8, 512, [128, 192, 256, 320, 384, 448, 512]),
+        (1, 512, [64, 128, 192, 256, 320, 384, 448, 512]),
+        (1, 100, [64, 100]),
+        (8, 64, []),
+        (8, 65, [65]),
+    ],
+)
+def test_mixed_capture_sizes(q, tokens, want):
+    """Multiples of MIXED_GRAPH_STEP above q x DECODE_GRAPH_MAX_BATCH, and
+    max_num_batched_tokens."""
+    assert icfg.MIXED_GRAPH_STEP == 64
+    assert icfg.mixed_capture_sizes(q, tokens) == want
+
+
+@pytest.mark.parametrize(
+    "sizes, q, want",
+    [
+        ([1, 2, 4, 8, 128, 512], 8, 8),
+        ([8, 16, 64, 128], 8, 64),
+        ([1, 2, 8, 64, 512], 1, 8),
+        ([64, 512], 1, 0),
+        ([], 1, 0),
+    ],
+)
+def test_decode_capture_cap(sizes, q, want):
+    assert icfg.decode_capture_cap(sizes, q) == want
+
+
+@pytest.mark.parametrize(
+    "spec, max_num_seqs, want_decode",
+    [
+        (None, 8, [1, 2, 4, 8]),
+        (None, 3, [1, 2, 3]),
+        ("dspark", 8, [1, 2, 3, 4, 5, 6, 7, 8]),
+    ],
+)
+def test_hook_adds_mixed_graph_sizes(
+    device, route_log, monkeypatch, spec, max_num_seqs, want_decode
+):
+    """Breakable graphs and no mode: FULL_AND_PIECEWISE, the decode sizes
+    kept and the mixed sizes added up to max_num_batched_tokens; the TurboMind
+    tuning still covers the decode sizes only."""
+    from vllm.config.compilation import CUDAGraphMode
+
+    _set_env(monkeypatch, DECODE_GRAPH, None)
+    _set_env(monkeypatch, MIXED_GRAPH, None)
+    _set_env(monkeypatch, BREAKABLE, "1")
+    for knob in icfg.TM_TUNE_KNOBS:
+        monkeypatch.delenv(knob, raising=False)
+    device(7, 0)
+    if spec:
+        from vllm_sm70.models.inkling2_sm70 import draft
+
+        monkeypatch.delenv("VLLM_SM70_INKLING_DSPARK_AUTO", raising=False)
+        spec = SimpleNamespace(
+            method="dspark",
+            num_speculative_tokens=7,
+            num_speculative_tokens_per_batch_size=None,
+            draft_model_config=SimpleNamespace(hf_config=draft.draft_config(DATA)),
+        )
+    cfg = _vllm_config(spec=spec)
+    cfg.use_v2_model_runner = True
+    cfg.scheduler_config.max_num_seqs = max_num_seqs
+    cfg.scheduler_config.max_num_batched_tokens = 512
+    cfg.compilation_config.cudagraph_capture_sizes = None
+    cfg.compilation_config.max_cudagraph_capture_size = None
+    icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    comp = cfg.compilation_config
+    assert comp.cudagraph_mode is CUDAGraphMode.FULL_AND_PIECEWISE
+    q = 8 if spec else 1
+    assert comp.cudagraph_capture_sizes == want_decode + icfg.mixed_capture_sizes(
+        q, 512
+    )
+    assert comp.max_cudagraph_capture_size == 512
+    assert icfg.decode_capture_cap(comp.cudagraph_capture_sizes, q) == max(want_decode)
 
 
 @pytest.mark.parametrize("given", [None, "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
