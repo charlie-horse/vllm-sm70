@@ -454,6 +454,21 @@ def test_short_query_rows_route(monkeypatch, short, rows, shared):
     assert seen == {"rows": rows, "shared": shared}
 
 
+def test_every_request_takes_the_kernel_without_a_limit(monkeypatch):
+    """The default SHORT_QUERY_LEN (None): the kernel takes every row,
+    whatever the query length; nothing runs the torch shared-key loop."""
+    attention = cases.attention_module()
+    assert attention.SHORT_QUERY_LEN is None
+    monkeypatch.delenv(SHORT_SWITCH, raising=False)
+    seen = _spy_route(monkeypatch, attention)
+    case = cases.Case(
+        torch.float32, None, 8, [40, 600, 60, 9], pad=2, decode_only=False,
+        query_lens=[1, 512, 7, 1],
+    )  # fmt: skip
+    case.run(attention)
+    assert seen == {"rows": [list(range(521))], "shared": []}
+
+
 def test_short_query_rows_stay_on_torch_with_hf_rounding(monkeypatch):
     attention = cases.attention_module()
     monkeypatch.delenv(SHORT_SWITCH, raising=False)
@@ -480,8 +495,8 @@ def test_short_query_rows_stay_on_torch_with_hf_rounding(monkeypatch):
 def test_short_query_rows_match_the_torch_route(
     monkeypatch, dtype, tol, window, extent, seq_lens, query_lens
 ):
-    """Eager batches whose short requests run on the kernel (SHORT_QUERY_LEN
-    is 64: the 65-token request stays on torch) against the torch route."""
+    """Eager batches whose multi-query requests run on the kernel (no
+    SHORT_QUERY_LEN: the 65-token request too) against the torch route."""
     monkeypatch.setattr(cases, "NUM_BLOCKS", 40)
     monkeypatch.delenv(SHORT_SWITCH, raising=False)
     case = cases.Case(
