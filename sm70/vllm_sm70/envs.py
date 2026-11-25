@@ -346,6 +346,12 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/
         # config.py, backend.py). Env-only (no Sm70Config field).
         "VLLM_SM70_INKLING_DECODE_GRAPH": kill_switch("VLLM_SM70_INKLING_DECODE_GRAPH"),
+        # "0": with VLLM_USE_BREAKABLE_CUDAGRAPH=1 and no cudagraph_mode, the
+        # Inkling 2 config hook picks FULL_DECODE_ONLY, so mixed batches
+        # (prefill chunks) run eagerly. Otherwise it picks FULL_AND_PIECEWISE
+        # and adds PIECEWISE sizes up to max_num_batched_tokens
+        # (inkling2_sm70/config.py). Env-only, read once per engine config.
+        "VLLM_SM70_INKLING_MIXED_GRAPH": kill_switch("VLLM_SM70_INKLING_MIXED_GRAPH"),
         # "0": the Inkling 2 experts held in the model dtype take the torch
         # expert sum (a host sync per batch, row by row in decode-only
         # batches) instead of the sync-free grouped route. Env-only (no

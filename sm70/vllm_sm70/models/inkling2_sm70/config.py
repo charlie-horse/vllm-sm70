@@ -9,7 +9,9 @@
   2 x ``max_num_batched_tokens``; VLLM_SM70_INKLING_ASYNC_SCHED=0 turns it off.
 * Sets the DSpark batch-size schedule (spec_policy.py).
 * CUDA graphs: an unset mode becomes FULL_DECODE_ONLY; FULL mixed batches are
-  refused; capture sizes are capped at q x ``DECODE_GRAPH_MAX_BATCH``.
+  refused; capture sizes are capped at q x ``DECODE_GRAPH_MAX_BATCH``. With
+  breakable graphs, an unset mode becomes FULL_AND_PIECEWISE instead and
+  ``mixed_capture_sizes`` are added (VLLM_SM70_INKLING_MIXED_GRAPH=0: off).
 * Copies ``max_image_encoder_tokens`` onto ``hf_config`` and, unless they are
   set or VLLM_SM70_INKLING_TM_TUNE=0, sets the TurboMind tuning knobs for
   the workers (``tm_tuning_env``). Logs the routes once per process.
@@ -33,6 +35,8 @@ KV_BLOCK_SIZE = 32
 # Most requests of a decode batch captured in a FULL graph: a decode step
 # gathers the whole block-table width of keys per global-layer row.
 DECODE_GRAPH_MAX_BATCH = 8
+# Token step of the PIECEWISE graph sizes of mixed batches.
+MIXED_GRAPH_STEP = 64
 
 TM_TUNE_KNOBS = (
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES",
@@ -111,6 +115,42 @@ def _cap_decode_graph_batch(
         compilation_config.max_cudagraph_capture_size = cap * query_len
         return
     sizes = _schedule_capture_sizes(schedule, query_len, cap)
+    compilation_config.cudagraph_capture_sizes = sizes
+    compilation_config.max_cudagraph_capture_size = sizes[-1]
+
+
+def decode_capture_cap(sizes: Any, query_len: int) -> int:
+    """The largest of `sizes` a FULL decode graph may have: at most
+    `query_len` x ``DECODE_GRAPH_MAX_BATCH`` tokens (0 for none)."""
+    bound = DECODE_GRAPH_MAX_BATCH * query_len
+    return max((int(s) for s in sizes or () if int(s) <= bound), default=0)
+
+
+def mixed_capture_sizes(query_len: int, max_num_batched_tokens: int) -> list[int]:
+    """PIECEWISE sizes of mixed batches: the multiples of
+    ``MIXED_GRAPH_STEP`` above the largest decode size (`query_len` x
+    ``DECODE_GRAPH_MAX_BATCH``) and below `max_num_batched_tokens`, and
+    `max_num_batched_tokens` itself when it is above that decode size."""
+    bound = DECODE_GRAPH_MAX_BATCH * query_len
+    first = (bound // MIXED_GRAPH_STEP + 1) * MIXED_GRAPH_STEP
+    sizes = set(range(first, max_num_batched_tokens, MIXED_GRAPH_STEP))
+    if max_num_batched_tokens > bound:
+        sizes.add(max_num_batched_tokens)
+    return sorted(sizes)
+
+
+def _add_mixed_sizes(compilation_config: Any, scheduler_config: Any, q: int) -> None:
+    """Adds ``mixed_capture_sizes`` to the capture sizes (decode sizes kept)."""
+    tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
+    if not isinstance(tokens, int) or tokens <= 0:
+        return
+    decode = getattr(compilation_config, "cudagraph_capture_sizes", None) or []
+    largest = getattr(compilation_config, "max_cudagraph_capture_size", None)
+    if not decode and largest:
+        # Upstream's default ladder below the decode cap.
+        decode = {1, 2, 4, largest, *range(8, largest + 1, 8)} - {0}
+        decode = {s for s in decode if s <= largest}
+    sizes = sorted({*decode, *mixed_capture_sizes(q, tokens)})
     compilation_config.cudagraph_capture_sizes = sizes
     compilation_config.max_cudagraph_capture_size = sizes[-1]
 
@@ -231,8 +271,16 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
         decode_graph = decode_graph_enabled(vllm_config)
+        mixed_graph = (
+            cudagraph_mode is None
+            and decode_graph
+            and envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            and sm70_envs.VLLM_SM70_INKLING_MIXED_GRAPH
+        )
         if cudagraph_mode is None:
-            if decode_graph:
+            if mixed_graph:
+                cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            elif decode_graph:
                 cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
             elif envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
                 cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -271,6 +319,8 @@ class Inkling2Sm70ModelConfig(VerifyAndUpdateConfig):
             )
         hf_config = getattr(model_config, "hf_config", None)
         tuning = tm_tuning_env(compilation_config, hf_config, query_len)
+        if mixed_graph:
+            _add_mixed_sizes(compilation_config, scheduler_config, query_len)
         if tuning:
             os.environ.update(tuning)
             logger.info(

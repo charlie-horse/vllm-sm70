@@ -9,6 +9,7 @@ The kill switches use ``vllm_sm70.envs.kill_switch``: only "0" acts,
 and the environment can never turn a feature on.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -179,6 +180,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
         "VLLM_SM70_INKLING_SHORT_QUERY_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
+        "VLLM_SM70_INKLING_MIXED_GRAPH",
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
         "VLLM_SM70_INKLING_TM_TUNE",
@@ -763,6 +765,53 @@ def _inkling_decode_graph_off(name):
         assert builder.get_cudagraph_support(None, None) is AttentionCGSupport.NEVER
 
 
+def _inkling_mixed_graph_off(name):
+    """Under breakable graphs the Inkling 2 hook leaves mixed batches eager
+    (FULL_DECODE_ONLY, decode sizes only); the default is in
+    tests/models/test_m12_inkling2_config_cpu.py."""
+    from unittest import mock
+
+    pytest.importorskip("vllm")
+    import torch
+    import vllm.platforms
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_sm70.models.inkling2_sm70 import config as icfg
+
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.float16, hf_config=None),
+        attention_config=SimpleNamespace(backend=None),
+        cache_config=SimpleNamespace(
+            cache_dtype="auto", block_size=16, user_specified_block_size=False
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=None, max_num_seqs=4, max_num_batched_tokens=512
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=None,
+            cudagraph_capture_sizes=None,
+            max_cudagraph_capture_size=None,
+        ),
+        speculative_config=None,
+        additional_config=None,
+        kernel_config=None,
+    )
+    v100 = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+    )
+    with (
+        mock.patch.object(vllm.platforms, "_current_platform", v100),
+        mock.patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}),
+    ):
+        icfg.Inkling2Sm70ModelConfig.verify_and_update_config(cfg)
+    comp = cfg.compilation_config
+    assert comp.cudagraph_mode is CUDAGraphMode.FULL_DECODE_ONLY
+    assert comp.cudagraph_capture_sizes is None
+    assert comp.max_cudagraph_capture_size == 4
+
+
 def _inkling_merged_proj(name, on):
     """Models pack their projections only when on; the packed and
     unpacked models are compared in test_m12_inkling2_merged_proj_cpu.py."""
@@ -853,6 +902,8 @@ def _path_off(name):
         _inkling_short_query_attn_off(name)
     elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
         _inkling_decode_graph_off(name)
+    elif name == "VLLM_SM70_INKLING_MIXED_GRAPH":
+        _inkling_mixed_graph_off(name)
     elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
         _inkling_grouped_moe_off(name)
     elif name == "VLLM_SM70_INKLING_FUSED_ROUTING":

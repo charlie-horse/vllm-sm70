@@ -130,8 +130,14 @@ def replays_decode_graph(vllm_config: Any, cm: CommonAttentionMetadata) -> bool:
     model_config = getattr(vllm_config, "model_config", None)
     if getattr(model_config, "enforce_eager", False):
         return False
-    cap = getattr(compilation, "max_cudagraph_capture_size", None) or 0
-    return cm.num_actual_tokens <= cap
+    from .config import decode_capture_cap
+
+    sizes = getattr(compilation, "cudagraph_capture_sizes", None) or [
+        getattr(compilation, "max_cudagraph_capture_size", None) or 0
+    ]
+    return cm.num_actual_tokens <= decode_capture_cap(
+        sizes, decode_query_len(vllm_config)
+    )
 
 
 def is_decode_only(metadata: Any) -> bool:
