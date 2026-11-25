@@ -375,6 +375,22 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         # capture cap are tuned in eager warmup and reused by capture
         # (inkling2_sm70/config.py). Env-only, read once per engine config.
         "VLLM_SM70_INKLING_TM_TUNE": kill_switch("VLLM_SM70_INKLING_TM_TUNE"),
+        # "0": Inkling 2 prefill batches on the TurboMind expert route (more
+        # routed slots than the compact groups, one slot chunk) run the
+        # soft-capped SwiGLU in torch and sum each token's experts with an
+        # fp32 index_add. Otherwise one Triton kernel does each (inkling2_sm70/
+        # moe_tm.py). Env-only, read per eager call.
+        "VLLM_SM70_INKLING_TM_PREFILL_FUSED": kill_switch(
+            "VLLM_SM70_INKLING_TM_PREFILL_FUSED"
+        ),
+        # "0": the Inkling 2 TurboMind expert stages of prefill batches take
+        # TurboMind's default tile. Otherwise they run at a fixed row count
+        # and the config hook names their W13 tile for the workers
+        # (inkling2_sm70/moe_tm.py, config.py). Env-only, read once per
+        # engine config and when a layer is loaded.
+        "VLLM_SM70_INKLING_TM_PREFILL_TILE": kill_switch(
+            "VLLM_SM70_INKLING_TM_PREFILL_TILE"
+        ),
         # "0": the Inkling 2 config hook refuses every --speculative-config
         # and Sm70CudaPlatform.get_speculator_cls returns None
         # (inkling2_sm70/draft.py). Env-only, read once per engine config.

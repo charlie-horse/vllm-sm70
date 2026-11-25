@@ -176,9 +176,10 @@ def recording_tm():
         rows = inp.shape[0]
         assert out.shape == (rows, n) and inp.shape[1] == k and g == 16
         assert len(offsets) >= ne + 1 and len(ids) >= ne
-        assert int(offsets[ne]) == rows
+        used = int(offsets[ne])
+        assert used <= rows
         ops.calls.append(
-            (rows, ne, k, n, tm.nvfp4_moe_dense_stage_route(rows, ne, k, n))
+            (used, ne, k, n, tm.nvfp4_moe_dense_stage_route(rows, ne, k, n), rows)
         )
         out.zero_()
 
@@ -224,7 +225,7 @@ def test_prefill_runs_one_grouped_launch_per_stage_and_chunk(monkeypatch, tokens
     assert [c[0] for c in ops.calls[::2]] == [
         min(moe_tm.CHUNK_ROWS, slots - i * moe_tm.CHUNK_ROWS) for i in range(chunks)
     ]
-    assert {c[1:] for c in ops.calls} == {
+    assert {c[1:5] for c in ops.calls} == {
         (EXPERTS, *W13, "grouped"),
         (EXPERTS, *W2, "grouped"),
     }
@@ -250,7 +251,18 @@ def test_first_dense_size_is_grouped(monkeypatch):
     route, ops = experts(monkeypatch)
     tokens = moe_tm.COMPACT_BATCH_MAX_SLOTS // TOP_K + 1
     run(route, tokens)
-    assert [c[:1] + c[4:] for c in ops.calls] == [(tokens * TOP_K, "grouped")] * 2
+    assert [c[:1] + c[4:5] for c in ops.calls] == [(tokens * TOP_K, "grouped")] * 2
+
+
+@pytest.mark.parametrize("tile", ["1", "0"])
+def test_prefill_tile_pins_the_stage_rows(monkeypatch, tile):
+    """With VLLM_SM70_INKLING_TM_PREFILL_TILE on, every dense stage spans
+    the CHUNK_ROWS workspace rows (one TurboMind shape); off, the slots."""
+    monkeypatch.setenv(moe_tm.PREFILL_TILE, tile)
+    route, ops = experts(monkeypatch)
+    run(route, 100)
+    rows = moe_tm.CHUNK_ROWS if tile == "1" else 800
+    assert [(c[0], c[5]) for c in ops.calls] == [(800, rows)] * 2
 
 
 def test_compact_off_sends_65_slots_and_up_to_grouped(monkeypatch):
@@ -286,3 +298,23 @@ def test_decode_tuning_limit_stays_below_the_dense_form(monkeypatch, query_len):
     knobs = icfg.tm_tuning_env(comp, hf, query_len)
     limit = int(knobs["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"])
     assert limit <= moe_tm.COMPACT_BATCH_MAX_SLOTS
+
+
+def test_hook_names_the_prefill_w13_tile(monkeypatch):
+    """The config hook adds the W13 tile to the TurboMind target list for
+    the workers, keeps other entries and never overrides a named one."""
+    monkeypatch.delenv(moe_tm.GEMM_TARGETS, raising=False)
+    monkeypatch.delenv(moe_tm.PREFILL_TILE, raising=False)
+    entry = f"{moe_tm.PREFILL_W13_DESC}|{moe_tm.PREFILL_W13_TILE}"
+    assert moe_tm.PREFILL_W13_DESC.endswith(f"_{moe_tm.CHUNK_ROWS}x1152x2304_128")
+    assert icfg.prefill_gemm_targets() == {moe_tm.GEMM_TARGETS: entry}
+    monkeypatch.setenv(moe_tm.GEMM_TARGETS, "other|8x64x64:1:0:0")
+    assert icfg.prefill_gemm_targets() == {
+        moe_tm.GEMM_TARGETS: f"other|8x64x64:1:0:0;{entry}"
+    }
+    mine = f"{moe_tm.PREFILL_W13_DESC}|16x128x32:1:0:1"
+    monkeypatch.setenv(moe_tm.GEMM_TARGETS, mine)
+    assert icfg.prefill_gemm_targets() == {}
+    monkeypatch.setenv("VLLM_SM70_INKLING_NVFP4_TM", "0")
+    monkeypatch.delenv(moe_tm.GEMM_TARGETS)
+    assert icfg.prefill_gemm_targets() == {}
