@@ -77,6 +77,7 @@ def _vllm_config(
     cudagraph_mode: str = "FULL_DECODE_ONLY",
     capture_size: int = 8,
     enforce_eager: bool = False,
+    capture_sizes: list[int] | None = None,
 ):
     from vllm.config import CacheConfig
     from vllm.config.compilation import CUDAGraphMode
@@ -98,6 +99,7 @@ def _vllm_config(
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode[cudagraph_mode],
             max_cudagraph_capture_size=capture_size,
+            cudagraph_capture_sizes=capture_sizes,
         ),
         kv_transfer_config=None,
         speculative_config=None,
@@ -252,6 +254,9 @@ def test_sconv_metadata(built):
         (None, {"cudagraph_mode": "PIECEWISE"}, False),
         (None, {"enforce_eager": True}, False),
         (None, {"capture_size": 2}, False),
+        # PIECEWISE sizes of mixed batches (config.py) above the decode cap.
+        (None, {"capture_size": 512, "capture_sizes": [1, 2, 4, 64, 512]}, True),
+        (None, {"capture_size": 512, "capture_sizes": [1, 2, 64, 512]}, False),
     ],
 )
 def test_a_replayed_decode_batch_is_decode_only(

@@ -68,8 +68,12 @@ Serve rules:
   `piecewise` or `none`; `full` is refused. A mode with piecewise graphs
   captures mixed batches only with `VLLM_USE_BREAKABLE_CUDAGRAPH=1`. With
   `VLLM_SM70_INKLING_DECODE_GRAPH=0` or a `visit_dump_dir`, no mode with FULL
-  graphs is accepted. Capture sizes above q × `DECODE_GRAPH_MAX_BATCH` tokens
-  are refused (q = 1, or 1 + `num_speculative_tokens`).
+  graphs is accepted. Capture sizes you set above q × `DECODE_GRAPH_MAX_BATCH`
+  tokens are refused (q = 1, or 1 + `num_speculative_tokens`). With
+  `VLLM_USE_BREAKABLE_CUDAGRAPH=1` and the mode unset, mixed batches (prefill
+  chunks) also replay piecewise graphs (CUDA graphs broken around the
+  attention, conv and expert ops) up to `--max-num-batched-tokens`;
+  `VLLM_SM70_INKLING_MIXED_GRAPH=0` runs them eagerly.
   The checks are in `sm70/vllm_sm70/models/inkling2_sm70/config.py`.
 - With `VLLM_SM70_INKLING_ASYNC_SCHED=0`, don't pass `--async-scheduling`.
 - `sm70.inkling2` fields are set only through `--additional-config`
