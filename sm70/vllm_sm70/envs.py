@@ -333,6 +333,14 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN": kill_switch(
             "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
         ),
+        # "0": the query rows of an Inkling 2 request with 2 to
+        # SHORT_QUERY_LEN query tokens in an eager batch take the torch
+        # attention over shared key chunks instead of the decode-attention
+        # kernel. Env-only (no Sm70Config field), read per eager call
+        # (inkling2_sm70/attention_torch.py); only where that kernel runs.
+        "VLLM_SM70_INKLING_SHORT_QUERY_ATTN": kill_switch(
+            "VLLM_SM70_INKLING_SHORT_QUERY_ATTN"
+        ),
         # "0": Inkling 2 decode-only batches take the ops of mixed batches,
         # the cache backends declare no full-graph support and an
         # unset cudagraph_mode is not FULL_DECODE_ONLY (inkling2_sm70/

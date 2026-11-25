@@ -10,7 +10,10 @@ paged_attention.py) and its route (attention_torch.py ``gather_attention``).
   a row may not read holds NaN;
 - split-KV (the default): ``split_count`` from static bounds, the kill
   switch VLLM_SM70_INKLING_SPLIT_KV_ATTN, and parity against the torch route
-  and the unsplit kernel.
+  and the unsplit kernel;
+- short queries: the rows of requests with at most SHORT_QUERY_LEN query
+  tokens on the kernel, the kill switch VLLM_SM70_INKLING_SHORT_QUERY_ATTN,
+  and parity against the torch route.
 The interpreted cases run in a child pytest with TRITON_INTERPRET=1
 (test_interpreted_suite). AOT compile: test_m12_inkling2_triton_sm70_compile_cpu.py.
 """
@@ -52,6 +55,7 @@ OPS = (
 )
 SWITCH = cases.SWITCH
 SPLIT_SWITCH = "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
+SHORT_SWITCH = "VLLM_SM70_INKLING_SHORT_QUERY_ATTN"
 INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1"
 interpreted = pytest.mark.skipif(not INTERPRETED, reason="interpreted child run only")
 DTYPES = [
@@ -85,6 +89,7 @@ def test_interpreted_suite():
     env = dict(os.environ, TRITON_INTERPRET="1")
     env.pop(SWITCH, None)
     env.pop(SPLIT_SWITCH, None)
+    env.pop(SHORT_SWITCH, None)
     proc = subprocess.run(
         [
             sys.executable,
@@ -376,3 +381,113 @@ def test_split_verify_rows_match_the_eager_route(
     rows = sum(query_lens)
     assert cases.rel_err(got[:rows], want[:rows]) <= tol
     assert bool((got[rows:] == 0).all())
+
+
+# --- short queries --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"), [(None, True), ("1", True), ("0", False)]
+)
+def test_short_query_kill_switch(monkeypatch, value, enabled):
+    attention = cases.attention_module()
+    if value is None:
+        monkeypatch.delenv(SHORT_SWITCH, raising=False)
+    else:
+        monkeypatch.setenv(SHORT_SWITCH, value)
+    assert attention.SHORT_SWITCH == SHORT_SWITCH
+    assert attention.on_short_query() is enabled
+
+
+def test_row_index_lists_every_query_token():
+    import numpy as np
+
+    attention = cases.attention_module()
+    got = attention._row_index(np.array([0, 5, 30]), np.array([1, 3, 2]))
+    assert got.tolist() == [0, 5, 6, 7, 30, 31]
+
+
+def _spy_route(monkeypatch, attention):
+    """Rows given to the kernel and requests given to the shared-key torch
+    route, with the kernel stubbed out (no Triton needed)."""
+    seen = {"rows": [], "shared": []}
+
+    def kernel(query, rel, sinks, cache, md, out, *, rows, **kwargs):
+        rows = list(range(rows)) if isinstance(rows, int) else rows.tolist()
+        seen["rows"].append(rows)
+        out[rows] = 0
+        return out
+
+    shared = attention._shared_keys
+
+    def spied(*args, request, **kwargs):
+        seen["shared"].append(request)
+        return shared(*args, request=request, **kwargs)
+
+    monkeypatch.setattr(attention, "on_triton", lambda x: True)
+    monkeypatch.setattr(attention, "decode_attention", kernel)
+    monkeypatch.setattr(attention, "_shared_keys", spied)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("short", "rows", "shared"),
+    [(None, [[0, 1, 2, 3, 4, 5, 13]], [2]), ("0", [[0, 13]], [1, 2])],
+    ids=["on", "off"],
+)
+def test_short_query_rows_route(monkeypatch, short, rows, shared):
+    """Query lengths [1, 5, 7, 1] with SHORT_QUERY_LEN 6: the kernel takes
+    every row of the requests with at most 6 query tokens, the torch route
+    the 7-token request; with the switch off, the one-query rows only."""
+    attention = cases.attention_module()
+    monkeypatch.setattr(attention, "SHORT_QUERY_LEN", 6)
+    if short is None:
+        monkeypatch.delenv(SHORT_SWITCH, raising=False)
+    else:
+        monkeypatch.setenv(SHORT_SWITCH, short)
+    seen = _spy_route(monkeypatch, attention)
+    case = cases.Case(
+        torch.float32, None, 8, [40, 50, 60, 9], pad=2, decode_only=False,
+        query_lens=[1, 5, 7, 1],
+    )  # fmt: skip
+    case.run(attention)
+    assert seen == {"rows": rows, "shared": shared}
+
+
+def test_short_query_rows_stay_on_torch_with_hf_rounding(monkeypatch):
+    attention = cases.attention_module()
+    monkeypatch.delenv(SHORT_SWITCH, raising=False)
+    seen = _spy_route(monkeypatch, attention)
+    case = cases.Case(
+        torch.float32, None, 8, [40, 9], decode_only=False, query_lens=[5, 1]
+    )
+    case.run(attention, hf_rounding=True)
+    assert seen == {"rows": [], "shared": [0]}
+
+
+@interpreted
+@pytest.mark.parametrize(("dtype", "tol"), DTYPES)
+@LAYERS
+@pytest.mark.parametrize(
+    "seq_lens, query_lens",
+    [
+        ([90, 300, 50], [1, 19, 1]),
+        ([300, 2 * cases.BLOCK + 3, 70], [33, 8, 2]),
+        ([200, 129], [65, 1]),
+    ],
+    ids=["prefill-tail", "three-short", "long-and-one"],
+)
+def test_short_query_rows_match_the_torch_route(
+    monkeypatch, dtype, tol, window, extent, seq_lens, query_lens
+):
+    """Eager batches whose short requests run on the kernel (SHORT_QUERY_LEN
+    is 64: the 65-token request stays on torch) against the torch route."""
+    monkeypatch.setattr(cases, "NUM_BLOCKS", 40)
+    monkeypatch.delenv(SHORT_SWITCH, raising=False)
+    case = cases.Case(
+        dtype, window, extent, seq_lens, pad=3, decode_only=False,
+        query_lens=query_lens, seed=6,
+    )  # fmt: skip
+    got, want = cases.both_routes(case, monkeypatch)
+    assert cases.rel_err(got, want) <= tol
+    assert bool((got[sum(query_lens) :] == 0).all())

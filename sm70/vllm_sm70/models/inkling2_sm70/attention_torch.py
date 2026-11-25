@@ -11,7 +11,9 @@ gathered in steps of at most `key_chunk` into a running softmax. A
 decode-only batch reads no host data. Rows with a negative slot are zero.
 One-query rows run ops/paged_attention.py (split-KV unless
 VLLM_SM70_INKLING_SPLIT_KV_ATTN=0) unless VLLM_SM70_INKLING_TRITON_DECODE_ATTN=0
-or `hf_rounding` (debug: softmax weights rounded as the reference).
+or `hf_rounding` (debug: softmax weights rounded as the reference). So do
+the rows of a request with at most SHORT_QUERY_LEN query tokens, each over
+its own keys, unless VLLM_SM70_INKLING_SHORT_QUERY_ATTN=0.
 Shapes: P padded batch tokens, T real tokens, R requests, D head dim.
 """
 
@@ -39,12 +41,15 @@ __all__ = [
     "DEFAULT_KEY_CHUNK",
     "DEFAULT_QUERY_CHUNK",
     "OWN_KEY_STEPS",
+    "SHORT_QUERY_LEN",
+    "SHORT_SWITCH",
     "SPLIT_SWITCH",
     "SWITCH",
     "attention_with_metadata",
     "gate_and_project",
     "gather_attention",
     "kv_cache_views",
+    "on_short_query",
     "on_split_kv",
     "on_triton",
     "paged_attention",
@@ -54,11 +59,15 @@ SWITCH = "VLLM_SM70_INKLING_TRITON_DECODE_ATTN"
 _enabled = envs.environment_variables()[SWITCH]
 SPLIT_SWITCH = "VLLM_SM70_INKLING_SPLIT_KV_ATTN"
 _split_enabled = envs.environment_variables()[SPLIT_SWITCH]
+SHORT_SWITCH = "VLLM_SM70_INKLING_SHORT_QUERY_ATTN"
+_short_enabled = envs.environment_variables()[SHORT_SWITCH]
 
 DEFAULT_QUERY_CHUNK = 256
 DEFAULT_KEY_CHUNK = 1024
 # Single-query requests gather this many key chunks per step between them.
 OWN_KEY_STEPS = 8
+# Most query tokens of a request whose rows run the one-query kernel.
+SHORT_QUERY_LEN = 64
 # Key chunk of `hf_rounding`: every key in one step.
 _ALL_KEYS = 1 << 62
 
@@ -74,6 +83,19 @@ def on_triton(x: torch.Tensor) -> bool:
 def on_split_kv() -> bool:
     """Whether the Triton kernel of one-query rows may split their keys."""
     return _split_enabled()
+
+
+def on_short_query() -> bool:
+    """Whether the Triton kernel of one-query rows also takes the rows of
+    requests with at most SHORT_QUERY_LEN query tokens."""
+    return _short_enabled()
+
+
+def _row_index(starts: np.ndarray, query_lens: np.ndarray) -> np.ndarray:
+    """Batch rows of every query token of the requests with these first
+    rows and query lengths, in order."""
+    ends = np.cumsum(query_lens)
+    return np.repeat(starts - ends + query_lens, query_lens) + np.arange(ends[-1])
 
 
 def kv_cache_views(
@@ -363,14 +385,17 @@ def gather_attention(
     query_lens = np.asarray(md.query_lens_cpu[: md.num_reqs])
     seq_lens = np.asarray(md.seq_lens_cpu[: md.num_reqs])
     starts = np.concatenate(([0], np.cumsum(query_lens)))
-    single = np.flatnonzero(query_lens == 1)
+    kernel = not hf_rounding and on_triton(query)
+    own_len = SHORT_QUERY_LEN if kernel and on_short_query() else 1
+    single = np.flatnonzero((query_lens >= 1) & (query_lens <= own_len))
     if single.size:
-        if single[-1] == single.size - 1:
+        if single[-1] == single.size - 1 and int(starts[single.size]) == single.size:
             # Decode-first batch: the device copy of `starts` has the tokens.
             tokens = md.query_start_loc[: single.size].long()
         else:
-            tokens = torch.as_tensor(starts[single], device=query.device)
-    if single.size and not hf_rounding and on_triton(query):
+            rows = _row_index(starts[single], query_lens[single])
+            tokens = torch.as_tensor(rows, device=query.device)
+    if single.size and kernel:
         decode_attention(
             query, rel_logits, sinks, kv_cache, md, out, rows=tokens, padding=False,
             split_kv=on_split_kv(), max_keys=int(seq_lens[single].max()),
@@ -388,7 +413,7 @@ def gather_attention(
             key_chunk=key_chunk,
             hf_rounding=hf_rounding,
         )
-    for request in np.flatnonzero(query_lens > 1).tolist():
+    for request in np.flatnonzero(query_lens > own_len).tolist():
         start, stop = int(starts[request]), int(starts[request + 1])
         _shared_keys(
             query,
