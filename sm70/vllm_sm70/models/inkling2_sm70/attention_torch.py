@@ -29,7 +29,7 @@ from vllm_sm70 import envs
 
 from . import gemv
 from .backend import is_decode_only
-from .fused_small import on_fused
+from .fused_small import on_small
 from .ops import _compat, small_ops
 from .ops.paged_attention import decode_attention
 
@@ -491,7 +491,7 @@ def attention_with_metadata(
         key_chunk=key_chunk,
         hf_rounding=hf_rounding,
     )
-    if on_fused(attn_output, is_decode_only(md)):
+    if on_small(attn_output, is_decode_only(md)):
         rows = min(output.shape[0], md.slot_mapping.shape[0])
         if out_weight is None and output.dtype == attn_output.dtype:
             return small_ops.gate(attn_output, gate, md.slot_mapping, rows, output)

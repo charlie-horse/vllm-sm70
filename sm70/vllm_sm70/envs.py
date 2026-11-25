@@ -449,6 +449,17 @@ _SECTIONS: dict[str, dict[str, Callable[[], Any]]] = {
         "VLLM_SM70_INKLING_FUSED_SMALL_OPS": kill_switch(
             "VLLM_SM70_INKLING_FUSED_SMALL_OPS"
         ),
+        # "0": Inkling 2 batches that are not decode-only (prefill and mixed
+        # steps) run the prologue's q/r clips and relative projection, the
+        # attention output gate and the expert router on torch ops instead
+        # of the kernels of inkling2_sm70/fused_small.py and ops/routing.py.
+        # Env-only (no Sm70Config field), read per eager call; these ops run
+        # outside the piecewise graphs. Needs
+        # VLLM_SM70_INKLING_FUSED_SMALL_OPS on; tensors off the GPU always
+        # take the torch ops.
+        "VLLM_SM70_INKLING_MIXED_SMALL_OPS": kill_switch(
+            "VLLM_SM70_INKLING_MIXED_SMALL_OPS"
+        ),
         # "0": Inkling 2 decode-only batches run one kernel per op of a layer
         # visit instead of the merged kernels of inkling2_sm70/
         # visit_fusion.py (short conv with residual and AttnRes mix, message
