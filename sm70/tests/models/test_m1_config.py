@@ -177,6 +177,7 @@ def test_registered_names_are_exactly_ours():
         "VLLM_SM70_INKLING_TRITON_SCONV",
         "VLLM_SM70_INKLING_TRITON_DECODE_ATTN",
         "VLLM_SM70_INKLING_SPLIT_KV_ATTN",
+        "VLLM_SM70_INKLING_SHORT_QUERY_ATTN",
         "VLLM_SM70_INKLING_DECODE_GRAPH",
         "VLLM_SM70_INKLING_GROUPED_MOE",
         "VLLM_SM70_INKLING_FUSED_ROUTING",
@@ -471,6 +472,17 @@ def _inkling_split_kv_attn_off(name):
 
     assert attention_torch.SPLIT_SWITCH == name
     assert attention_torch.on_split_kv() is False
+
+
+def _inkling_short_query_attn_off(name):
+    """Requests with several query tokens take the shared-key torch route;
+    the route's own checks are
+    tests/ops/test_m12_inkling2_triton_decode_attn_cpu.py."""
+    pytest.importorskip("vllm")
+    from vllm_sm70.models.inkling2_sm70 import attention_torch
+
+    assert attention_torch.SHORT_SWITCH == name
+    assert attention_torch.on_short_query() is False
 
 
 def _inkling_grouped_moe_off(name):
@@ -837,6 +849,8 @@ def _path_off(name):
         _inkling_triton_decode_attn_off(name)
     elif name == "VLLM_SM70_INKLING_SPLIT_KV_ATTN":
         _inkling_split_kv_attn_off(name)
+    elif name == "VLLM_SM70_INKLING_SHORT_QUERY_ATTN":
+        _inkling_short_query_attn_off(name)
     elif name == "VLLM_SM70_INKLING_DECODE_GRAPH":
         _inkling_decode_graph_off(name)
     elif name == "VLLM_SM70_INKLING_GROUPED_MOE":
